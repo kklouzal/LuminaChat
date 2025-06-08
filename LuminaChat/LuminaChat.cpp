@@ -20,11 +20,13 @@
 // 2. Stay consistent with similar coding styles and patterns throughout the codebase.
 // 3. Comment code thoroughly, where necessary, to explain complex logic or decisions.
 // 4. Always eliminate unused code, dead code, legacy code, and cleanup includes.
-// 5. Use consistent _t fixed-width variable types to ensure portability across platforms.
-// 6. Cache frequently used variables to avoid repeated allocations.
-// 7. Ensure there are no logical errors and the execution paths flow as expected.
-// 8. Refactor where necessary to maintain clean code, efficient code, and to conform to the above settings and directives.
-// 9. NEVER BREAK FUNCTIONALITY THAT IS ALREADY WORKING.
+// 5. Combine or split functions where necessary to eliminate redundancy.
+// 6. Focus on overall codebase reduction without sacrificing functionality.
+// 7. Use consistent _t fixed-width variable types to ensure portability across platforms.
+// 8. Cache frequently used variables to avoid repeated allocations.
+// 9. Ensure there are no logical errors and the execution paths flow as expected.
+// 10. Refactor where necessary to maintain clean code, efficient code, and to conform to the above settings and directives.
+// 11. NEVER BREAK FUNCTIONALITY THAT IS ALREADY WORKING.
 
 #include <wx/wx.h>
 #include <wx/filedlg.h>
@@ -46,7 +48,46 @@
 #include <sstream>
 #include <memory>
 #include <atomic>
+#include <iostream>
+#include <streambuf>
 #include "LlamaManager.hpp"
+
+// Forward declarations
+class LuminaChatFrame;
+class ModelWorkerThread;
+
+// ADDED: Custom stream buffer for redirecting cout/cerr to wxWidgets
+class wxLogStreamBuffer : public std::streambuf {
+private:
+    LuminaChatFrame* frame;
+    std::string buffer;
+    
+public:
+    wxLogStreamBuffer(LuminaChatFrame* f) : frame(f) {}
+    
+protected:
+    virtual int_type overflow(int_type c) override {
+        if (c != EOF) {
+            buffer += static_cast<char>(c);
+            if (c == '\n') {
+                FlushBuffer();
+            }
+        }
+        return c;
+    }
+    
+    virtual std::streamsize xsputn(const char* s, std::streamsize count) override {
+        buffer.append(s, count);
+        // Check for newlines and flush if found
+        if (buffer.find('\n') != std::string::npos) {
+            FlushBuffer();
+        }
+        return count;
+    }
+    
+private:
+    void FlushBuffer(); // Declaration only - implementation after LuminaChatFrame is defined
+};
 
 // Event IDs
 enum {
@@ -68,10 +109,6 @@ wxDECLARE_EVENT(wxEVT_PROGRESS_UPDATE, wxCommandEvent);
 wxDEFINE_EVENT(wxEVT_MODEL_LOADED, wxCommandEvent);
 wxDEFINE_EVENT(wxEVT_RESPONSE_READY, wxCommandEvent);
 wxDEFINE_EVENT(wxEVT_PROGRESS_UPDATE, wxCommandEvent);
-
-// Forward declarations
-class LuminaChatFrame;
-class ModelWorkerThread;
 
 // Progress callback function for model loading
 bool model_loading_progress_callback(float progress, void *user_data);
@@ -468,11 +505,23 @@ private:
     }
 };
 
+// MOVED: Global pointer declaration before LuminaChatFrame class
+LuminaChatFrame* g_main_frame = nullptr;
+
+// MOVED: Declaration only - implementation after LuminaChatFrame is defined
+void llama_manager_log_callback(const std::string& message);
+
 // Main Frame with optimized performance
 class LuminaChatFrame : public wxFrame {
 private:
     // Core components
     std::unique_ptr<LlamaManager> llama_manager;
+    
+    // ADDED: Stream buffers for console redirection
+    std::unique_ptr<wxLogStreamBuffer> cout_buffer;
+    std::unique_ptr<wxLogStreamBuffer> cerr_buffer;
+    std::streambuf* original_cout;
+    std::streambuf* original_cerr;
     
     // Settings
     std::string model_path;
@@ -505,12 +554,20 @@ private:
 public:
     LuminaChatFrame() : wxFrame(nullptr, wxID_ANY, "LuminaChat", wxDefaultPosition, wxSize(800, 600)),
                         llama_manager(std::make_unique<LlamaManager>()),
-                        context_size(2048), gpu_layers(0), predict_tokens(256), is_started(false) {
+                        context_size(2048), gpu_layers(0), predict_tokens(256), is_started(false),
+                        original_cout(nullptr), original_cerr(nullptr) {
+        
+        // ADDED: Set global pointer for log callback
+        g_main_frame = this;
         
         SettingsManager::LoadSettings(model_path, context_size, gpu_layers, predict_tokens, 
                                     chat_template, identity_directive, other_directives);
         
         CreateUI();
+        
+        // ADDED: Redirect cout and cerr to logs panel after UI is created
+        SetupConsoleRedirection();
+        
         UpdateButtonStates();
         UpdateWindowTitle();
 
@@ -521,13 +578,53 @@ public:
     }
 
     ~LuminaChatFrame() {
+        // ADDED: Restore original cout/cerr
+        if (original_cout) {
+            std::cout.rdbuf(original_cout);
+        }
+        if (original_cerr) {
+            std::cerr.rdbuf(original_cerr);
+        }
+        
+        // ADDED: Clear global pointer
+        g_main_frame = nullptr;
+        
         if (worker_thread) {
             worker_thread->RequestStop();
             worker_thread = nullptr;
         }
     }
 
+    // Add method to append to logs from callback (thread-safe)
+    void AppendToLogsThreadSafe(const wxString& message) {
+        // Use CallAfter to ensure this runs on the main thread
+        CallAfter([this, message]() {
+            if (logs_text) {
+                logs_text->AppendText(message);
+                logs_text->SetInsertionPointEnd();
+            }
+        });
+    }
+
 private:
+    // ADDED: Setup console output redirection
+    void SetupConsoleRedirection() {
+        // Store original stream buffers
+        original_cout = std::cout.rdbuf();
+        original_cerr = std::cerr.rdbuf();
+        
+        // Create new stream buffers that redirect to wxWidgets
+        cout_buffer = std::make_unique<wxLogStreamBuffer>(this);
+        cerr_buffer = std::make_unique<wxLogStreamBuffer>(this);
+        
+        // Redirect cout and cerr
+        std::cout.rdbuf(cout_buffer.get());
+        std::cerr.rdbuf(cerr_buffer.get());
+        
+        // Add initial message to logs
+        AppendToLogsThreadSafe("Console output redirected to logs panel\n");
+    }
+
     void UpdateWindowTitle() {
         if (!model_path.empty()) {
             wxFileName modelFile(wxString::FromUTF8(model_path));
@@ -796,17 +893,15 @@ private:
         progress_bar->Show();
         main_panel->Layout(); // Use main_panel->Layout() instead of GetSizer()->Layout()
         
-        // Log loading information
-        logs_text->AppendText(wxString::Format(
-            "Initializing LuminaChat...\n"
-            "Context Size: %d tokens\n"
-            "GPU Layers: %d\n"
-            "Max Prediction: %d tokens\n"
-            "Loading model: %s\n",
-            context_size, gpu_layers, predict_tokens, model_path));
+        // ADDED: Use cout for logging (will be redirected to logs panel)
+        std::cout << "Initializing LuminaChat..." << std::endl;
+        std::cout << "Context Size: " << context_size << " tokens" << std::endl;
+        std::cout << "GPU Layers: " << gpu_layers << std::endl;
+        std::cout << "Max Prediction: " << predict_tokens << " tokens" << std::endl;
+        std::cout << "Loading model: " << model_path << std::endl;
         
         if (!GetCombinedSystemPrompt().empty()) {
-            logs_text->AppendText("System prompt configured\n");
+            std::cout << "System prompt configured" << std::endl;
         }
         
         // Start model loading thread
@@ -854,18 +949,18 @@ private:
                     chat_template = model_template;
                     SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, 
                                                 chat_template, identity_directive, other_directives);
-                    logs_text->AppendText("Loaded chat template from model\n");
+                    std::cout << "Loaded chat template from model" << std::endl;
                 }
             } else {
                 llama_manager->set_custom_chat_template(chat_template);
-                logs_text->AppendText("Using custom chat template\n");
+                std::cout << "Using custom chat template" << std::endl;
             }
             
             // Set system prompt
             std::string combined_prompt = GetCombinedSystemPrompt();
             if (!combined_prompt.empty()) {
                 llama_manager->set_system_prompt(combined_prompt);
-                logs_text->AppendText("System prompt applied\n");
+                std::cout << "System prompt applied" << std::endl;
             }
             
             is_started = true;
@@ -877,7 +972,7 @@ private:
             llama_manager->reset_timings();
             timings_label->SetLabel("");
         } else {
-            logs_text->AppendText("Error: Failed to load model\n");
+            std::cerr << "Error: Failed to load model" << std::endl;
         }
         
         UpdateButtonStates();
@@ -900,7 +995,7 @@ private:
         is_started = false;
         is_processing = false;
         UpdateButtonStates();
-        logs_text->AppendText("LuminaChat stopped.\n\n");
+        std::cout << "LuminaChat stopped." << std::endl << std::endl;
         timings_label->SetLabel("");
     }
     
@@ -967,19 +1062,6 @@ private:
         chat_history->ShowPosition(chat_history->GetLastPosition());
     }
 
-public:
-    // Add method to append to logs from callback (thread-safe)
-    void AppendToLogsThreadSafe(const wxString& message) {
-        // Use CallAfter to ensure this runs on the main thread
-        CallAfter([this, message]() {
-            if (logs_text) {
-                logs_text->AppendText(message);
-                logs_text->SetInsertionPointEnd();
-            }
-        });
-    }
-
-private:
     void UpdateTimingsDisplay() {
         if (!is_started || !llama_manager) {
             return;
@@ -996,6 +1078,30 @@ private:
         }
     }
 };
+
+// ADDED: Implementation of wxLogStreamBuffer::FlushBuffer now that LuminaChatFrame is defined
+void wxLogStreamBuffer::FlushBuffer() {
+    if (!buffer.empty() && frame) {
+        // Remove trailing newlines for cleaner display
+        while (!buffer.empty() && (buffer.back() == '\n' || buffer.back() == '\r')) {
+            buffer.pop_back();
+        }
+        
+        if (!buffer.empty()) {
+            // Use thread-safe method to append to logs
+            wxString message = wxString::FromUTF8(buffer) + "\n";
+            frame->AppendToLogsThreadSafe(message);
+        }
+        buffer.clear();
+    }
+}
+
+// MOVED: Implementation of llama manager log callback now that LuminaChatFrame is defined
+void llama_manager_log_callback(const std::string& message) {
+    if (g_main_frame) {
+        g_main_frame->AppendToLogsThreadSafe(wxString::FromUTF8(message) + "\n");
+    }
+}
 
 // Progress callback function for model loading - implementation
 bool model_loading_progress_callback(float progress, void *user_data) {
