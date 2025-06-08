@@ -21,9 +21,10 @@
 // 3. Comment code thoroughly, where necessary, to explain complex logic or decisions.
 // 4. Always eliminate unused code, dead code, legacy code, and cleanup includes.
 // 5. Use consistent _t fixed-width variable types to ensure portability across platforms.
-// 6. Ensure there are no logical errors and the execution paths flow as expected.
-// 7. Refactor where necessary to maintain clean code, efficient code, and to conform to the above settings and directives.
-// 8. NEVER BREAK FUNCTIONALITY THAT IS ALREADY WORKING.
+// 6. Cache frequently used variables to avoid repeated allocations.
+// 7. Ensure there are no logical errors and the execution paths flow as expected.
+// 8. Refactor where necessary to maintain clean code, efficient code, and to conform to the above settings and directives.
+// 9. NEVER BREAK FUNCTIONALITY THAT IS ALREADY WORKING.
 
 #include <wx/wx.h>
 #include <wx/filedlg.h>
@@ -186,6 +187,48 @@ private:
 
 // Settings management functions
 class SettingsManager {
+private:
+    // Helper functions to escape/unescape strings for INI storage
+    static std::string EscapeString(const std::string& input) {
+        std::string result = input;
+        size_t pos = 0;
+        while ((pos = result.find('\n', pos)) != std::string::npos) {
+            result.replace(pos, 1, "\\n");
+            pos += 2;
+        }
+        pos = 0;
+        while ((pos = result.find('\r', pos)) != std::string::npos) {
+            result.replace(pos, 1, "\\r");
+            pos += 2;
+        }
+        return result;
+    }
+    
+    static std::string UnescapeString(const std::string& input) {
+        std::string result = input;
+        size_t pos = 0;
+        while ((pos = result.find("\\n", pos)) != std::string::npos) {
+            result.replace(pos, 2, "\n");
+            pos += 1;
+        }
+        pos = 0;
+        while ((pos = result.find("\\r", pos)) != std::string::npos) {
+            result.replace(pos, 2, "\r");
+            pos += 1;
+        }
+        return result;
+    }
+    
+    // Validate and clamp integer values
+    static int32_t ValidateInt32(const std::string& value, int32_t default_val, int32_t min_val, int32_t max_val) {
+        try {
+            int32_t parsed = std::stoi(value);
+            return (parsed >= min_val && parsed <= max_val) ? parsed : default_val;
+        } catch (...) {
+            return default_val;
+        }
+    }
+
 public:
     static std::string GetSettingsFilePath() {
         wxStandardPaths& stdPaths = wxStandardPaths::Get();
@@ -194,155 +237,57 @@ public:
         return iniPath.ToStdString();
     }
     
-    static void SaveSettings(const std::string& model_path, int32_t context_size, int32_t gpu_layers, int32_t predict_tokens, const std::string& chat_template, const std::string& identity_directive, const std::string& other_directives) {
-        std::string filePath = GetSettingsFilePath();
-        std::ofstream file(filePath);
+    static void SaveSettings(const std::string& model_path, int32_t context_size, int32_t gpu_layers, 
+                           int32_t predict_tokens, const std::string& chat_template, 
+                           const std::string& identity_directive, const std::string& other_directives) {
+        std::ofstream file(GetSettingsFilePath());
         
         if (file.is_open()) {
-            file << "[General]\n";
-            file << "ModelPath=" << model_path << "\n";
-            file << "ContextSize=" << context_size << "\n";
-            file << "GpuLayers=" << gpu_layers << "\n";
-            file << "PredictTokens=" << predict_tokens << "\n";
-            file << "\n[ChatTemplate]\n";
-            
-            // Escape newlines for storage
-            std::string escaped_template = chat_template;
-            size_t pos = 0;
-            while ((pos = escaped_template.find('\n', pos)) != std::string::npos) {
-                escaped_template.replace(pos, 1, "\\n");
-                pos += 2;
-            }
-            while ((pos = escaped_template.find('\r', pos)) != std::string::npos) {
-                escaped_template.replace(pos, 1, "\\r");
-                pos += 2;
-            }
-            
-            file << "Template=" << escaped_template << "\n";
-            
-            file << "\n[SystemPrompt]\n";
-            
-            // Escape newlines for identity directive
-            std::string escaped_identity = identity_directive;
-            pos = 0;
-            while ((pos = escaped_identity.find('\n', pos)) != std::string::npos) {
-                escaped_identity.replace(pos, 1, "\\n");
-                pos += 2;
-            }
-            while ((pos = escaped_identity.find('\r', pos)) != std::string::npos) {
-                escaped_identity.replace(pos, 1, "\\r");
-                pos += 2;
-            }
-            
-            file << "IdentityDirective=" << escaped_identity << "\n";
-            
-            // Escape newlines for other directives
-            std::string escaped_other = other_directives;
-            pos = 0;
-            while ((pos = escaped_other.find('\n', pos)) != std::string::npos) {
-                escaped_other.replace(pos, 1, "\\n");
-                pos += 2;
-            }
-            while ((pos = escaped_other.find('\r', pos)) != std::string::npos) {
-                escaped_other.replace(pos, 1, "\\r");
-                pos += 2;
-            }
-            
-            file << "OtherDirectives=" << escaped_other << "\n";
-            
-            file.close();
+            file << "[General]\n"
+                 << "ModelPath=" << model_path << "\n"
+                 << "ContextSize=" << context_size << "\n"
+                 << "GpuLayers=" << gpu_layers << "\n"
+                 << "PredictTokens=" << predict_tokens << "\n"
+                 << "\n[ChatTemplate]\n"
+                 << "Template=" << EscapeString(chat_template) << "\n"
+                 << "\n[SystemPrompt]\n"
+                 << "IdentityDirective=" << EscapeString(identity_directive) << "\n"
+                 << "OtherDirectives=" << EscapeString(other_directives) << "\n";
         }
     }
     
-    static void LoadSettings(std::string& model_path, int32_t& context_size, int32_t& gpu_layers, int32_t& predict_tokens, std::string& chat_template, std::string& identity_directive, std::string& other_directives) {
-        std::string filePath = GetSettingsFilePath();
-        std::ifstream file(filePath);
+    static void LoadSettings(std::string& model_path, int32_t& context_size, int32_t& gpu_layers, 
+                           int32_t& predict_tokens, std::string& chat_template, 
+                           std::string& identity_directive, std::string& other_directives) {
+        std::ifstream file(GetSettingsFilePath());
         
         if (file.is_open()) {
             std::string line;
             while (std::getline(file, line)) {
-                // Skip section headers and empty lines
-                if (line.empty() || line[0] == '[') {
-                    continue;
-                }
+                if (line.empty() || line[0] == '[') continue;
                 
                 size_t equalPos = line.find('=');
-                if (equalPos != std::string::npos) {
-                    std::string key = line.substr(0, equalPos);
-                    std::string value = line.substr(equalPos + 1);
-                    
-                    if (key == "ModelPath") {
-                        model_path = value;
-                    } else if (key == "ContextSize") {
-                        try {
-                            context_size = std::stoi(value);
-                            if (context_size <= 0 || context_size > 131072) {
-                                context_size = 2048;
-                            }
-                        } catch (...) {
-                            context_size = 2048;
-                        }
-                    } else if (key == "GpuLayers") {
-                        try {
-                            gpu_layers = std::stoi(value);
-                            if (gpu_layers < 0 || gpu_layers > 999) {
-                                gpu_layers = 0;
-                            }
-                        } catch (...) {
-                            gpu_layers = 0;
-                        }
-                    } else if (key == "PredictTokens") {
-                        try {
-                            predict_tokens = std::stoi(value);
-                            if (predict_tokens <= 0 || predict_tokens > 4096) {
-                                predict_tokens = 256;
-                            }
-                        } catch (...) {
-                            predict_tokens = 256;
-                        }
-                    } else if (key == "Template") {
-                        // Unescape newlines
-                        chat_template = value;
-                        size_t pos = 0;
-                        while ((pos = chat_template.find("\\n", pos)) != std::string::npos) {
-                            chat_template.replace(pos, 2, "\n");
-                            pos += 1;
-                        }
-                        pos = 0;
-                        while ((pos = chat_template.find("\\r", pos)) != std::string::npos) {
-                            chat_template.replace(pos, 2, "\r");
-                            pos += 1;
-                        }
-                    } else if (key == "IdentityDirective") {
-                        // Unescape newlines
-                        identity_directive = value;
-                        size_t pos = 0;
-                        while ((pos = identity_directive.find("\\n", pos)) != std::string::npos) {
-                            identity_directive.replace(pos, 2, "\n");
-                            pos += 1;
-                        }
-                        pos = 0;
-                        while ((pos = identity_directive.find("\\r", pos)) != std::string::npos) {
-                            identity_directive.replace(pos, 2, "\r");
-                            pos += 1;
-                        }
-                    } else if (key == "OtherDirectives") {
-                        // Unescape newlines
-                        other_directives = value;
-                        size_t pos = 0;
-                        while ((pos = other_directives.find("\\n", pos)) != std::string::npos) {
-                            other_directives.replace(pos, 2, "\n");
-                            pos += 1;
-                        }
-                        pos = 0;
-                        while ((pos = other_directives.find("\\r", pos)) != std::string::npos) {
-                            other_directives.replace(pos, 2, "\r");
-                            pos += 1;
-                        }
-                    }
+                if (equalPos == std::string::npos) continue;
+                
+                std::string key = line.substr(0, equalPos);
+                std::string value = line.substr(equalPos + 1);
+                
+                if (key == "ModelPath") {
+                    model_path = value;
+                } else if (key == "ContextSize") {
+                    context_size = ValidateInt32(value, 2048, 1, 131072);
+                } else if (key == "GpuLayers") {
+                    gpu_layers = ValidateInt32(value, 0, 0, 999);
+                } else if (key == "PredictTokens") {
+                    predict_tokens = ValidateInt32(value, 256, 1, 4096);
+                } else if (key == "Template") {
+                    chat_template = UnescapeString(value);
+                } else if (key == "IdentityDirective") {
+                    identity_directive = UnescapeString(value);
+                } else if (key == "OtherDirectives") {
+                    other_directives = UnescapeString(value);
                 }
             }
-            file.close();
         }
     }
 };
@@ -350,6 +295,7 @@ public:
 // Settings Dialog
 class SettingsDialog : public wxDialog {
 private:
+    // UI controls
     wxTextCtrl* model_path_text;
     wxTextCtrl* context_size_text;
     wxTextCtrl* gpu_layers_text;
@@ -357,6 +303,8 @@ private:
     wxTextCtrl* chat_template_text;
     wxTextCtrl* identity_directive_text;
     wxTextCtrl* other_directives_text;
+    
+    // References to settings
     std::string& model_path_ref;
     int32_t& context_size_ref;
     int32_t& gpu_layers_ref;
@@ -365,8 +313,25 @@ private:
     std::string& identity_directive_ref;
     std::string& other_directives_ref;
 
+    // Validation helper
+    bool ValidateAndSetInt32(wxTextCtrl* control, int32_t& target, int32_t default_val, 
+                           int32_t min_val, int32_t max_val, const wxString& field_name) {
+        long value;
+        if (control->GetValue().ToLong(&value) && value >= min_val && value <= max_val) {
+            target = static_cast<int32_t>(value);
+            return true;
+        } else {
+            wxMessageBox(wxString::Format("Invalid %s. Using default value (%d).", field_name, default_val), 
+                        "Warning", wxOK | wxICON_WARNING);
+            target = default_val;
+            return false;
+        }
+    }
+
 public:
-    SettingsDialog(wxWindow* parent, std::string& model_path, int32_t& context_size, int32_t& gpu_layers, int32_t& predict_tokens, std::string& chat_template, std::string& identity_directive, std::string& other_directives) 
+    SettingsDialog(wxWindow* parent, std::string& model_path, int32_t& context_size, int32_t& gpu_layers, 
+                  int32_t& predict_tokens, std::string& chat_template, std::string& identity_directive, 
+                  std::string& other_directives) 
         : wxDialog(parent, wxID_ANY, "Settings", wxDefaultPosition, wxSize(700, 500)),
           model_path_ref(model_path), context_size_ref(context_size), gpu_layers_ref(gpu_layers), 
           predict_tokens_ref(predict_tokens), chat_template_ref(chat_template),
@@ -484,39 +449,20 @@ private:
     void OnOK(wxCommandEvent& event) {
         model_path_ref = model_path_text->GetValue().ToStdString();
         
-        long context_size_val;
-        if (context_size_text->GetValue().ToLong(&context_size_val) && context_size_val > 0 && context_size_val <= 131072) {
-            context_size_ref = static_cast<int32_t>(context_size_val);
-        } else {
-            wxMessageBox("Invalid context size. Using default value (2048).", "Warning", wxOK | wxICON_WARNING);
-            context_size_ref = 2048;
-        }
+        // Validate all numeric fields
+        ValidateAndSetInt32(context_size_text, context_size_ref, 2048, 1, 131072, "context size");
+        ValidateAndSetInt32(gpu_layers_text, gpu_layers_ref, 0, 0, 999, "GPU layers");
+        ValidateAndSetInt32(predict_tokens_text, predict_tokens_ref, 256, 1, 4096, "prediction tokens");
         
-        long gpu_layers_val;
-        if (gpu_layers_text->GetValue().ToLong(&gpu_layers_val) && gpu_layers_val >= 0 && gpu_layers_val <= 999) {
-            gpu_layers_ref = static_cast<int32_t>(gpu_layers_val);
-        } else {
-            wxMessageBox("Invalid GPU layers. Using default value (0).", "Warning", wxOK | wxICON_WARNING);
-            gpu_layers_ref = 0;
-        }
-        
-        long predict_tokens_val;
-        if (predict_tokens_text->GetValue().ToLong(&predict_tokens_val) && predict_tokens_val > 0 && predict_tokens_val <= 4096) {
-            predict_tokens_ref = static_cast<int32_t>(predict_tokens_val);
-        } else {
-            wxMessageBox("Invalid prediction tokens. Using default value (256).", "Warning", wxOK | wxICON_WARNING);
-            predict_tokens_ref = 256;
-        }
-        
-        // Get chat template
+        // Get text fields
         chat_template_ref = chat_template_text->GetValue().ToUTF8().data();
-        
-        // Get system prompt components
         identity_directive_ref = identity_directive_text->GetValue().ToUTF8().data();
         other_directives_ref = other_directives_text->GetValue().ToUTF8().data();
         
-        // Save settings to INI file including system prompt components
-        SettingsManager::SaveSettings(model_path_ref, context_size_ref, gpu_layers_ref, predict_tokens_ref, chat_template_ref, identity_directive_ref, other_directives_ref);
+        // Save settings
+        SettingsManager::SaveSettings(model_path_ref, context_size_ref, gpu_layers_ref, 
+                                    predict_tokens_ref, chat_template_ref, 
+                                    identity_directive_ref, other_directives_ref);
         
         EndModal(wxID_OK);
     }
@@ -525,7 +471,10 @@ private:
 // Main Frame with optimized performance
 class LuminaChatFrame : public wxFrame {
 private:
+    // Core components
     std::unique_ptr<LlamaManager> llama_manager;
+    
+    // Settings
     std::string model_path;
     int32_t context_size;
     int32_t gpu_layers;
@@ -533,9 +482,12 @@ private:
     std::string chat_template;
     std::string identity_directive;
     std::string other_directives;
+    
+    // State
     bool is_started;
     std::atomic<bool> is_processing{false};
     
+    // UI controls
     wxButton* start_btn;
     wxButton* stop_btn;
     wxButton* settings_btn;
@@ -554,15 +506,12 @@ public:
                         llama_manager(std::make_unique<LlamaManager>()),
                         context_size(2048), gpu_layers(0), predict_tokens(256), is_started(false) {
         
-        SettingsManager::LoadSettings(model_path, context_size, gpu_layers, predict_tokens, chat_template, identity_directive, other_directives);
+        SettingsManager::LoadSettings(model_path, context_size, gpu_layers, predict_tokens, 
+                                    chat_template, identity_directive, other_directives);
         
         CreateUI();
         UpdateButtonStates();
-        
-        if (!model_path.empty()) {
-            wxFileName modelFile(wxString::FromUTF8(model_path));
-            SetTitle(wxString::Format("LuminaChat - %s", modelFile.GetName()));
-        }
+        UpdateWindowTitle();
 
         // Bind custom events
         Bind(wxEVT_MODEL_LOADED, &LuminaChatFrame::OnModelLoaded, this);
@@ -573,12 +522,43 @@ public:
     ~LuminaChatFrame() {
         if (worker_thread) {
             worker_thread->RequestStop();
-            // Don't wait for detached thread, just clean up
             worker_thread = nullptr;
         }
     }
 
 private:
+    void UpdateWindowTitle() {
+        if (!model_path.empty()) {
+            wxFileName modelFile(wxString::FromUTF8(model_path));
+            SetTitle(wxString::Format("LuminaChat - %s", modelFile.GetName()));
+        } else {
+            SetTitle("LuminaChat");
+        }
+    }
+    
+    std::string GetCombinedSystemPrompt() const {
+        std::string combined;
+        if (!identity_directive.empty()) {
+            combined = identity_directive;
+            if (!other_directives.empty()) {
+                combined += "\n\n" + other_directives;
+            }
+        } else if (!other_directives.empty()) {
+            combined = other_directives;
+        }
+        return combined;
+    }
+    
+    void SetDefaultSystemPromptIfEmpty() {
+        if (identity_directive.empty() && other_directives.empty()) {
+            identity_directive = "You are a helpful AI assistant named Lumina.";
+            other_directives = "Answer each user request thoughtfully and to the best of your ability. Be clear and concise in your responses.";
+            
+            SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, 
+                                        chat_template, identity_directive, other_directives);
+        }
+    }
+
     void CreateUI() {
         wxPanel* main_panel = new wxPanel(this);
         
@@ -753,50 +733,33 @@ private:
             return;
         }
         
-        if (is_processing) {
-            return;
-        }
+        if (is_processing) return;
 
-        // Set default system prompt values if empty
-        if (identity_directive.empty() && other_directives.empty()) {
-            identity_directive = "You are a helpful AI assistant named Lumina.";
-            other_directives = "Answer each user request thoughtfully and to the best of your ability. Be clear and concise in your responses.";
-            
-            // Save the defaults to settings
-            SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, chat_template, identity_directive, other_directives);
-        }
+        SetDefaultSystemPromptIfEmpty();
 
         is_processing = true;
         UpdateButtonStates();
         
-        // Show progress bar and update label
+        // Show progress bar
         progress_label->SetLabel("Loading model...");
         progress_bar->SetValue(0);
         progress_bar->Show();
-        Layout(); // Refresh layout to show progress bar
+        Layout();
         
-        logs_text->AppendText("Initializing LuminaChat...\n");
-        logs_text->AppendText(wxString::Format("Context Size: %d tokens\n", context_size));
-        logs_text->AppendText(wxString::Format("GPU Layers: %d\n", gpu_layers));
-        logs_text->AppendText(wxString::Format("Max Prediction: %d tokens\n", predict_tokens));
-        logs_text->AppendText("Loading model: " + model_path + "\n");
+        // Log loading information
+        logs_text->AppendText(wxString::Format(
+            "Initializing LuminaChat...\n"
+            "Context Size: %d tokens\n"
+            "GPU Layers: %d\n"
+            "Max Prediction: %d tokens\n"
+            "Loading model: %s\n",
+            context_size, gpu_layers, predict_tokens, model_path));
         
-        // Combine identity and other directives for system prompt
-        std::string combined_system_prompt;
-        if (!identity_directive.empty()) {
-            combined_system_prompt = identity_directive;
-            if (!other_directives.empty()) {
-                combined_system_prompt += "\n\n" + other_directives;
-            }
-        } else if (!other_directives.empty()) {
-            combined_system_prompt = other_directives;
-        }
-        
-        if (!combined_system_prompt.empty()) {
+        if (!GetCombinedSystemPrompt().empty()) {
             logs_text->AppendText("System prompt configured\n");
         }
         
-        // Start model loading in background thread
+        // Start model loading thread
         worker_thread = new ModelWorkerThread(this, llama_manager.get(), ModelWorkerThread::LOAD_MODEL);
         worker_thread->SetModelParams(model_path, context_size, gpu_layers, predict_tokens, chat_template);
         
@@ -808,7 +771,7 @@ private:
             progress_label->SetLabel("Ready");
             Layout();
             UpdateButtonStates();
-            chat_history->AppendText("Error: Failed to start model loading thread\n");
+            AddSystemMessage("Error: Failed to start model loading thread");
         }
     }
     
@@ -825,7 +788,6 @@ private:
         is_processing = false;
         worker_thread = nullptr;
         
-        // Hide progress bar and reset label
         progress_bar->Hide();
         progress_label->SetLabel("Ready");
         Layout();
@@ -833,11 +795,13 @@ private:
         bool success = event.GetInt() == 1;
         
         if (success) {
+            // Handle chat template
             if (chat_template.empty()) {
                 std::string model_template = llama_manager->get_model_chat_template();
                 if (!model_template.empty()) {
                     chat_template = model_template;
-                    SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, chat_template, identity_directive, other_directives);
+                    SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, 
+                                                chat_template, identity_directive, other_directives);
                     logs_text->AppendText("Loaded chat template from model\n");
                 }
             } else {
@@ -845,31 +809,19 @@ private:
                 logs_text->AppendText("Using custom chat template\n");
             }
             
-            // Set system prompt from combined directives
-            std::string combined_system_prompt;
-            if (!identity_directive.empty()) {
-                combined_system_prompt = identity_directive;
-                if (!other_directives.empty()) {
-                    combined_system_prompt += "\n\n" + other_directives;
-                }
-            } else if (!other_directives.empty()) {
-                combined_system_prompt = other_directives;
-            }
-            
-            if (!combined_system_prompt.empty()) {
-                llama_manager->set_system_prompt(combined_system_prompt);
+            // Set system prompt
+            std::string combined_prompt = GetCombinedSystemPrompt();
+            if (!combined_prompt.empty()) {
+                llama_manager->set_system_prompt(combined_prompt);
                 logs_text->AppendText("System prompt applied\n");
             }
             
             is_started = true;
             
-            // Clear welcome message and add ready message
             chat_history->Clear();
             AddSystemMessage("LuminaChat ready! Type your message below.");
-            
             input_text->SetFocus();
             
-            // Reset timings for fresh measurement
             llama_manager->reset_timings();
             timings_label->SetLabel("");
         } else {
@@ -901,24 +853,18 @@ private:
     }
     
     void OnSettings(wxCommandEvent& event) {
-        SettingsDialog dialog(this, model_path, context_size, gpu_layers, predict_tokens, chat_template, identity_directive, other_directives);
+        SettingsDialog dialog(this, model_path, context_size, gpu_layers, predict_tokens, 
+                            chat_template, identity_directive, other_directives);
         if (dialog.ShowModal() == wxID_OK) {
-            // Update window title if model path changed
-            if (!model_path.empty()) {
-                wxFileName modelFile(wxString::FromUTF8(model_path));
-                SetTitle(wxString::Format("LuminaChat - %s", modelFile.GetName()));
-            } else {
-                SetTitle("LuminaChat");
-            }
+            UpdateWindowTitle();
             
-            // If the model is currently running and settings changed, inform user
             if (is_started) {
                 wxMessageBox("Settings have been saved. Please restart the model for changes to take effect.", 
                            "Settings Updated", wxOK | wxICON_INFORMATION);
             }
         }
     }
-    
+
     void OnInputEnter(wxCommandEvent& event) {
         if (!is_started || is_processing) return;
         
@@ -1044,10 +990,6 @@ public:
         LuminaChatFrame* frame = new LuminaChatFrame();
         frame->Show(true);
         return true;
-    }
-    
-    int32_t OnExit() override {
-        return wxApp::OnExit();
     }
 };
 

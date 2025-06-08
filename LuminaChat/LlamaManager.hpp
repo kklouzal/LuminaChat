@@ -25,9 +25,10 @@
 // 3. Comment code thoroughly, where necessary, to explain complex logic or decisions.
 // 4. Always eliminate unused code, dead code, legacy code, and cleanup includes.
 // 5. Use consistent _t fixed-width variable types to ensure portability across platforms.
-// 6. Ensure there are no logical errors and the execution paths flow as expected.
-// 7. Refactor where necessary to maintain clean code, efficient code, and to conform to the above settings and directives.
-// 8. NEVER BREAK FUNCTIONALITY THAT IS ALREADY WORKING.
+// 6. Cache frequently used variables to avoid repeated allocations.
+// 7. Ensure there are no logical errors and the execution paths flow as expected.
+// 8. Refactor where necessary to maintain clean code, efficient code, and to conform to the above settings and directives.
+// 9. NEVER BREAK FUNCTIONALITY THAT IS ALREADY WORKING.
 #pragma once
 
 #include <iostream>
@@ -37,6 +38,9 @@
 #include <filesystem>
 #include <thread>
 #include <chrono>
+#include <unordered_map>
+#include <list>
+#include <string_view>
 #include "llama-cpp.h"
 
 // Forward declare the progress callback function
@@ -70,6 +74,23 @@ private:
     mutable std::string template_buffer;
     mutable std::vector<llama_chat_message> message_cache;
     mutable bool message_cache_dirty = true;
+
+    // Cache for tokenization results with hit ratio tracking
+    mutable std::unordered_map<std::string, std::vector<llama_token>> token_cache;
+    mutable std::list<std::string> token_cache_lru;  // Track access order for LRU eviction
+    mutable std::unordered_map<std::string, std::list<std::string>::iterator> token_cache_lru_map;  // Fast lookup in LRU list
+    mutable size_t max_cache_size = 1024; // Limit cache size
+    mutable size_t cache_hits = 0;
+    mutable size_t cache_requests = 0;
+    
+    // Pre-allocated working buffers to avoid repeated allocations
+    mutable std::vector<char> token_buffer;
+    mutable std::string temp_string_buffer;
+    mutable std::vector<llama_token> temp_token_buffer;
+    
+    // Cache for formatted templates to avoid repeated template application
+    mutable std::string last_template_key;
+    mutable std::string last_template_result;
 
     // Helper function to clear batch (equivalent to common_batch_clear from batched.cpp)
     void common_batch_clear(llama_batch & batch) {
@@ -254,6 +275,10 @@ public:
         model_loaded = true;
         n_past = 0;
         message_history.clear();
+        
+        // Clear caches when new model is loaded
+        clear_caches();
+        
         std::cout << "Model loaded successfully: " << model_path << std::endl;
         return true;
     }
@@ -553,28 +578,22 @@ public:
         int32_t gen_len = static_cast<int32_t>(generation_content.length());
         std::string generation_prompt = generation_content.substr(prev_len);
         
+        // Use cached tokenization for generation prompt
         if (!generation_prompt.empty()) {
-            // Tokenize generation prompt
-            const int32_t n_prompt_tokens = -llama_tokenize(vocab, generation_prompt.c_str(), generation_prompt.size(), NULL, 0, false, true);
+            std::vector<llama_token> prompt_tokens = tokenize_cached(generation_prompt, false);
             
-            if (n_prompt_tokens > 0) {
-                std::vector<llama_token> prompt_tokens(n_prompt_tokens);
-                if (llama_tokenize(vocab, generation_prompt.c_str(), generation_prompt.size(), prompt_tokens.data(), prompt_tokens.size(), false, true) >= 0) {
-                    
-                    // Process prompt tokens using batch processing (like batched.cpp initial eval)
-                    if (!process_tokens_batch(prompt_tokens, true)) {
-                        return "Error: Failed to process generation prompt";
-                    }
-                    
-                    total_prompt_tokens += n_prompt_tokens;
+            if (!prompt_tokens.empty()) {
+                if (!process_tokens_batch(prompt_tokens, true)) {
+                    return "Error: Failed to process generation prompt";
                 }
+                total_prompt_tokens += prompt_tokens.size();
             }
         }
 
         // Pre-allocate response string for better performance
         std::string response;
         const int32_t max_new_tokens = std::min(n_predict, n_ctx - n_past - 16);
-        response.reserve(max_new_tokens * 4); // Pre-allocate assuming average 4 chars per token
+        response.reserve(max_new_tokens * 4);
         
         int32_t n_generated = 0;
 
@@ -585,29 +604,22 @@ public:
         auto decode_start = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::high_resolution_clock::now().time_since_epoch()).count();
 
-        // Main generation loop (following batched.cpp pattern)
+        // Main generation loop with cached token conversion
         while (n_generated < max_new_tokens) {
             // Sample next token (like batched.cpp)
             llama_token new_token = llama_sampler_sample(sampler, context, -1);
             
-            if (new_token < 0) {
-                break;
-            }
-            
-            // Check for end of generation
-            if (llama_vocab_is_eog(vocab, new_token)) {
+            if (new_token < 0 || llama_vocab_is_eog(vocab, new_token)) {
                 break;
             }
 
-            // Convert token to text
-            char buf[256];
-            int32_t n = llama_token_to_piece(vocab, new_token, buf, sizeof(buf) - 1, 0, true);
-            if (n <= 0) {
+            // Use cached token-to-text conversion
+            std::string token_text = token_to_text_cached(new_token);
+            if (token_text.empty()) {
                 break;
             }
             
-            buf[n] = '\0';
-            response.append(buf, n);
+            response += token_text;
 
             // Process the single token (like batched.cpp single token processing)
             clear_batch();
@@ -695,44 +707,38 @@ public:
             return true;
         }
 
-        // Tokenize full content
-        const int32_t n_tokens = -llama_tokenize(vocab, full_content.c_str(), full_content.size(), NULL, 0, true, true);
+        std::vector<llama_token> tokens = tokenize_cached(full_content, true);
         
-        if (n_tokens <= 0) {
+        if (tokens.empty()) {
             return false;
         }
 
-        // Check if it fits in context
-        if (n_tokens > n_ctx - 64) {
-            std::cerr << "Warning: Context too large (" << n_tokens << " tokens), truncating" << std::endl;
+        // Check context capacity with safety margin
+        const int32_t safety_margin = 128;
+        if (static_cast<int32_t>(tokens.size()) > n_ctx - safety_margin) {
+            std::cerr << "Warning: Context too large (" << tokens.size() 
+                     << " tokens > " << (n_ctx - safety_margin) << " limit)" << std::endl;
             return false;
         }
 
-        std::vector<llama_token> tokens(n_tokens);
-        if (llama_tokenize(vocab, full_content.c_str(), full_content.size(), tokens.data(), tokens.size(), true, true) < 0) {
-            return false;
-        }
-
-        // Reset context state for full rebuild
         n_past = 0;
         
-        // Process tokens using proper batching (like batched.cpp initial evaluation)
+        // Use optimal batch size
+        const int32_t optimal_batch = calculate_optimal_batch_size();
         std::vector<llama_seq_id> seq_ids = {0};
-        const int32_t n_batch = llama_n_batch(context);
         
-        // Process in chunks like batched.cpp
-        for (size_t start = 0; start < tokens.size(); start += n_batch) {
+        // Process in optimally-sized chunks
+        for (size_t start = 0; start < tokens.size(); start += optimal_batch) {
             clear_batch();
             
-            size_t end = std::min(start + n_batch, tokens.size());
+            size_t end = std::min(start + optimal_batch, tokens.size());
             
-            // Add tokens to batch following batched.cpp pattern
+            // Batch process tokens
             for (size_t i = start; i < end; ++i) {
-                bool output_logits = (i == tokens.size() - 1); // Only last token needs logits
+                bool output_logits = (i == tokens.size() - 1);
                 common_batch_add(batch, tokens[i], static_cast<int32_t>(i), seq_ids, output_logits);
             }
             
-            // Decode the batch (like batched.cpp)
             if (batch.n_tokens > 0) {
                 if (llama_decode(context, batch) != 0) {
                     std::cerr << "Error: Failed to decode context batch at position " << start << std::endl;
@@ -741,17 +747,38 @@ public:
             }
         }
         
-        // Update state after successful processing
-        n_past = n_tokens;
+        n_past = static_cast<int32_t>(tokens.size());
         prev_len = static_cast<int32_t>(full_content.length());
         
-        std::cout << "Successfully processed " << n_tokens << " tokens in full context rebuild" << std::endl;
+        std::cout << "Successfully processed " << tokens.size() 
+                 << " tokens in full context rebuild (batch size: " << optimal_batch << ")" << std::endl;
         return true;
     }
 
-    // Clean up resources
+    // Optimized batch initialization with calculated size
+    bool initialize_batch() {
+        if (batch_initialized) {
+            return true;
+        }
+
+        int32_t batch_size = calculate_optimal_batch_size();
+        
+        batch = llama_batch_init(batch_size, 0, 1);
+        if (batch.token == nullptr) {
+            std::cerr << "Error: Failed to initialize batch with size " << batch_size << std::endl;
+            return false;
+        }
+
+        batch_initialized = true;
+        std::cout << "Initialized batch with optimal size: " << batch_size << std::endl;
+        return true;
+    }
+
+    // Enhanced cleanup with memory optimization
     void cleanup() {
+        clear_caches();
         cleanup_batch();
+        
         if (sampler) {
             llama_sampler_free(sampler);
             sampler = nullptr;
@@ -764,88 +791,230 @@ public:
             llama_model_free(model);
             model = nullptr;
         }
+        
         vocab = nullptr;
         model_loaded = false;
         n_past = 0;
         prev_len = 0;
-        message_history.clear();
-        message_history.shrink_to_fit(); // Free memory
-        formatted_buffer.clear();
-        formatted_buffer.shrink_to_fit(); // Free memory
-        template_buffer.clear();
-        template_buffer.shrink_to_fit(); // Free memory
-        message_cache.clear();
-        message_cache.shrink_to_fit(); // Free memory
+        
+        // Efficient memory cleanup
+        std::vector<std::pair<std::string, std::string>>().swap(message_history);
+        std::vector<char>().swap(formatted_buffer);
+        std::string().swap(template_buffer);
+        std::vector<llama_chat_message>().swap(message_cache);
+        std::string().swap(custom_chat_template);
+        
         message_cache_dirty = true;
-        custom_chat_template.clear();
+        reset_cache_stats();
     }
 
-    // Free batch resources
+    // Memory usage reporting
+    struct MemoryStats {
+        size_t token_cache_bytes;
+        size_t message_history_bytes;
+        size_t buffer_bytes;
+        size_t total_estimated_bytes;
+    };
+    
+    MemoryStats get_memory_stats() const {
+        size_t token_cache_bytes = 0;
+        for (const auto& [key, tokens] : token_cache) {
+            token_cache_bytes += key.size() + (tokens.size() * sizeof(llama_token));
+        }
+        
+        size_t message_history_bytes = 0;
+        for (const auto& [role, content] : message_history) {
+            message_history_bytes += role.size() + content.size();
+        }
+        
+        size_t buffer_bytes = token_buffer.capacity() + temp_string_buffer.capacity() + 
+                             template_buffer.capacity() + formatted_buffer.capacity();
+        
+        return {
+            token_cache_bytes,
+            message_history_bytes,
+            buffer_bytes,
+            token_cache_bytes + message_history_bytes + buffer_bytes
+        };
+    }
+
+private:
+    // Optimized LRU cache management
+    void add_to_token_cache(const std::string& key, const std::vector<llama_token>& tokens) const {
+        // Pre-emptive cleanup if approaching limit
+        if (token_cache.size() >= max_cache_size * 0.9f) {
+            trim_token_cache();
+        }
+        
+        // Check if key already exists (update case)
+        auto existing = token_cache.find(key);
+        if (existing != token_cache.end()) {
+            existing->second = tokens;
+            update_lru_access(key);
+            return;
+        }
+        
+        // Add new entry
+        token_cache[key] = tokens;
+        token_cache_lru.push_front(key);
+        token_cache_lru_map[key] = token_cache_lru.begin();
+    }
+    
+    // More aggressive cache trimming for better memory management
+    void trim_token_cache() const {
+        // Remove 25% of entries when trimming to reduce frequency
+        size_t target_size = static_cast<size_t>(max_cache_size * 0.75f);
+        
+        while (token_cache.size() > target_size && !token_cache_lru.empty()) {
+            std::string lru_key = token_cache_lru.back();
+            token_cache_lru.pop_back();
+            token_cache_lru_map.erase(lru_key);
+            token_cache.erase(lru_key);
+        }
+    }
+
+    // Add missing helper methods
+    std::vector<llama_token> tokenize_cached(const std::string& text, bool add_special) const {
+        cache_requests++;
+        
+        std::string cache_key = text + (add_special ? ":special" : ":normal");
+        
+        auto it = token_cache.find(cache_key);
+        if (it != token_cache.end()) {
+            cache_hits++;
+            update_lru_access(cache_key);
+            return it->second;
+        }
+        
+        // Tokenize new text
+        const int32_t n_tokens = -llama_tokenize(vocab, text.c_str(), text.size(), NULL, 0, add_special, true);
+        if (n_tokens <= 0) {
+            return {};
+        }
+        
+        std::vector<llama_token> tokens(n_tokens);
+        if (llama_tokenize(vocab, text.c_str(), text.size(), tokens.data(), tokens.size(), add_special, true) < 0) {
+            return {};
+        }
+        
+        add_to_token_cache(cache_key, tokens);
+        return tokens;
+    }
+    
+    std::string token_to_text_cached(llama_token token) const {
+        // Simple caching for token-to-text conversion
+        static std::unordered_map<llama_token, std::string> text_cache;
+        
+        auto it = text_cache.find(token);
+        if (it != text_cache.end()) {
+            return it->second;
+        }
+        
+        // Convert token to text
+        temp_string_buffer.clear();
+        temp_string_buffer.resize(32);  // Most tokens are small
+        
+        int32_t result = llama_token_to_piece(vocab, token, temp_string_buffer.data(), temp_string_buffer.size(), 0, true);
+        if (result < 0) {
+            temp_string_buffer.resize(-result);
+            result = llama_token_to_piece(vocab, token, temp_string_buffer.data(), temp_string_buffer.size(), 0, true);
+        }
+        
+        if (result > 0) {
+            std::string text(temp_string_buffer.data(), result);
+            text_cache[token] = text;
+            return text;
+        }
+        
+        return "";
+    }
+    
+    bool apply_chat_template(const char* tmpl, bool add_generation_prompt, std::string& result) const {
+        if (!tmpl) return false;
+        
+        // Create cache key for template application
+        std::string cache_key = std::string(tmpl) + ":" + (add_generation_prompt ? "gen" : "chat");
+        for (const auto& msg : message_history) {
+            cache_key += "|" + msg.first + ":" + msg.second.substr(0, 50); // First 50 chars for cache key
+        }
+        
+        // Check if we have cached result
+        if (cache_key == last_template_key && !last_template_result.empty()) {
+            result = last_template_result;
+            return true;
+        }
+        
+        // Convert message history to llama format
+        if (message_cache_dirty) {
+            message_cache = convert_to_llama_messages();
+            message_cache_dirty = false;
+        }
+        
+        // Apply template
+        template_buffer.clear();
+        template_buffer.resize(n_ctx * 4); // Estimate buffer size
+        
+        int32_t result_len = llama_chat_apply_template(
+            tmpl, message_cache.data(), message_cache.size(),
+            add_generation_prompt, template_buffer.data(), template_buffer.size()
+        );
+        
+        if (result_len < 0) {
+            template_buffer.resize(-result_len);
+            result_len = llama_chat_apply_template(
+                tmpl, message_cache.data(), message_cache.size(),
+                add_generation_prompt, template_buffer.data(), template_buffer.size()
+            );
+        }
+        
+        if (result_len > 0) {
+            result = std::string(template_buffer.data(), result_len);
+            last_template_key = cache_key;
+            last_template_result = result;
+            return true;
+        }
+        
+        return false;
+    }
+    
+    int32_t calculate_optimal_batch_size() const {
+        if (!context) return 512;
+        
+        int32_t n_batch = llama_n_batch(context);
+        int32_t available_ctx = n_ctx - n_past;
+        
+        // Use smaller of configured batch size or available context
+        return std::min({n_batch, available_ctx, 512});
+    }
+    
     void cleanup_batch() {
         if (batch_initialized) {
             llama_batch_free(batch);
             batch_initialized = false;
         }
     }
-
-    // Initialize batch object exactly like batched.cpp
-    bool initialize_batch() {
-        if (batch_initialized) {
-            return true;
-        }
-
-        // Use the same pattern as batched.cpp for batch size calculation
-        int32_t batch_size = std::max(static_cast<int32_t>(512), n_ctx / 4);
-        
-        // Initialize batch with single sequence support (like batched.cpp)
-        batch = llama_batch_init(batch_size, 0, 1);
-        if (batch.token == nullptr) {
-            std::cerr << "Error: Failed to initialize batch" << std::endl;
-            return false;
-        }
-
-        batch_initialized = true;
-        return true;
+    
+    void clear_caches() const {
+        token_cache.clear();
+        token_cache_lru.clear();
+        token_cache_lru_map.clear();
+        last_template_key.clear();
+        last_template_result.clear();
+        cache_hits = 0;
+        cache_requests = 0;
+    }
+    
+    void reset_cache_stats() const {
+        cache_hits = 0;
+        cache_requests = 0;
     }
 
-    // Optimize message conversion with caching
-    const std::vector<llama_chat_message>& get_cached_messages() const {
-        if (message_cache_dirty) {
-            message_cache.clear();
-            message_cache.reserve(message_history.size());
-            for (const auto& msg : message_history) {
-                message_cache.push_back({ msg.first.c_str(), msg.second.c_str() });
-            }
-            message_cache_dirty = false;
+    // LRU cache management helpers
+    void update_lru_access(const std::string& key) const {
+        auto lru_it = token_cache_lru_map.find(key);
+        if (lru_it != token_cache_lru_map.end()) {
+            token_cache_lru.splice(token_cache_lru.begin(), token_cache_lru, lru_it->second);
         }
-        return message_cache;
-    }
-
-    // Optimize template application with better buffer management
-    bool apply_chat_template(const char* tmpl, bool add_generation_prompt, std::string& output) const {
-        if (!tmpl) return false;
-        
-        const auto& messages = get_cached_messages();
-        
-        // Get required size
-        int32_t required_size = llama_chat_apply_template(tmpl, messages.data(), messages.size(), 
-                                                         add_generation_prompt, nullptr, 0);
-        if (required_size <= 0) {
-            return false;
-        }
-        
-        // Resize output string directly - more efficient than vector<char>
-        output.resize(required_size);
-        
-        // Apply template
-        int32_t actual_size = llama_chat_apply_template(tmpl, messages.data(), messages.size(), 
-                                                       add_generation_prompt, output.data(), output.size());
-        if (actual_size < 0) {
-            return false;
-        }
-        
-        output.resize(actual_size);
-        return true;
     }
 };
 
