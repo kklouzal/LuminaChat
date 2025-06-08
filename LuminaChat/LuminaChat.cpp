@@ -498,6 +498,7 @@ private:
     wxTextCtrl* input_text;
     wxTextCtrl* logs_text;
     wxNotebook* main_notebook;
+    wxPanel* main_panel;  // Store reference to main panel
     
     ModelWorkerThread* worker_thread = nullptr;
 
@@ -560,7 +561,7 @@ private:
     }
 
     void CreateUI() {
-        wxPanel* main_panel = new wxPanel(this);
+        main_panel = new wxPanel(this);
         
         // Top toolbar
         wxBoxSizer* toolbar_sizer = new wxBoxSizer(wxHORIZONTAL);
@@ -618,22 +619,28 @@ private:
         logs_panel->SetSizer(logs_sizer);
         main_notebook->AddPage(logs_panel, "Logs");
         
-        // Layout
+        // Layout - fixed alignment flags to prevent assertion
         wxBoxSizer* main_sizer = new wxBoxSizer(wxVERTICAL);
         main_sizer->Add(toolbar_sizer, 0, wxEXPAND | wxALL, 10);
         
-        // Progress and timings row
+        // Progress and timings row - fixed incompatible alignment flags
         wxBoxSizer* status_sizer = new wxBoxSizer(wxHORIZONTAL);
         status_sizer->Add(progress_label, 0, wxALIGN_CENTER_VERTICAL);
         status_sizer->AddSpacer(20);
-        status_sizer->Add(timings_label, 0, wxALIGN_CENTER_VERTICAL);
-        status_sizer->AddStretchSpacer();
+        // Remove wxEXPAND when using wxALIGN_CENTER_VERTICAL in horizontal sizer
+        status_sizer->Add(timings_label, 1, wxALIGN_CENTER_VERTICAL);
         
         main_sizer->Add(status_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT, 10);
+        
+        // Progress bar in its own sizer with proper show/hide behavior
         main_sizer->Add(progress_bar, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+        
         main_sizer->Add(main_notebook, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
         
         main_panel->SetSizer(main_sizer);
+        
+        // Set minimum window size to prevent UI from becoming unusable
+        SetMinSize(wxSize(600, 400));
         
         // Bind events
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnStart, this, ID_START);
@@ -660,27 +667,6 @@ private:
         chat_history->Newline();
     }
     
-    // Add user message with light blue background
-    void AddUserMessage(const wxString& message) {
-        // Add some spacing before message
-        chat_history->Newline();
-        
-        // Create user message style with light blue background
-        wxRichTextAttr userAttr;
-        userAttr.SetTextColour(*wxBLACK);
-        userAttr.SetBackgroundColour(wxColour(173, 216, 230)); // Light blue
-        userAttr.SetLeftIndent(50);   // Indent from left
-        userAttr.SetRightIndent(50);  // Indent from right
-        userAttr.SetParagraphSpacingBefore(5);
-        userAttr.SetParagraphSpacingAfter(5);
-        userAttr.SetLineSpacing(120); // 1.2x line spacing
-        
-        chat_history->BeginStyle(userAttr);
-        chat_history->WriteText("You: " + message);
-        chat_history->EndStyle();
-        chat_history->Newline();
-    }
-    
     // Add AI message with light green background
     void AddAIMessage(const wxString& message) {
         // Create AI message style with light green background
@@ -689,15 +675,79 @@ private:
         aiAttr.SetBackgroundColour(wxColour(144, 238, 144)); // Light green
         aiAttr.SetLeftIndent(50);   // Indent from left
         aiAttr.SetRightIndent(50);  // Indent from right
-        aiAttr.SetParagraphSpacingBefore(5);
-        aiAttr.SetParagraphSpacingAfter(5);
-        aiAttr.SetLineSpacing(120); // 1.2x line spacing
+        aiAttr.SetParagraphSpacingBefore(0);  // Remove all paragraph spacing
+        aiAttr.SetParagraphSpacingAfter(0);   // Remove all paragraph spacing
+        aiAttr.SetLineSpacing(100); // Normal line spacing (100%)
         
+        // Split message by double newlines (paragraph breaks) and single newlines
+        wxArrayString paragraphs = wxSplit(message, '\n', '\0');
+        
+        // Start the AI message
         chat_history->BeginStyle(aiAttr);
-        chat_history->WriteText("AI: " + message);
+        chat_history->WriteText("AI: ");
+
+        // Add each paragraph/line separately
+        for (size_t i = 0; i < paragraphs.GetCount(); ++i) {
+            wxString para = paragraphs[i].Trim();
+            
+            if (!para.IsEmpty()) {
+                if (i > 0) {
+                    // Add a small space between non-empty paragraphs
+                    chat_history->WriteText(" ");
+                }
+                chat_history->WriteText(para);
+            } else if (i > 0 && i < paragraphs.GetCount() - 1) {
+                // For empty lines (paragraph breaks), add a bit more space
+                chat_history->WriteText(" - - ");
+            }
+        }
+        
         chat_history->EndStyle();
-        chat_history->Newline();
-        chat_history->Newline(); // Extra space after AI response
+        
+        // Manual spacing between messages
+        chat_history->WriteText("\n\n");
+    }
+    
+    // Add user message with light blue background
+    void AddUserMessage(const wxString& message) {
+        // Create user message style with light blue background
+        wxRichTextAttr userAttr;
+        userAttr.SetTextColour(*wxBLACK);
+        userAttr.SetBackgroundColour(wxColour(173, 216, 230)); // Light blue
+        userAttr.SetLeftIndent(50);   // Indent from left
+        userAttr.SetRightIndent(50);  // Indent from right
+        userAttr.SetParagraphSpacingBefore(0);  // Remove all paragraph spacing
+        userAttr.SetParagraphSpacingAfter(0);   // Remove all paragraph spacing
+        userAttr.SetLineSpacing(100); // Normal line spacing (100%)
+        
+        // Add spacing before user message
+        chat_history->WriteText("\n");
+        
+        // Split message by newlines for user messages too
+        wxArrayString paragraphs = wxSplit(message, '\n', '\0');
+        
+        // Start the user message
+        chat_history->BeginStyle(userAttr);
+        chat_history->WriteText("You: ");
+        
+        // Add each paragraph/line separately
+        for (size_t i = 0; i < paragraphs.GetCount(); ++i) {
+            wxString para = paragraphs[i].Trim();
+            
+            if (!para.IsEmpty()) {
+                if (i > 0) {
+                    chat_history->WriteText(" ");
+                }
+                chat_history->WriteText(para);
+            } else if (i > 0 && i < paragraphs.GetCount() - 1) {
+                chat_history->WriteText("  ");
+            }
+        }
+        
+        chat_history->EndStyle();
+        
+        // Single newline after user message
+        chat_history->WriteText("\n");
     }
     
     // Add system message with gray background
@@ -707,15 +757,15 @@ private:
         systemAttr.SetBackgroundColour(wxColour(245, 245, 245)); // Very light gray
         systemAttr.SetLeftIndent(30);
         systemAttr.SetRightIndent(30);
-        systemAttr.SetParagraphSpacingBefore(5);
-        systemAttr.SetParagraphSpacingAfter(5);
+        systemAttr.SetParagraphSpacingBefore(0);  // Remove all paragraph spacing
+        systemAttr.SetParagraphSpacingAfter(0);   // Remove all paragraph spacing
+        systemAttr.SetLineSpacing(100); // Normal line spacing
         systemAttr.SetFontStyle(wxFONTSTYLE_ITALIC);
         
         chat_history->BeginStyle(systemAttr);
         chat_history->WriteText("System: " + message);
         chat_history->EndStyle();
-        chat_history->Newline();
-        chat_history->Newline();
+        chat_history->WriteText("\n\n");
     }
 
 private:
@@ -740,11 +790,11 @@ private:
         is_processing = true;
         UpdateButtonStates();
         
-        // Show progress bar
+        // Show progress bar with proper layout update
         progress_label->SetLabel("Loading model...");
         progress_bar->SetValue(0);
         progress_bar->Show();
-        Layout();
+        main_panel->Layout(); // Use main_panel->Layout() instead of GetSizer()->Layout()
         
         // Log loading information
         logs_text->AppendText(wxString::Format(
@@ -769,7 +819,7 @@ private:
             is_processing = false;
             progress_bar->Hide();
             progress_label->SetLabel("Ready");
-            Layout();
+            main_panel->Layout();
             UpdateButtonStates();
             AddSystemMessage("Error: Failed to start model loading thread");
         }
@@ -780,17 +830,19 @@ private:
         progress_bar->SetValue(percent);
         progress_label->SetLabel(wxString::Format("Loading model... %d%%", percent));
         
-        // Force UI update
-        Update();
+        // Force UI update with proper refresh
+        progress_bar->Refresh();
+        progress_label->Refresh();
     }
     
     void OnModelLoaded(wxCommandEvent& event) {
         is_processing = false;
         worker_thread = nullptr;
         
+        // Hide progress bar with proper layout update
         progress_bar->Hide();
         progress_label->SetLabel("Ready");
-        Layout();
+        main_panel->Layout(); // Use main_panel->Layout() instead of GetSizer()->Layout()
         
         bool success = event.GetInt() == 1;
         
@@ -837,11 +889,11 @@ private:
             worker_thread = nullptr;
         }
         
-        // Hide progress bar if visible
+        // Hide progress bar if visible with proper layout update
         if (progress_bar->IsShown()) {
             progress_bar->Hide();
             progress_label->SetLabel("Ready");
-            Layout();
+            main_panel->Layout(); // Use main_panel->Layout() instead of GetSizer()->Layout()
         }
         
         llama_manager->cleanup();
