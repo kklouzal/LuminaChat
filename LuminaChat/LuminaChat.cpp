@@ -29,6 +29,7 @@
 #include <wx/filedlg.h>
 #include <wx/notebook.h>
 #include <wx/textctrl.h>
+#include <wx/richtext/richtextctrl.h>
 #include <wx/button.h>
 #include <wx/sizer.h>
 #include <wx/panel.h>
@@ -193,7 +194,7 @@ public:
         return iniPath.ToStdString();
     }
     
-    static void SaveSettings(const std::string& model_path, int32_t context_size, int32_t gpu_layers, int32_t predict_tokens, const std::string& chat_template) {
+    static void SaveSettings(const std::string& model_path, int32_t context_size, int32_t gpu_layers, int32_t predict_tokens, const std::string& chat_template, const std::string& identity_directive, const std::string& other_directives) {
         std::string filePath = GetSettingsFilePath();
         std::ofstream file(filePath);
         
@@ -218,11 +219,42 @@ public:
             }
             
             file << "Template=" << escaped_template << "\n";
+            
+            file << "\n[SystemPrompt]\n";
+            
+            // Escape newlines for identity directive
+            std::string escaped_identity = identity_directive;
+            pos = 0;
+            while ((pos = escaped_identity.find('\n', pos)) != std::string::npos) {
+                escaped_identity.replace(pos, 1, "\\n");
+                pos += 2;
+            }
+            while ((pos = escaped_identity.find('\r', pos)) != std::string::npos) {
+                escaped_identity.replace(pos, 1, "\\r");
+                pos += 2;
+            }
+            
+            file << "IdentityDirective=" << escaped_identity << "\n";
+            
+            // Escape newlines for other directives
+            std::string escaped_other = other_directives;
+            pos = 0;
+            while ((pos = escaped_other.find('\n', pos)) != std::string::npos) {
+                escaped_other.replace(pos, 1, "\\n");
+                pos += 2;
+            }
+            while ((pos = escaped_other.find('\r', pos)) != std::string::npos) {
+                escaped_other.replace(pos, 1, "\\r");
+                pos += 2;
+            }
+            
+            file << "OtherDirectives=" << escaped_other << "\n";
+            
             file.close();
         }
     }
     
-    static void LoadSettings(std::string& model_path, int32_t& context_size, int32_t& gpu_layers, int32_t& predict_tokens, std::string& chat_template) {
+    static void LoadSettings(std::string& model_path, int32_t& context_size, int32_t& gpu_layers, int32_t& predict_tokens, std::string& chat_template, std::string& identity_directive, std::string& other_directives) {
         std::string filePath = GetSettingsFilePath();
         std::ifstream file(filePath);
         
@@ -281,6 +313,32 @@ public:
                             chat_template.replace(pos, 2, "\r");
                             pos += 1;
                         }
+                    } else if (key == "IdentityDirective") {
+                        // Unescape newlines
+                        identity_directive = value;
+                        size_t pos = 0;
+                        while ((pos = identity_directive.find("\\n", pos)) != std::string::npos) {
+                            identity_directive.replace(pos, 2, "\n");
+                            pos += 1;
+                        }
+                        pos = 0;
+                        while ((pos = identity_directive.find("\\r", pos)) != std::string::npos) {
+                            identity_directive.replace(pos, 2, "\r");
+                            pos += 1;
+                        }
+                    } else if (key == "OtherDirectives") {
+                        // Unescape newlines
+                        other_directives = value;
+                        size_t pos = 0;
+                        while ((pos = other_directives.find("\\n", pos)) != std::string::npos) {
+                            other_directives.replace(pos, 2, "\n");
+                            pos += 1;
+                        }
+                        pos = 0;
+                        while ((pos = other_directives.find("\\r", pos)) != std::string::npos) {
+                            other_directives.replace(pos, 2, "\r");
+                            pos += 1;
+                        }
                     }
                 }
             }
@@ -297,17 +355,22 @@ private:
     wxTextCtrl* gpu_layers_text;
     wxTextCtrl* predict_tokens_text;
     wxTextCtrl* chat_template_text;
+    wxTextCtrl* identity_directive_text;
+    wxTextCtrl* other_directives_text;
     std::string& model_path_ref;
     int32_t& context_size_ref;
     int32_t& gpu_layers_ref;
     int32_t& predict_tokens_ref;
     std::string& chat_template_ref;
+    std::string& identity_directive_ref;
+    std::string& other_directives_ref;
 
 public:
-    SettingsDialog(wxWindow* parent, std::string& model_path, int32_t& context_size, int32_t& gpu_layers, int32_t& predict_tokens, std::string& chat_template) 
+    SettingsDialog(wxWindow* parent, std::string& model_path, int32_t& context_size, int32_t& gpu_layers, int32_t& predict_tokens, std::string& chat_template, std::string& identity_directive, std::string& other_directives) 
         : wxDialog(parent, wxID_ANY, "Settings", wxDefaultPosition, wxSize(700, 500)),
           model_path_ref(model_path), context_size_ref(context_size), gpu_layers_ref(gpu_layers), 
-          predict_tokens_ref(predict_tokens), chat_template_ref(chat_template) {
+          predict_tokens_ref(predict_tokens), chat_template_ref(chat_template),
+          identity_directive_ref(identity_directive), other_directives_ref(other_directives) {
         
         wxNotebook* notebook = new wxNotebook(this, wxID_ANY);
         
@@ -344,6 +407,29 @@ public:
         
         model_panel->SetSizer(model_sizer);
         notebook->AddPage(model_panel, "Model Settings");
+        
+        // System Prompt Tab
+        wxPanel* system_panel = new wxPanel(notebook);
+        wxBoxSizer* system_sizer = new wxBoxSizer(wxVERTICAL);
+        
+        // Identity Directive (1/3 height)
+        system_sizer->Add(new wxStaticText(system_panel, wxID_ANY, "Identity Directive:"), 0, wxALL, 5);
+        identity_directive_text = new wxTextCtrl(system_panel, wxID_ANY, wxString::FromUTF8(identity_directive), 
+                                               wxDefaultPosition, wxDefaultSize, 
+                                               wxTE_MULTILINE | wxTE_WORDWRAP);
+        identity_directive_text->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+        system_sizer->Add(identity_directive_text, 1, wxEXPAND | wxALL, 5);
+        
+        // Other Directives (2/3 height)
+        system_sizer->Add(new wxStaticText(system_panel, wxID_ANY, "Other Directives:"), 0, wxALL, 5);
+        other_directives_text = new wxTextCtrl(system_panel, wxID_ANY, wxString::FromUTF8(other_directives), 
+                                             wxDefaultPosition, wxDefaultSize, 
+                                             wxTE_MULTILINE | wxTE_WORDWRAP);
+        other_directives_text->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+        system_sizer->Add(other_directives_text, 2, wxEXPAND | wxALL, 5);
+        
+        system_panel->SetSizer(system_sizer);
+        notebook->AddPage(system_panel, "System Prompt");
         
         // Chat Template Tab
         wxPanel* template_panel = new wxPanel(notebook);
@@ -425,8 +511,12 @@ private:
         // Get chat template
         chat_template_ref = chat_template_text->GetValue().ToUTF8().data();
         
-        // Save settings to INI file including chat template
-        SettingsManager::SaveSettings(model_path_ref, context_size_ref, gpu_layers_ref, predict_tokens_ref, chat_template_ref);
+        // Get system prompt components
+        identity_directive_ref = identity_directive_text->GetValue().ToUTF8().data();
+        other_directives_ref = other_directives_text->GetValue().ToUTF8().data();
+        
+        // Save settings to INI file including system prompt components
+        SettingsManager::SaveSettings(model_path_ref, context_size_ref, gpu_layers_ref, predict_tokens_ref, chat_template_ref, identity_directive_ref, other_directives_ref);
         
         EndModal(wxID_OK);
     }
@@ -441,6 +531,8 @@ private:
     int32_t gpu_layers;
     int32_t predict_tokens;
     std::string chat_template;
+    std::string identity_directive;
+    std::string other_directives;
     bool is_started;
     std::atomic<bool> is_processing{false};
     
@@ -450,7 +542,7 @@ private:
     wxGauge* progress_bar;
     wxStaticText* progress_label;
     wxStaticText* timings_label;
-    wxTextCtrl* chat_history;
+    wxRichTextCtrl* chat_history;
     wxTextCtrl* input_text;
     wxTextCtrl* logs_text;
     wxNotebook* main_notebook;
@@ -462,7 +554,7 @@ public:
                         llama_manager(std::make_unique<LlamaManager>()),
                         context_size(2048), gpu_layers(0), predict_tokens(256), is_started(false) {
         
-        SettingsManager::LoadSettings(model_path, context_size, gpu_layers, predict_tokens, chat_template);
+        SettingsManager::LoadSettings(model_path, context_size, gpu_layers, predict_tokens, chat_template, identity_directive, other_directives);
         
         CreateUI();
         UpdateButtonStates();
@@ -517,10 +609,10 @@ private:
         wxPanel* chat_panel = new wxPanel(main_notebook);
         wxBoxSizer* chat_sizer = new wxBoxSizer(wxVERTICAL);
         
-        // Chat history (read-only)
-        chat_history = new wxTextCtrl(chat_panel, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
-                                     wxTE_MULTILINE | wxTE_READONLY | wxTE_WORDWRAP);
-        chat_history->SetFont(wxFont(10, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+        // Chat history (read-only rich text control for colored backgrounds)
+        chat_history = new wxRichTextCtrl(chat_panel, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
+                                         wxRE_READONLY | wxRE_MULTILINE | wxVSCROLL);
+        chat_history->SetFont(wxFont(10, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
         
         // Input text box
         input_text = new wxTextCtrl(chat_panel, ID_INPUT_TEXT, "", wxDefaultPosition, wxDefaultSize,
@@ -570,9 +662,83 @@ private:
         Bind(wxEVT_COMMAND_TEXT_ENTER, &LuminaChatFrame::OnInputEnter, this, ID_INPUT_TEXT);
         
         // Set initial message
-        chat_history->SetValue("Welcome to LuminaChat!\nClick 'Settings' to select a model, then 'Start' to begin.\n\n");
+        AddWelcomeMessage();
     }
     
+    // Add welcome message with proper formatting
+    void AddWelcomeMessage() {
+        wxRichTextAttr attr;
+        attr.SetTextColour(*wxBLACK);
+        attr.SetBackgroundColour(wxColour(240, 240, 240)); // Light gray background
+        attr.SetAlignment(wxTEXT_ALIGNMENT_CENTER);
+        attr.SetParagraphSpacingAfter(5);
+        
+        chat_history->BeginStyle(attr);
+        chat_history->WriteText("Welcome to LuminaChat!\nClick 'Settings' to select a model, then 'Start' to begin.");
+        chat_history->EndStyle();
+        chat_history->Newline();
+        chat_history->Newline();
+    }
+    
+    // Add user message with light blue background
+    void AddUserMessage(const wxString& message) {
+        // Add some spacing before message
+        chat_history->Newline();
+        
+        // Create user message style with light blue background
+        wxRichTextAttr userAttr;
+        userAttr.SetTextColour(*wxBLACK);
+        userAttr.SetBackgroundColour(wxColour(173, 216, 230)); // Light blue
+        userAttr.SetLeftIndent(50);   // Indent from left
+        userAttr.SetRightIndent(50);  // Indent from right
+        userAttr.SetParagraphSpacingBefore(5);
+        userAttr.SetParagraphSpacingAfter(5);
+        userAttr.SetLineSpacing(120); // 1.2x line spacing
+        
+        chat_history->BeginStyle(userAttr);
+        chat_history->WriteText("You: " + message);
+        chat_history->EndStyle();
+        chat_history->Newline();
+    }
+    
+    // Add AI message with light green background
+    void AddAIMessage(const wxString& message) {
+        // Create AI message style with light green background
+        wxRichTextAttr aiAttr;
+        aiAttr.SetTextColour(*wxBLACK);
+        aiAttr.SetBackgroundColour(wxColour(144, 238, 144)); // Light green
+        aiAttr.SetLeftIndent(50);   // Indent from left
+        aiAttr.SetRightIndent(50);  // Indent from right
+        aiAttr.SetParagraphSpacingBefore(5);
+        aiAttr.SetParagraphSpacingAfter(5);
+        aiAttr.SetLineSpacing(120); // 1.2x line spacing
+        
+        chat_history->BeginStyle(aiAttr);
+        chat_history->WriteText("AI: " + message);
+        chat_history->EndStyle();
+        chat_history->Newline();
+        chat_history->Newline(); // Extra space after AI response
+    }
+    
+    // Add system message with gray background
+    void AddSystemMessage(const wxString& message) {
+        wxRichTextAttr systemAttr;
+        systemAttr.SetTextColour(wxColour(100, 100, 100)); // Dark gray text
+        systemAttr.SetBackgroundColour(wxColour(245, 245, 245)); // Very light gray
+        systemAttr.SetLeftIndent(30);
+        systemAttr.SetRightIndent(30);
+        systemAttr.SetParagraphSpacingBefore(5);
+        systemAttr.SetParagraphSpacingAfter(5);
+        systemAttr.SetFontStyle(wxFONTSTYLE_ITALIC);
+        
+        chat_history->BeginStyle(systemAttr);
+        chat_history->WriteText("System: " + message);
+        chat_history->EndStyle();
+        chat_history->Newline();
+        chat_history->Newline();
+    }
+
+private:
     void UpdateButtonStates() {
         start_btn->Enable(!is_started && !is_processing);
         stop_btn->Enable(is_started);
@@ -591,6 +757,15 @@ private:
             return;
         }
 
+        // Set default system prompt values if empty
+        if (identity_directive.empty() && other_directives.empty()) {
+            identity_directive = "You are a helpful AI assistant named Lumina.";
+            other_directives = "Answer each user request thoughtfully and to the best of your ability. Be clear and concise in your responses.";
+            
+            // Save the defaults to settings
+            SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, chat_template, identity_directive, other_directives);
+        }
+
         is_processing = true;
         UpdateButtonStates();
         
@@ -605,6 +780,21 @@ private:
         logs_text->AppendText(wxString::Format("GPU Layers: %d\n", gpu_layers));
         logs_text->AppendText(wxString::Format("Max Prediction: %d tokens\n", predict_tokens));
         logs_text->AppendText("Loading model: " + model_path + "\n");
+        
+        // Combine identity and other directives for system prompt
+        std::string combined_system_prompt;
+        if (!identity_directive.empty()) {
+            combined_system_prompt = identity_directive;
+            if (!other_directives.empty()) {
+                combined_system_prompt += "\n\n" + other_directives;
+            }
+        } else if (!other_directives.empty()) {
+            combined_system_prompt = other_directives;
+        }
+        
+        if (!combined_system_prompt.empty()) {
+            logs_text->AppendText("System prompt configured\n");
+        }
         
         // Start model loading in background thread
         worker_thread = new ModelWorkerThread(this, llama_manager.get(), ModelWorkerThread::LOAD_MODEL);
@@ -647,7 +837,7 @@ private:
                 std::string model_template = llama_manager->get_model_chat_template();
                 if (!model_template.empty()) {
                     chat_template = model_template;
-                    SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, chat_template);
+                    SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, chat_template, identity_directive, other_directives);
                     logs_text->AppendText("Loaded chat template from model\n");
                 }
             } else {
@@ -655,8 +845,28 @@ private:
                 logs_text->AppendText("Using custom chat template\n");
             }
             
+            // Set system prompt from combined directives
+            std::string combined_system_prompt;
+            if (!identity_directive.empty()) {
+                combined_system_prompt = identity_directive;
+                if (!other_directives.empty()) {
+                    combined_system_prompt += "\n\n" + other_directives;
+                }
+            } else if (!other_directives.empty()) {
+                combined_system_prompt = other_directives;
+            }
+            
+            if (!combined_system_prompt.empty()) {
+                llama_manager->set_system_prompt(combined_system_prompt);
+                logs_text->AppendText("System prompt applied\n");
+            }
+            
             is_started = true;
-            chat_history->AppendText("LuminaChat ready! Type your message below.\n\n");
+            
+            // Clear welcome message and add ready message
+            chat_history->Clear();
+            AddSystemMessage("LuminaChat ready! Type your message below.");
+            
             input_text->SetFocus();
             
             // Reset timings for fresh measurement
@@ -691,7 +901,7 @@ private:
     }
     
     void OnSettings(wxCommandEvent& event) {
-        SettingsDialog dialog(this, model_path, context_size, gpu_layers, predict_tokens, chat_template);
+        SettingsDialog dialog(this, model_path, context_size, gpu_layers, predict_tokens, chat_template, identity_directive, other_directives);
         if (dialog.ShowModal() == wxID_OK) {
             // Update window title if model path changed
             if (!model_path.empty()) {
@@ -715,8 +925,8 @@ private:
         wxString input = input_text->GetValue().Trim();
         if (input.IsEmpty()) return;
         
-        // Display user input immediately
-        chat_history->AppendText("You: " + input + "\n");
+        // Display user input with blue background
+        AddUserMessage(input);
         input_text->Clear();
         
         is_processing = true;
@@ -731,7 +941,7 @@ private:
             worker_thread = nullptr;
             is_processing = false;
             UpdateButtonStates();
-            chat_history->AppendText("Error: Failed to start response generation thread\n");
+            AddSystemMessage("Error: Failed to start response generation thread");
         }
     }
     
@@ -743,9 +953,9 @@ private:
         
         // Check for error responses
         if (response.StartsWith("Error:")) {
-            chat_history->AppendText("System: " + response + "\n\n");
+            AddSystemMessage(response);
         } else {
-            chat_history->AppendText("AI: " + response + "\n\n");
+            AddAIMessage(response);
             
             // Update timings after successful inference
             UpdateTimingsDisplay();
@@ -756,6 +966,7 @@ private:
         
         // Auto-scroll to bottom
         chat_history->SetInsertionPointEnd();
+        chat_history->ShowPosition(chat_history->GetLastPosition());
     }
 
 public:
