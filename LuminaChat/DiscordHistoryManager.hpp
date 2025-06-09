@@ -166,12 +166,29 @@ private:
         discord_manager_log_callback(message);
     }
     
-    // ADDED: Helper methods for safe context operations
+    // ADDED: Helper methods for safe context operations with better error handling
     bool create_context_safely(const std::string& context_id) {
-        if (!llama_manager) return false;
+        if (!llama_manager) {
+            log_message("Error: LlamaManager not available for context creation");
+            return false;
+        }
+        
+        if (context_id.empty()) {
+            log_message("Error: Cannot create context with empty ID");
+            return false;
+        }
         
         try {
-            return llama_manager->create_context(context_id, "");
+            if (llama_manager->has_context(context_id)) {
+                log_message("Context '" + context_id + "' already exists");
+                return true;
+            }
+            
+            bool success = llama_manager->create_context(context_id, "");
+            if (!success) {
+                log_message("Failed to create context '" + context_id + "'");
+            }
+            return success;
         } catch (const std::exception& e) {
             log_message("Exception creating context '" + context_id + "': " + std::string(e.what()));
             return false;
@@ -179,16 +196,29 @@ private:
     }
     
     bool switch_context_safely(const std::string& context_id) {
-        if (!llama_manager) return false;
+        if (!llama_manager) {
+            log_message("Error: LlamaManager not available for context switch");
+            return false;
+        }
+        
+        if (context_id.empty()) {
+            log_message("Error: Cannot switch to context with empty ID");
+            return false;
+        }
         
         try {
+            if (!llama_manager->has_context(context_id)) {
+                log_message("Error: Context '" + context_id + "' does not exist");
+                return false;
+            }
+            
             return llama_manager->switch_to_context(context_id);
         } catch (const std::exception& e) {
             log_message("Exception switching to context '" + context_id + "': " + std::string(e.what()));
             return false;
         }
     }
-    
+
     void fetch_channel_history(uint64_t channel_id, uint64_t before_message_id = 0) {
         if (!bot || !llama_manager) {
             log_message("Cannot fetch history: bot or llama_manager not available");
@@ -345,7 +375,7 @@ private:
         std::string context_id;
         
         if (is_isolated_chan) {
-            // Get or create isolated channel context
+            // FIXED: Proper isolated channel context handling
             if (channel_contexts) {
                 auto it = channel_contexts->find(channel_id);
                 if (it != channel_contexts->end()) {
@@ -360,12 +390,9 @@ private:
                     log_message("Created isolated context for channel history: " + context_id);
                 }
             } else {
-                context_id = "discord_channel_" + std::to_string(channel_id);
-                if (!create_context_safely(context_id)) {
-                    log_message("Failed to create isolated context for channel " + std::to_string(channel_id));
-                    actual_tokens_added = 0;
-                    return false;
-                }
+                log_message("Error: Channel contexts map not available");
+                actual_tokens_added = 0;
+                return false;
             }
         } else {
             context_id = main_context_id;
@@ -378,6 +405,7 @@ private:
         }
         
         if (!check_context_capacity_before_add(context_id, channel_id, messages)) {
+            log_message("Context capacity check failed for " + context_id);
             actual_tokens_added = 0;
             return false;
         }
@@ -390,7 +418,14 @@ private:
             return false;
         }
         
-        int32_t tokens_before = llama_manager->get_message_history_token_count();
+        // FIXED: Better token counting with error handling
+        int32_t tokens_before = 0;
+        try {
+            tokens_before = llama_manager->get_message_history_token_count();
+        } catch (const std::exception& e) {
+            log_message("Error getting token count before adding history: " + std::string(e.what()));
+            tokens_before = 0;
+        }
         
         for (const auto& msg : messages) {
             llama_manager->add_message_to_history(msg.username, msg.content);
@@ -399,8 +434,14 @@ private:
         bool success = llama_manager->update_context_from_history();
         
         if (success) {
-            int32_t tokens_after = llama_manager->get_message_history_token_count();
-            actual_tokens_added = tokens_after - tokens_before;
+            int32_t tokens_after = 0;
+            try {
+                tokens_after = llama_manager->get_message_history_token_count();
+                actual_tokens_added = std::max(0, tokens_after - tokens_before);
+            } catch (const std::exception& e) {
+                log_message("Error getting token count after adding history: " + std::string(e.what()));
+                actual_tokens_added = 0;
+            }
             
             update_context_usage_tracking(context_id, channel_id, actual_tokens_added);
             
@@ -412,13 +453,15 @@ private:
         }
         
         // Restore original context
-        if (!original_context.empty()) {
-            llama_manager->switch_to_context(original_context);
+        if (!original_context.empty() && original_context != context_id) {
+            if (!switch_context_safely(original_context)) {
+                log_message("Warning: Failed to restore original context: " + original_context);
+            }
         }
         
         return success;
     }
-    
+
     bool check_context_capacity_before_add(const std::string& context_id, uint64_t channel_id, const std::vector<HistoryMessage>& messages) {
         std::lock_guard<std::mutex> lock(context_backfill_mutex);
         
@@ -452,18 +495,31 @@ private:
         
         return true;
     }
-    
+
+    // FIXED: Better initialization with null checks
     void initialize_context_backfill_info(const std::string& context_id) {
+        if (context_id.empty()) {
+            log_message("Error: Cannot initialize backfill info for empty context ID");
+            return;
+        }
+        
         ContextBackfillInfo info;
         info.context_id = context_id;
         info.is_main_context = (context_id == main_context_id);
         info.last_updated = std::chrono::system_clock::now();
         
         if (llama_manager) {
-            int32_t context_size = llama_manager->get_context_size();
-            info.capacity_limit = static_cast<int32_t>(context_size * MAX_CONTEXT_FILL_RATIO);
-            info.actual_tokens = get_actual_context_usage(context_id);
+            try {
+                int32_t context_size = llama_manager->get_context_size();
+                info.capacity_limit = static_cast<int32_t>(context_size * MAX_CONTEXT_FILL_RATIO);
+                info.actual_tokens = get_actual_context_usage(context_id);
+            } catch (const std::exception& e) {
+                log_message("Error initializing context info: " + std::string(e.what()));
+                info.capacity_limit = static_cast<int32_t>(2048 * MAX_CONTEXT_FILL_RATIO);
+                info.actual_tokens = 0;
+            }
         } else {
+            log_message("Warning: LlamaManager not available during context initialization");
             info.capacity_limit = static_cast<int32_t>(2048 * MAX_CONTEXT_FILL_RATIO);
             info.actual_tokens = 0;
         }
@@ -684,14 +740,32 @@ public:
     
     // Main interface
     bool start_backfill() {
-        if (backfill_in_progress || !bot || !llama_manager) {
-            log_message("Cannot start backfill - already in progress or dependencies not available");
+        if (backfill_in_progress) {
+            log_message("Backfill already in progress");
+            return true;
+        }
+        
+        if (!bot || !llama_manager) {
+            log_message("Cannot start backfill - dependencies not available (bot: " + 
+                       std::string(bot ? "OK" : "NULL") + ", llama: " + 
+                       std::string(llama_manager ? "OK" : "NULL") + ")");
+            return false;
+        }
+        
+        if (main_context_id.empty()) {
+            log_message("Cannot start backfill - main context ID not set");
+            return false;
+        }
+        
+        if (!llama_manager->has_context(main_context_id)) {
+            log_message("Cannot start backfill - main context '" + main_context_id + "' does not exist");
             return false;
         }
         
         backfill_in_progress = true;
         log_message("Starting chat history backfill with round-robin for shared channels...");
         
+        // Clear previous state
         {
             std::lock_guard<std::mutex> lock(backfill_mutex);
             channel_backfill_state.clear();
@@ -705,6 +779,12 @@ public:
         {
             std::lock_guard<std::mutex> rr_lock(round_robin_mutex);
             shared_round_robin = SharedChannelRoundRobin{};
+        }
+        
+        // Initialize main context tracking
+        {
+            std::lock_guard<std::mutex> capacity_lock(context_backfill_mutex);
+            initialize_context_backfill_info(main_context_id);
         }
         
         try {

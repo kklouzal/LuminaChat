@@ -97,13 +97,13 @@ private:
     
     // Integration with LlamaManager
     LlamaManager* llama_manager;
-    std::string main_context_id; // ADDED: ID of the main shared context
+    std::string main_context_id;
     
     // ADDED: Channel filtering
     std::unordered_set<uint64_t> allowed_channels;
-    std::unordered_set<uint64_t> isolated_channels; // ADDED: Channels that get isolated contexts
-    std::unordered_set<uint64_t> shared_history_channels; // ADDED: Shared channels that pull message history
-    bool allow_dms = true; // ADDED: Setting to enable/disable DM handling
+    std::unordered_set<uint64_t> isolated_channels;
+    std::unordered_set<uint64_t> shared_history_channels;
+    bool allow_dms = true;
     mutable std::mutex channel_mutex;
     
     // Message handling - made mutable for const methods
@@ -118,22 +118,15 @@ private:
     // ADDED: Response rate limiting
     std::unordered_map<uint64_t, std::chrono::system_clock::time_point> last_response_time;
     mutable std::mutex rate_limit_mutex;
-    const std::chrono::milliseconds min_response_interval{2000}; // 2 seconds between responses per user
+    const std::chrono::milliseconds min_response_interval{2000};
     
     // ADDED: Context management for Discord users and channels
-    std::unordered_map<uint64_t, std::string> user_contexts; // user_id -> context_id (for DMs only)
-    std::unordered_map<uint64_t, std::string> channel_contexts; // channel_id -> context_id (for isolated channels)
+    std::unordered_map<uint64_t, std::string> user_contexts;
+    std::unordered_map<uint64_t, std::string> channel_contexts;
     mutable std::mutex context_mutex;
     
-    // ADDED: History manager delegation (replaces all backfill-related members)
+    // ADDED: History manager delegation
     std::unique_ptr<DiscordHistoryManager> history_manager;
-    
-    // REMOVED: All duplicate backfill-related members that conflict with DiscordHistoryManager
-    // - std::unordered_map<uint64_t, ChannelBackfillState> channel_backfill_state;
-    // - mutable std::mutex backfill_mutex;
-    // - std::atomic<bool> backfill_in_progress{false};
-    // - static constexpr int32_t MESSAGES_PER_FETCH = 10;
-    // - static constexpr float MAX_CONTEXT_FILL_RATIO = 0.5f;
 
 public:
     // UPDATED: Use DiscordHistoryManager's BackfillStatus type
@@ -539,7 +532,7 @@ private:
         return (it != user_conversations.end()) ? it->second : std::vector<DiscordMessageContext>{};
     }
     
-    // SIMPLIFIED: Helper to get or create context with consistent system prompt handling
+    // FIXED: Enhanced context management for proper isolation
     std::string get_or_create_user_context(uint64_t user_id, const std::string& username, uint64_t channel_id, uint64_t guild_id) {
         bool is_dm = (guild_id == 0);
         bool is_isolated_chan = is_isolated_channel(channel_id);
@@ -568,7 +561,7 @@ private:
                 }
             }
             
-            // Create new DM context - empty system prompt will inherit from main
+            // Create new DM context
             if (llama_manager) {
                 std::string context_id = "discord_dm_" + std::to_string(user_id);
                 log_message("Creating DM context '" + context_id + "' for user: " + username);
@@ -594,7 +587,7 @@ private:
                 }
             }
             
-            // Create new isolated channel context - empty system prompt will inherit from main
+            // Create new isolated channel context
             if (llama_manager) {
                 std::string context_id = "discord_channel_" + std::to_string(channel_id);
                 log_message("Creating isolated channel context '" + context_id + "' for channel: " + std::to_string(channel_id));
@@ -806,16 +799,25 @@ public:
         }
     }
     
-    // UPDATED: Delegate backfill to history manager
+    // UPDATED: Delegate backfill to history manager with proper initialization
     bool start_chat_history_backfill() {
+        if (!llama_manager || main_context_id.empty()) {
+            log_message("Cannot start backfill: LlamaManager or main context not available");
+            return false;
+        }
+        
         if (!history_manager) {
             history_manager = std::make_unique<DiscordHistoryManager>();
             history_manager->configure(bot.get(), llama_manager, main_context_id);
+            
+            // FIXED: Pass proper channel configuration with thread-safe access
+            std::lock_guard<std::mutex> lock(channel_mutex);
             history_manager->set_channel_configuration(
                 &allowed_channels, &isolated_channels, 
                 &shared_history_channels, &channel_contexts
             );
         }
+        
         return history_manager->start_backfill();
     }
     

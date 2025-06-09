@@ -87,26 +87,11 @@ private:
     std::string active_context_id;
     ContextInfo* current_context;
     
-    // Remove old single-context members that are now per-context
-    // llama_context* context; - REMOVED
-    // llama_sampler* sampler; - REMOVED
-    // llama_batch batch; - REMOVED
-    // bool batch_initialized; - REMOVED
-    // int32_t n_past; - REMOVED
-    // std::vector<std::pair<std::string, std::string>> message_history; - REMOVED
-    // int32_t prev_len; - REMOVED
-    // std::string system_message; - REMOVED
-    
     // Keep model-level settings
     int32_t n_ctx;
     int32_t n_predict;
     int32_t n_gpu_layers;
     bool model_loaded;
-    
-    // Global performance tracking (aggregated across all contexts)
-    // int64_t total_prompt_tokens = 0; - REMOVED (now per-context)
-    // int64_t total_generation_tokens = 0; - REMOVED (now per-context)
-    // int64_t last_decode_time_us = 0; - REMOVED (now per-context)
     
     // Keep shared template and cache management (model-level)
     std::string custom_chat_template;
