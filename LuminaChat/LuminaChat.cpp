@@ -232,33 +232,51 @@ private:
 // Settings management functions
 class SettingsManager {
 private:
-    // Helper functions to escape/unescape strings for INI storage
     static std::string EscapeString(const std::string& input) {
-        std::string result = input;
-        size_t pos = 0;
-        while ((pos = result.find('\n', pos)) != std::string::npos) {
-            result.replace(pos, 1, "\\n");
-            pos += 2;
-        }
-        pos = 0;
-        while ((pos = result.find('\r', pos)) != std::string::npos) {
-            result.replace(pos, 1, "\\r");
-            pos += 2;
+        std::string result;
+        for (char c : input) {
+            if (c == '\n') {
+                result += "\\n";
+            } else if (c == '\r') {
+                result += "\\r";
+            } else if (c == '\t') {
+                result += "\\t";
+            } else if (c == '\\') {
+                result += "\\\\";
+            } else if (c == '=') {
+                result += "\\=";
+            } else {
+                result += c;
+            }
         }
         return result;
     }
     
     static std::string UnescapeString(const std::string& input) {
-        std::string result = input;
-        size_t pos = 0;
-        while ((pos = result.find("\\n", pos)) != std::string::npos) {
-            result.replace(pos, 2, "\n");
-            pos += 1;
-        }
-        pos = 0;
-        while ((pos = result.find("\\r", pos)) != std::string::npos) {
-            result.replace(pos, 2, "\r");
-            pos += 1;
+        std::string result;
+        for (size_t i = 0; i < input.size(); ++i) {
+            if (input[i] == '\\' && i + 1 < input.size()) {
+                if (input[i + 1] == 'n') {
+                    result += '\n';
+                    i++;
+                } else if (input[i + 1] == 'r') {
+                    result += '\r';
+                    i++;
+                } else if (input[i + 1] == 't') {
+                    result += '\t';
+                    i++;
+                } else if (input[i + 1] == '\\') {
+                    result += '\\';
+                    i++;
+                } else if (input[i + 1] == '=') {
+                    result += '=';
+                    i++;
+                } else {
+                    result += input[i];
+                }
+            } else {
+                result += input[i];
+            }
         }
         return result;
     }
@@ -266,8 +284,8 @@ private:
     // Validate and clamp integer values
     static int32_t ValidateInt32(const std::string& value, int32_t default_val, int32_t min_val, int32_t max_val) {
         try {
-            int32_t parsed = std::stoi(value);
-            return (parsed >= min_val && parsed <= max_val) ? parsed : default_val;
+            int32_t result = std::stoi(value);
+            return std::clamp(result, min_val, max_val);
         } catch (...) {
             return default_val;
         }
@@ -275,34 +293,59 @@ private:
 
 public:
     static std::string GetSettingsFilePath() {
-        wxStandardPaths& stdPaths = wxStandardPaths::Get();
-        wxString exeDir = stdPaths.GetExecutablePath().BeforeLast(wxFileName::GetPathSeparator());
-        wxString iniPath = exeDir + wxFileName::GetPathSeparator() + wxT("LuminaChat.ini");
-        return iniPath.ToStdString();
+        // Get the directory where the executable is located
+        wxString exeDir = wxStandardPaths::Get().GetExecutablePath();
+        wxFileName exePath(exeDir);
+        wxString appDir = exePath.GetPath();
+        
+        // Create the settings file path in the same directory as the executable
+        wxFileName configFile(appDir, "luminachat.ini");
+        std::string filepath = configFile.GetFullPath().ToStdString();
+        
+        std::cout << "Settings file path: " << filepath << std::endl;
+        return filepath;
     }
     
     static void SaveSettings(const std::string& model_path, int32_t context_size, int32_t gpu_layers, 
                            int32_t predict_tokens, const std::string& chat_template, 
                            const std::string& identity_directive, const std::string& other_directives,
                            const std::string& discord_bot_token, const std::string& discord_channel_ids,
-                           const std::string& discord_isolated_channel_ids) {
-        std::ofstream file(GetSettingsFilePath());
+                           const std::string& discord_isolated_channel_ids, bool discord_allow_dms) {
+        std::string filepath = GetSettingsFilePath();
+        std::ofstream file(filepath);
         
         if (file.is_open()) {
-            file << "[General]\n"
-                 << "ModelPath=" << model_path << "\n"
-                 << "ContextSize=" << context_size << "\n"
-                 << "GpuLayers=" << gpu_layers << "\n"
-                 << "PredictTokens=" << predict_tokens << "\n"
-                 << "\n[ChatTemplate]\n"
-                 << "Template=" << EscapeString(chat_template) << "\n"
-                 << "\n[SystemPrompt]\n"
-                 << "IdentityDirective=" << EscapeString(identity_directive) << "\n"
-                 << "OtherDirectives=" << EscapeString(other_directives) << "\n"
-                 << "\n[Discord]\n"
-                 << "BotToken=" << EscapeString(discord_bot_token) << "\n"
-                 << "ChannelIds=" << discord_channel_ids << "\n"
-                 << "IsolatedChannelIds=" << discord_isolated_channel_ids << "\n";
+            // [General] section
+            file << "[General]" << std::endl;
+            file << "ModelPath=" << EscapeString(model_path) << std::endl;
+            file << "ContextSize=" << context_size << std::endl;
+            file << "GpuLayers=" << gpu_layers << std::endl;
+            file << "PredictTokens=" << predict_tokens << std::endl;
+            file << std::endl;
+            
+            // [ChatTemplate] section
+            file << "[ChatTemplate]" << std::endl;
+            file << "Template=" << EscapeString(chat_template) << std::endl;
+            file << std::endl;
+            
+            // [SystemPrompt] section
+            file << "[SystemPrompt]" << std::endl;
+            file << "IdentityDirective=" << EscapeString(identity_directive) << std::endl;
+            file << "OtherDirectives=" << EscapeString(other_directives) << std::endl;
+            file << std::endl;
+            
+            // [Discord] section
+            file << "[Discord]" << std::endl;
+            file << "BotToken=" << EscapeString(discord_bot_token) << std::endl;
+            file << "ChannelIds=" << EscapeString(discord_channel_ids) << std::endl;
+            file << "IsolatedChannelIds=" << EscapeString(discord_isolated_channel_ids) << std::endl;
+            file << "AllowDMs=" << (discord_allow_dms ? "1" : "0") << std::endl;
+            
+            file.close();
+            
+            std::cout << "Settings saved to: " << filepath << std::endl;
+        } else {
+            std::cerr << "Error: Failed to save settings to: " << filepath << std::endl;
         }
     }
     
@@ -310,42 +353,115 @@ public:
                            int32_t& predict_tokens, std::string& chat_template, 
                            std::string& identity_directive, std::string& other_directives,
                            std::string& discord_bot_token, std::string& discord_channel_ids,
-                           std::string& discord_isolated_channel_ids) {
-        std::ifstream file(GetSettingsFilePath());
+                           std::string& discord_isolated_channel_ids, bool& discord_allow_dms) {
+        std::string filepath = GetSettingsFilePath();
+        std::ifstream file(filepath);
+        
+        // Set defaults first
+        if (model_path.empty()) model_path = "";
+        if (context_size == 0) context_size = 2048;
+        if (gpu_layers == 0) gpu_layers = 0;
+        if (predict_tokens == 0) predict_tokens = 256;
+        discord_allow_dms = true; // Default to true
         
         if (file.is_open()) {
+            std::cout << "Loading settings from: " << filepath << std::endl;
             std::string line;
+            std::string current_section;
+            int loaded_count = 0;
+            
             while (std::getline(file, line)) {
-                if (line.empty() || line[0] == '[') continue;
+                // Trim whitespace
+                line.erase(0, line.find_first_not_of(" \t\r\n"));
+                line.erase(line.find_last_not_of(" \t\r\n") + 1);
                 
-                size_t equalPos = line.find('=');
-                if (equalPos == std::string::npos) continue;
+                // Skip empty lines and comments
+                if (line.empty() || line[0] == '#' || line[0] == ';') {
+                    continue;
+                }
                 
-                std::string key = line.substr(0, equalPos);
-                std::string value = line.substr(equalPos + 1);
+                // Check for section headers
+                if (line[0] == '[' && line.back() == ']') {
+                    current_section = line.substr(1, line.length() - 2);
+                    std::cout << "Reading section: [" << current_section << "]" << std::endl;
+                    continue;
+                }
                 
-                if (key == "ModelPath") {
-                    model_path = value;
-                } else if (key == "ContextSize") {
-                    context_size = ValidateInt32(value, 2048, 1, 131072);
-                } else if (key == "GpuLayers") {
-                    gpu_layers = ValidateInt32(value, 0, 0, 999);
-                } else if (key == "PredictTokens") {
-                    predict_tokens = ValidateInt32(value, 256, 1, 4096);
-                } else if (key == "Template") {
-                    chat_template = UnescapeString(value);
-                } else if (key == "IdentityDirective") {
-                    identity_directive = UnescapeString(value);
-                } else if (key == "OtherDirectives") {
-                    other_directives = UnescapeString(value);
-                } else if (key == "BotToken") {
-                    discord_bot_token = UnescapeString(value);
-                } else if (key == "ChannelIds") {
-                    discord_channel_ids = value;
-                } else if (key == "IsolatedChannelIds") {
-                    discord_isolated_channel_ids = value;
+                // Parse key=value pairs
+                size_t pos = line.find('=');
+                if (pos != std::string::npos) {
+                    std::string key = line.substr(0, pos);
+                    std::string value = line.substr(pos + 1);
+                    
+                    // Trim key and value
+                    key.erase(0, key.find_first_not_of(" \t"));
+                    key.erase(key.find_last_not_of(" \t") + 1);
+                    value.erase(0, value.find_first_not_of(" \t"));
+                    value.erase(value.find_last_not_of(" \t") + 1);
+                    
+                    // Handle settings based on section
+                    if (current_section == "General") {
+                        if (key == "ModelPath") {
+                            model_path = UnescapeString(value);
+                            loaded_count++;
+                            std::cout << "Loaded ModelPath: " << model_path << std::endl;
+                        } else if (key == "ContextSize") {
+                            context_size = ValidateInt32(value, 2048, 1, 131072);
+                            loaded_count++;
+                            std::cout << "Loaded ContextSize: " << context_size << std::endl;
+                        } else if (key == "GpuLayers") {
+                            gpu_layers = ValidateInt32(value, 0, 0, 999);
+                            loaded_count++;
+                            std::cout << "Loaded GpuLayers: " << gpu_layers << std::endl;
+                        } else if (key == "PredictTokens") {
+                            predict_tokens = ValidateInt32(value, 256, 1, 4096);
+                            loaded_count++;
+                            std::cout << "Loaded PredictTokens: " << predict_tokens << std::endl;
+                        }
+                    } else if (current_section == "ChatTemplate") {
+                        if (key == "Template") {
+                            chat_template = UnescapeString(value);
+                            loaded_count++;
+                            std::cout << "Loaded Template: " << (chat_template.empty() ? "(empty)" : "configured") << std::endl;
+                        }
+                    } else if (current_section == "SystemPrompt") {
+                        if (key == "IdentityDirective") {
+                            identity_directive = UnescapeString(value);
+                            loaded_count++;
+                            std::cout << "Loaded IdentityDirective: " << (identity_directive.empty() ? "(empty)" : "configured") << std::endl;
+                        } else if (key == "OtherDirectives") {
+                            other_directives = UnescapeString(value);
+                            loaded_count++;
+                            std::cout << "Loaded OtherDirectives: " << (other_directives.empty() ? "(empty)" : "configured") << std::endl;
+                        }
+                    } else if (current_section == "Discord") {
+                        if (key == "BotToken") {
+                            discord_bot_token = UnescapeString(value);
+                            loaded_count++;
+                            std::cout << "Loaded BotToken: " << (discord_bot_token.empty() ? "(empty)" : "configured") << std::endl;
+                        } else if (key == "ChannelIds") {
+                            discord_channel_ids = UnescapeString(value);
+                            loaded_count++;
+                            std::cout << "Loaded ChannelIds: " << discord_channel_ids << std::endl;
+                        } else if (key == "IsolatedChannelIds") {
+                            discord_isolated_channel_ids = UnescapeString(value);
+                            loaded_count++;
+                            std::cout << "Loaded IsolatedChannelIds: " << discord_isolated_channel_ids << std::endl;
+                        } else if (key == "AllowDMs") {
+                            discord_allow_dms = (value == "1" || value == "true" || value == "True" || value == "TRUE");
+                            loaded_count++;
+                            std::cout << "Loaded AllowDMs: " << (discord_allow_dms ? "true" : "false") << std::endl;
+                        }
+                    } else {
+                        std::cout << "Unknown section/setting: [" << current_section << "] " << key << "=" << value << std::endl;
+                    }
                 }
             }
+            file.close();
+            
+            std::cout << "Settings loading complete. Loaded " << loaded_count << " settings." << std::endl;
+        } else {
+            std::cout << "Settings file not found: " << filepath << " (using defaults)" << std::endl;
         }
     }
 };
@@ -363,7 +479,8 @@ private:
     wxTextCtrl* other_directives_text;
     wxTextCtrl* discord_bot_token_text;
     wxTextCtrl* discord_channel_ids_text;
-    wxTextCtrl* discord_isolated_channel_ids_text; // ADDED: New textbox for isolated channels
+    wxTextCtrl* discord_isolated_channel_ids_text;
+    wxCheckBox* discord_allow_dms_checkbox; // ADDED: New checkbox for DM handling
     
     // References to settings
     std::string& model_path_ref;
@@ -375,7 +492,8 @@ private:
     std::string& other_directives_ref;
     std::string& discord_bot_token_ref;
     std::string& discord_channel_ids_ref;
-    std::string& discord_isolated_channel_ids_ref; // ADDED: New reference
+    std::string& discord_isolated_channel_ids_ref;
+    bool& discord_allow_dms_ref; // ADDED: New reference
 
     // Validation helper
     bool ValidateAndSetInt32(wxTextCtrl* control, int32_t& target, int32_t default_val, 
@@ -396,13 +514,13 @@ public:
     SettingsDialog(wxWindow* parent, std::string& model_path, int32_t& context_size, int32_t& gpu_layers, 
                   int32_t& predict_tokens, std::string& chat_template, std::string& identity_directive, 
                   std::string& other_directives, std::string& discord_bot_token, std::string& discord_channel_ids,
-                  std::string& discord_isolated_channel_ids) 
+                  std::string& discord_isolated_channel_ids, bool& discord_allow_dms) 
         : wxDialog(parent, wxID_ANY, "Settings", wxDefaultPosition, wxSize(700, 600)),
           model_path_ref(model_path), context_size_ref(context_size), gpu_layers_ref(gpu_layers), 
           predict_tokens_ref(predict_tokens), chat_template_ref(chat_template),
           identity_directive_ref(identity_directive), other_directives_ref(other_directives),
           discord_bot_token_ref(discord_bot_token), discord_channel_ids_ref(discord_channel_ids),
-          discord_isolated_channel_ids_ref(discord_isolated_channel_ids) {
+          discord_isolated_channel_ids_ref(discord_isolated_channel_ids), discord_allow_dms_ref(discord_allow_dms) {
         
         wxNotebook* notebook = new wxNotebook(this, wxID_ANY);
         
@@ -501,6 +619,12 @@ public:
         discord_bot_token_text->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
         discord_sizer->Add(discord_bot_token_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
         
+        // ADDED: Allow DMs checkbox
+        discord_allow_dms_checkbox = new wxCheckBox(discord_panel, wxID_ANY, "Allow Direct Messages (DMs)");
+        discord_allow_dms_checkbox->SetValue(discord_allow_dms);
+        discord_sizer->Add(discord_allow_dms_checkbox, 0, wxALL, 5);
+        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "When unchecked, the bot will auto-reply to DMs that the feature is disabled"), 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
+        
         // Channel IDs
         discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Allowed Channel IDs (comma separated):"), 0, wxALL, 5);
         discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "List of Discord channel IDs where the bot should respond (leave empty for all channels)"), 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
@@ -511,7 +635,7 @@ public:
         discord_channel_ids_text->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
         discord_sizer->Add(discord_channel_ids_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
         
-        // ADDED: Isolated Context Channel IDs
+        // Isolated Context Channel IDs
         discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Isolated Context Channel IDs (comma separated):"), 0, wxALL, 5);
         discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Channels that get their own separate context (each user gets individual context)"), 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
         
@@ -530,7 +654,8 @@ public:
             "4. Separate multiple channel IDs with commas (e.g., 123456789,987654321)\n"
             "5. Channels NOT in 'Isolated Context' list will use the shared main chat context\n"
             "6. Channels IN 'Isolated Context' list will get their own separate context (shared by all users in that channel)\n"
-            "7. Direct Messages (DMs) ALWAYS use individual isolated contexts (one per user for privacy)");
+            "7. Direct Messages (DMs) use individual isolated contexts when enabled (one per user for privacy)\n"
+            "8. When DMs are disabled, users will receive an auto-reply explaining the feature is turned off");
         discord_help->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_ITALIC, wxFONTWEIGHT_NORMAL));
         discord_sizer->Add(discord_help, 1, wxEXPAND | wxALL, 5);
         
@@ -577,7 +702,8 @@ private:
         other_directives_ref = other_directives_text->GetValue().ToUTF8().data();
         discord_bot_token_ref = discord_bot_token_text->GetValue().ToUTF8().data();
         discord_channel_ids_ref = discord_channel_ids_text->GetValue().ToUTF8().data();
-        discord_isolated_channel_ids_ref = discord_isolated_channel_ids_text->GetValue().ToUTF8().data(); // ADDED
+        discord_isolated_channel_ids_ref = discord_isolated_channel_ids_text->GetValue().ToUTF8().data();
+        discord_allow_dms_ref = discord_allow_dms_checkbox->GetValue(); // ADDED: Get checkbox value
         
         // Validate Discord channel IDs format if provided
         if (!discord_channel_ids_ref.empty()) {
@@ -589,7 +715,7 @@ private:
             }
         }
         
-        // ADDED: Validate isolated channel IDs format if provided
+        // Validate isolated channel IDs format if provided
         if (!discord_isolated_channel_ids_ref.empty()) {
             std::string cleaned_ids = ValidateChannelIds(discord_isolated_channel_ids_ref);
             if (cleaned_ids != discord_isolated_channel_ids_ref) {
@@ -604,7 +730,7 @@ private:
                                     predict_tokens_ref, chat_template_ref, 
                                     identity_directive_ref, other_directives_ref,
                                     discord_bot_token_ref, discord_channel_ids_ref,
-                                    discord_isolated_channel_ids_ref);
+                                    discord_isolated_channel_ids_ref, discord_allow_dms_ref);
         
         EndModal(wxID_OK);
     }
@@ -669,8 +795,9 @@ private:
     std::string other_directives;
     std::string discord_bot_token;
     std::string discord_channel_ids;
-    std::string discord_isolated_channel_ids; // ADDED: New setting
-    
+    std::string discord_isolated_channel_ids;
+    bool discord_allow_dms = true; // ADDED: New setting for DM handling
+
     // State
     bool is_started;
     std::atomic<bool> is_processing{false};
@@ -707,7 +834,7 @@ public:
         
         SettingsManager::LoadSettings(model_path, context_size, gpu_layers, predict_tokens, 
                                     chat_template, identity_directive, other_directives,
-                                    discord_bot_token, discord_channel_ids, discord_isolated_channel_ids);
+                                    discord_bot_token, discord_channel_ids, discord_isolated_channel_ids, discord_allow_dms);
         
         CreateUI();
         
@@ -800,7 +927,7 @@ private:
             
             SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, 
                                         chat_template, identity_directive, other_directives,
-                                        discord_bot_token, discord_channel_ids, discord_isolated_channel_ids);
+                                        discord_bot_token, discord_channel_ids, discord_isolated_channel_ids, discord_allow_dms);
         }
     }
 
@@ -1108,7 +1235,7 @@ private:
                     chat_template = model_template;
                     SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, 
                                                 chat_template, identity_directive, other_directives,
-                                                discord_bot_token, discord_channel_ids, discord_isolated_channel_ids);
+                                                discord_bot_token, discord_channel_ids, discord_isolated_channel_ids, discord_allow_dms);
                     std::cout << "Loaded chat template from model" << std::endl;
                 }
             } else {
@@ -1213,6 +1340,7 @@ private:
             // Set channel configuration
             discord_manager->set_allowed_channels(discord_channel_ids);
             discord_manager->set_isolated_channels(discord_isolated_channel_ids);
+            discord_manager->set_allow_dms(discord_allow_dms); // ADDED: Set DM allowance
             
             // SIMPLIFIED: Set LlamaManager integration if model is loaded
             if (is_started && llama_manager && context_created) {
@@ -1231,7 +1359,7 @@ private:
                 if (!discord_isolated_channel_ids.empty()) {
                     std::cout << "Isolated context channels: " << discord_isolated_channel_ids << std::endl;
                 }
-                std::cout << "Note: Direct Messages always use isolated contexts" << std::endl;
+                std::cout << "Direct Messages: " << (discord_allow_dms ? "Enabled" : "Disabled") << std::endl;
                 std::cout << "All contexts use the same system prompt and chat template" << std::endl;
             } else {
                 wxMessageBox("Failed to start Discord bot. Check the logs for details.", 
@@ -1245,7 +1373,7 @@ private:
     void OnSettings(wxCommandEvent& event) {
         SettingsDialog dialog(this, model_path, context_size, gpu_layers, predict_tokens, 
                             chat_template, identity_directive, other_directives,
-                            discord_bot_token, discord_channel_ids, discord_isolated_channel_ids);
+                            discord_bot_token, discord_channel_ids, discord_isolated_channel_ids, discord_allow_dms);
         if (dialog.ShowModal() == wxID_OK) {
             UpdateWindowTitle();
             

@@ -98,6 +98,7 @@ private:
     // ADDED: Channel filtering
     std::unordered_set<uint64_t> allowed_channels;
     std::unordered_set<uint64_t> isolated_channels; // ADDED: Channels that get isolated contexts
+    bool allow_dms = true; // ADDED: Setting to enable/disable DM handling
     mutable std::mutex channel_mutex;
     
     // Message handling - made mutable for const methods
@@ -381,6 +382,13 @@ public:
     // ADDED: Method to set isolated channels
     void set_isolated_channels(const std::string& channel_ids) {
         parse_isolated_channel_ids(channel_ids);
+    }
+    
+    // ADDED: Method to set DM allowance
+    void set_allow_dms(bool allow) {
+        std::lock_guard<std::mutex> lock(channel_mutex);
+        allow_dms = allow;
+        log_message("Direct Messages: " + std::string(allow ? "Enabled" : "Disabled"));
     }
     
     // ADDED: Method to set main context ID for shared channels
@@ -685,7 +693,16 @@ private:
             // Determine if this is a DM using guild_id
             bool is_dm = (event.msg.guild_id == 0);
             
-            // For DMs, always allow processing (don't check allowed channels)
+            // ADDED: Check if DMs are disabled and handle auto-reply
+            if (is_dm && !allow_dms) {
+                // Send auto-reply for disabled DMs
+                std::string auto_reply = "Sorry, Direct Messages are currently disabled. Please use the appropriate server channels to chat with me.";
+                send_message(event.msg.channel_id, auto_reply);
+                log_message("Auto-replied to DM from " + event.msg.author.username + " (DMs disabled)");
+                return;
+            }
+            
+            // For DMs, always allow processing when enabled (don't check allowed channels)
             // For guild messages, check if channel is allowed
             if (!is_dm && !is_channel_allowed(event.msg.channel_id)) {
                 return;
