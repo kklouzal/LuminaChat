@@ -1,6 +1,9 @@
 // LuminaChat.cpp - Main application file for LuminaChat with wxWidgets GUI
 // Handles initialization, UI setup, and main application logic
 //
+// File Specific Directives:
+// Manages all wxWidgets GUI components and application lifecycle.
+//
 // Project Settings:
 // C++ Language Standard: ISO C++20 Standard (/std:c++20)
 // C Language Standard: ISO C17 (2018) Standard (/std:c17)

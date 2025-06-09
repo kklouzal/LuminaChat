@@ -4,6 +4,8 @@
 // File Specific Directives:
 // Only keep a maximum of 90% maximum token usage in the context.
 // Use a maximum of 90% context usage, prune older messages to bring us down to 60% usage.
+// Context usage is tracked per-context, not globally.
+// Context switching functionality is available, the main application and shared channels use the main context, isolated channels and DMs use their own contexts.
 //
 // Project Settings:
 // C++ Language Standard: ISO C++20 Standard (/std:c++20)

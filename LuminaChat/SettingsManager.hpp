@@ -1,6 +1,11 @@
 // SettingsManager.hpp - header-only implementation for settings management
 // Handles loading and saving configuration in INI format with sections
 //
+// File Specific Directives:
+// Manage settings in a structured INI format with sections for each setting.
+// Handles saving/loading of all application settings.
+// .ini file is saved in the same directory as the executable.
+//
 // Project Settings:
 // C++ Language Standard: ISO C++20 Standard (/std:c++20)
 // C Language Standard: ISO C17 (2018) Standard (/std:c17)
