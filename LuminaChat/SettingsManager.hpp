@@ -20,19 +20,17 @@
 // Enable Run-Time Type Information (RTTI) YES (/GR)
 // Link Time Code Generation: Use Link Time Code Generation (/LTCG)
 //
-// CODING DIRECTIVES:
-// 1. Keep the codebase minimalistic, focused on functionality and efficiency.
-// 2. Stay consistent with similar coding styles and patterns throughout the codebase.
-// 3. Comment code thoroughly, where necessary, to explain complex logic or decisions.
-// 4. Always eliminate unused code, dead code, legacy code, and cleanup includes.
-// 5. Combine or split functions where necessary to eliminate redundancy.
-// 6. Focus on overall codebase reduction without sacrificing functionality.
-// 7. Use consistent _t fixed-width variable types to ensure portability across platforms.
-// 8. Cache frequently used variables to avoid repeated allocations.
-// 9. Ensure there are no logical errors and the execution paths flow as expected.
-// 10. Refactor where necessary to maintain clean code, efficient code, and to conform to the above settings and directives.
-// 11. After making changes, go back and make sure the codebase has been updated to incorporate the new changes and that it still adheres to the coding directives.
-// 12. NEVER BREAK FUNCTIONALITY THAT IS ALREADY WORKING.
+// CRITICAL CODING DIRECTIVES:
+// 1. Minimalism & Performance: Deliver lean, efficient solutions that avoid unnecessary bloat.
+// 2. Consistent Coding Style: Maintain uniform style and structure for clear, maintainable code.
+// 3. Clear Documentation: Provide concise comments explaining complex logic and key decisions.
+// 4. Eliminate Redundancy: Remove unused, obsolete, and legacy code along with excess includes.
+// 5. Optimize Function Structure: Adjust function boundaries to reduce overlap and clarify responsibilities.
+// 6. Preserve Core Functionality: Streamline code while safeguarding essential features.
+// 7. Cross-Platform Standards: Use fixed-width types and proper initialization to ensure portability.
+// 8. Smart Caching: Cache frequently used variables to reduce repeated allocations.
+// 9. Ensure Logical Consistency: Review code flow to maintain coherent, error-free execution.
+// 10. Continuous Refinement: Regularly refactor and verify that updates preserve stable functionality.
 #pragma once
 
 #include <string>

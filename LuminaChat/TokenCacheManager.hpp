@@ -6,11 +6,17 @@
 // Character Set: Use Unicode Character Set
 // Optimization: Maximum Optimization (Favor Speed) (/O2)
 //
-// CODING DIRECTIVES:
-// 1. Keep the codebase minimalistic, focused on functionality and efficiency.
-// 2. Use consistent _t fixed-width variable types to ensure portability across platforms.
-// 3. Cache frequently used variables to avoid repeated allocations.
-// 4. Focus on overall codebase reduction without sacrificing functionality.
+// CRITICAL CODING DIRECTIVES:
+// 1. Minimalism & Performance: Deliver lean, efficient solutions that avoid unnecessary bloat.
+// 2. Consistent Coding Style: Maintain uniform style and structure for clear, maintainable code.
+// 3. Clear Documentation: Provide concise comments explaining complex logic and key decisions.
+// 4. Eliminate Redundancy: Remove unused, obsolete, and legacy code along with excess includes.
+// 5. Optimize Function Structure: Adjust function boundaries to reduce overlap and clarify responsibilities.
+// 6. Preserve Core Functionality: Streamline code while safeguarding essential features.
+// 7. Cross-Platform Standards: Use fixed-width types and proper initialization to ensure portability.
+// 8. Smart Caching: Cache frequently used variables to reduce repeated allocations.
+// 9. Ensure Logical Consistency: Review code flow to maintain coherent, error-free execution.
+// 10. Continuous Refinement: Regularly refactor and verify that updates preserve stable functionality.
 #pragma once
 
 #include <unordered_map>
