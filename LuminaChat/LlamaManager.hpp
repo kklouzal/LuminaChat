@@ -797,8 +797,8 @@ public:
 
         int32_t new_len = static_cast<int32_t>(formatted_content.length());
 
-        // Handle content changes with proper tokenization
-        if (current_context->prev_len > new_len || pruning_occurred) {
+        // FIXED: If pruning occurred, always do full rebuild regardless of length comparison
+        if (pruning_occurred || current_context->prev_len > new_len) {
             // Rebuild context - use add_special=true for full context
             std::vector<llama_token> tokens = process_text_to_tokens(formatted_content, true);
             if (tokens.empty()) {
@@ -836,8 +836,8 @@ public:
             return false;
         }
 
-        // Process new content incrementally
-        if (new_len > current_context->prev_len) {
+        // FIXED: Only process incremental content if no pruning occurred and context is stable
+        if (!pruning_occurred && new_len > current_context->prev_len) {
             std::string new_content = formatted_content.substr(current_context->prev_len);
             if (!new_content.empty()) {
                 std::vector<llama_token> new_tokens = process_text_to_tokens(new_content, false);
@@ -855,6 +855,8 @@ public:
                         log_message("Error: Failed to process incremental tokens");
                         return false;
                     }
+                } else {
+                    log_message("Warning: Incremental content produced no tokens, skipping");
                 }
             }
         }
