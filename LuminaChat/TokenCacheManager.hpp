@@ -28,54 +28,60 @@
 
 class TokenCacheManager {
 private:
-    // Cache storage and LRU tracking
+    // Cache storage and LRU tracking - using move semantics for better performance
     mutable std::unordered_map<std::string, std::vector<llama_token>> token_cache;
-    mutable std::list<std::string> lru_list;  // Track access order for LRU eviction
-    mutable std::unordered_map<std::string, std::list<std::string>::iterator> lru_map;  // Fast lookup in LRU list
+    mutable std::list<std::string> lru_list;
+    mutable std::unordered_map<std::string, std::list<std::string>::iterator> lru_map;
     
-    // Cache configuration and statistics
-    mutable size_t max_cache_size = 1024;
+    // Cache configuration and statistics with better defaults
+    static constexpr size_t DEFAULT_MAX_SIZE = 1024;
+    static constexpr float TRIM_THRESHOLD = 0.9f;
+    static constexpr float TRIM_TARGET = 0.75f;
+    
+    mutable size_t max_cache_size = DEFAULT_MAX_SIZE;
     mutable size_t cache_hits = 0;
     mutable size_t cache_requests = 0;
     
-    // Update LRU access order
-    void update_lru_access(const std::string& key) const {
-        auto lru_it = lru_map.find(key);
-        if (lru_it != lru_map.end()) {
+    // Optimized LRU access with bounds checking
+    void update_lru_access(const std::string& key) const noexcept {
+        if (auto lru_it = lru_map.find(key); lru_it != lru_map.end()) {
             lru_list.splice(lru_list.begin(), lru_list, lru_it->second);
         }
     }
     
-    // Add entry to cache with LRU tracking
-    void add_to_cache(const std::string& key, const std::vector<llama_token>& tokens) const {
+    // Streamlined cache addition with move semantics
+    void add_to_cache(const std::string& key, std::vector<llama_token> tokens) const {
         // Pre-emptive cleanup if approaching limit
-        if (token_cache.size() >= max_cache_size * 0.9f) {
+        if (token_cache.size() >= static_cast<size_t>(max_cache_size * TRIM_THRESHOLD)) {
             trim_cache();
         }
         
-        // Check if key already exists (update case)
-        auto existing = token_cache.find(key);
-        if (existing != token_cache.end()) {
-            existing->second = tokens;
+        // Handle existing key case efficiently
+        if (auto existing = token_cache.find(key); existing != token_cache.end()) {
+            existing->second = std::move(tokens);
             update_lru_access(key);
             return;
         }
         
-        // Add new entry
-        token_cache[key] = tokens;
-        lru_list.push_front(key);
-        lru_map[key] = lru_list.begin();
+        // Add new entry with move semantics
+        auto [cache_it, inserted] = token_cache.emplace(key, std::move(tokens));
+        if (inserted) {
+            lru_list.push_front(key);
+            lru_map.emplace(key, lru_list.begin());
+        }
     }
     
-    // Trim cache using LRU eviction - remove 25% of entries to reduce frequency
-    void trim_cache() const {
-        size_t target_size = static_cast<size_t>(max_cache_size * 0.75f);
+    // Optimized cache trimming with batch removal
+    void trim_cache() const noexcept {
+        const size_t target_size = static_cast<size_t>(max_cache_size * TRIM_TARGET);
         
         while (token_cache.size() > target_size && !lru_list.empty()) {
-            std::string lru_key = lru_list.back();
-            lru_list.pop_back();
-            lru_map.erase(lru_key);
+            const std::string& lru_key = lru_list.back();
+            
+            // Remove from all data structures
             token_cache.erase(lru_key);
+            lru_map.erase(lru_key);
+            lru_list.pop_back();
         }
     }
 
@@ -83,76 +89,73 @@ public:
     TokenCacheManager() = default;
     ~TokenCacheManager() = default;
     
-    // Non-copyable but movable
+    // Non-copyable but movable for resource management
     TokenCacheManager(const TokenCacheManager&) = delete;
     TokenCacheManager& operator=(const TokenCacheManager&) = delete;
     TokenCacheManager(TokenCacheManager&&) = default;
     TokenCacheManager& operator=(TokenCacheManager&&) = default;
     
-    // Get cached tokens or return empty vector if not found
+    // Optimized cache retrieval with move semantics
     std::vector<llama_token> get_cached_tokens(const std::string& cache_key) const {
-        cache_requests++;
+        ++cache_requests;
         
-        auto it = token_cache.find(cache_key);
-        if (it != token_cache.end()) {
-            cache_hits++;
+        if (auto it = token_cache.find(cache_key); it != token_cache.end()) {
+            ++cache_hits;
             update_lru_access(cache_key);
-            return it->second;
+            return it->second; // Return copy for safety
         }
         
-        return {};
+        return {}; // Empty vector for cache miss
     }
     
-    // Cache tokenization result
-    void cache_tokens(const std::string& cache_key, const std::vector<llama_token>& tokens) const {
-        add_to_cache(cache_key, tokens);
+    // Cache tokens with move semantics for performance
+    void cache_tokens(const std::string& cache_key, std::vector<llama_token> tokens) const {
+        add_to_cache(cache_key, std::move(tokens));
     }
     
-    // Check if key exists in cache
-    bool has_cached_tokens(const std::string& cache_key) const {
-        return token_cache.find(cache_key) != token_cache.end();
+    // Inline simple checks for better performance
+    bool has_cached_tokens(const std::string& cache_key) const noexcept {
+        return token_cache.contains(cache_key);
     }
     
-    // Configuration methods
-    void set_max_cache_size(size_t size) {
-        max_cache_size = size;
+    // Configuration with validation
+    void set_max_cache_size(size_t size) noexcept {
+        max_cache_size = std::max(size, size_t{64}); // Minimum reasonable size
         if (token_cache.size() > max_cache_size) {
             trim_cache();
         }
     }
     
-    size_t get_max_cache_size() const {
-        return max_cache_size;
-    }
+    // Inline getters for performance
+    size_t get_max_cache_size() const noexcept { return max_cache_size; }
+    size_t get_cache_size() const noexcept { return token_cache.size(); }
+    size_t get_cache_hits() const noexcept { return cache_hits; }
+    size_t get_cache_requests() const noexcept { return cache_requests; }
     
-    // Statistics
-    size_t get_cache_size() const {
-        return token_cache.size();
-    }
-    
-    size_t get_cache_hits() const {
-        return cache_hits;
-    }
-    
-    size_t get_cache_requests() const {
-        return cache_requests;
-    }
-    
-    float get_cache_hit_ratio() const {
+    float get_cache_hit_ratio() const noexcept {
         return cache_requests > 0 ? static_cast<float>(cache_hits) / cache_requests : 0.0f;
     }
     
-    // Cache management
-    void clear_cache() const {
+    // Efficient cache management
+    void clear_cache() const noexcept {
         token_cache.clear();
         lru_list.clear();
         lru_map.clear();
+        reset_stats();
+    }
+    
+    void reset_stats() const noexcept {
         cache_hits = 0;
         cache_requests = 0;
     }
     
-    void reset_stats() const {
-        cache_hits = 0;
-        cache_requests = 0;
+    // Memory usage estimation for monitoring
+    size_t estimate_memory_usage() const noexcept {
+        size_t total = 0;
+        for (const auto& [key, tokens] : token_cache) {
+            total += key.size() + tokens.size() * sizeof(llama_token);
+        }
+        return total + lru_list.size() * sizeof(std::string) + 
+               lru_map.size() * sizeof(std::pair<std::string, std::list<std::string>::iterator>);
     }
 };

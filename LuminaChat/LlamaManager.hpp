@@ -256,7 +256,8 @@ private:
             // FIXED: Don't treat empty tokenization as warning for whitespace-only text
             if (std::all_of(text.begin(), text.end(), [](char c) { return std::isspace(c); })) {
                 // Cache empty result for whitespace-only strings
-                token_cache_manager.cache_tokens(cache_key, {});
+                std::vector<llama_token> empty_tokens;
+                token_cache_manager.cache_tokens(cache_key, std::move(empty_tokens));
                 return {};
             }
             log_message("Warning: Text tokenization failed or resulted in 0 tokens: '" + 
@@ -302,7 +303,7 @@ private:
         
         // FIXED: Don't cache results with invalid tokens
         if (!has_invalid_tokens) {
-            token_cache_manager.cache_tokens(cache_key, tokens);
+            token_cache_manager.cache_tokens(cache_key, std::vector<llama_token>(tokens));
         }
         
         return tokens;
