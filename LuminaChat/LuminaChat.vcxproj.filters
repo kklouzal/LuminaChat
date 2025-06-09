@@ -26,5 +26,8 @@
     <ClInclude Include="DiscordManager.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="SettingsManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

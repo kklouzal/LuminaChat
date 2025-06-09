@@ -693,7 +693,7 @@ private:
             // Determine if this is a DM using guild_id
             bool is_dm = (event.msg.guild_id == 0);
             
-            // ADDED: Check if DMs are disabled and handle auto-reply
+            // Check if DMs are disabled and handle auto-reply
             if (is_dm && !allow_dms) {
                 // Send auto-reply for disabled DMs
                 std::string auto_reply = "Sorry, Direct Messages are currently disabled. Please use the appropriate server channels to chat with me.";
@@ -759,7 +759,7 @@ private:
                        " in " + context.channel_name + " (" + context_type + " context): " + 
                        message_content.substr(0, 100) + (message_content.size() > 100 ? "..." : ""));
             
-            // FIXED: Process message with guild_id for proper DM detection
+            // Process message with guild_id for proper DM detection
             std::string response = process_user_message(message_content, event.msg.author.username, 
                                                       event.msg.author.id, event.msg.channel_id, event.msg.guild_id);
             

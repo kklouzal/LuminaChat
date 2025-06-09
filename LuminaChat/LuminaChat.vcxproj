@@ -143,6 +143,7 @@
   <ItemGroup>
     <ClInclude Include="DiscordManager.hpp" />
     <ClInclude Include="LlamaManager.hpp" />
+    <ClInclude Include="SettingsManager.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

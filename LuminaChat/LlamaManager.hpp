@@ -305,11 +305,9 @@ private:
                 llama_kv_self_clear(current_context->context);
                 current_context->n_past = 0;
                 prune_message_history(0.6f);
-                return false; // Signal caller to rebuild full context
+                return false;
             } else {
-                // For full rebuilds, this is a hard error
-                log_message("Error: Even after pruning, context is too large (" + 
-                           std::to_string(tokens.size()) + " tokens > " + std::to_string(max_threshold) + " limit)");
+                log_message("Error: Full context rebuild would exceed context limit");
                 return false;
             }
         }
@@ -322,20 +320,13 @@ private:
             bool output_logits = is_incremental && (end == tokens.size());
             
             if (add_tokens_to_batch(chunk, current_context->n_past, seq_ids, output_logits)) {
-                if (llama_decode(current_context->context, current_context->batch) != 0) {
-                    log_message("Error: Failed to decode batch at position " + std::to_string(start) + 
-                               " (tokens " + std::to_string(start) + "-" + std::to_string(end-1) + ")");
+                if (current_context->batch.n_tokens > 0 && llama_decode(current_context->context, current_context->batch) != 0) {
+                    log_message("Error: Failed to decode batch at position " + std::to_string(current_context->n_past));
                     return false;
                 }
-                current_context->n_past += current_context->batch.n_tokens;
-                
-                // FIXED: Validate n_past doesn't exceed context bounds
-                if (current_context->n_past > n_ctx) {
-                    log_message("Error: n_past (" + std::to_string(current_context->n_past) + ") exceeded context size (" + std::to_string(n_ctx) + ")");
-                    return false;
-                }
+                current_context->n_past += static_cast<int32_t>(chunk.size());
             } else {
-                log_message("Error: Failed to add tokens to batch at position " + std::to_string(start));
+                log_message("Error: Failed to add tokens to batch at position " + std::to_string(current_context->n_past));
                 return false;
             }
         }
@@ -394,11 +385,9 @@ private:
         temp_string_buffer.resize(32);
         int32_t result = llama_token_to_piece(vocab, token, temp_string_buffer.data(), temp_string_buffer.size(), 0, true);
         if (result < 0) {
-            // FIXED: Add bounds checking for buffer resize
             size_t required_size = static_cast<size_t>(-result);
-            if (required_size > 1024) { // Sanity check - tokens shouldn't need huge buffers
-                log_message("Warning: Token " + std::to_string(token) + " requires unusually large buffer (" + 
-                           std::to_string(required_size) + " bytes)");
+            if (required_size > 1024) {
+                log_message("Error: Token conversion requires excessive buffer size: " + std::to_string(required_size));
                 return "";
             }
             temp_string_buffer.resize(required_size);
@@ -421,7 +410,7 @@ private:
         size_t messages_to_keep = std::max(size_t(2), static_cast<size_t>(total_messages * keep_ratio));
         
         if (messages_to_keep >= total_messages) {
-            return; // No pruning needed
+            return;
         }
         
         // Use move semantics for better performance
@@ -653,10 +642,8 @@ public:
             
             // Switch to another context if available
             if (!contexts.empty()) {
-                auto first_remaining = contexts.begin();
-                if (first_remaining->first != context_id) {
-                    switch_to_context(first_remaining->first);
-                }
+                auto first_context = contexts.begin();
+                switch_to_context(first_context->first);
             }
         }
         
@@ -787,8 +774,8 @@ public:
             // Rebuild context - use add_special=true for full context
             std::vector<llama_token> tokens = process_text_to_tokens(formatted_content, true);
             if (tokens.empty()) {
-                log_message("Error: Failed to tokenize formatted content for rebuild");
-                return false;
+                log_message("Warning: Template produced no tokens for full rebuild");
+                return true;
             }
             
             if (process_context_tokens(tokens, false)) {
@@ -802,39 +789,10 @@ public:
         if (new_len > current_context->prev_len) {
             std::string new_content = formatted_content.substr(current_context->prev_len);
             if (!new_content.empty()) {
-                // For incremental updates, don't add special tokens unless it's the very first content
-                bool add_special_tokens = (current_context->prev_len == 0);
-                std::vector<llama_token> tokens = process_text_to_tokens(new_content, add_special_tokens);
-                
-                if (tokens.empty()) {
-                    log_message("Warning: New content tokenized to empty token vector: '" + 
-                               new_content.substr(0, 50) + (new_content.size() > 50 ? "..." : "") + "'");
-                    // Don't fail here, just update prev_len and continue
-                    current_context->prev_len = new_len;
-                    return true;
-                }
-                
-                if (process_context_tokens(tokens, true)) {
-                    current_context->prev_len = new_len;
-                    return true;
-                } else {
-                    // FIXED: Pruning was triggered - do full rebuild instead of infinite recursion
-                    log_message("Incremental processing failed, performing full rebuild...");
-                    
-                    // Clear everything and rebuild from scratch
-                    llama_kv_self_clear(current_context->context);
-                    current_context->n_past = 0;
-                    current_context->prev_len = 0;
-                    
-                    // Tokenize and process the full formatted content
-                    std::vector<llama_token> full_tokens = process_text_to_tokens(formatted_content, true);
-                    if (!full_tokens.empty() && process_context_tokens(full_tokens, false)) {
-                        current_context->prev_len = new_len;
-                        return true;
-                    } else {
-                        log_message("Error: Full context rebuild failed after pruning");
-                        return false;
-                    }
+                std::vector<llama_token> new_tokens = process_text_to_tokens(new_content, false);
+                if (!new_tokens.empty() && !process_context_tokens(new_tokens, true)) {
+                    log_message("Error: Failed to process incremental tokens");
+                    return false;
                 }
             }
         }
@@ -927,13 +885,8 @@ public:
             
             retry_count++;
             if (retry_count < max_retries) {
-                log_message("Context update failed, retrying (" + std::to_string(retry_count) + "/" + std::to_string(max_retries) + ")...");
-                
-                // More aggressive pruning for retry
-                llama_kv_self_clear(current_context->context);
-                current_context->n_past = 0;
-                current_context->prev_len = 0;
-                prune_message_history(0.4f); // More aggressive pruning
+                log_message("Retrying context update (" + std::to_string(retry_count + 1) + "/" + std::to_string(max_retries) + ")");
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             } else {
                 return "Error: Failed to update context after " + std::to_string(max_retries) + " attempts";
             }
@@ -954,9 +907,8 @@ public:
                 if (!process_context_tokens(prompt_tokens, true)) {
                     return "Error: Failed to process generation prompt";
                 }
-                current_context->total_prompt_tokens += prompt_tokens.size();
             } else {
-                log_message("Warning: Generation prompt tokenized to empty vector");
+                log_message("Warning: Generation prompt produced no tokens");
             }
         }
 
@@ -998,83 +950,66 @@ public:
         while (n_generated < max_new_tokens) {
             // FIXED: Validate sampler on every iteration to catch when it becomes null
             if (!current_context->sampler) {
-                log_message("CRITICAL: Sampler became NULL during generation at token " + std::to_string(n_generated));
-                log_message("Attempting emergency recovery...");
-                if (!validate_and_recover_sampler()) {
-                    log_message("Emergency recovery failed, stopping generation");
-                    break;
-                }
-                log_message("Emergency recovery successful, continuing generation");
+                log_message("CRITICAL: Sampler became null during generation at token " + std::to_string(n_generated));
+                return "Error: Sampler failed during generation";
             }
             
             if (!current_context->context) {
-                log_message("Error: Context became null during generation");
-                break;
+                log_message("CRITICAL: Context became null during generation");
+                return "Error: Context lost during generation";
             }
             
             // FIXED: Validate that n_past is within reasonable bounds
             if (current_context->n_past <= 0 || current_context->n_past >= n_ctx) {
-                log_message("Error: Invalid n_past value: " + std::to_string(current_context->n_past) + " (context size: " + std::to_string(n_ctx) + ")");
-                break;
+                log_message("Error: Invalid context position during generation: " + std::to_string(current_context->n_past));
+                return "Error: Context position invalid";
             }
             
             llama_token new_token;
             try {
-                // FIXED: Additional pre-sampling validation
-                if (!current_context->sampler || !current_context->context) {
-                    log_message("CRITICAL: Sampler or context null just before sampling call!");
-                    break;
-                }
-                
                 new_token = llama_sampler_sample(current_context->sampler, current_context->context, -1);
-                
-                // FIXED: Check if sampler was corrupted by the sampling call
-                if (!current_context->sampler) {
-                    log_message("CRITICAL: Sampler became NULL after sampling call!");
-                    break;
-                }
-                
             } catch (const std::exception& e) {
-                log_message("Exception during sampling: " + std::string(e.what()));
-                break;
+                log_message("Exception during token sampling: " + std::string(e.what()));
+                return "Error: Exception during token generation";
             } catch (...) {
-                log_message("Unknown exception during sampling");
-                break;
+                log_message("Unknown exception during token sampling");
+                return "Error: Unknown exception during generation";
             }
             
             if (new_token < 0) {
-                log_message("Warning: Sampler returned invalid token: " + std::to_string(new_token));
+                log_message("Error: Invalid token generated: " + std::to_string(new_token));
                 break;
             }
             
             if (llama_vocab_is_eog(vocab, new_token)) {
-                break; // End of generation token
+                log_message("End of generation token encountered");
+                break;
             }
 
             // Convert token to text using unified function
             std::string token_text = convert_token_to_text(new_token);
             if (token_text.empty()) {
-                log_message("Warning: Token " + std::to_string(new_token) + " converted to empty string");
-                break;
+                log_message("Warning: Empty token text for token " + std::to_string(new_token));
+                continue;
             }
             
             response += token_text;
 
             // FIXED: Validate batch state before adding token
             if (!current_context->batch_initialized) {
-                log_message("Error: Batch became uninitialized during generation");
-                break;
+                log_message("Error: Batch not initialized during generation");
+                return "Error: Batch system failed";
             }
 
             // Process token using unified batch function
             if (!add_single_token_to_batch(new_token, current_context->n_past, seq_ids, true)) {
-                log_message("Warning: Failed to add token to batch");
-                break;
+                log_message("Error: Failed to add token to batch during generation");
+                return "Error: Token processing failed";
             }
             
             if (current_context->batch.n_tokens > 0 && llama_decode(current_context->context, current_context->batch) != 0) {
-                log_message("Warning: Failed to decode batch during generation");
-                break;
+                log_message("Error: Failed to decode during generation at token " + std::to_string(n_generated));
+                return "Error: Token decode failed";
             }
             
             current_context->n_past++;
@@ -1082,8 +1017,8 @@ public:
             
             // FIXED: Periodic sampler validation during long generation
             if (n_generated % 10 == 0 && !current_context->sampler) {
-                log_message("CRITICAL: Sampler null detected at token " + std::to_string(n_generated));
-                break;
+                log_message("CRITICAL: Sampler became null during long generation at token " + std::to_string(n_generated));
+                return "Error: Sampler failed during long generation";
             }
         }
 
@@ -1225,7 +1160,6 @@ public:
         // Clean up all contexts
         for (auto& [id, context_info] : contexts) {
             if (context_info->sampler) {
-                log_message("Freeing sampler for context '" + id + "'...");
                 llama_sampler_free(context_info->sampler);
                 context_info->sampler = nullptr;
             }
