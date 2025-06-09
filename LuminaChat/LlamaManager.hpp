@@ -1212,22 +1212,100 @@ public:
         return current_context->n_past;
     }
 
-    // MOVED: Batch update context after adding multiple history messages
+    // FIXED: Enhanced batch update with proper token tracking
     bool update_context_from_history() {
         if (!current_context) return false;
 
-        // Clear current context state
+        // Store original state for rollback
+        int32_t original_n_past = current_context->n_past;
+        int32_t original_prev_len = current_context->prev_len;
+
+        // Clear current context state for rebuild
         if (current_context->context) {
             llama_kv_self_clear(current_context->context);
         }
         current_context->n_past = 0;
         current_context->prev_len = 0;
 
-        // Rebuild context from message history
-        return update_context_with_pruning();
+        // Rebuild context from message history with enhanced error handling
+        bool success = update_context_with_pruning();
+        
+        if (!success) {
+            // Rollback on failure
+            current_context->n_past = original_n_past;
+            current_context->prev_len = original_prev_len;
+            log_message("Failed to update context from history, rolled back to previous state");
+            return false;
+        }
+        
+        // Validate the rebuild was successful
+        if (current_context->n_past <= 0 && !current_context->message_history.empty()) {
+            log_message("Warning: Context rebuild resulted in zero tokens despite having message history");
+        }
+        
+        log_message("Successfully rebuilt context from " + std::to_string(current_context->message_history.size()) + 
+                   " messages, using " + std::to_string(current_context->n_past) + " tokens");
+        return true;
+    }
+
+    // ADDED: Get actual tokenized length of current message history
+    int32_t get_message_history_token_count() const {
+        if (!current_context || !model || !vocab) return 0;
+        
+        // Apply template to get formatted content
+        std::string formatted_content;
+        if (!apply_template_optimized(false, formatted_content)) {
+            return 0;
+        }
+        
+        // Tokenize and return count
+        std::vector<llama_token> tokens = process_text_to_tokens(formatted_content, true);
+        return static_cast<int32_t>(tokens.size());
     }
 
 private:
+    // LRU cache management helpers
+    void update_lru_access(const std::string& key) const {
+        auto lru_it = token_cache_lru_map.find(key);
+        if (lru_it != token_cache_lru_map.end()) {
+            token_cache_lru.splice(token_cache_lru.begin(), token_cache_lru, lru_it->second);
+        }
+    }
+
+    // ADDED: Optimized LRU cache management
+    void add_to_token_cache(const std::string& key, const std::vector<llama_token>& tokens) const {
+        // Pre-emptive cleanup if approaching limit
+        if (token_cache.size() >= max_cache_size * 0.9f) {
+            trim_token_cache();
+        }
+        
+        // Check if key already exists (update case)
+        auto existing = token_cache.find(key);
+        if (existing != token_cache.end()) {
+            existing->second = tokens;
+            update_lru_access(key);
+            return;
+        }
+        
+        // Add new entry
+        token_cache[key] = tokens;
+        token_cache_lru.push_front(key);
+        token_cache_lru_map[key] = token_cache_lru.begin();
+    }
+    
+    // ADDED: More aggressive cache trimming for better memory management
+    void trim_token_cache() const {
+        // Remove 25% of entries when trimming to reduce frequency
+        size_t target_size = static_cast<size_t>(max_cache_size * 0.75f);
+        
+        while (token_cache.size() > target_size && !token_cache_lru.empty()) {
+            std::string lru_key = token_cache_lru.back();
+            token_cache_lru.pop_back();
+            token_cache_lru_map.erase(lru_key);
+            token_cache.erase(lru_key);
+        }
+    }
+
     // REFACTOR: Update helper methods to use current context
     int32_t calculate_optimal_batch_size() const {
         if (!current_context || !current_context->context) {
@@ -1269,48 +1347,6 @@ private:
     void reset_cache_stats() const {
         cache_hits = 0;
         cache_requests = 0;
-    }
-
-    // LRU cache management helpers
-    void update_lru_access(const std::string& key) const {
-        auto lru_it = token_cache_lru_map.find(key);
-        if (lru_it != token_cache_lru_map.end()) {
-            token_cache_lru.splice(token_cache_lru.begin(), token_cache_lru, lru_it->second);
-        }
-    }
-
-    // ADDED: Optimized LRU cache management
-    void add_to_token_cache(const std::string& key, const std::vector<llama_token>& tokens) const {
-        // Pre-emptive cleanup if approaching limit
-        if (token_cache.size() >= max_cache_size * 0.9f) {
-            trim_token_cache();
-        }
-        
-        // Check if key already exists (update case)
-        auto existing = token_cache.find(key);
-        if (existing != token_cache.end()) {
-            existing->second = tokens;
-            update_lru_access(key);
-            return;
-        }
-        
-        // Add new entry
-        token_cache[key] = tokens;
-        token_cache_lru.push_front(key);
-        token_cache_lru_map[key] = token_cache_lru.begin();
-    }
-    
-    // ADDED: More aggressive cache trimming for better memory management
-    void trim_token_cache() const {
-        // Remove 25% of entries when trimming to reduce frequency
-        size_t target_size = static_cast<size_t>(max_cache_size * 0.75f);
-        
-        while (token_cache.size() > target_size && !token_cache_lru.empty()) {
-            std::string lru_key = token_cache_lru.back();
-            token_cache_lru.pop_back();
-            token_cache_lru_map.erase(lru_key);
-            token_cache.erase(lru_key);
-        }
     }
 };
 

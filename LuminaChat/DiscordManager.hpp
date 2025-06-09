@@ -149,9 +149,13 @@ private:
     
     // ADDED: Helper to estimate token count (rough approximation)
     int32_t estimate_message_tokens(const std::string& username, const std::string& content) const {
-        // Rough estimate: 1 token per 4 characters for English text
-        // Add some overhead for username, role formatting, and chat template
-        return static_cast<int32_t>((username.length() + content.length() + 30) / 4);
+        // IMPROVED: More accurate token estimation
+        // Account for chat template overhead, role formatting, and special tokens
+        const int32_t base_overhead = 50; // Base template overhead per message
+        const int32_t role_overhead = username.length() + 20; // Username + role formatting
+        const int32_t content_tokens = static_cast<int32_t>((content.length() + 2) / 3); // ~3 chars per token for English
+        
+        return base_overhead + role_overhead + content_tokens;
     }
     
     // ADDED: Per-context token tracking for backfill
@@ -284,6 +288,7 @@ private:
                 context_id = it->second;
             } else {
                 context_id = "discord_channel_" + std::to_string(channel_id);
+                // FIXED: Ensure context is properly created with empty system prompt that inherits from main
                 if (llama_manager->create_context(context_id, "")) {
                     channel_contexts[channel_id] = context_id;
                     log_message("Created isolated context for channel history: " + context_id);
@@ -302,7 +307,7 @@ private:
             return false;
         }
         
-        // UPDATED: Check context capacity before adding messages
+        // Check context capacity before adding messages
         if (!check_and_update_context_capacity(context_id, channel_id, messages)) {
             return false; // Context is at capacity
         }
@@ -314,6 +319,9 @@ private:
             return false;
         }
         
+        // FIXED: Get token count before adding messages for validation
+        int32_t tokens_before = llama_manager->get_message_history_token_count();
+        
         // Add messages as conversation history
         for (const auto& msg : messages) {
             // Add user message to history without immediate context update
@@ -323,21 +331,44 @@ private:
         // Batch update the context after adding all messages
         bool success = llama_manager->update_context_from_history();
         
+        if (success) {
+            // ADDED: Validate actual token usage vs estimates
+            int32_t tokens_after = llama_manager->get_message_history_token_count();
+            int32_t actual_tokens_added = tokens_after - tokens_before;
+            
+            // Update our tracking with actual values
+            {
+                std::lock_guard<std::mutex> capacity_lock(context_backfill_mutex);
+                auto& info = context_backfill_info[context_id];
+                
+                // Adjust our estimates based on actual usage
+                int32_t estimated_added = 0;
+                for (const auto& msg : messages) {
+                    estimated_added += estimate_message_tokens(msg.username, msg.content);
+                }
+                
+                // Update with actual token count
+                info.estimated_tokens = tokens_after;
+                
+                float accuracy = (estimated_added > 0) ? ((float)actual_tokens_added / estimated_added * 100.0f) : 100.0f;
+                log_message("Added " + std::to_string(messages.size()) + " history messages to context " + context_id +
+                           " - Actual: " + std::to_string(actual_tokens_added) + " tokens, " +
+                           "Estimated: " + std::to_string(estimated_added) + " tokens (" +
+                           std::to_string(accuracy) + "% accuracy)");
+            }
+        } else {
+            log_message("Failed to update context after adding history messages to " + context_id);
+        }
+        
         // Restore original context
         if (!original_context.empty()) {
             llama_manager->switch_to_context(original_context);
         }
         
-        if (success) {
-            log_message("Added " + std::to_string(messages.size()) + " history messages to context " + context_id);
-        } else {
-            log_message("Failed to update context after adding history messages to " + context_id);
-        }
-        
         return success;
     }
     
-    // ADDED: Check and update context capacity tracking
+    // FIXED: Enhanced context capacity tracking with actual token validation
     bool check_and_update_context_capacity(const std::string& context_id, uint64_t channel_id, const std::vector<HistoryMessage>& messages) {
         std::lock_guard<std::mutex> lock(context_backfill_mutex);
         
@@ -351,18 +382,21 @@ private:
                 int32_t context_size = llama_manager->get_context_size();
                 info.capacity_limit = static_cast<int32_t>(context_size * MAX_CONTEXT_FILL_RATIO);
                 
-                // Get current usage for this context
+                // FIXED: Get actual current usage for this context
                 std::string original_context = llama_manager->get_active_context();
                 if (llama_manager->switch_to_context(context_id)) {
-                    info.estimated_tokens = llama_manager->get_context_usage();
+                    // Use actual token count method instead of n_past
+                    info.estimated_tokens = llama_manager->get_message_history_token_count();
                     if (!original_context.empty()) {
                         llama_manager->switch_to_context(original_context);
                     }
                 } else {
                     log_message("Failed to switch to context '" + context_id + "' for capacity check");
+                    info.estimated_tokens = 0; // Assume empty if we can't access
                 }
             } else {
                 info.capacity_limit = static_cast<int32_t>(2048 * MAX_CONTEXT_FILL_RATIO); // Fallback
+                info.estimated_tokens = 0;
             }
             
             context_backfill_info[context_id] = info;
@@ -378,7 +412,7 @@ private:
             info.associated_channels.push_back(channel_id);
         }
         
-        // Calculate tokens for new messages
+        // Calculate tokens for new messages with improved estimation
         int32_t new_tokens = 0;
         for (const auto& msg : messages) {
             new_tokens += estimate_message_tokens(msg.username, msg.content);
@@ -388,22 +422,26 @@ private:
         if (info.estimated_tokens + new_tokens > info.capacity_limit) {
             log_message("Context '" + context_id + "' would exceed capacity limit (" +
                        std::to_string(info.estimated_tokens + new_tokens) + "/" +
-                       std::to_string(info.capacity_limit) + " tokens) - stopping backfill");
+                       std::to_string(info.capacity_limit) + " tokens) - stopping backfill for channel " +
+                       std::to_string(channel_id));
             return false;
         }
         
-        // Update token count
+        // Update estimated token count
         info.estimated_tokens += new_tokens;
         
-        log_message("Context '" + context_id + "' usage: " + 
+        float usage_percent = (float)info.estimated_tokens / info.capacity_limit * 100.0f;
+        log_message("Context '" + context_id + "' estimated usage: " + 
                    std::to_string(info.estimated_tokens) + "/" + 
                    std::to_string(info.capacity_limit) + " tokens (" +
-                   std::to_string((float)info.estimated_tokens / info.capacity_limit * 100.0f) + "%)");
+                   std::to_string(usage_percent) + "%) after adding " +
+                   std::to_string(messages.size()) + " messages from channel " +
+                   std::to_string(channel_id));
         
         return true;
     }
     
-    // UPDATED: Check if we should continue backfilling for a channel (context-aware)
+    // IMPROVED: More accurate should_continue_backfill with actual token tracking
     bool should_continue_backfill(uint64_t channel_id) const {
         if (!llama_manager) {
             return false;
@@ -428,21 +466,51 @@ private:
             target_context = main_context_id;
         }
         
-        // Check context capacity
+        // Check context capacity with actual usage
         std::lock_guard<std::mutex> capacity_lock(context_backfill_mutex);
         auto capacity_it = context_backfill_info.find(target_context);
         if (capacity_it != context_backfill_info.end()) {
             const auto& info = capacity_it->second;
             
-            // Stop if context is approaching capacity (90% of limit)
+            // FIXED: Use actual token count if available, fall back to estimate
+            int32_t current_usage = info.estimated_tokens;
+            
+            // Get actual current usage for more accurate decisions
+            std::string original_context = llama_manager->get_active_context();
+            if (llama_manager->switch_to_context(target_context)) {
+                current_usage = llama_manager->get_message_history_token_count();
+                if (!original_context.empty()) {
+                    llama_manager->switch_to_context(original_context);
+                }
+            }
+            
+            // Stop if context is approaching our target (50% usage)
+            if (current_usage >= info.capacity_limit) {
+                log_message("Stopping backfill for channel " + std::to_string(channel_id) + 
+                           " - context '" + target_context + "' reached target usage: " +
+                           std::to_string(current_usage) + "/" + std::to_string(info.capacity_limit) + " tokens");
+                return false;
+            }
+            
+            // Also check if we're very close to the limit (within 90% of target)
             int32_t soft_limit = static_cast<int32_t>(info.capacity_limit * 0.9f);
-            if (info.estimated_tokens >= soft_limit) {
+            if (current_usage >= soft_limit) {
+                log_message("Approaching backfill limit for channel " + std::to_string(channel_id) + 
+                           " - context '" + target_context + "' at " +
+                           std::to_string(current_usage) + "/" + std::to_string(info.capacity_limit) + " tokens");
                 return false;
             }
         }
         
-        // Also limit to reasonable number of messages per channel
-        return state_it->second.messages_fetched < 100;
+        // Also limit to reasonable number of messages per channel to prevent runaway backfill
+        const int32_t max_messages_per_channel = 200;
+        if (state_it->second.messages_fetched >= max_messages_per_channel) {
+            log_message("Stopping backfill for channel " + std::to_string(channel_id) + 
+                       " - reached message limit (" + std::to_string(max_messages_per_channel) + ")");
+            return false;
+        }
+        
+        return true;
     }
     
 public:
@@ -1308,15 +1376,35 @@ public:
         if (all_complete) {
             backfill_in_progress = false;
             
-            // Report final usage per context
+            // Report final usage per context with actual token counts
             std::lock_guard<std::mutex> capacity_lock(context_backfill_mutex);
             for (const auto& [context_id, info] : context_backfill_info) {
-                float usage_percent = (float)info.estimated_tokens / info.capacity_limit * 100.0f;
+                // Get actual final usage
+                int32_t actual_usage = info.estimated_tokens;
+                if (llama_manager) {
+                    std::string original_context = llama_manager->get_active_context();
+                    if (llama_manager->switch_to_context(context_id)) {
+                        actual_usage = llama_manager->get_message_history_token_count();
+                        if (!original_context.empty()) {
+                            llama_manager->switch_to_context(original_context);
+                        }
+                    }
+                }
+                
+                float usage_percent = (float)actual_usage / info.capacity_limit * 100.0f;
+                float target_percent = MAX_CONTEXT_FILL_RATIO * 100.0f;
+                
                 log_message("Final backfill for context '" + context_id + "': " +
-                           std::to_string(info.estimated_tokens) + "/" +
+                           std::to_string(actual_usage) + "/" +
                            std::to_string(info.capacity_limit) + " tokens (" +
-                           std::to_string(usage_percent) + "%) across " +
+                           std::to_string(usage_percent) + "% of " + std::to_string(target_percent) + "% target) across " +
                            std::to_string(info.associated_channels.size()) + " channels");
+                
+                // Warn if we didn't reach a reasonable fill level
+                if (usage_percent < (target_percent * 0.1f)) { // Less than 10% of target (5% of total context)
+                    log_message("Warning: Context '" + context_id + "' has very low usage after backfill - " +
+                               "may indicate insufficient message history in channels");
+                }
             }
             
             log_message("Chat history backfill completed for all contexts");
