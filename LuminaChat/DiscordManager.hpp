@@ -93,9 +93,11 @@ private:
     
     // Integration with LlamaManager
     LlamaManager* llama_manager;
+    std::string main_context_id; // ADDED: ID of the main shared context
     
     // ADDED: Channel filtering
     std::unordered_set<uint64_t> allowed_channels;
+    std::unordered_set<uint64_t> isolated_channels; // ADDED: Channels that get isolated contexts
     mutable std::mutex channel_mutex;
     
     // Message handling - made mutable for const methods
@@ -111,6 +113,11 @@ private:
     std::unordered_map<uint64_t, std::chrono::system_clock::time_point> last_response_time;
     mutable std::mutex rate_limit_mutex;
     const std::chrono::milliseconds min_response_interval{2000}; // 2 seconds between responses per user
+    
+    // ADDED: Context management for Discord users and channels
+    std::unordered_map<uint64_t, std::string> user_contexts; // user_id -> context_id (for DMs only)
+    std::unordered_map<uint64_t, std::string> channel_contexts; // channel_id -> context_id (for isolated channels)
+    mutable std::mutex context_mutex;
     
     // Helper function for thread-safe logging
     void log_message(const std::string& message) const {
@@ -148,10 +155,47 @@ private:
         log_message("Configured " + std::to_string(allowed_channels.size()) + " allowed channels");
     }
     
+    // ADDED: Parse channel IDs from comma-separated string (overloaded for isolated channels)
+    void parse_isolated_channel_ids(const std::string& channel_ids_str) {
+        std::lock_guard<std::mutex> lock(channel_mutex);
+        isolated_channels.clear();
+        
+        if (channel_ids_str.empty()) {
+            return; // Empty means no isolated channels
+        }
+        
+        std::stringstream ss(channel_ids_str);
+        std::string id_str;
+        
+        while (std::getline(ss, id_str, ',')) {
+            // Trim whitespace
+            id_str.erase(0, id_str.find_first_not_of(" \t\n\r"));
+            id_str.erase(id_str.find_last_not_of(" \t\n\r") + 1);
+            
+            if (!id_str.empty()) {
+                try {
+                    uint64_t channel_id = std::stoull(id_str);
+                    isolated_channels.insert(channel_id);
+                    log_message("Added isolated context channel: " + std::to_string(channel_id));
+                } catch (const std::exception& e) {
+                    log_message("Warning: Invalid isolated channel ID '" + id_str + "': " + e.what());
+                }
+            }
+        }
+        
+        log_message("Configured " + std::to_string(isolated_channels.size()) + " isolated context channels");
+    }
+    
     // ADDED: Check if channel is allowed
     bool is_channel_allowed(uint64_t channel_id) const {
         std::lock_guard<std::mutex> lock(channel_mutex);
         return allowed_channels.empty() || allowed_channels.count(channel_id) > 0;
+    }
+    
+    // ADDED: Check if channel should use isolated context
+    bool is_isolated_channel(uint64_t channel_id) const {
+        std::lock_guard<std::mutex> lock(channel_mutex);
+        return isolated_channels.count(channel_id) > 0;
     }
     
     // ADDED: Rate limiting check
@@ -188,6 +232,113 @@ private:
         std::lock_guard<std::mutex> lock(message_mutex);
         auto it = user_conversations.find(user_id);
         return (it != user_conversations.end()) ? it->second : std::vector<DiscordMessageContext>{};
+    }
+    
+    // SIMPLIFIED: Helper to get or create context with consistent system prompt handling
+    std::string get_or_create_user_context(uint64_t user_id, const std::string& username, uint64_t channel_id, uint64_t guild_id) {
+        bool is_dm = (guild_id == 0);
+        bool is_isolated_chan = is_isolated_channel(channel_id);
+        
+        // For regular channels, use shared main context
+        if (!is_isolated_chan && !is_dm) {
+            if (!main_context_id.empty() && llama_manager && llama_manager->has_context(main_context_id)) {
+                return main_context_id;
+            } else {
+                log_message("Warning: Main context '" + main_context_id + "' not available for shared channel");
+                return "";
+            }
+        }
+        
+        std::lock_guard<std::mutex> lock(context_mutex);
+        
+        // Handle DMs - per-user isolated contexts
+        if (is_dm) {
+            auto it = user_contexts.find(user_id);
+            
+            if (it != user_contexts.end()) {
+                if (llama_manager && llama_manager->has_context(it->second)) {
+                    return it->second;
+                } else {
+                    user_contexts.erase(it);
+                }
+            }
+            
+            // Create new DM context - empty system prompt will inherit from main
+            if (llama_manager) {
+                std::string context_id = "discord_dm_" + std::to_string(user_id);
+                log_message("Creating DM context '" + context_id + "' for user: " + username);
+                
+                if (llama_manager->create_context(context_id, "")) {
+                    user_contexts[user_id] = context_id;
+                    return context_id;
+                } else {
+                    log_message("Failed to create DM context for user: " + username);
+                    return "";
+                }
+            }
+        }
+        // Handle isolated channels - per-channel contexts shared by all users
+        else if (is_isolated_chan) {
+            auto it = channel_contexts.find(channel_id);
+            
+            if (it != channel_contexts.end()) {
+                if (llama_manager && llama_manager->has_context(it->second)) {
+                    return it->second;
+                } else {
+                    channel_contexts.erase(it);
+                }
+            }
+            
+            // Create new isolated channel context - empty system prompt will inherit from main
+            if (llama_manager) {
+                std::string context_id = "discord_channel_" + std::to_string(channel_id);
+                log_message("Creating isolated channel context '" + context_id + "' for channel: " + std::to_string(channel_id));
+                
+                if (llama_manager->create_context(context_id, "")) {
+                    channel_contexts[channel_id] = context_id;
+                    return context_id;
+                } else {
+                    log_message("Failed to create isolated channel context for channel: " + std::to_string(channel_id));
+                    return "";
+                }
+            }
+        }
+        
+        return "";
+    }
+    
+    // UPDATED: Clean up user context (DMs only)
+    void cleanup_user_context(uint64_t user_id) {
+        std::lock_guard<std::mutex> lock(context_mutex);
+        
+        auto it = user_contexts.find(user_id);
+        if (it != user_contexts.end()) {
+            if (llama_manager) {
+                // Only remove if it's not the main shared context
+                if (it->second != main_context_id) {
+                    llama_manager->remove_context(it->second);
+                    log_message("Removed DM context for Discord user: " + std::to_string(user_id));
+                }
+            }
+            user_contexts.erase(it);
+        }
+    }
+    
+    // ADDED: Clean up channel context
+    void cleanup_channel_context(uint64_t channel_id) {
+        std::lock_guard<std::mutex> lock(context_mutex);
+        
+        auto it = channel_contexts.find(channel_id);
+        if (it != channel_contexts.end()) {
+            if (llama_manager) {
+                // Only remove if it's not the main shared context
+                if (it->second != main_context_id) {
+                    llama_manager->remove_context(it->second);
+                    log_message("Removed isolated channel context for channel: " + std::to_string(channel_id));
+                }
+            }
+            channel_contexts.erase(it);
+        }
     }
 
 public:
@@ -227,6 +378,17 @@ public:
         parse_channel_ids(channel_ids);
     }
     
+    // ADDED: Method to set isolated channels
+    void set_isolated_channels(const std::string& channel_ids) {
+        parse_isolated_channel_ids(channel_ids);
+    }
+    
+    // ADDED: Method to set main context ID for shared channels
+    void set_main_context_id(const std::string& context_id) {
+        main_context_id = context_id;
+        log_message("Set main shared context ID: " + context_id);
+    }
+    
     // Integration with LlamaManager
     void set_llama_manager(LlamaManager* manager) {
         llama_manager = manager;
@@ -234,6 +396,39 @@ public:
             log_message("LlamaManager integration enabled");
         } else {
             log_message("LlamaManager integration disabled");
+            // Clean up all user contexts when disconnecting
+            cleanup_all_user_contexts();
+        }
+    }
+    
+    // ADDED: Clean up all user and channel contexts
+    void cleanup_all_user_contexts() {
+        std::lock_guard<std::mutex> lock(context_mutex);
+        
+        if (llama_manager) {
+            // Clean up DM contexts
+            for (const auto& [user_id, context_id] : user_contexts) {
+                if (context_id != main_context_id) {
+                    llama_manager->remove_context(context_id);
+                }
+            }
+            
+            // Clean up isolated channel contexts
+            for (const auto& [channel_id, context_id] : channel_contexts) {
+                if (context_id != main_context_id) {
+                    llama_manager->remove_context(context_id);
+                }
+            }
+        }
+        
+        size_t dm_count = user_contexts.size();
+        size_t channel_count = channel_contexts.size();
+        user_contexts.clear();
+        channel_contexts.clear();
+        
+        if (dm_count > 0 || channel_count > 0) {
+            log_message("Cleaned up " + std::to_string(dm_count) + " DM contexts and " + 
+                       std::to_string(channel_count) + " isolated channel contexts (preserved main context)");
         }
     }
     
@@ -303,6 +498,9 @@ public:
         
         is_running = false;
         is_connected = false;
+        
+        // Clean up all user contexts
+        cleanup_all_user_contexts();
         
         // Clear conversation cache
         {
@@ -391,14 +589,41 @@ public:
     void clear_user_conversation(uint64_t user_id) {
         std::lock_guard<std::mutex> lock(message_mutex);
         user_conversations.erase(user_id);
-        log_message("Cleared conversation for user " + std::to_string(user_id));
+        
+        // Only clean up DM context for this user, not channel contexts
+        cleanup_user_context(user_id);
+        
+        log_message("Cleared conversation and DM context for user " + std::to_string(user_id));
     }
     
-    void clear_all_conversations() {
+    // ADDED: Clear conversation for a specific channel
+    void clear_channel_conversation(uint64_t channel_id) {
+        // Clear message history for all users who were active in this channel
         std::lock_guard<std::mutex> lock(message_mutex);
-        size_t count = user_conversations.size();
-        user_conversations.clear();
-        log_message("Cleared " + std::to_string(count) + " conversations");
+        
+        // Remove conversations that were in this channel
+        auto it = user_conversations.begin();
+        while (it != user_conversations.end()) {
+            auto& conversations = it->second;
+            conversations.erase(
+                std::remove_if(conversations.begin(), conversations.end(),
+                    [channel_id](const DiscordMessageContext& ctx) {
+                        return ctx.channel_id == channel_id;
+                    }),
+                conversations.end()
+            );
+            
+            if (conversations.empty()) {
+                it = user_conversations.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        
+        // Clean up the isolated channel context
+        cleanup_channel_context(channel_id);
+        
+        log_message("Cleared conversation and isolated context for channel " + std::to_string(channel_id));
     }
     
     // Utility methods
@@ -457,8 +682,12 @@ private:
                 return;
             }
             
-            // Check if channel is allowed
-            if (!is_channel_allowed(event.msg.channel_id)) {
+            // Determine if this is a DM using guild_id
+            bool is_dm = (event.msg.guild_id == 0);
+            
+            // For DMs, always allow processing (don't check allowed channels)
+            // For guild messages, check if channel is allowed
+            if (!is_dm && !is_channel_allowed(event.msg.channel_id)) {
                 return;
             }
             
@@ -481,35 +710,48 @@ private:
             context.guild_id = event.msg.guild_id;
             context.username = event.msg.author.username;
             context.timestamp = std::chrono::system_clock::now();
-            context.is_dm = (event.msg.guild_id == 0);
+            context.is_dm = is_dm;
             
-            // Try to get channel name
-            if (event.msg.guild_id != 0) {
+            // Set channel name based on context
+            if (is_dm) {
+                context.channel_name = "DM";
+            } else {
+                // Try to get channel name for guild channels
+                context.channel_name = "Unknown"; // Fallback
                 bot->channel_get(event.msg.channel_id, [this, context](const dpp::confirmation_callback_t& callback) mutable {
                     if (!callback.is_error()) {
                         auto channel = callback.get<dpp::channel>();
                         context.channel_name = channel.name;
                     }
                 });
-            } else {
-                context.channel_name = "DM";
             }
             
             store_message_context(context);
             
+            // Improved context type logging
+            std::string context_type;
+            if (is_dm) {
+                context_type = "DM (isolated)";
+            } else if (is_isolated_channel(event.msg.channel_id)) {
+                context_type = "isolated";
+            } else {
+                context_type = "shared";
+            }
+            
             log_message("Processing message from " + event.msg.author.username + 
-                       " in " + context.channel_name + ": " + 
+                       " in " + context.channel_name + " (" + context_type + " context): " + 
                        message_content.substr(0, 100) + (message_content.size() > 100 ? "..." : ""));
             
-            // Process message with LlamaManager - pass username
-            std::string response = process_user_message(message_content, event.msg.author.username, event.msg.author.id);
+            // FIXED: Process message with guild_id for proper DM detection
+            std::string response = process_user_message(message_content, event.msg.author.username, 
+                                                      event.msg.author.id, event.msg.channel_id, event.msg.guild_id);
             
             if (!response.empty() && !response.starts_with("Error:")) {
                 // Send response
                 send_message(event.msg.channel_id, response);
             } else if (response.starts_with("Error:")) {
                 log_message("Error processing message: " + response);
-                // Optionally send error message to user
+                // Send error message to user
                 send_message(event.msg.channel_id, "I'm having trouble processing your message right now. Please try again later.");
             }
             
@@ -536,8 +778,8 @@ private:
         }
     }
     
-    // ADDED: Message processing with LlamaManager integration - updated to accept username
-    std::string process_user_message(const std::string& message, const std::string& username, uint64_t user_id) {
+    // FIXED: Message processing with correct function signature
+    std::string process_user_message(const std::string& message, const std::string& username, uint64_t user_id, uint64_t channel_id, uint64_t guild_id) {
         if (!llama_manager) {
             return "Error: AI backend not available";
         }
@@ -546,6 +788,32 @@ private:
         last_activity = std::chrono::system_clock::now();
         
         try {
+            // Get or create context for this user and channel
+            std::string context_id = get_or_create_user_context(user_id, username, channel_id, guild_id);
+            if (context_id.empty()) {
+                return "Error: Failed to access chat context";
+            }
+            
+            // Switch to appropriate context (shared, isolated channel, or DM)
+            if (!llama_manager->switch_to_context(context_id)) {
+                log_message("Failed to switch to context '" + context_id + "' for user: " + username);
+                return "Error: Failed to access your chat context";
+            }
+            
+            // Improved context usage logging
+            bool is_dm = (guild_id == 0);
+            bool is_isolated_chan = is_isolated_channel(channel_id);
+            
+            if (context_id == main_context_id) {
+                log_message("Using shared main context for user: " + username + " in channel: " + std::to_string(channel_id));
+            } else if (is_dm) {
+                log_message("Using DM context '" + context_id + "' for user: " + username);
+            } else if (is_isolated_chan) {
+                log_message("Using isolated channel context '" + context_id + "' for channel: " + std::to_string(channel_id) + " (user: " + username + ")");
+            } else {
+                log_message("Using context '" + context_id + "' for user: " + username);
+            }
+            
             // Generate response using LlamaManager with username
             std::string response = llama_manager->generate_response(message, username);
             

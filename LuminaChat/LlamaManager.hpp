@@ -56,30 +56,59 @@ class LlamaManager {
 private:
     llama_model* model;
     const llama_vocab* vocab;
-    llama_context* context;
-    llama_sampler* sampler;
-    llama_batch batch;
+    
+    // REFACTOR: Multi-context support
+    struct ContextInfo {
+        llama_context* context;
+        llama_sampler* sampler;
+        llama_batch batch;
+        bool batch_initialized;
+        int32_t n_past;
+        int32_t prev_len;
+        std::vector<std::pair<std::string, std::string>> message_history;
+        std::string system_message;
+        
+        // Per-context performance tracking
+        int64_t total_prompt_tokens = 0;
+        int64_t total_generation_tokens = 0;
+        int64_t last_decode_time_us = 0;
+        
+        // Per-context cache state
+        mutable bool message_cache_dirty = true;
+        mutable std::vector<llama_chat_message> message_cache;
+        
+        ContextInfo() : context(nullptr), sampler(nullptr), batch_initialized(false), 
+                       n_past(0), prev_len(0) {}
+    };
+    
+    std::unordered_map<std::string, std::unique_ptr<ContextInfo>> contexts;
+    std::string active_context_id;
+    ContextInfo* current_context;
+    
+    // Remove old single-context members that are now per-context
+    // llama_context* context; - REMOVED
+    // llama_sampler* sampler; - REMOVED
+    // llama_batch batch; - REMOVED
+    // bool batch_initialized; - REMOVED
+    // int32_t n_past; - REMOVED
+    // std::vector<std::pair<std::string, std::string>> message_history; - REMOVED
+    // int32_t prev_len; - REMOVED
+    // std::string system_message; - REMOVED
+    
+    // Keep model-level settings
     int32_t n_ctx;
     int32_t n_predict;
     int32_t n_gpu_layers;
     bool model_loaded;
-    bool batch_initialized;
-    int32_t n_past;
-    std::vector<std::pair<std::string, std::string>> message_history;
-    std::vector<char> formatted_buffer;
-    int32_t prev_len;
-    std::string system_message;
+    
+    // Global performance tracking (aggregated across all contexts)
+    // int64_t total_prompt_tokens = 0; - REMOVED (now per-context)
+    // int64_t total_generation_tokens = 0; - REMOVED (now per-context)
+    // int64_t last_decode_time_us = 0; - REMOVED (now per-context)
+    
+    // Keep shared template and cache management (model-level)
     std::string custom_chat_template;
-    
-    // Performance tracking
-    int64_t total_prompt_tokens = 0;
-    int64_t total_generation_tokens = 0;
-    int64_t last_decode_time_us = 0;
-    
-    // Optimize buffer management - use string for better memory handling
     mutable std::string template_buffer;
-    mutable std::vector<llama_chat_message> message_cache;
-    mutable bool message_cache_dirty = true;
 
     // Cache for tokenization results with hit ratio tracking
     mutable std::unordered_map<std::string, std::vector<llama_token>> token_cache;
@@ -100,10 +129,10 @@ private:
 
     // Unified batch management
     void manage_batch(bool clear_only = true) {
-        if (!batch_initialized) return;
+        if (!current_context || !current_context->batch_initialized) return;
         
         if (clear_only) {
-            batch.n_tokens = 0;
+            current_context->batch.n_tokens = 0;
         }
     }
 
@@ -115,7 +144,7 @@ private:
     // Unified batch token addition with direct position control - FIXED API usage
     bool add_tokens_to_batch(const std::vector<llama_token>& tokens, int32_t start_pos, 
                             const std::vector<llama_seq_id>& seq_ids, bool output_logits = false) {
-        if (!batch_initialized || tokens.empty()) return false;
+        if (!current_context || !current_context->batch_initialized || tokens.empty()) return false;
         
         // FIXED: Validate start_pos is reasonable
         if (start_pos < 0 || start_pos >= n_ctx) {
@@ -123,7 +152,7 @@ private:
             return false;
         }
         
-        const int32_t n_batch = llama_n_batch(context);
+        const int32_t n_batch = llama_n_batch(current_context->context);
         manage_batch(true); // Clear batch
         
         // FIXED: Validate sequence IDs
@@ -132,7 +161,7 @@ private:
             return false;
         }
         
-        for (size_t i = 0; i < tokens.size() && batch.n_tokens < n_batch; ++i) {
+        for (size_t i = 0; i < tokens.size() && current_context->batch.n_tokens < n_batch; ++i) {
             // FIXED: Check position bounds
             int32_t pos = start_pos + static_cast<int32_t>(i);
             if (pos >= n_ctx) {
@@ -140,21 +169,21 @@ private:
                 break;
             }
             
-            batch.token[batch.n_tokens] = tokens[i];
-            batch.pos[batch.n_tokens] = pos;
-            batch.n_seq_id[batch.n_tokens] = static_cast<int32_t>(seq_ids.size());
+            current_context->batch.token[current_context->batch.n_tokens] = tokens[i];
+            current_context->batch.pos[current_context->batch.n_tokens] = pos;
+            current_context->batch.n_seq_id[current_context->batch.n_tokens] = static_cast<int32_t>(seq_ids.size());
             
             // FIXED: Use safe bounds checking without undefined constant
             const size_t max_seq_ids = 8; // Reasonable limit for sequence IDs
             for (size_t j = 0; j < seq_ids.size() && j < max_seq_ids; ++j) {
-                batch.seq_id[batch.n_tokens][j] = seq_ids[j];
+                current_context->batch.seq_id[current_context->batch.n_tokens][j] = seq_ids[j];
             }
             
-            batch.logits[batch.n_tokens] = (i == tokens.size() - 1) ? output_logits : false;
-            batch.n_tokens++;
+            current_context->batch.logits[current_context->batch.n_tokens] = (i == tokens.size() - 1) ? output_logits : false;
+            current_context->batch.n_tokens++;
         }
         
-        return batch.n_tokens > 0;
+        return current_context->batch.n_tokens > 0;
     }
 
     // Single token addition for generation loop
@@ -231,10 +260,10 @@ private:
         return tokens;
     }
 
-    // FIXED: Enhanced context processing with corrected API usage
+    // REFACTOR: Enhanced context processing with corrected API usage
     bool process_context_tokens(const std::vector<llama_token>& tokens, bool is_incremental = true) {
-        if (!batch_initialized) {
-            log_message("Error: Batch not initialized");
+        if (!current_context || !current_context->batch_initialized) {
+            log_message("Error: No active context or batch not initialized");
             return false;
         }
         
@@ -253,7 +282,7 @@ private:
         
         // Check context capacity
         int32_t max_threshold = static_cast<int32_t>(n_ctx * 0.9f);
-        if (!is_incremental) n_past = 0; // Reset for full context rebuild
+        if (!is_incremental) current_context->n_past = 0; // Reset for full context rebuild
         
         // FIXED: Use model-based token validation instead of undefined function
         for (size_t i = 0; i < tokens.size(); ++i) {
@@ -264,17 +293,17 @@ private:
         }
         
         // FIXED: Better overflow protection
-        if (n_past < 0 || tokens.size() > static_cast<size_t>(std::numeric_limits<int32_t>::max() - n_past)) {
+        if (current_context->n_past < 0 || tokens.size() > static_cast<size_t>(std::numeric_limits<int32_t>::max() - current_context->n_past)) {
             log_message("Error: Token addition would cause integer overflow");
             return false;
         }
         
-        if (n_past + static_cast<int32_t>(tokens.size()) > max_threshold) {
+        if (current_context->n_past + static_cast<int32_t>(tokens.size()) > max_threshold) {
             if (is_incremental) {
-                log_message("Context would exceed 90% (" + std::to_string(n_past + tokens.size()) + 
+                log_message("Context would exceed 90% (" + std::to_string(current_context->n_past + tokens.size()) + 
                            "/" + std::to_string(n_ctx) + " tokens), triggering pruning...");
-                llama_kv_self_clear(context);
-                n_past = 0;
+                llama_kv_self_clear(current_context->context);
+                current_context->n_past = 0;
                 prune_message_history(0.6f);
                 return false; // Signal caller to rebuild full context
             } else {
@@ -292,17 +321,17 @@ private:
             
             bool output_logits = is_incremental && (end == tokens.size());
             
-            if (add_tokens_to_batch(chunk, n_past, seq_ids, output_logits)) {
-                if (llama_decode(context, batch) != 0) {
+            if (add_tokens_to_batch(chunk, current_context->n_past, seq_ids, output_logits)) {
+                if (llama_decode(current_context->context, current_context->batch) != 0) {
                     log_message("Error: Failed to decode batch at position " + std::to_string(start) + 
                                " (tokens " + std::to_string(start) + "-" + std::to_string(end-1) + ")");
                     return false;
                 }
-                n_past += batch.n_tokens;
+                current_context->n_past += current_context->batch.n_tokens;
                 
                 // FIXED: Validate n_past doesn't exceed context bounds
-                if (n_past > n_ctx) {
-                    log_message("Error: n_past (" + std::to_string(n_past) + ") exceeded context size (" + std::to_string(n_ctx) + ")");
+                if (current_context->n_past > n_ctx) {
+                    log_message("Error: n_past (" + std::to_string(current_context->n_past) + ") exceeded context size (" + std::to_string(n_ctx) + ")");
                     return false;
                 }
             } else {
@@ -316,26 +345,28 @@ private:
 
     // Unified template application
     bool apply_template_optimized(bool add_generation_prompt, std::string& result) const {
+        if (!current_context) return false;
+        
         const char* tmpl = get_current_chat_template();
         if (!tmpl) return false;
         
         // Update message cache if needed
-        if (message_cache_dirty) {
-            message_cache = convert_to_llama_messages();
-            message_cache_dirty = false;
+        if (current_context->message_cache_dirty) {
+            current_context->message_cache = convert_to_llama_messages();
+            current_context->message_cache_dirty = false;
         }
         
         // Apply template with auto-resize
         template_buffer.resize(n_ctx * 4);
         int32_t result_len = llama_chat_apply_template(
-            tmpl, message_cache.data(), message_cache.size(),
+            tmpl, current_context->message_cache.data(), current_context->message_cache.size(),
             add_generation_prompt, template_buffer.data(), template_buffer.size()
         );
         
         if (result_len < 0) {
             template_buffer.resize(-result_len);
             result_len = llama_chat_apply_template(
-                tmpl, message_cache.data(), message_cache.size(),
+                tmpl, current_context->message_cache.data(), current_context->message_cache.size(),
                 add_generation_prompt, template_buffer.data(), template_buffer.size()
             );
         }
@@ -379,14 +410,14 @@ private:
 
     // Prune message history to keep specified ratio of messages
     void prune_message_history(float keep_ratio) {
-        if (message_history.empty()) return;
+        if (!current_context || current_context->message_history.empty()) return;
         
         // Always keep system message if present
-        bool has_system = !message_history.empty() && message_history[0].first == "system";
+        bool has_system = !current_context->message_history.empty() && current_context->message_history[0].first == "system";
         size_t system_offset = has_system ? 1 : 0;
         
         // Calculate how many non-system messages to keep
-        size_t total_messages = message_history.size() - system_offset;
+        size_t total_messages = current_context->message_history.size() - system_offset;
         size_t messages_to_keep = std::max(size_t(2), static_cast<size_t>(total_messages * keep_ratio));
         
         if (messages_to_keep >= total_messages) {
@@ -398,23 +429,57 @@ private:
         pruned.reserve(messages_to_keep + system_offset);
         
         if (has_system) {
-            pruned.emplace_back(std::move(message_history[0]));
+            pruned.emplace_back(std::move(current_context->message_history[0]));
         }
         
-        size_t start_idx = message_history.size() - messages_to_keep;
-        for (size_t i = start_idx; i < message_history.size(); ++i) {
-            pruned.emplace_back(std::move(message_history[i]));
+        size_t start_idx = current_context->message_history.size() - messages_to_keep;
+        for (size_t i = start_idx; i < current_context->message_history.size(); ++i) {
+            pruned.emplace_back(std::move(current_context->message_history[i]));
         }
         
-        message_history = std::move(pruned);
-        message_cache_dirty = true;
-        log_message("Pruned message history to " + std::to_string(message_history.size()) + " messages");
+        current_context->message_history = std::move(pruned);
+        current_context->message_cache_dirty = true;
+        log_message("Pruned message history to " + std::to_string(current_context->message_history.size()) + " messages");
+    }
+
+    // REFACTOR: Update context validation
+    bool validate_and_recover_sampler() {
+        if (!current_context) {
+            log_message("Error: No active context for sampler validation");
+            return false;
+        }
+        
+        if (current_context->sampler) {
+            return true; // Sampler is valid
+        }
+        
+        log_message("WARNING: Sampler is NULL, attempting recovery...");
+        
+        // Attempt to recreate a basic greedy sampler
+        auto sparams = llama_sampler_chain_default_params();
+        sparams.no_perf = false;
+        current_context->sampler = llama_sampler_chain_init(sparams);
+        
+        if (!current_context->sampler) {
+            log_message("CRITICAL: Failed to recover sampler!");
+            return false;
+        }
+        
+        // Add basic greedy sampling
+        llama_sampler_chain_add(current_context->sampler, llama_sampler_init_greedy());
+        
+        if (!current_context->sampler) {
+            log_message("CRITICAL: Sampler became NULL after adding greedy sampler during recovery!");
+            return false;
+        }
+        
+        log_message("Sampler recovered successfully with greedy sampling");
+        return true;
     }
 
 public:
-    LlamaManager() : model(nullptr), vocab(nullptr), context(nullptr), sampler(nullptr),
-                     n_ctx(2048), n_predict(256), n_gpu_layers(0), model_loaded(false), 
-                     batch_initialized(false), n_past(0), prev_len(0) {}
+    LlamaManager() : model(nullptr), vocab(nullptr), current_context(nullptr),
+                     n_ctx(2048), n_predict(256), n_gpu_layers(0), model_loaded(false) {}
 
     ~LlamaManager() {
         cleanup();
@@ -465,102 +530,183 @@ public:
 
         vocab = llama_model_get_vocab(model);
 
-        // Set up context parameters with proper batch sizing
-        llama_context_params ctx_params = llama_context_default_params();
-        ctx_params.n_ctx = n_ctx;
-        ctx_params.n_batch = std::min(512, n_ctx / 4); // Optimal batch size
-        ctx_params.n_threads = std::thread::hardware_concurrency();
-        ctx_params.no_perf = false;
-
-        // Create context
-        context = llama_init_from_model(model, ctx_params);
-        if (!context) {
-            log_message("Error: Failed to create context");
-            llama_model_free(model);
-            model = nullptr;
-            return false;
-        }
-
-        // Initialize batch after context creation
-        if (!initialize_batch()) {
-            llama_free(context);
-            llama_model_free(model);
-            context = nullptr;
-            model = nullptr;
-            return false;
-        }
-
-        // FIXED: Enhanced sampler initialization with corrected validation logic
-        if (sampler) {
-            llama_sampler_free(sampler);
-            sampler = nullptr;
-        }
-        
-        auto sparams = llama_sampler_chain_default_params();
-        sparams.no_perf = false;
-        sampler = llama_sampler_chain_init(sparams);
-        
-        if (!sampler) {
-            log_message("Error: Failed to create sampler chain");
-            cleanup_batch();
-            llama_free(context);
-            llama_model_free(model);
-            context = nullptr;
-            model = nullptr;
-            return false;
-        }
-        
-        // FIXED: llama_sampler_chain_add modifies sampler in place, doesn't return it
-        // The previous check was incorrectly setting sampler to null
-        llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
-        
-        // FIXED: Only validate sampler is still valid, don't check return value of chain_add
-        if (!sampler) {
-            log_message("Error: Sampler became invalid after adding greedy sampler");
-            cleanup_batch();
-            llama_free(context);
-            llama_model_free(model);
-            context = nullptr;
-            model = nullptr;
-            return false;
-        }
-
         model_loaded = true;
-        n_past = 0;
-        message_history.clear();
         
         // Clear caches when new model is loaded
         clear_caches();
         
         log_message("Model loaded successfully: " + model_path);
-        log_message("Sampler initialized successfully");
         return true;
+    }
+
+    // SIMPLIFIED: Context creation with consistent system prompt usage
+    bool create_context(const std::string& context_id, const std::string& system_prompt = "") {
+        if (!model_loaded || !model) {
+            log_message("Error: Model must be loaded before creating contexts");
+            return false;
+        }
+        
+        if (contexts.find(context_id) != contexts.end()) {
+            log_message("Error: Context '" + context_id + "' already exists");
+            return false;
+        }
+        
+        auto context_info = std::make_unique<ContextInfo>();
+        
+        // Set up context parameters
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx = n_ctx;
+        ctx_params.n_batch = std::min(512, n_ctx / 4);
+        ctx_params.n_threads = std::thread::hardware_concurrency();
+        ctx_params.no_perf = false;
+        
+        // Create context
+        context_info->context = llama_init_from_model(model, ctx_params);
+        if (!context_info->context) {
+            log_message("Error: Failed to create context '" + context_id + "'");
+            return false;
+        }
+        
+        // Initialize batch
+        int32_t batch_size = std::min(512, n_ctx / 4);
+        context_info->batch = llama_batch_init(batch_size, 0, 1);
+        if (context_info->batch.token == nullptr) {
+            log_message("Error: Failed to initialize batch for context '" + context_id + "'");
+            llama_free(context_info->context);
+            return false;
+        }
+        context_info->batch_initialized = true;
+        
+        // Initialize sampler
+        auto sparams = llama_sampler_chain_default_params();
+        sparams.no_perf = false;
+        context_info->sampler = llama_sampler_chain_init(sparams);
+        
+        if (!context_info->sampler) {
+            log_message("Error: Failed to create sampler for context '" + context_id + "'");
+            llama_batch_free(context_info->batch);
+            llama_free(context_info->context);
+            return false;
+        }
+        
+        llama_sampler_chain_add(context_info->sampler, llama_sampler_init_greedy());
+        
+        // SIMPLIFIED: Always use provided system prompt, or copy from main context if empty
+        std::string prompt_to_use = system_prompt;
+        if (prompt_to_use.empty() && current_context && !current_context->system_message.empty()) {
+            prompt_to_use = current_context->system_message;
+        }
+        
+        // Set system message if we have one
+        if (!prompt_to_use.empty()) {
+            context_info->system_message = prompt_to_use;
+            context_info->message_history.emplace_back("system", prompt_to_use);
+            context_info->message_cache_dirty = true;
+        }
+        
+        contexts[context_id] = std::move(context_info);
+        log_message("Created context '" + context_id + "' successfully");
+        
+        // If this is the first context, make it active
+        if (active_context_id.empty()) {
+            switch_to_context(context_id);
+        }
+        
+        return true;
+    }
+    
+    bool switch_to_context(const std::string& context_id) {
+        auto it = contexts.find(context_id);
+        if (it == contexts.end()) {
+            log_message("Error: Context '" + context_id + "' not found");
+            return false;
+        }
+        
+        active_context_id = context_id;
+        current_context = it->second.get();
+        log_message("Switched to context '" + context_id + "'");
+        return true;
+    }
+    
+    bool remove_context(const std::string& context_id) {
+        auto it = contexts.find(context_id);
+        if (it == contexts.end()) {
+            log_message("Error: Context '" + context_id + "' not found");
+            return false;
+        }
+        
+        // Clean up the context
+        if (it->second->sampler) {
+            llama_sampler_free(it->second->sampler);
+        }
+        if (it->second->batch_initialized) {
+            llama_batch_free(it->second->batch);
+        }
+        if (it->second->context) {
+            llama_free(it->second->context);
+        }
+        
+        // If this was the active context, clear it
+        if (active_context_id == context_id) {
+            active_context_id.clear();
+            current_context = nullptr;
+            
+            // Switch to another context if available
+            if (!contexts.empty()) {
+                auto first_remaining = contexts.begin();
+                if (first_remaining->first != context_id) {
+                    switch_to_context(first_remaining->first);
+                }
+            }
+        }
+        
+        contexts.erase(it);
+        log_message("Removed context '" + context_id + "'");
+        return true;
+    }
+    
+    std::vector<std::string> list_contexts() const {
+        std::vector<std::string> context_list;
+        for (const auto& [id, _] : contexts) {
+            context_list.push_back(id);
+        }
+        return context_list;
+    }
+    
+    std::string get_active_context() const {
+        return active_context_id;
+    }
+    
+    bool has_context(const std::string& context_id) const {
+        return contexts.find(context_id) != contexts.end();
     }
 
     // Clear conversation history
     void clear_conversation() {
-        if (context) {
-            llama_kv_self_clear(context);
+        if (!current_context) return;
+        
+        if (current_context->context) {
+            llama_kv_self_clear(current_context->context);
         }
-        message_history.clear();
-        message_cache_dirty = true;
-        n_past = 0;
-        prev_len = 0;
+        current_context->message_history.clear();
+        current_context->message_cache_dirty = true;
+        current_context->n_past = 0;
+        current_context->prev_len = 0;
     }
 
     // Set system message
     bool set_system_prompt(const std::string& system_prompt) {
-        if (!model_loaded) {
+        if (!model_loaded || !current_context) {
             return false;
         }
 
-        system_message = system_prompt;
-        message_cache_dirty = true;
+        current_context->system_message = system_prompt;
+        current_context->message_cache_dirty = true;
         
         clear_conversation();
         
-        if (!system_message.empty()) {
-            message_history.emplace_back("system", system_message);
+        if (!current_context->system_message.empty()) {
+            current_context->message_history.emplace_back("system", current_context->system_message);
             return update_context_with_pruning();
         }
         
@@ -569,8 +715,10 @@ public:
 
     // Convert message history to llama_chat_message format
     std::vector<llama_chat_message> convert_to_llama_messages() const {
+        if (!current_context) return {};
+        
         std::vector<llama_chat_message> messages;
-        for (const auto& msg : message_history) {
+        for (const auto& msg : current_context->message_history) {
             messages.push_back({ msg.first.c_str(), msg.second.c_str() });
         }
         return messages;
@@ -606,22 +754,22 @@ public:
 
     // Enhanced context update with better tokenization handling - FIXED recursion issue
     bool update_context_with_pruning() {
-        if (!model_loaded || !model || !context || !vocab) {
+        if (!model_loaded || !model || !current_context || !current_context->context || !vocab) {
             log_message("Error: Model components not initialized");
             return false;
         }
 
         // Check and handle pruning first
-        int32_t n_ctx_used = n_past;
+        int32_t n_ctx_used = current_context->n_past;
         int32_t max_threshold = static_cast<int32_t>(n_ctx * 0.9f);
         
         if (n_ctx_used > max_threshold) {
             log_message("Context usage at " + std::to_string((float)n_ctx_used / n_ctx * 100.0f) + 
                        "%, pruning to 60%");
             
-            llama_kv_self_clear(context);
-            n_past = 0;
-            prev_len = 0;
+            llama_kv_self_clear(current_context->context);
+            current_context->n_past = 0;
+            current_context->prev_len = 0;
             prune_message_history(0.6f);
         }
 
@@ -635,7 +783,7 @@ public:
         int32_t new_len = static_cast<int32_t>(formatted_content.length());
 
         // Handle content changes with proper tokenization
-        if (prev_len > new_len) {
+        if (current_context->prev_len > new_len) {
             // Rebuild context - use add_special=true for full context
             std::vector<llama_token> tokens = process_text_to_tokens(formatted_content, true);
             if (tokens.empty()) {
@@ -644,44 +792,44 @@ public:
             }
             
             if (process_context_tokens(tokens, false)) {
-                prev_len = new_len;
+                current_context->prev_len = new_len;
                 return true;
             }
             return false;
         }
 
         // Process new content incrementally
-        if (new_len > prev_len) {
-            std::string new_content = formatted_content.substr(prev_len);
+        if (new_len > current_context->prev_len) {
+            std::string new_content = formatted_content.substr(current_context->prev_len);
             if (!new_content.empty()) {
                 // For incremental updates, don't add special tokens unless it's the very first content
-                bool add_special_tokens = (prev_len == 0);
+                bool add_special_tokens = (current_context->prev_len == 0);
                 std::vector<llama_token> tokens = process_text_to_tokens(new_content, add_special_tokens);
                 
                 if (tokens.empty()) {
                     log_message("Warning: New content tokenized to empty token vector: '" + 
                                new_content.substr(0, 50) + (new_content.size() > 50 ? "..." : "") + "'");
                     // Don't fail here, just update prev_len and continue
-                    prev_len = new_len;
+                    current_context->prev_len = new_len;
                     return true;
                 }
                 
                 if (process_context_tokens(tokens, true)) {
-                    prev_len = new_len;
+                    current_context->prev_len = new_len;
                     return true;
                 } else {
                     // FIXED: Pruning was triggered - do full rebuild instead of infinite recursion
                     log_message("Incremental processing failed, performing full rebuild...");
                     
                     // Clear everything and rebuild from scratch
-                    llama_kv_self_clear(context);
-                    n_past = 0;
-                    prev_len = 0;
+                    llama_kv_self_clear(current_context->context);
+                    current_context->n_past = 0;
+                    current_context->prev_len = 0;
                     
                     // Tokenize and process the full formatted content
                     std::vector<llama_token> full_tokens = process_text_to_tokens(formatted_content, true);
                     if (!full_tokens.empty() && process_context_tokens(full_tokens, false)) {
-                        prev_len = new_len;
+                        current_context->prev_len = new_len;
                         return true;
                     } else {
                         log_message("Error: Full context rebuild failed after pruning");
@@ -691,90 +839,65 @@ public:
             }
         }
 
-        prev_len = new_len;
-        return true;
-    }
-
-    // FIXED: Add sampler validation and recovery function
-    bool validate_and_recover_sampler() {
-        if (sampler) {
-            return true; // Sampler is valid
-        }
-        
-        log_message("WARNING: Sampler is NULL, attempting recovery...");
-        
-        // Attempt to recreate a basic greedy sampler
-        auto sparams = llama_sampler_chain_default_params();
-        sparams.no_perf = false;
-        sampler = llama_sampler_chain_init(sparams);
-        
-        if (!sampler) {
-            log_message("CRITICAL: Failed to recover sampler!");
-            return false;
-        }
-        
-        // Add basic greedy sampling
-        llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
-        
-        if (!sampler) {
-            log_message("CRITICAL: Sampler became NULL after adding greedy sampler during recovery!");
-            return false;
-        }
-        
-        log_message("Sampler recovered successfully with greedy sampling");
+        current_context->prev_len = new_len;
         return true;
     }
 
     // FIXED: Enhanced sampler configuration with runtime validation
     void configure_sampler(float temperature = 0.8f, float min_p = 0.05f, float top_p = 0.9f, int32_t top_k = 40) {
-        log_message("Configuring sampler - current sampler: " + std::string(sampler ? "valid" : "NULL"));
+        if (!current_context) {
+            log_message("Error: No active context for sampler configuration");
+            return;
+        }
         
-        if (sampler) {
-            llama_sampler_free(sampler);
-            sampler = nullptr;
+        log_message("Configuring sampler for context '" + active_context_id + "'");
+        
+        if (current_context->sampler) {
+            llama_sampler_free(current_context->sampler);
+            current_context->sampler = nullptr;
         }
         
         auto sparams = llama_sampler_chain_default_params();
         sparams.no_perf = false;
-        sampler = llama_sampler_chain_init(sparams);
+        current_context->sampler = llama_sampler_chain_init(sparams);
         
-        if (!sampler) {
+        if (!current_context->sampler) {
             log_message("Error: Failed to create sampler chain");
             return;
         }
         
         // FIXED: Add sampling strategies without checking return values incorrectly
         if (top_k > 0) {
-            llama_sampler_chain_add(sampler, llama_sampler_init_top_k(top_k));
+            llama_sampler_chain_add(current_context->sampler, llama_sampler_init_top_k(top_k));
         }
         
         if (top_p < 1.0f) {
-            llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
+            llama_sampler_chain_add(current_context->sampler, llama_sampler_init_top_p(top_p, 1));
         }
         
         if (min_p > 0.0f) {
-            llama_sampler_chain_add(sampler, llama_sampler_init_min_p(min_p, 1));
+            llama_sampler_chain_add(current_context->sampler, llama_sampler_init_min_p(min_p, 1));
         }
         
         if (temperature > 0.0f) {
-            llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
-            llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+            llama_sampler_chain_add(current_context->sampler, llama_sampler_init_temp(temperature));
+            llama_sampler_chain_add(current_context->sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
         } else {
-            llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+            llama_sampler_chain_add(current_context->sampler, llama_sampler_init_greedy());
         }
         
         // FIXED: Only validate final sampler state
-        if (!sampler) {
+        if (!current_context->sampler) {
             log_message("Error: Sampler became null during configuration");
         } else {
-            log_message("Sampler reconfigured successfully");
+            log_message("Sampler reconfigured successfully for context '" + active_context_id + "'");
         }
     }
 
     // FIXED: Enhanced generation with sampler validation and recovery
     std::string generate_response(const std::string& input, const std::string& username = "Schwi") {
-        if (!model_loaded || !model || !context || !vocab || !batch_initialized) {
-            return "Error: Model components not properly initialized";
+        if (!model_loaded || !model || !current_context || !current_context->context || !vocab || !current_context->batch_initialized) {
+            return "Error: Model components not properly initialized or no active context";
         }
 
         if (input.empty()) return "Error: Empty input";
@@ -785,13 +908,13 @@ public:
         }
 
         // Setup conversation
-        if (message_history.empty() && !system_message.empty()) {
-            message_history.emplace_back("system", system_message);
-            message_cache_dirty = true;
+        if (current_context->message_history.empty() && !current_context->system_message.empty()) {
+            current_context->message_history.emplace_back("system", current_context->system_message);
+            current_context->message_cache_dirty = true;
         }
 
-        message_history.emplace_back(username, input);
-        message_cache_dirty = true;
+        current_context->message_history.emplace_back(username, input);
+        current_context->message_cache_dirty = true;
 
         // Update context using unified function - with retry logic
         int32_t retry_count = 0;
@@ -807,9 +930,9 @@ public:
                 log_message("Context update failed, retrying (" + std::to_string(retry_count) + "/" + std::to_string(max_retries) + ")...");
                 
                 // More aggressive pruning for retry
-                llama_kv_self_clear(context);
-                n_past = 0;
-                prev_len = 0;
+                llama_kv_self_clear(current_context->context);
+                current_context->n_past = 0;
+                current_context->prev_len = 0;
                 prune_message_history(0.4f); // More aggressive pruning
             } else {
                 return "Error: Failed to update context after " + std::to_string(max_retries) + " attempts";
@@ -823,7 +946,7 @@ public:
         }
 
         // Process generation prompt using unified tokenization
-        std::string generation_prompt = generation_content.substr(prev_len);
+        std::string generation_prompt = generation_content.substr(current_context->prev_len);
         if (!generation_prompt.empty()) {
             // For generation prompts, typically don't add special tokens
             std::vector<llama_token> prompt_tokens = process_text_to_tokens(generation_prompt, false);
@@ -831,7 +954,7 @@ public:
                 if (!process_context_tokens(prompt_tokens, true)) {
                     return "Error: Failed to process generation prompt";
                 }
-                total_prompt_tokens += prompt_tokens.size();
+                current_context->total_prompt_tokens += prompt_tokens.size();
             } else {
                 log_message("Warning: Generation prompt tokenized to empty vector");
             }
@@ -840,32 +963,32 @@ public:
         // Generate response using unified functions
         std::string response;
         const int32_t safety_margin = 32; // Reserve space for potential special tokens
-        const int32_t max_new_tokens = std::min(n_predict, n_ctx - n_past - safety_margin);
+        const int32_t max_new_tokens = std::min(n_predict, n_ctx - current_context->n_past - safety_margin);
         response.reserve(max_new_tokens * 4);
         
         if (max_new_tokens <= 0) {
             return "Error: No space left in context for generation (context: " + 
-                   std::to_string(n_past) + "/" + std::to_string(n_ctx) + ")";
+                   std::to_string(current_context->n_past) + "/" + std::to_string(n_ctx) + ")";
         }
 
         // FIXED: Enhanced validation before generation loop
-        if (!sampler) {
+        if (!current_context->sampler) {
             log_message("CRITICAL: Sampler is null before generation loop after validation!");
             return "Error: Sampler validation failed";
         }
         
-        if (!context) {
+        if (!current_context->context) {
             log_message("Error: Context is null before generation");
             return "Error: Context not properly initialized";
         }
         
         // FIXED: Validate that we have logits available for sampling
-        if (n_past == 0) {
+        if (current_context->n_past == 0) {
             log_message("Error: No tokens processed yet, cannot generate");
             return "Error: Context is empty, cannot generate response";
         }
 
-        log_message("Starting generation with " + std::to_string(max_new_tokens) + " max tokens, n_past=" + std::to_string(n_past));
+        log_message("Starting generation with " + std::to_string(max_new_tokens) + " max tokens, n_past=" + std::to_string(current_context->n_past));
 
         auto decode_start = std::chrono::high_resolution_clock::now();
         int32_t n_generated = 0;
@@ -874,7 +997,7 @@ public:
         // FIXED: Enhanced generation loop with comprehensive validation
         while (n_generated < max_new_tokens) {
             // FIXED: Validate sampler on every iteration to catch when it becomes null
-            if (!sampler) {
+            if (!current_context->sampler) {
                 log_message("CRITICAL: Sampler became NULL during generation at token " + std::to_string(n_generated));
                 log_message("Attempting emergency recovery...");
                 if (!validate_and_recover_sampler()) {
@@ -884,29 +1007,29 @@ public:
                 log_message("Emergency recovery successful, continuing generation");
             }
             
-            if (!context) {
+            if (!current_context->context) {
                 log_message("Error: Context became null during generation");
                 break;
             }
             
             // FIXED: Validate that n_past is within reasonable bounds
-            if (n_past <= 0 || n_past >= n_ctx) {
-                log_message("Error: Invalid n_past value: " + std::to_string(n_past) + " (context size: " + std::to_string(n_ctx) + ")");
+            if (current_context->n_past <= 0 || current_context->n_past >= n_ctx) {
+                log_message("Error: Invalid n_past value: " + std::to_string(current_context->n_past) + " (context size: " + std::to_string(n_ctx) + ")");
                 break;
             }
             
             llama_token new_token;
             try {
                 // FIXED: Additional pre-sampling validation
-                if (!sampler || !context) {
+                if (!current_context->sampler || !current_context->context) {
                     log_message("CRITICAL: Sampler or context null just before sampling call!");
                     break;
                 }
                 
-                new_token = llama_sampler_sample(sampler, context, -1);
+                new_token = llama_sampler_sample(current_context->sampler, current_context->context, -1);
                 
                 // FIXED: Check if sampler was corrupted by the sampling call
-                if (!sampler) {
+                if (!current_context->sampler) {
                     log_message("CRITICAL: Sampler became NULL after sampling call!");
                     break;
                 }
@@ -938,27 +1061,27 @@ public:
             response += token_text;
 
             // FIXED: Validate batch state before adding token
-            if (!batch_initialized) {
+            if (!current_context->batch_initialized) {
                 log_message("Error: Batch became uninitialized during generation");
                 break;
             }
 
             // Process token using unified batch function
-            if (!add_single_token_to_batch(new_token, n_past, seq_ids, true)) {
+            if (!add_single_token_to_batch(new_token, current_context->n_past, seq_ids, true)) {
                 log_message("Warning: Failed to add token to batch");
                 break;
             }
             
-            if (batch.n_tokens > 0 && llama_decode(context, batch) != 0) {
+            if (current_context->batch.n_tokens > 0 && llama_decode(current_context->context, current_context->batch) != 0) {
                 log_message("Warning: Failed to decode batch during generation");
                 break;
             }
             
-            n_past++;
+            current_context->n_past++;
             n_generated++;
             
             // FIXED: Periodic sampler validation during long generation
-            if (n_generated % 10 == 0 && !sampler) {
+            if (n_generated % 10 == 0 && !current_context->sampler) {
                 log_message("CRITICAL: Sampler null detected at token " + std::to_string(n_generated));
                 break;
             }
@@ -966,29 +1089,28 @@ public:
 
         // Update timing and history
         auto decode_end = std::chrono::high_resolution_clock::now();
-        last_decode_time_us = std::chrono::duration_cast<std::chrono::microseconds>(decode_end - decode_start).count();
-        total_generation_tokens += n_generated;
+        current_context->last_decode_time_us = std::chrono::duration_cast<std::chrono::microseconds>(decode_end - decode_start).count();
+        current_context->total_generation_tokens += n_generated;
 
         if (!response.empty()) {
-            message_history.emplace_back("assistant", response);
-            message_cache_dirty = true;
+            current_context->message_history.emplace_back("assistant", response);
+            current_context->message_cache_dirty = true;
             
-            // Update prev_len using unified template function
             std::string updated_content;
             if (apply_template_optimized(false, updated_content)) {
-                prev_len = static_cast<int32_t>(updated_content.length());
+                current_context->prev_len = static_cast<int32_t>(updated_content.length());
             }
         }
 
         if (n_generated > 0) {
-            float tokens_per_second = (float)n_generated / ((float)last_decode_time_us / 1000000.0f);
+            float tokens_per_second = (float)n_generated / ((float)current_context->last_decode_time_us / 1000000.0f);
             log_message("Generated " + std::to_string(n_generated) + " tokens in " + 
-                       std::to_string(last_decode_time_us / 1000.0f) + "ms (" + 
+                       std::to_string(current_context->last_decode_time_us / 1000.0f) + "ms (" + 
                        std::to_string(tokens_per_second) + " t/s)");
         }
 
         // FIXED: Final sampler validation
-        if (!sampler) {
+        if (!current_context->sampler) {
             log_message("WARNING: Sampler is NULL at end of generation!");
         }
 
@@ -1004,15 +1126,19 @@ public:
     };
     
     PerformanceStats get_performance_stats() const {
+        if (!current_context) {
+            return {0, 0, 0, 0.0f};
+        }
+        
         float avg_tps = 0.0f;
-        if (last_decode_time_us > 0 && total_generation_tokens > 0) {
-            avg_tps = (float)total_generation_tokens / ((float)last_decode_time_us / 1000000.0f);
+        if (current_context->last_decode_time_us > 0 && current_context->total_generation_tokens > 0) {
+            avg_tps = (float)current_context->total_generation_tokens / ((float)current_context->last_decode_time_us / 1000000.0f);
         }
         
         return {
-            total_prompt_tokens,
-            total_generation_tokens,
-            last_decode_time_us,
+            current_context->total_prompt_tokens,
+            current_context->total_generation_tokens,
+            current_context->last_decode_time_us,
             avg_tps
         };
     }
@@ -1024,21 +1150,27 @@ public:
     };
     
     void reset_timings() {
-        total_prompt_tokens = 0;
-        total_generation_tokens = 0;
-        last_decode_time_us = 0;
+        if (!current_context) return;
+        
+        current_context->total_prompt_tokens = 0;
+        current_context->total_generation_tokens = 0;
+        current_context->last_decode_time_us = 0;
     }
     
     Timings get_timings() const {
+        if (!current_context) {
+            return {0, 0.0f};
+        }
+        
         Timings timings;
-        timings.n_eval = static_cast<int32_t>(total_generation_tokens);
-        timings.t_eval_ms = static_cast<float>(last_decode_time_us) / 1000.0f;
+        timings.n_eval = static_cast<int32_t>(current_context->total_generation_tokens);
+        timings.t_eval_ms = static_cast<float>(current_context->last_decode_time_us) / 1000.0f;
         return timings;
     }
 
     // Simplified batch processing using unified functions only
     bool process_full_context(const std::string& full_content) {
-        if (full_content.empty()) return true;
+        if (!current_context || full_content.empty()) return true;
 
         // Use unified tokenization
         std::vector<llama_token> tokens = process_text_to_tokens(full_content, true);
@@ -1053,12 +1185,12 @@ public:
         }
 
         // Use unified context processing
-        n_past = 0;
+        current_context->n_past = 0;
         if (!process_context_tokens(tokens, false)) {
             return false;
         }
         
-        prev_len = static_cast<int32_t>(full_content.length());
+        current_context->prev_len = static_cast<int32_t>(full_content.length());
         
         log_message("Successfully processed " + std::to_string(tokens.size()) + 
                    " tokens in full context rebuild");
@@ -1067,40 +1199,50 @@ public:
 
     // Optimized batch initialization with calculated size
     bool initialize_batch() {
-        if (batch_initialized) {
+        if (!current_context || current_context->batch_initialized) {
             return true;
         }
 
         int32_t batch_size = calculate_optimal_batch_size();
         
-        batch = llama_batch_init(batch_size, 0, 1);
-        if (batch.token == nullptr) {
+        current_context->batch = llama_batch_init(batch_size, 0, 1);
+        if (current_context->batch.token == nullptr) {
             log_message("Error: Failed to initialize batch with size " + std::to_string(batch_size));
             return false;
         }
 
-        batch_initialized = true;
+        current_context->batch_initialized = true;
         log_message("Initialized batch with optimal size: " + std::to_string(batch_size));
         return true;
     }
 
     // Enhanced cleanup with memory optimization
     void cleanup() {
-        log_message("Cleanup called - sampler state: " + std::string(sampler ? "valid" : "NULL"));
+        log_message("Cleanup called - cleaning up " + std::to_string(contexts.size()) + " contexts");
         
         clear_caches();
-        cleanup_batch();
         
-        if (sampler) {
-            log_message("Freeing sampler...");
-            llama_sampler_free(sampler);
-            sampler = nullptr;
-            log_message("Sampler freed");
+        // Clean up all contexts
+        for (auto& [id, context_info] : contexts) {
+            if (context_info->sampler) {
+                log_message("Freeing sampler for context '" + id + "'...");
+                llama_sampler_free(context_info->sampler);
+                context_info->sampler = nullptr;
+            }
+            if (context_info->batch_initialized) {
+                llama_batch_free(context_info->batch);
+                context_info->batch_initialized = false;
+            }
+            if (context_info->context) {
+                llama_free(context_info->context);
+                context_info->context = nullptr;
+            }
         }
-        if (context) {
-            llama_free(context);
-            context = nullptr;
-        }
+        
+        contexts.clear();
+        active_context_id.clear();
+        current_context = nullptr;
+        
         if (model) {
             llama_model_free(model);
             model = nullptr;
@@ -1108,60 +1250,25 @@ public:
         
         vocab = nullptr;
         model_loaded = false;
-        n_past = 0;
-        prev_len = 0;
         
         // Efficient memory cleanup
-        std::vector<std::pair<std::string, std::string>>().swap(message_history);
-        std::vector<char>().swap(formatted_buffer);
         std::string().swap(template_buffer);
-        std::vector<llama_chat_message>().swap(message_cache);
         std::string().swap(custom_chat_template);
         
-        message_cache_dirty = true;
         reset_cache_stats();
-    }
-
-    // Memory usage reporting
-    struct MemoryStats {
-        size_t token_cache_bytes;
-        size_t message_history_bytes;
-        size_t buffer_bytes;
-        size_t total_estimated_bytes;
-    };
-    
-    MemoryStats get_memory_stats() const {
-        size_t token_cache_bytes = 0;
-        for (const auto& [key, tokens] : token_cache) {
-            token_cache_bytes += key.size() + (tokens.size() * sizeof(llama_token));
-        }
-        
-        size_t message_history_bytes = 0;
-        for (const auto& [role, content] : message_history) {
-            message_history_bytes += role.size() + content.size();
-        }
-        
-        size_t buffer_bytes = token_buffer.capacity() + temp_string_buffer.capacity() + 
-                             template_buffer.capacity() + formatted_buffer.capacity();
-        
-        return {
-            token_cache_bytes,
-            message_history_bytes,
-            buffer_bytes,
-            token_cache_bytes + message_history_bytes + buffer_bytes
-        };
+        log_message("Cleanup completed");
     }
 
 private:
-    // Add missing helper methods
+    // REFACTOR: Update helper methods to use current context
     int32_t calculate_optimal_batch_size() const {
-        if (!context) {
+        if (!current_context || !current_context->context) {
             log_message("Warning: Context not available for batch size calculation");
-            return 512; // Safe default
+            return 512;
         }
         
-        int32_t n_batch = llama_n_batch(context);
-        int32_t available_ctx = n_ctx - n_past;
+        int32_t n_batch = llama_n_batch(current_context->context);
+        int32_t available_ctx = n_ctx - current_context->n_past;
         
         // Ensure we have reasonable bounds
         int32_t min_batch = 1;
@@ -1173,11 +1280,11 @@ private:
         // Ensure we don't return 0 or negative values
         return std::max(optimal, min_batch);
     }
-    
+
     void cleanup_batch() {
-        if (batch_initialized) {
-            llama_batch_free(batch);
-            batch_initialized = false;
+        if (current_context && current_context->batch_initialized) {
+            llama_batch_free(current_context->batch);
+            current_context->batch_initialized = false;
         }
     }
     

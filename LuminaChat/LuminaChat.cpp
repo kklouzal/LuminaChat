@@ -139,6 +139,7 @@ public:
 
     Operation operation;
     std::string input_text;
+    std::string input_username; // ADDED: Store username for generation
     std::string result;
     bool success = false;
 
@@ -153,8 +154,10 @@ public:
         chat_template = tmpl;
     }
 
-    void SetInput(const std::string& input) {
+    // UPDATED: Add username parameter for context-aware generation
+    void SetInput(const std::string& input, const std::string& username = "User") {
         input_text = input;
+        input_username = username;
     }
 
     void RequestStop() {
@@ -221,7 +224,8 @@ private:
             return "";
         }
         
-        return llama_manager->generate_response(input_text);
+        // UPDATED: Use username parameter for generation
+        return llama_manager->generate_response(input_text, input_username);
     }
 };
 
@@ -280,7 +284,8 @@ public:
     static void SaveSettings(const std::string& model_path, int32_t context_size, int32_t gpu_layers, 
                            int32_t predict_tokens, const std::string& chat_template, 
                            const std::string& identity_directive, const std::string& other_directives,
-                           const std::string& discord_bot_token, const std::string& discord_channel_ids) {
+                           const std::string& discord_bot_token, const std::string& discord_channel_ids,
+                           const std::string& discord_isolated_channel_ids) {
         std::ofstream file(GetSettingsFilePath());
         
         if (file.is_open()) {
@@ -296,14 +301,16 @@ public:
                  << "OtherDirectives=" << EscapeString(other_directives) << "\n"
                  << "\n[Discord]\n"
                  << "BotToken=" << EscapeString(discord_bot_token) << "\n"
-                 << "ChannelIds=" << discord_channel_ids << "\n";
+                 << "ChannelIds=" << discord_channel_ids << "\n"
+                 << "IsolatedChannelIds=" << discord_isolated_channel_ids << "\n";
         }
     }
     
     static void LoadSettings(std::string& model_path, int32_t& context_size, int32_t& gpu_layers, 
                            int32_t& predict_tokens, std::string& chat_template, 
                            std::string& identity_directive, std::string& other_directives,
-                           std::string& discord_bot_token, std::string& discord_channel_ids) {
+                           std::string& discord_bot_token, std::string& discord_channel_ids,
+                           std::string& discord_isolated_channel_ids) {
         std::ifstream file(GetSettingsFilePath());
         
         if (file.is_open()) {
@@ -335,6 +342,8 @@ public:
                     discord_bot_token = UnescapeString(value);
                 } else if (key == "ChannelIds") {
                     discord_channel_ids = value;
+                } else if (key == "IsolatedChannelIds") {
+                    discord_isolated_channel_ids = value;
                 }
             }
         }
@@ -354,6 +363,7 @@ private:
     wxTextCtrl* other_directives_text;
     wxTextCtrl* discord_bot_token_text;
     wxTextCtrl* discord_channel_ids_text;
+    wxTextCtrl* discord_isolated_channel_ids_text; // ADDED: New textbox for isolated channels
     
     // References to settings
     std::string& model_path_ref;
@@ -365,6 +375,7 @@ private:
     std::string& other_directives_ref;
     std::string& discord_bot_token_ref;
     std::string& discord_channel_ids_ref;
+    std::string& discord_isolated_channel_ids_ref; // ADDED: New reference
 
     // Validation helper
     bool ValidateAndSetInt32(wxTextCtrl* control, int32_t& target, int32_t default_val, 
@@ -384,12 +395,14 @@ private:
 public:
     SettingsDialog(wxWindow* parent, std::string& model_path, int32_t& context_size, int32_t& gpu_layers, 
                   int32_t& predict_tokens, std::string& chat_template, std::string& identity_directive, 
-                  std::string& other_directives, std::string& discord_bot_token, std::string& discord_channel_ids) 
-        : wxDialog(parent, wxID_ANY, "Settings", wxDefaultPosition, wxSize(700, 500)),
+                  std::string& other_directives, std::string& discord_bot_token, std::string& discord_channel_ids,
+                  std::string& discord_isolated_channel_ids) 
+        : wxDialog(parent, wxID_ANY, "Settings", wxDefaultPosition, wxSize(700, 600)),
           model_path_ref(model_path), context_size_ref(context_size), gpu_layers_ref(gpu_layers), 
           predict_tokens_ref(predict_tokens), chat_template_ref(chat_template),
           identity_directive_ref(identity_directive), other_directives_ref(other_directives),
-          discord_bot_token_ref(discord_bot_token), discord_channel_ids_ref(discord_channel_ids) {
+          discord_bot_token_ref(discord_bot_token), discord_channel_ids_ref(discord_channel_ids),
+          discord_isolated_channel_ids_ref(discord_isolated_channel_ids) {
         
         wxNotebook* notebook = new wxNotebook(this, wxID_ANY);
         
@@ -489,14 +502,24 @@ public:
         discord_sizer->Add(discord_bot_token_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
         
         // Channel IDs
-        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Channel IDs (comma separated):"), 0, wxALL, 5);
-        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "List of Discord channel IDs where the bot should respond"), 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
+        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Allowed Channel IDs (comma separated):"), 0, wxALL, 5);
+        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "List of Discord channel IDs where the bot should respond (leave empty for all channels)"), 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
         
         discord_channel_ids_text = new wxTextCtrl(discord_panel, wxID_ANY, wxString::FromUTF8(discord_channel_ids), 
-                                                 wxDefaultPosition, wxDefaultSize, 
+                                                 wxDefaultPosition, wxSize(-1, 60), 
                                                  wxTE_MULTILINE | wxTE_WORDWRAP);
         discord_channel_ids_text->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
-        discord_sizer->Add(discord_channel_ids_text, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
+        discord_sizer->Add(discord_channel_ids_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
+        
+        // ADDED: Isolated Context Channel IDs
+        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Isolated Context Channel IDs (comma separated):"), 0, wxALL, 5);
+        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Channels that get their own separate context (each user gets individual context)"), 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
+        
+        discord_isolated_channel_ids_text = new wxTextCtrl(discord_panel, wxID_ANY, wxString::FromUTF8(discord_isolated_channel_ids), 
+                                                           wxDefaultPosition, wxSize(-1, 60), 
+                                                           wxTE_MULTILINE | wxTE_WORDWRAP);
+        discord_isolated_channel_ids_text->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+        discord_sizer->Add(discord_isolated_channel_ids_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
         
         // Help text for Discord settings
         wxStaticText* discord_help = new wxStaticText(discord_panel, wxID_ANY, 
@@ -505,9 +528,11 @@ public:
             "2. Create a bot and copy the token above\n"
             "3. Right-click Discord channels and 'Copy ID' to get channel IDs\n"
             "4. Separate multiple channel IDs with commas (e.g., 123456789,987654321)\n"
-            "5. Leave channel IDs empty to respond in all channels where bot has access");
+            "5. Channels NOT in 'Isolated Context' list will use the shared main chat context\n"
+            "6. Channels IN 'Isolated Context' list will get their own separate context (shared by all users in that channel)\n"
+            "7. Direct Messages (DMs) ALWAYS use individual isolated contexts (one per user for privacy)");
         discord_help->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_ITALIC, wxFONTWEIGHT_NORMAL));
-        discord_sizer->Add(discord_help, 0, wxALL, 5);
+        discord_sizer->Add(discord_help, 1, wxEXPAND | wxALL, 5);
         
         discord_panel->SetSizer(discord_sizer);
         notebook->AddPage(discord_panel, "Discord Settings");
@@ -552,13 +577,24 @@ private:
         other_directives_ref = other_directives_text->GetValue().ToUTF8().data();
         discord_bot_token_ref = discord_bot_token_text->GetValue().ToUTF8().data();
         discord_channel_ids_ref = discord_channel_ids_text->GetValue().ToUTF8().data();
+        discord_isolated_channel_ids_ref = discord_isolated_channel_ids_text->GetValue().ToUTF8().data(); // ADDED
         
         // Validate Discord channel IDs format if provided
         if (!discord_channel_ids_ref.empty()) {
             std::string cleaned_ids = ValidateChannelIds(discord_channel_ids_ref);
             if (cleaned_ids != discord_channel_ids_ref) {
                 discord_channel_ids_ref = cleaned_ids;
-                wxMessageBox("Channel IDs have been cleaned up. Invalid entries were removed.", 
+                wxMessageBox("Allowed Channel IDs have been cleaned up. Invalid entries were removed.", 
+                           "Channel IDs Modified", wxOK | wxICON_INFORMATION);
+            }
+        }
+        
+        // ADDED: Validate isolated channel IDs format if provided
+        if (!discord_isolated_channel_ids_ref.empty()) {
+            std::string cleaned_ids = ValidateChannelIds(discord_isolated_channel_ids_ref);
+            if (cleaned_ids != discord_isolated_channel_ids_ref) {
+                discord_isolated_channel_ids_ref = cleaned_ids;
+                wxMessageBox("Isolated Context Channel IDs have been cleaned up. Invalid entries were removed.", 
                            "Channel IDs Modified", wxOK | wxICON_INFORMATION);
             }
         }
@@ -567,7 +603,8 @@ private:
         SettingsManager::SaveSettings(model_path_ref, context_size_ref, gpu_layers_ref, 
                                     predict_tokens_ref, chat_template_ref, 
                                     identity_directive_ref, other_directives_ref,
-                                    discord_bot_token_ref, discord_channel_ids_ref);
+                                    discord_bot_token_ref, discord_channel_ids_ref,
+                                    discord_isolated_channel_ids_ref);
         
         EndModal(wxID_OK);
     }
@@ -632,6 +669,7 @@ private:
     std::string other_directives;
     std::string discord_bot_token;
     std::string discord_channel_ids;
+    std::string discord_isolated_channel_ids; // ADDED: New setting
     
     // State
     bool is_started;
@@ -653,6 +691,10 @@ private:
     
     ModelWorkerThread* worker_thread = nullptr;
 
+    // ADDED: Context management
+    static constexpr const char* DEFAULT_CONTEXT_ID = "main_chat";
+    bool context_created = false;
+
 public:
     LuminaChatFrame() : wxFrame(nullptr, wxID_ANY, "LuminaChat", wxDefaultPosition, wxSize(800, 600)),
                         llama_manager(std::make_unique<LlamaManager>()),
@@ -665,7 +707,7 @@ public:
         
         SettingsManager::LoadSettings(model_path, context_size, gpu_layers, predict_tokens, 
                                     chat_template, identity_directive, other_directives,
-                                    discord_bot_token, discord_channel_ids);
+                                    discord_bot_token, discord_channel_ids, discord_isolated_channel_ids);
         
         CreateUI();
         
@@ -758,7 +800,7 @@ private:
             
             SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, 
                                         chat_template, identity_directive, other_directives,
-                                        discord_bot_token, discord_channel_ids);
+                                        discord_bot_token, discord_channel_ids, discord_isolated_channel_ids);
         }
     }
 
@@ -1008,7 +1050,7 @@ private:
         progress_label->SetLabel("Loading model...");
         progress_bar->SetValue(0);
         progress_bar->Show();
-        main_panel->Layout(); // Use main_panel->Layout() instead of GetSizer()->Layout()
+        main_panel->Layout();
         
         // ADDED: Use cout for logging (will be redirected to logs panel)
         std::cout << "Initializing LuminaChat..." << std::endl;
@@ -1059,14 +1101,14 @@ private:
         bool success = event.GetInt() == 1;
         
         if (success) {
-            // Handle chat template
+            // Handle chat template first
             if (chat_template.empty()) {
                 std::string model_template = llama_manager->get_model_chat_template();
                 if (!model_template.empty()) {
                     chat_template = model_template;
                     SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, 
                                                 chat_template, identity_directive, other_directives,
-                                                discord_bot_token, discord_channel_ids);
+                                                discord_bot_token, discord_channel_ids, discord_isolated_channel_ids);
                     std::cout << "Loaded chat template from model" << std::endl;
                 }
             } else {
@@ -1074,18 +1116,24 @@ private:
                 std::cout << "Using custom chat template" << std::endl;
             }
             
-            // Set system prompt
+            // SIMPLIFIED: Create main chat context with system prompt from settings
             std::string combined_prompt = GetCombinedSystemPrompt();
-            if (!combined_prompt.empty()) {
-                llama_manager->set_system_prompt(combined_prompt);
-                std::cout << "System prompt applied" << std::endl;
+            if (!llama_manager->create_context(DEFAULT_CONTEXT_ID, combined_prompt)) {
+                std::cerr << "Error: Failed to create main chat context" << std::endl;
+                success = false;
+            } else {
+                context_created = true;
+                std::cout << "Main chat context created with system prompt" << std::endl;
             }
-            
+        }
+        
+        if (success) {
             is_started = true;
             
-            // ADDED: Connect Discord manager to LlamaManager when model is loaded
+            // Connect Discord manager to LlamaManager when model is loaded
             if (discord_manager && discord_manager->is_bot_running()) {
                 discord_manager->set_llama_manager(llama_manager.get());
+                discord_manager->set_main_context_id(DEFAULT_CONTEXT_ID);
                 std::cout << "Discord bot connected to loaded model" << std::endl;
             }
             
@@ -1096,7 +1144,7 @@ private:
             llama_manager->reset_timings();
             timings_label->SetLabel("");
         } else {
-            std::cerr << "Error: Failed to load model" << std::endl;
+            std::cerr << "Error: Failed to load model or create context" << std::endl;
         }
         
         UpdateButtonStates();
@@ -1122,6 +1170,7 @@ private:
         }
         
         llama_manager->cleanup();
+        context_created = false; // ADDED: Reset context state
         is_started = false;
         is_processing = false;
         UpdateButtonStates();
@@ -1161,12 +1210,14 @@ private:
                 return;
             }
             
-            // ADDED: Set allowed channels
+            // Set channel configuration
             discord_manager->set_allowed_channels(discord_channel_ids);
+            discord_manager->set_isolated_channels(discord_isolated_channel_ids);
             
-            // Set LlamaManager integration if model is loaded
-            if (is_started && llama_manager) {
+            // SIMPLIFIED: Set LlamaManager integration if model is loaded
+            if (is_started && llama_manager && context_created) {
                 discord_manager->set_llama_manager(llama_manager.get());
+                discord_manager->set_main_context_id(DEFAULT_CONTEXT_ID);
             }
             
             // Start Discord bot
@@ -1177,6 +1228,11 @@ private:
                 } else {
                     std::cout << "Bot will respond in all accessible channels" << std::endl;
                 }
+                if (!discord_isolated_channel_ids.empty()) {
+                    std::cout << "Isolated context channels: " << discord_isolated_channel_ids << std::endl;
+                }
+                std::cout << "Note: Direct Messages always use isolated contexts" << std::endl;
+                std::cout << "All contexts use the same system prompt and chat template" << std::endl;
             } else {
                 wxMessageBox("Failed to start Discord bot. Check the logs for details.", 
                            "Discord Connection Error", wxOK | wxICON_ERROR);
@@ -1189,7 +1245,7 @@ private:
     void OnSettings(wxCommandEvent& event) {
         SettingsDialog dialog(this, model_path, context_size, gpu_layers, predict_tokens, 
                             chat_template, identity_directive, other_directives,
-                            discord_bot_token, discord_channel_ids);
+                            discord_bot_token, discord_channel_ids, discord_isolated_channel_ids);
         if (dialog.ShowModal() == wxID_OK) {
             UpdateWindowTitle();
             
@@ -1203,6 +1259,12 @@ private:
     void OnInputEnter(wxCommandEvent& event) {
         if (!is_started || is_processing) return;
         
+        // ADDED: Check if context is created
+        if (!context_created) {
+            AddSystemMessage("Error: Chat context not available. Please restart the model.");
+            return;
+        }
+        
         wxString input = input_text->GetValue().Trim();
         if (input.IsEmpty()) return;
         
@@ -1215,7 +1277,7 @@ private:
         
         // Start response generation in background thread
         worker_thread = new ModelWorkerThread(this, llama_manager.get(), ModelWorkerThread::GENERATE_RESPONSE);
-        worker_thread->SetInput(input.ToStdString());
+        worker_thread->SetInput(input.ToStdString(), "User"); // UPDATED: Pass username
         
         if (worker_thread->Run() != wxTHREAD_NO_ERROR) {
             delete worker_thread;
