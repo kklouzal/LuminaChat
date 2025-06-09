@@ -26,7 +26,8 @@
 // 8. Cache frequently used variables to avoid repeated allocations.
 // 9. Ensure there are no logical errors and the execution paths flow as expected.
 // 10. Refactor where necessary to maintain clean code, efficient code, and to conform to the above settings and directives.
-// 11. NEVER BREAK FUNCTIONALITY THAT IS ALREADY WORKING.
+// 11. After making changes, go back and make sure the codebase has been updated to incorporate the new changes and that it still adheres to the coding directives.
+// 12. NEVER BREAK FUNCTIONALITY THAT IS ALREADY WORKING.
 
 #include <wx/wx.h>
 #include <wx/filedlg.h>
@@ -51,6 +52,7 @@
 #include <iostream>
 #include <streambuf>
 #include "LlamaManager.hpp"
+#include "DiscordManager.hpp"
 
 // Forward declarations
 class LuminaChatFrame;
@@ -98,7 +100,8 @@ enum {
     ID_BROWSE_MODEL,
     ID_MODEL_LOADED,
     ID_RESPONSE_READY,
-    ID_PROGRESS_UPDATE
+    ID_PROGRESS_UPDATE,
+    ID_CONNECT_DISCORD
 };
 
 // Custom events for thread communication
@@ -276,7 +279,8 @@ public:
     
     static void SaveSettings(const std::string& model_path, int32_t context_size, int32_t gpu_layers, 
                            int32_t predict_tokens, const std::string& chat_template, 
-                           const std::string& identity_directive, const std::string& other_directives) {
+                           const std::string& identity_directive, const std::string& other_directives,
+                           const std::string& discord_bot_token, const std::string& discord_channel_ids) {
         std::ofstream file(GetSettingsFilePath());
         
         if (file.is_open()) {
@@ -289,13 +293,17 @@ public:
                  << "Template=" << EscapeString(chat_template) << "\n"
                  << "\n[SystemPrompt]\n"
                  << "IdentityDirective=" << EscapeString(identity_directive) << "\n"
-                 << "OtherDirectives=" << EscapeString(other_directives) << "\n";
+                 << "OtherDirectives=" << EscapeString(other_directives) << "\n"
+                 << "\n[Discord]\n"
+                 << "BotToken=" << EscapeString(discord_bot_token) << "\n"
+                 << "ChannelIds=" << discord_channel_ids << "\n";
         }
     }
     
     static void LoadSettings(std::string& model_path, int32_t& context_size, int32_t& gpu_layers, 
                            int32_t& predict_tokens, std::string& chat_template, 
-                           std::string& identity_directive, std::string& other_directives) {
+                           std::string& identity_directive, std::string& other_directives,
+                           std::string& discord_bot_token, std::string& discord_channel_ids) {
         std::ifstream file(GetSettingsFilePath());
         
         if (file.is_open()) {
@@ -323,6 +331,10 @@ public:
                     identity_directive = UnescapeString(value);
                 } else if (key == "OtherDirectives") {
                     other_directives = UnescapeString(value);
+                } else if (key == "BotToken") {
+                    discord_bot_token = UnescapeString(value);
+                } else if (key == "ChannelIds") {
+                    discord_channel_ids = value;
                 }
             }
         }
@@ -340,6 +352,8 @@ private:
     wxTextCtrl* chat_template_text;
     wxTextCtrl* identity_directive_text;
     wxTextCtrl* other_directives_text;
+    wxTextCtrl* discord_bot_token_text;
+    wxTextCtrl* discord_channel_ids_text;
     
     // References to settings
     std::string& model_path_ref;
@@ -349,6 +363,8 @@ private:
     std::string& chat_template_ref;
     std::string& identity_directive_ref;
     std::string& other_directives_ref;
+    std::string& discord_bot_token_ref;
+    std::string& discord_channel_ids_ref;
 
     // Validation helper
     bool ValidateAndSetInt32(wxTextCtrl* control, int32_t& target, int32_t default_val, 
@@ -368,11 +384,12 @@ private:
 public:
     SettingsDialog(wxWindow* parent, std::string& model_path, int32_t& context_size, int32_t& gpu_layers, 
                   int32_t& predict_tokens, std::string& chat_template, std::string& identity_directive, 
-                  std::string& other_directives) 
+                  std::string& other_directives, std::string& discord_bot_token, std::string& discord_channel_ids) 
         : wxDialog(parent, wxID_ANY, "Settings", wxDefaultPosition, wxSize(700, 500)),
           model_path_ref(model_path), context_size_ref(context_size), gpu_layers_ref(gpu_layers), 
           predict_tokens_ref(predict_tokens), chat_template_ref(chat_template),
-          identity_directive_ref(identity_directive), other_directives_ref(other_directives) {
+          identity_directive_ref(identity_directive), other_directives_ref(other_directives),
+          discord_bot_token_ref(discord_bot_token), discord_channel_ids_ref(discord_channel_ids) {
         
         wxNotebook* notebook = new wxNotebook(this, wxID_ANY);
         
@@ -457,6 +474,44 @@ public:
         template_panel->SetSizer(template_sizer);
         notebook->AddPage(template_panel, "Chat Template");
         
+        // Discord Settings Tab
+        wxPanel* discord_panel = new wxPanel(notebook);
+        wxBoxSizer* discord_sizer = new wxBoxSizer(wxVERTICAL);
+        
+        // Bot Token
+        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Discord Bot Token:"), 0, wxALL, 5);
+        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Enter your Discord bot's authentication token"), 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
+        
+        discord_bot_token_text = new wxTextCtrl(discord_panel, wxID_ANY, wxString::FromUTF8(discord_bot_token), 
+                                               wxDefaultPosition, wxDefaultSize, 
+                                               wxTE_PASSWORD); // Hide token for security
+        discord_bot_token_text->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+        discord_sizer->Add(discord_bot_token_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
+        
+        // Channel IDs
+        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Channel IDs (comma separated):"), 0, wxALL, 5);
+        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "List of Discord channel IDs where the bot should respond"), 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
+        
+        discord_channel_ids_text = new wxTextCtrl(discord_panel, wxID_ANY, wxString::FromUTF8(discord_channel_ids), 
+                                                 wxDefaultPosition, wxDefaultSize, 
+                                                 wxTE_MULTILINE | wxTE_WORDWRAP);
+        discord_channel_ids_text->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+        discord_sizer->Add(discord_channel_ids_text, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
+        
+        // Help text for Discord settings
+        wxStaticText* discord_help = new wxStaticText(discord_panel, wxID_ANY, 
+            "Instructions:\n"
+            "1. Create a Discord application at https://discord.com/developers/applications\n"
+            "2. Create a bot and copy the token above\n"
+            "3. Right-click Discord channels and 'Copy ID' to get channel IDs\n"
+            "4. Separate multiple channel IDs with commas (e.g., 123456789,987654321)\n"
+            "5. Leave channel IDs empty to respond in all channels where bot has access");
+        discord_help->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_ITALIC, wxFONTWEIGHT_NORMAL));
+        discord_sizer->Add(discord_help, 0, wxALL, 5);
+        
+        discord_panel->SetSizer(discord_sizer);
+        notebook->AddPage(discord_panel, "Discord Settings");
+        
         // Dialog buttons
         wxBoxSizer* btn_sizer = new wxBoxSizer(wxHORIZONTAL);
         btn_sizer->Add(new wxButton(this, wxID_OK, "OK"), 0, wxRIGHT, 5);
@@ -495,13 +550,53 @@ private:
         chat_template_ref = chat_template_text->GetValue().ToUTF8().data();
         identity_directive_ref = identity_directive_text->GetValue().ToUTF8().data();
         other_directives_ref = other_directives_text->GetValue().ToUTF8().data();
+        discord_bot_token_ref = discord_bot_token_text->GetValue().ToUTF8().data();
+        discord_channel_ids_ref = discord_channel_ids_text->GetValue().ToUTF8().data();
+        
+        // Validate Discord channel IDs format if provided
+        if (!discord_channel_ids_ref.empty()) {
+            std::string cleaned_ids = ValidateChannelIds(discord_channel_ids_ref);
+            if (cleaned_ids != discord_channel_ids_ref) {
+                discord_channel_ids_ref = cleaned_ids;
+                wxMessageBox("Channel IDs have been cleaned up. Invalid entries were removed.", 
+                           "Channel IDs Modified", wxOK | wxICON_INFORMATION);
+            }
+        }
         
         // Save settings
         SettingsManager::SaveSettings(model_path_ref, context_size_ref, gpu_layers_ref, 
                                     predict_tokens_ref, chat_template_ref, 
-                                    identity_directive_ref, other_directives_ref);
+                                    identity_directive_ref, other_directives_ref,
+                                    discord_bot_token_ref, discord_channel_ids_ref);
         
         EndModal(wxID_OK);
+    }
+    
+    // Validate and clean up channel IDs format
+    std::string ValidateChannelIds(const std::string& input) {
+        std::string result;
+        std::string current_id;
+        
+        for (char c : input) {
+            if (std::isdigit(c)) {
+                current_id += c;
+            } else if (c == ',' || c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+                if (!current_id.empty()) {
+                    if (!result.empty()) result += ",";
+                    result += current_id;
+                    current_id.clear();
+                }
+            }
+            // Skip other characters
+        }
+        
+        // Add last ID if any
+        if (!current_id.empty()) {
+            if (!result.empty()) result += ",";
+            result += current_id;
+        }
+        
+        return result;
     }
 };
 
@@ -511,11 +606,15 @@ LuminaChatFrame* g_main_frame = nullptr;
 // MOVED: Declaration only - implementation after LuminaChatFrame is defined
 void llama_manager_log_callback(const std::string& message);
 
+// MOVED: Declaration only - implementation after LuminaChatFrame is defined
+void discord_manager_log_callback(const std::string& message);
+
 // Main Frame with optimized performance
 class LuminaChatFrame : public wxFrame {
 private:
     // Core components
     std::unique_ptr<LlamaManager> llama_manager;
+    std::unique_ptr<DiscordManager> discord_manager;
     
     // ADDED: Stream buffers for console redirection
     std::unique_ptr<wxLogStreamBuffer> cout_buffer;
@@ -531,6 +630,8 @@ private:
     std::string chat_template;
     std::string identity_directive;
     std::string other_directives;
+    std::string discord_bot_token;
+    std::string discord_channel_ids;
     
     // State
     bool is_started;
@@ -540,6 +641,7 @@ private:
     wxButton* start_btn;
     wxButton* stop_btn;
     wxButton* settings_btn;
+    wxButton* discord_btn;
     wxGauge* progress_bar;
     wxStaticText* progress_label;
     wxStaticText* timings_label;
@@ -554,6 +656,7 @@ private:
 public:
     LuminaChatFrame() : wxFrame(nullptr, wxID_ANY, "LuminaChat", wxDefaultPosition, wxSize(800, 600)),
                         llama_manager(std::make_unique<LlamaManager>()),
+                        discord_manager(std::make_unique<DiscordManager>()),
                         context_size(2048), gpu_layers(0), predict_tokens(256), is_started(false),
                         original_cout(nullptr), original_cerr(nullptr) {
         
@@ -561,7 +664,8 @@ public:
         g_main_frame = this;
         
         SettingsManager::LoadSettings(model_path, context_size, gpu_layers, predict_tokens, 
-                                    chat_template, identity_directive, other_directives);
+                                    chat_template, identity_directive, other_directives,
+                                    discord_bot_token, discord_channel_ids);
         
         CreateUI();
         
@@ -653,7 +757,8 @@ private:
             other_directives = "Answer each user request thoughtfully and to the best of your ability. Be clear and concise in your responses.";
             
             SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, 
-                                        chat_template, identity_directive, other_directives);
+                                        chat_template, identity_directive, other_directives,
+                                        discord_bot_token, discord_channel_ids);
         }
     }
 
@@ -665,10 +770,12 @@ private:
         start_btn = new wxButton(main_panel, ID_START, "Start");
         stop_btn = new wxButton(main_panel, ID_STOP, "Stop");
         settings_btn = new wxButton(main_panel, ID_SETTINGS, "Settings");
+        discord_btn = new wxButton(main_panel, ID_CONNECT_DISCORD, "Connect Discord");
         
         toolbar_sizer->Add(start_btn, 0, wxRIGHT, 5);
         toolbar_sizer->Add(stop_btn, 0, wxRIGHT, 5);
-        toolbar_sizer->Add(settings_btn, 0);
+        toolbar_sizer->Add(settings_btn, 0, wxRIGHT, 5);
+        toolbar_sizer->Add(discord_btn, 0);
         toolbar_sizer->AddStretchSpacer();
         
         // Progress bar and label
@@ -743,6 +850,7 @@ private:
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnStart, this, ID_START);
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnStop, this, ID_STOP);
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnSettings, this, ID_SETTINGS);
+        Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnConnectDiscord, this, ID_CONNECT_DISCORD);
         Bind(wxEVT_COMMAND_TEXT_ENTER, &LuminaChatFrame::OnInputEnter, this, ID_INPUT_TEXT);
         
         // Set initial message
@@ -871,6 +979,15 @@ private:
         stop_btn->Enable(is_started);
         input_text->Enable(is_started && !is_processing);
         settings_btn->Enable(!is_processing);
+        
+        // Update Discord button text and state
+        if (discord_manager && discord_manager->is_bot_running()) {
+            discord_btn->SetLabel("Disconnect Discord");
+            discord_btn->Enable(true);
+        } else {
+            discord_btn->SetLabel("Connect Discord");
+            discord_btn->Enable(true);
+        }
     }
     
     void OnStart(wxCommandEvent& event) {
@@ -937,7 +1054,7 @@ private:
         // Hide progress bar with proper layout update
         progress_bar->Hide();
         progress_label->SetLabel("Ready");
-        main_panel->Layout(); // Use main_panel->Layout() instead of GetSizer()->Layout()
+        main_panel->Layout();
         
         bool success = event.GetInt() == 1;
         
@@ -948,7 +1065,8 @@ private:
                 if (!model_template.empty()) {
                     chat_template = model_template;
                     SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, 
-                                                chat_template, identity_directive, other_directives);
+                                                chat_template, identity_directive, other_directives,
+                                                discord_bot_token, discord_channel_ids);
                     std::cout << "Loaded chat template from model" << std::endl;
                 }
             } else {
@@ -964,6 +1082,12 @@ private:
             }
             
             is_started = true;
+            
+            // ADDED: Connect Discord manager to LlamaManager when model is loaded
+            if (discord_manager && discord_manager->is_bot_running()) {
+                discord_manager->set_llama_manager(llama_manager.get());
+                std::cout << "Discord bot connected to loaded model" << std::endl;
+            }
             
             chat_history->Clear();
             AddSystemMessage("LuminaChat ready! Type your message below.");
@@ -991,6 +1115,12 @@ private:
             main_panel->Layout(); // Use main_panel->Layout() instead of GetSizer()->Layout()
         }
         
+        // ADDED: Disconnect Discord manager from LlamaManager when model is stopped
+        if (discord_manager && discord_manager->is_bot_running()) {
+            discord_manager->set_llama_manager(nullptr);
+            std::cout << "Discord bot disconnected from model" << std::endl;
+        }
+        
         llama_manager->cleanup();
         is_started = false;
         is_processing = false;
@@ -999,9 +1129,67 @@ private:
         timings_label->SetLabel("");
     }
     
+    void OnConnectDiscord(wxCommandEvent& event) {
+        if (!discord_manager) {
+            wxMessageBox("Discord manager not initialized.", "Error", wxOK | wxICON_ERROR);
+            return;
+        }
+        
+        if (discord_manager->is_bot_running()) {
+            // Disconnect Discord bot
+            discord_manager->shutdown();
+            std::cout << "Discord bot disconnected." << std::endl;
+        } else {
+            // Connect Discord bot
+            if (discord_bot_token.empty()) {
+                wxMessageBox("Please configure your Discord bot token in Settings first.", 
+                           "Discord Token Required", wxOK | wxICON_WARNING);
+                return;
+            }
+            
+            // Configure Discord bot
+            DiscordBotConfig config;
+            config.bot_token = discord_bot_token;
+            config.auto_reconnect = true;
+            config.enable_message_cache = true;
+            config.message_cache_size = 100;
+            config.rate_limit_buffer_ms = 100;
+            
+            if (!discord_manager->configure(config)) {
+                wxMessageBox("Failed to configure Discord bot. Check the logs for details.", 
+                           "Discord Configuration Error", wxOK | wxICON_ERROR);
+                return;
+            }
+            
+            // ADDED: Set allowed channels
+            discord_manager->set_allowed_channels(discord_channel_ids);
+            
+            // Set LlamaManager integration if model is loaded
+            if (is_started && llama_manager) {
+                discord_manager->set_llama_manager(llama_manager.get());
+            }
+            
+            // Start Discord bot
+            if (discord_manager->start()) {
+                std::cout << "Discord bot connection initiated..." << std::endl;
+                if (!discord_channel_ids.empty()) {
+                    std::cout << "Bot configured for channels: " << discord_channel_ids << std::endl;
+                } else {
+                    std::cout << "Bot will respond in all accessible channels" << std::endl;
+                }
+            } else {
+                wxMessageBox("Failed to start Discord bot. Check the logs for details.", 
+                           "Discord Connection Error", wxOK | wxICON_ERROR);
+            }
+        }
+        
+        UpdateButtonStates();
+    }
+
     void OnSettings(wxCommandEvent& event) {
         SettingsDialog dialog(this, model_path, context_size, gpu_layers, predict_tokens, 
-                            chat_template, identity_directive, other_directives);
+                            chat_template, identity_directive, other_directives,
+                            discord_bot_token, discord_channel_ids);
         if (dialog.ShowModal() == wxID_OK) {
             UpdateWindowTitle();
             
@@ -1100,6 +1288,13 @@ void wxLogStreamBuffer::FlushBuffer() {
 void llama_manager_log_callback(const std::string& message) {
     if (g_main_frame) {
         g_main_frame->AppendToLogsThreadSafe(wxString::FromUTF8(message) + "\n");
+    }
+}
+
+// MOVED: Implementation of discord manager log callback now that LuminaChatFrame is defined
+void discord_manager_log_callback(const std::string& message) {
+    if (g_main_frame) {
+        g_main_frame->AppendToLogsThreadSafe(wxString::FromUTF8("[Discord] " + message) + "\n");
     }
 }
 

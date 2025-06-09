@@ -30,7 +30,8 @@
 // 8. Cache frequently used variables to avoid repeated allocations.
 // 9. Ensure there are no logical errors and the execution paths flow as expected.
 // 10. Refactor where necessary to maintain clean code, efficient code, and to conform to the above settings and directives.
-// 11. NEVER BREAK FUNCTIONALITY THAT IS ALREADY WORKING.
+// 11. After making changes, go back and make sure the codebase has been updated to incorporate the new changes and that it still adheres to the coding directives.
+// 12. NEVER BREAK FUNCTIONALITY THAT IS ALREADY WORKING.
 #pragma once
 
 #include <iostream>
@@ -771,7 +772,7 @@ public:
     }
 
     // FIXED: Enhanced generation with sampler validation and recovery
-    std::string generate_response(const std::string& input) {
+    std::string generate_response(const std::string& input, const std::string& username = "Schwi") {
         if (!model_loaded || !model || !context || !vocab || !batch_initialized) {
             return "Error: Model components not properly initialized";
         }
@@ -789,7 +790,7 @@ public:
             message_cache_dirty = true;
         }
 
-        message_history.emplace_back("user", input);
+        message_history.emplace_back(username, input);
         message_cache_dirty = true;
 
         // Update context using unified function - with retry logic

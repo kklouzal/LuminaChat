@@ -75,8 +75,8 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <IncludePath>C:\_Libraries\llama.cpp\llama.cpp\include;C:\_Libraries\llama.cpp\llama.cpp\ggml\include;$(IncludePath)</IncludePath>
-    <LibraryPath>C:\_Libraries\llama.cpp\llama.cpp\build\src\Release;C:\_Libraries\llama.cpp\llama.cpp\build\ggml\src\Release;$(LibraryPath)</LibraryPath>
+    <IncludePath>C:\_Libraries\llama.cpp\llama.cpp\include;C:\_Libraries\llama.cpp\llama.cpp\ggml\include;C:\_Libraries\libdpp-10.1.2-win64\include\dpp-10.1;$(IncludePath)</IncludePath>
+    <LibraryPath>C:\_Libraries\llama.cpp\llama.cpp\build\src\Release;C:\_Libraries\llama.cpp\llama.cpp\build\ggml\src\Release;C:\_Libraries\libdpp-10.1.2-win64\lib\dpp-10.1;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -134,13 +134,14 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <IgnoreSpecificDefaultLibraries>llama.lib;ggml-cuda.lib;%(IgnoreSpecificDefaultLibraries)</IgnoreSpecificDefaultLibraries>
-      <AdditionalDependencies>llama.lib;ggml.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>llama.lib;ggml.lib;dpp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="LuminaChat.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="DiscordManager.hpp" />
     <ClInclude Include="LlamaManager.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
