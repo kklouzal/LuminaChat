@@ -126,7 +126,8 @@ public:
                            int32_t predict_tokens, const std::string& chat_template, 
                            const std::string& identity_directive, const std::string& other_directives,
                            const std::string& discord_bot_token, const std::string& discord_channel_ids,
-                           const std::string& discord_isolated_channel_ids, bool discord_allow_dms) {
+                           const std::string& discord_isolated_channel_ids, const std::string& discord_shared_history_channel_ids,
+                           bool discord_allow_dms) {
         std::string filepath = GetSettingsFilePath();
         std::ofstream file(filepath);
         
@@ -155,6 +156,7 @@ public:
             file << "BotToken=" << EscapeString(discord_bot_token) << std::endl;
             file << "ChannelIds=" << EscapeString(discord_channel_ids) << std::endl;
             file << "IsolatedChannelIds=" << EscapeString(discord_isolated_channel_ids) << std::endl;
+            file << "SharedHistoryChannelIds=" << EscapeString(discord_shared_history_channel_ids) << std::endl;
             file << "AllowDMs=" << (discord_allow_dms ? "1" : "0") << std::endl;
             
             file.close();
@@ -169,7 +171,8 @@ public:
                            int32_t& predict_tokens, std::string& chat_template, 
                            std::string& identity_directive, std::string& other_directives,
                            std::string& discord_bot_token, std::string& discord_channel_ids,
-                           std::string& discord_isolated_channel_ids, bool& discord_allow_dms) {
+                           std::string& discord_isolated_channel_ids, std::string& discord_shared_history_channel_ids,
+                           bool& discord_allow_dms) {
         std::string filepath = GetSettingsFilePath();
         std::ifstream file(filepath);
         
@@ -209,7 +212,6 @@ public:
                     std::string key = line.substr(0, pos);
                     std::string value = line.substr(pos + 1);
                     
-                    // Trim key and value
                     key.erase(0, key.find_first_not_of(" \t"));
                     key.erase(key.find_last_not_of(" \t") + 1);
                     value.erase(0, value.find_first_not_of(" \t"));
@@ -220,7 +222,7 @@ public:
                         if (key == "ModelPath") {
                             model_path = UnescapeString(value);
                             loaded_count++;
-                            log_message("Loaded ModelPath: " + model_path);
+                            log_message("Loaded ModelPath: " + std::string(model_path.empty() ? "(empty)" : "configured"));
                         } else if (key == "ContextSize") {
                             context_size = ValidateInt32(value, 2048, 1, 131072);
                             loaded_count++;
@@ -238,7 +240,7 @@ public:
                         if (key == "Template") {
                             chat_template = UnescapeString(value);
                             loaded_count++;
-                            log_message("Loaded Template: " + std::string(chat_template.empty() ? "(empty)" : "configured"));
+                            log_message("Loaded ChatTemplate: " + std::string(chat_template.empty() ? "(empty)" : "configured"));
                         }
                     } else if (current_section == "SystemPrompt") {
                         if (key == "IdentityDirective") {
@@ -263,6 +265,10 @@ public:
                             discord_isolated_channel_ids = UnescapeString(value);
                             loaded_count++;
                             log_message("Loaded IsolatedChannelIds: " + discord_isolated_channel_ids);
+                        } else if (key == "SharedHistoryChannelIds") {
+                            discord_shared_history_channel_ids = UnescapeString(value);
+                            loaded_count++;
+                            log_message("Loaded SharedHistoryChannelIds: " + discord_shared_history_channel_ids);
                         } else if (key == "AllowDMs") {
                             discord_allow_dms = (value == "1" || value == "true" || value == "True" || value == "TRUE");
                             loaded_count++;

@@ -1193,6 +1193,40 @@ public:
         log_message("Cleanup completed");
     }
 
+    // MOVED: Helper method to add messages to history without immediate context update
+    void add_message_to_history(const std::string& role, const std::string& content) {
+        if (!current_context) return;
+
+        current_context->message_history.emplace_back(role, content);
+        current_context->message_cache_dirty = true;
+    }
+
+    // MOVED: Get context size for capacity calculations
+    int32_t get_context_size() const {
+        return n_ctx;
+    }
+
+    // MOVED: Get current context token usage
+    int32_t get_context_usage() const {
+        if (!current_context) return 0;
+        return current_context->n_past;
+    }
+
+    // MOVED: Batch update context after adding multiple history messages
+    bool update_context_from_history() {
+        if (!current_context) return false;
+
+        // Clear current context state
+        if (current_context->context) {
+            llama_kv_self_clear(current_context->context);
+        }
+        current_context->n_past = 0;
+        current_context->prev_len = 0;
+
+        // Rebuild context from message history
+        return update_context_with_pruning();
+    }
+
 private:
     // REFACTOR: Update helper methods to use current context
     int32_t calculate_optimal_batch_size() const {

@@ -256,6 +256,7 @@ private:
     wxTextCtrl* discord_bot_token_text;
     wxTextCtrl* discord_channel_ids_text;
     wxTextCtrl* discord_isolated_channel_ids_text;
+    wxTextCtrl* discord_shared_history_channel_ids_text; // ADDED: New textbox for shared history channels
     wxCheckBox* discord_allow_dms_checkbox;
     
     // References to settings
@@ -269,6 +270,7 @@ private:
     std::string& discord_bot_token_ref;
     std::string& discord_channel_ids_ref;
     std::string& discord_isolated_channel_ids_ref;
+    std::string& discord_shared_history_channel_ids_ref; // ADDED: Reference for shared history channels
     bool& discord_allow_dms_ref;
 
     // Validation helper
@@ -290,13 +292,15 @@ public:
     SettingsDialog(wxWindow* parent, std::string& model_path, int32_t& context_size, int32_t& gpu_layers, 
                   int32_t& predict_tokens, std::string& chat_template, std::string& identity_directive, 
                   std::string& other_directives, std::string& discord_bot_token, std::string& discord_channel_ids,
-                  std::string& discord_isolated_channel_ids, bool& discord_allow_dms) 
+                  std::string& discord_isolated_channel_ids, std::string& discord_shared_history_channel_ids, // ADDED: New parameter
+                  bool& discord_allow_dms) 
         : wxDialog(parent, wxID_ANY, "Settings", wxDefaultPosition, wxSize(700, 600)),
           model_path_ref(model_path), context_size_ref(context_size), gpu_layers_ref(gpu_layers), 
           predict_tokens_ref(predict_tokens), chat_template_ref(chat_template),
           identity_directive_ref(identity_directive), other_directives_ref(other_directives),
           discord_bot_token_ref(discord_bot_token), discord_channel_ids_ref(discord_channel_ids),
-          discord_isolated_channel_ids_ref(discord_isolated_channel_ids), discord_allow_dms_ref(discord_allow_dms) {
+          discord_isolated_channel_ids_ref(discord_isolated_channel_ids), discord_shared_history_channel_ids_ref(discord_shared_history_channel_ids), // ADDED: New reference
+          discord_allow_dms_ref(discord_allow_dms) {
         
         wxNotebook* notebook = new wxNotebook(this, wxID_ANY);
         
@@ -421,6 +425,16 @@ public:
         discord_isolated_channel_ids_text->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
         discord_sizer->Add(discord_isolated_channel_ids_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
         
+        // Shared History Channel IDs
+        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Shared History Channel IDs (comma separated):"), 0, wxALL, 5);
+        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Channels to pull message history from (leave empty for none)"), 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
+        
+        discord_shared_history_channel_ids_text = new wxTextCtrl(discord_panel, wxID_ANY, wxString::FromUTF8(discord_shared_history_channel_ids), 
+                                                                 wxDefaultPosition, wxSize(-1, 60), 
+                                                                 wxTE_MULTILINE | wxTE_WORDWRAP);
+        discord_shared_history_channel_ids_text->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+        discord_sizer->Add(discord_shared_history_channel_ids_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
+        
         // Help text for Discord settings
         wxStaticText* discord_help = new wxStaticText(discord_panel, wxID_ANY, 
             "Instructions:\n"
@@ -479,6 +493,7 @@ private:
         discord_bot_token_ref = discord_bot_token_text->GetValue().ToUTF8().data();
         discord_channel_ids_ref = discord_channel_ids_text->GetValue().ToUTF8().data();
         discord_isolated_channel_ids_ref = discord_isolated_channel_ids_text->GetValue().ToUTF8().data();
+        discord_shared_history_channel_ids_ref = discord_shared_history_channel_ids_text->GetValue().ToUTF8().data(); // ADDED: Get shared history channels
         discord_allow_dms_ref = discord_allow_dms_checkbox->GetValue();
         
         // Validate Discord channel IDs format if provided
@@ -501,12 +516,22 @@ private:
             }
         }
         
+        // Validate shared history channel IDs format if provided
+        if (!discord_shared_history_channel_ids_ref.empty()) {
+            std::string cleaned_ids = ValidateChannelIds(discord_shared_history_channel_ids_ref);
+            if (cleaned_ids != discord_shared_history_channel_ids_ref) {
+                discord_shared_history_channel_ids_ref = cleaned_ids;
+                wxMessageBox("Shared History Channel IDs have been cleaned up. Invalid entries were removed.", 
+                           "Channel IDs Modified", wxOK | wxICON_INFORMATION);
+            }
+        }
+        
         // Save settings
         SettingsManager::SaveSettings(model_path_ref, context_size_ref, gpu_layers_ref, 
                                     predict_tokens_ref, chat_template_ref, 
                                     identity_directive_ref, other_directives_ref,
                                     discord_bot_token_ref, discord_channel_ids_ref,
-                                    discord_isolated_channel_ids_ref, discord_allow_dms_ref);
+                                    discord_isolated_channel_ids_ref, discord_shared_history_channel_ids_ref, discord_allow_dms_ref);
         
         EndModal(wxID_OK);
     }
@@ -563,6 +588,7 @@ private:
     std::string discord_bot_token;
     std::string discord_channel_ids;
     std::string discord_isolated_channel_ids;
+    std::string discord_shared_history_channel_ids; // ADDED: New setting for shared channels with history backfill
     bool discord_allow_dms = true; // ADDED: New setting for DM handling
 
     // State
@@ -601,7 +627,8 @@ public:
         
         SettingsManager::LoadSettings(model_path, context_size, gpu_layers, predict_tokens, 
                                     chat_template, identity_directive, other_directives,
-                                    discord_bot_token, discord_channel_ids, discord_isolated_channel_ids, discord_allow_dms);
+                                    discord_bot_token, discord_channel_ids, discord_isolated_channel_ids, 
+                                    discord_shared_history_channel_ids, discord_allow_dms);
         
         CreateUI();
         
@@ -694,7 +721,8 @@ private:
             
             SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, 
                                         chat_template, identity_directive, other_directives,
-                                        discord_bot_token, discord_channel_ids, discord_isolated_channel_ids, discord_allow_dms);
+                                        discord_bot_token, discord_channel_ids, discord_isolated_channel_ids, 
+                                        discord_shared_history_channel_ids, discord_allow_dms); // ADDED: Save new setting
         }
     }
 
@@ -1002,7 +1030,8 @@ private:
                     chat_template = model_template;
                     SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, 
                                                 chat_template, identity_directive, other_directives,
-                                                discord_bot_token, discord_channel_ids, discord_isolated_channel_ids, discord_allow_dms);
+                                                discord_bot_token, discord_channel_ids, discord_isolated_channel_ids, 
+                                                discord_shared_history_channel_ids, discord_allow_dms);
                     std::cout << "Loaded chat template from model" << std::endl;
                 }
             } else {
@@ -1074,73 +1103,86 @@ private:
     
     void OnConnectDiscord(wxCommandEvent& event) {
         if (!discord_manager) {
-            wxMessageBox("Discord manager not initialized.", "Error", wxOK | wxICON_ERROR);
+            AddSystemMessage("Error: Discord manager not available");
             return;
         }
         
         if (discord_manager->is_bot_running()) {
-            // Disconnect Discord bot
+            // Stop Discord bot
             discord_manager->shutdown();
-            std::cout << "Discord bot disconnected." << std::endl;
+            discord_btn->SetLabel("Connect Discord");
+            AddSystemMessage("Discord bot disconnected");
         } else {
-            // Connect Discord bot
+            // Configure and start Discord bot
             if (discord_bot_token.empty()) {
-                wxMessageBox("Please configure your Discord bot token in Settings first.", 
-                           "Discord Token Required", wxOK | wxICON_WARNING);
+                AddSystemMessage("Discord bot token not configured. Please check Settings.");
                 return;
             }
             
-            // Configure Discord bot
+            // Configure bot
             DiscordBotConfig config;
             config.bot_token = discord_bot_token;
-            config.auto_reconnect = true;
-            config.enable_message_cache = true;
-            config.message_cache_size = 100;
-            config.rate_limit_buffer_ms = 100;
             
             if (!discord_manager->configure(config)) {
-                wxMessageBox("Failed to configure Discord bot. Check the logs for details.", 
-                           "Discord Configuration Error", wxOK | wxICON_ERROR);
+                AddSystemMessage("Failed to configure Discord bot");
                 return;
             }
             
-            // Set channel configuration
+            // Set up integration with LlamaManager
+            discord_manager->set_llama_manager(llama_manager.get());
+            discord_manager->set_main_context_id(DEFAULT_CONTEXT_ID);
             discord_manager->set_allowed_channels(discord_channel_ids);
             discord_manager->set_isolated_channels(discord_isolated_channel_ids);
-            discord_manager->set_allow_dms(discord_allow_dms); // ADDED: Set DM allowance
+            discord_manager->set_shared_history_channels(discord_shared_history_channel_ids); // ADDED: Set shared history channels
+            discord_manager->set_allow_dms(discord_allow_dms);
             
-            // SIMPLIFIED: Set LlamaManager integration if model is loaded
-            if (is_started && llama_manager && context_created) {
-                discord_manager->set_llama_manager(llama_manager.get());
-                discord_manager->set_main_context_id(DEFAULT_CONTEXT_ID);
-            }
-            
-            // Start Discord bot
+            // Start bot
             if (discord_manager->start()) {
-                std::cout << "Discord bot connection initiated..." << std::endl;
-                if (!discord_channel_ids.empty()) {
-                    std::cout << "Bot configured for channels: " << discord_channel_ids << std::endl;
-                } else {
-                    std::cout << "Bot will respond in all accessible channels" << std::endl;
-                }
-                if (!discord_isolated_channel_ids.empty()) {
-                    std::cout << "Isolated context channels: " << discord_isolated_channel_ids << std::endl;
-                }
-                std::cout << "Direct Messages: " << (discord_allow_dms ? "Enabled" : "Disabled") << std::endl;
-                std::cout << "All contexts use the same system prompt and chat template" << std::endl;
+                discord_btn->SetLabel("Disconnect Discord");
+                AddSystemMessage("Discord bot connecting...");
+                
+                // Start a timer to periodically report backfill status
+                std::thread([this]() {
+                    bool backfill_started = false;
+                    for (int i = 0; i < 60; ++i) { // Check for up to 60 seconds
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                        if (discord_manager) {
+                            auto status = discord_manager->get_backfill_status();
+                            
+                            if (status.in_progress) {
+                                if (!backfill_started) {
+                                    std::cout << "Chat history backfill started for accessible channels..." << std::endl;
+                                    backfill_started = true;
+                                }
+                                
+                                if (i % 5 == 0 && status.channels_processed > 0) { // Report every 5 seconds
+                                    std::cout << "Backfill progress: " << status.channels_complete 
+                                             << "/" << status.channels_processed << " channels processed, " 
+                                             << status.total_messages_fetched << " messages fetched" << std::endl;
+                                }
+                            } else if (backfill_started || status.total_messages_fetched > 0) {
+                                std::cout << "Chat history backfill completed: " 
+                                         << status.total_messages_fetched << " messages processed from " 
+                                         << status.channels_processed << " accessible channels" << std::endl;
+                                break;
+                            } else if (i > 10) { // Give some time for backfill to start
+                                std::cout << "No accessible channels found for history backfill or backfill disabled" << std::endl;
+                                break;
+                            }
+                        }
+                    }
+                }).detach();
             } else {
-                wxMessageBox("Failed to start Discord bot. Check the logs for details.", 
-                           "Discord Connection Error", wxOK | wxICON_ERROR);
+                AddSystemMessage("Failed to start Discord bot");
             }
         }
-        
-        UpdateButtonStates();
     }
 
     void OnSettings(wxCommandEvent& event) {
         SettingsDialog dialog(this, model_path, context_size, gpu_layers, predict_tokens, 
                             chat_template, identity_directive, other_directives,
-                            discord_bot_token, discord_channel_ids, discord_isolated_channel_ids, discord_allow_dms);
+                            discord_bot_token, discord_channel_ids, discord_isolated_channel_ids, 
+                            discord_shared_history_channel_ids, discord_allow_dms); // ADDED: Pass new setting
         if (dialog.ShowModal() == wxID_OK) {
             UpdateWindowTitle();
             
