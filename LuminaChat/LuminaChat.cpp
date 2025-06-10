@@ -46,6 +46,7 @@
 #include "LlamaManager.hpp"
 #include "DiscordManager.hpp" 
 #include "SettingsManager.hpp"
+#include "LogHandler.hpp"
 
 // Forward declarations
 class LuminaChatFrame;
@@ -583,6 +584,11 @@ public:
         llama_manager = std::make_unique<LlamaManager>();
         discord_manager = std::make_unique<DiscordManager>();
         
+        // Set up unified logging
+        LogHandler::set_output_callback([this](const std::string& msg) {
+            AppendToLogsThreadSafe(wxString::FromUTF8(msg));
+        });
+        
         LoadConfiguration();
         CreateUI();
         SetupConsoleRedirection();
@@ -870,7 +876,7 @@ private:
         ui.progress_bar->Show();
         ui.main_panel->Layout();
         
-        std::cout << "Loading model: " << config.model_path << std::endl;
+        LLAMA_LOG("Loading model: " + config.model_path);
         
         worker_thread = new ModelWorkerThread(this, llama_manager.get(), ModelWorkerThread::Operation::LOAD_MODEL);
         worker_thread->SetModelParams(config.model_path, config.context_size, config.gpu_layers, 
@@ -921,21 +927,21 @@ private:
                                                 config.discord_token, config.discord_isolated_channels, 
                                                 config.discord_shared_channels, config.discord_allow_dms,
                                                 config.discord_pull_history, config.discord_history_percentage);
-                    std::cout << "Loaded chat template from model" << std::endl;
+                    LLAMA_LOG("Loaded chat template from model");
                 }
             } else {
                 llama_manager->set_custom_chat_template(config.chat_template);
-                std::cout << "Using custom chat template" << std::endl;
+                LLAMA_LOG("Using custom chat template");
             }
             
             // Create main chat context with system prompt from settings
             std::string combined_prompt = GetCombinedSystemPrompt();
             if (!llama_manager->create_context("main_chat", combined_prompt)) {
-                std::cerr << "Error: Failed to create main chat context" << std::endl;
+                LLAMA_LOG_ERROR("Failed to create main chat context");
                 success = false;
             } else {
                 context_created = true;
-                std::cout << "Main chat context created with system prompt" << std::endl;
+                LLAMA_LOG("Main chat context created with system prompt");
             }
         }
         
@@ -946,7 +952,7 @@ private:
             if (discord_manager && discord_manager->is_bot_running()) {
                 discord_manager->set_llama_manager(llama_manager.get());
                 discord_manager->set_main_context_id("main_chat");
-                std::cout << "Discord bot connected to loaded model" << std::endl;
+                DISCORD_LOG("Discord bot connected to loaded model");
             }
             
             ui.chat_history->Clear();
@@ -956,7 +962,7 @@ private:
             llama_manager->reset_timings();
             ui.timings_label->SetLabel("");
         } else {
-            std::cerr << "Error: Failed to load model or create context" << std::endl;
+            LLAMA_LOG_ERROR("Failed to load model or create context");
         }
         
         UpdateButtonStates();
@@ -978,7 +984,7 @@ private:
         // Disconnect Discord manager from LlamaManager when model is stopped
         if (discord_manager && discord_manager->is_bot_running()) {
             discord_manager->set_llama_manager(nullptr);
-            std::cout << "Discord bot disconnected from model" << std::endl;
+            DISCORD_LOG("Discord bot disconnected from model");
         }
         
         llama_manager->cleanup();
@@ -986,7 +992,7 @@ private:
         is_started = false;
         is_processing = false;
         UpdateButtonStates();
-        std::cout << "LuminaChat stopped." << std::endl << std::endl;
+        LLAMA_LOG("LuminaChat stopped.");
         ui.timings_label->SetLabel("");
     }
     
@@ -1017,11 +1023,6 @@ private:
                 return;
             }
             
-            // Set up logging integration
-            discord_manager->set_log_callback([this](const std::string& msg) {
-                AppendToLogsThreadSafe(wxString::FromUTF8("[Discord] " + msg + "\n"));
-            });
-            
             // Set up integration with LlamaManager
             discord_manager->set_llama_manager(llama_manager.get());
             discord_manager->set_main_context_id("main_chat");
@@ -1046,25 +1047,25 @@ private:
                             
                             if (status.in_progress) {
                                 if (!backfill_started) {
-                                    std::cout << "Chat history backfill started with " << status.total_workers 
-                                             << " workers for accessible channels..." << std::endl;
+                                    DISCORD_HISTORY_LOG("Chat history backfill started with " + std::to_string(status.total_workers) + 
+                                                       " workers for accessible channels...");
                                     backfill_started = true;
                                 }
                                 
                                 if (i % 3 == 0 && status.active_workers >= 0) { // Report every 15 seconds
-                                    std::cout << "Backfill progress: " << status.active_workers 
-                                             << " workers active, processing " << status.context_usage.size() 
-                                             << " contexts" << std::endl;
+                                    DISCORD_HISTORY_LOG("Backfill progress: " + std::to_string(status.active_workers) + 
+                                                       " workers active, processing " + std::to_string(status.context_usage.size()) + 
+                                                       " contexts");
                                 }
                             } else if (backfill_started || !status.context_usage.empty()) {
-                                std::cout << "Chat history backfill completed for " 
-                                         << status.context_usage.size() << " contexts" << std::endl;
+                                DISCORD_HISTORY_LOG("Chat history backfill completed for " + 
+                                                   std::to_string(status.context_usage.size()) + " contexts");
                                 break;
                             } else if (i > 4) { // Give time for backfill to start
                                 if (config.discord_pull_history) {
-                                    std::cout << "No accessible channels found for history backfill" << std::endl;
+                                    DISCORD_HISTORY_LOG("No accessible channels found for history backfill");
                                 } else {
-                                    std::cout << "Message history backfill disabled in settings" << std::endl;
+                                    DISCORD_HISTORY_LOG("Message history backfill disabled in settings");
                                 }
                                 break;
                             }
@@ -1180,27 +1181,6 @@ void wxLogStreamBuffer::FlushBuffer() {
     }
     
     buffer.clear();
-}
-
-// Manager callback implementations
-void llama_manager_log_callback(const std::string& message) {
-    if (g_main_frame) {
-        g_main_frame->AppendToLogsThreadSafe(wxString::FromUTF8("[LlamaManager] " + message + "\n"));
-    }
-}
-
-void discord_manager_log_callback(const std::string& message) {
-    if (g_main_frame) {
-        g_main_frame->AppendToLogsThreadSafe(wxString::FromUTF8("[Discord] " + message + "\n"));
-    }
-}
-
-void settings_manager_log_callback(const std::string& message) {
-    if (g_main_frame) {
-        g_main_frame->AppendToLogsThreadSafe(wxString::FromUTF8("[Settings] " + message + "\n"));
-    } else {
-        std::cout << "[Settings] " << message << std::endl;
-    }
 }
 
 // Callback implementations

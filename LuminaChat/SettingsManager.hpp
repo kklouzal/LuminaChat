@@ -29,9 +29,7 @@
 #include <algorithm>
 #include <wx/stdpaths.h>
 #include <wx/filename.h>
-
-// Forward declare log callback function
-void settings_manager_log_callback(const std::string& message);
+#include "LogHandler.hpp"
 
 class SettingsManager {
 private:
@@ -96,7 +94,7 @@ private:
 
     // Helper function for thread-safe logging
     static void log_message(const std::string& message) {
-        settings_manager_log_callback(message);
+        SETTINGS_LOG(message);
     }
 
 public:
@@ -290,10 +288,3 @@ public:
         }
     }
 };
-
-// Log callback function declaration
-extern void settings_manager_log_callback(const std::string& message);
-
-//
-//  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!
-//

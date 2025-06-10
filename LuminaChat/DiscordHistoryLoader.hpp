@@ -31,6 +31,7 @@
 #include <future>
 
 #include <dpp/dpp.h>
+#include "LogHandler.hpp"
 
 // Forward declarations
 class LlamaManager;
@@ -79,9 +80,6 @@ private:
     dpp::cluster* bot;
     LlamaManager* llama_manager;
     std::string main_context_id;
-    
-    // Logging callback
-    std::function<void(const std::string&)> log_callback;
     
     // Channel configuration
     const std::unordered_set<uint64_t>* isolated_channels;
@@ -136,9 +134,7 @@ private:
     }
     
     void log_message(const std::string& message) const {
-        if (log_callback) {
-            log_callback(message);
-        }
+        DISCORD_HISTORY_LOG(message);
     }
     
     // Initialize context info for worker
@@ -190,7 +186,7 @@ private:
         
         return std::make_unique<DiscordHistoryWorker>(
             bot, llama_manager, context_id, std::vector<uint64_t>{channel_id}, 
-            false, log_callback, context_fill_percentage, &discord_api_mutex, worker_number
+            false, context_fill_percentage, &discord_api_mutex, worker_number
         );
     }
     
@@ -230,7 +226,7 @@ private:
         
         return std::make_unique<DiscordHistoryWorker>(
             bot, llama_manager, main_context_id, shared_channels, 
-            true, log_callback, context_fill_percentage, &discord_api_mutex, worker_number
+            true, context_fill_percentage, &discord_api_mutex, worker_number
         );
     }
     
@@ -413,10 +409,6 @@ public:
         shared_history_channels = shared_history;
     }
     
-    void set_log_callback(std::function<void(const std::string&)> callback) {
-        log_callback = callback;
-    }
-    
     // Set history settings
     void set_history_settings(bool enabled, int32_t fill_percentage) {
         history_enabled = enabled;
@@ -512,7 +504,6 @@ private:
     std::string context_id;
     std::vector<uint64_t> assigned_channels;
     bool is_shared_worker;
-    std::function<void(const std::string&)> log_callback;
     int32_t context_fill_percentage;
     
     // ADDED: Reference to Discord API mutex from parent loader
@@ -542,9 +533,7 @@ private:
     static constexpr float BASE_MAX_CONTEXT_FILL_RATIO = 0.01f;
     
     void log_message(const std::string& message) const {
-        if (log_callback) {
-            log_callback("[Worker#" + std::to_string(worker_number) + ":" + context_id + "] " + message);
-        }
+        DISCORD_HISTORY_LOG("[Worker#" + std::to_string(worker_number) + ":" + context_id + "] " + message);
     }
     
     // FIXED: Log worker progress for a specific channel with more detail
@@ -552,14 +541,12 @@ private:
         auto stats_it = channel_stats.find(channel_id);
         if (stats_it != channel_stats.end()) {
             const auto& stats = stats_it->second;
-            if (log_callback) {
-                log_callback("Worker #" + std::to_string(worker_number) + 
-                           " Progress for Context #" + context_id + 
-                           " Polling Channel #" + std::to_string(channel_id) + 
-                           ": Processed " + std::to_string(stats.messages_processed) + 
-                           " messages, Skipped " + std::to_string(stats.messages_skipped) + 
-                           " messages, Last Message ID: " + std::to_string(stats.last_message_id));
-            }
+            DISCORD_HISTORY_LOG("Worker #" + std::to_string(worker_number) + 
+                               " Progress for Context #" + context_id + 
+                               " Polling Channel #" + std::to_string(channel_id) + 
+                               ": Processed " + std::to_string(stats.messages_processed) + 
+                               " messages, Skipped " + std::to_string(stats.messages_skipped) + 
+                               " messages, Last Message ID: " + std::to_string(stats.last_message_id));
         }
     }
     
@@ -835,11 +822,10 @@ private:
 public:
     DiscordHistoryWorker(dpp::cluster* discord_bot, LlamaManager* llama_mgr, 
                         const std::string& ctx_id, const std::vector<uint64_t>& channels,
-                        bool shared_worker, std::function<void(const std::string&)> log_cb,
-                        int32_t fill_percentage, std::mutex* api_mutex = nullptr, int32_t worker_num = 1)
+                        bool shared_worker, int32_t fill_percentage, std::mutex* api_mutex = nullptr, int32_t worker_num = 1)
         : bot(discord_bot), llama_manager(llama_mgr), context_id(ctx_id), 
           assigned_channels(channels), is_shared_worker(shared_worker),
-          log_callback(log_cb), context_fill_percentage(fill_percentage),
+          context_fill_percentage(fill_percentage),
           discord_api_mutex(api_mutex), worker_number(worker_num) {
         
         // Initialize channel states and statistics
@@ -849,10 +835,8 @@ public:
         }
         
         // ADDED: Log worker initialization
-        if (log_callback) {
-            log_callback("Worker #" + std::to_string(worker_number) + " initialized for context '" + 
-                        context_id + "' with " + std::to_string(assigned_channels.size()) + " channels");
-        }
+        log_message("Worker #" + std::to_string(worker_number) + " initialized for context '" + 
+                   context_id + "' with " + std::to_string(assigned_channels.size()) + " channels");
     }
     
     std::string get_context_id() const { return context_id; }
@@ -864,11 +848,9 @@ public:
         result.success = false;
         
         // ADDED: Force initial log message
-        if (log_callback) {
-            log_callback("Worker #" + std::to_string(worker_number) + " STARTING execution for " + 
-                        std::to_string(assigned_channels.size()) + " channels (shared: " + 
-                        (is_shared_worker ? "yes" : "no") + ")");
-        }
+        DISCORD_HISTORY_LOG("Worker #" + std::to_string(worker_number) + " STARTING execution for " + 
+                           std::to_string(assigned_channels.size()) + " channels (shared: " + 
+                           (is_shared_worker ? "yes" : "no") + ")");
         
         try {
             std::vector<HistoryMessage> all_messages;

@@ -46,12 +46,7 @@
 
 // ADDED: Include history loader
 #include "DiscordHistoryLoader.hpp"
-
-// Forward declare the LlamaManager for integration
-class LlamaManager;
-
-// Forward declare log callback function
-void discord_manager_log_callback(const std::string& message);
+#include "LogHandler.hpp"
 
 // Discord bot configuration structure
 struct DiscordBotConfig {
@@ -369,11 +364,7 @@ private:
     
     // Helper function for thread-safe logging
     void log_message(const std::string& message) const {
-        if (log_callback) {
-            log_callback(message);
-        } else {
-            discord_manager_log_callback(message);
-        }
+        DISCORD_LOG(message);
     }
     
     // UPDATED: Parse isolated channel IDs
@@ -686,18 +677,10 @@ public:
         if (manager) {
             log_message("LlamaManager integration enabled");
             
-            // Set log callback for LlamaManager
-            if (log_callback) {
-                manager->set_log_callback([this](const std::string& msg) { 
-                    log_message("[LlamaManager] " + msg); 
-                });
-            }
-            
             // UPDATED: Configure history loader with Discord API mutex
             if (history_loader && bot) {
                 history_loader->configure(bot.get(), manager, main_context_id);
                 history_loader->set_channel_configuration(nullptr, &isolated_channels, &shared_history_channels);
-                history_loader->set_log_callback([this](const std::string& msg) { log_message(msg); });
                 history_loader->set_history_settings(pull_message_history, history_fill_percentage);
                 
                 // ADDED: Share Discord API mutex with history loader
@@ -760,7 +743,7 @@ public:
             if (history_loader && llama_manager) {
                 history_loader->configure(bot.get(), llama_manager, main_context_id);
                 history_loader->set_channel_configuration(nullptr, &isolated_channels, &shared_history_channels);
-                history_loader->set_log_callback([this](const std::string& msg) { log_message(msg); });
+                history_loader->set_history_settings(pull_message_history, history_fill_percentage);
             }
             
             log_message("Discord bot initialized with D++");
@@ -978,24 +961,7 @@ public:
             return "Connected";
         }
     }
-    
-    // ADDED: Log callback function pointer
-    std::function<void(const std::string&)> log_callback;
-
-public:
-    // ADDED: Set log callback method
-    void set_log_callback(std::function<void(const std::string&)> callback) {
-        log_callback = callback;
-        
-        // Also set callback for history loader
-        if (history_loader) {
-            history_loader->set_log_callback(callback);
-        }
-    }
 };
-
-// Log callback function declaration
-extern void discord_manager_log_callback(const std::string& message);
 
 //
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!

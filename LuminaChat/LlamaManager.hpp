@@ -37,12 +37,10 @@
 #include <list>
 #include <string_view>
 #include "llama-cpp.h"
+#include "LogHandler.hpp"
 
 // Forward declare the progress callback function
 bool model_loading_progress_callback(float progress, void *user_data);
-
-// ADDED: Forward declare log callback for thread-safe logging
-void llama_manager_log_callback(const std::string& message);
 
 class LlamaManager {
 private:
@@ -119,9 +117,6 @@ private:
     mutable std::string last_template_key;
     mutable std::string last_template_result;
 
-    // ADDED: Log callback function pointer
-    std::function<void(const std::string&)> log_callback;
-
     // Unified batch management
     void manage_batch(bool clear_only = true) {
         if (!current_context || !current_context->batch_initialized) return;
@@ -131,13 +126,9 @@ private:
         }
     }
 
-    // ADDED: Helper function for thread-safe logging
+    // Helper function for thread-safe logging
     void log_message(const std::string& message) const {
-        if (log_callback) {
-            log_callback(message);
-        } else {
-            llama_manager_log_callback(message);
-        }
+        LLAMA_LOG(message);
     }
 
     // Unified batch token addition with direct position control - FIXED API usage
@@ -1247,11 +1238,6 @@ public:
         return true;
     }
 
-    // ADDED: Set log callback method
-    void set_log_callback(std::function<void(const std::string&)> callback) {
-        log_callback = callback;
-    }
-
     // ADDED: Get actual tokenized length of current message history
     int32_t get_message_history_token_count() const {
         if (!current_context || !model || !vocab) return 0;
@@ -1356,9 +1342,6 @@ private:
 
 // Progress callback function declaration (needs to be outside class for C compatibility)
 extern bool model_loading_progress_callback(float progress, void *user_data);
-
-// ADDED: Log callback function declaration
-extern void llama_manager_log_callback(const std::string& message);
 
 //
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!
