@@ -169,9 +169,18 @@ private:
         if (!llama_manager || context_id.empty()) return false;
         
         try {
-            return llama_manager->has_context(context_id) || 
-                   llama_manager->create_context(context_id, "");
-        } catch (const std::exception&) {
+            bool has_context = llama_manager->has_context(context_id);
+            if (has_context) {
+                return true;
+            }
+            
+            // Try to create context if it doesn't exist
+            return llama_manager->create_context(context_id, "");
+        } catch (const std::exception& e) {
+            log_message("Error: Exception in ensure_context_available: " + std::string(e.what()));
+            return false;
+        } catch (...) {
+            log_message("Error: Unknown exception in ensure_context_available");
             return false;
         }
     }
@@ -182,7 +191,11 @@ private:
         try {
             return llama_manager->has_context(context_id) && 
                    llama_manager->switch_to_context(context_id);
-        } catch (const std::exception&) {
+        } catch (const std::exception& e) {
+            log_message("Error: Exception in switch_context_safely: " + std::string(e.what()));
+            return false;
+        } catch (...) {
+            log_message("Error: Unknown exception in switch_context_safely");
             return false;
         }
     }
@@ -308,6 +321,25 @@ private:
             return false;
         }
         
+        // FIXED: Validate llama_manager is still valid
+        try {
+            if (!llama_manager->get_active_context().empty()) {
+                // Manager is accessible
+            } else {
+                log_message("Error: LlamaManager context is empty");
+                actual_tokens_added = 0;
+                return false;
+            }
+        } catch (const std::exception& e) {
+            log_message("Error: LlamaManager access failed: " + std::string(e.what()));
+            actual_tokens_added = 0;
+            return false;
+        } catch (...) {
+            log_message("Error: Unknown exception accessing LlamaManager");
+            actual_tokens_added = 0;
+            return false;
+        }
+        
         // Determine target context
         std::string context_id;
         bool is_isolated_chan = is_isolated_channel(channel_id);
@@ -335,8 +367,16 @@ private:
             return false;
         }
         
-        // Switch context and add messages
-        std::string original_context = llama_manager->get_active_context();
+        // Switch context and add messages with enhanced error handling
+        std::string original_context;
+        try {
+            original_context = llama_manager->get_active_context();
+        } catch (const std::exception& e) {
+            log_message("Error: Failed to get active context: " + std::string(e.what()));
+            actual_tokens_added = 0;
+            return false;
+        }
+        
         if (!switch_context_safely(context_id)) {
             actual_tokens_added = 0;
             return false;
@@ -346,22 +386,41 @@ private:
         int32_t tokens_before = 0;
         try {
             tokens_before = llama_manager->get_message_history_token_count();
-        } catch (const std::exception&) {
+        } catch (const std::exception& e) {
+            log_message("Warning: Failed to get token count before processing: " + std::string(e.what()));
             tokens_before = 0;
         }
         
-        // Add all messages
-        for (const auto& msg : messages) {
-            llama_manager->add_message_to_history(msg.username, msg.content);
+        // Add all messages with error handling
+        bool add_success = true;
+        try {
+            for (const auto& msg : messages) {
+                if (msg.username.empty() || msg.content.empty()) {
+                    continue; // Skip invalid messages
+                }
+                llama_manager->add_message_to_history(msg.username, msg.content);
+            }
+        } catch (const std::exception& e) {
+            log_message("Error: Failed to add messages to history: " + std::string(e.what()));
+            add_success = false;
         }
         
-        bool success = llama_manager->update_context_from_history();
+        bool success = false;
+        if (add_success) {
+            try {
+                success = llama_manager->update_context_from_history();
+            } catch (const std::exception& e) {
+                log_message("Error: Failed to update context from history: " + std::string(e.what()));
+                success = false;
+            }
+        }
         
         if (success) {
             try {
                 int32_t tokens_after = llama_manager->get_message_history_token_count();
                 actual_tokens_added = std::max(0, tokens_after - tokens_before);
-            } catch (const std::exception&) {
+            } catch (const std::exception& e) {
+                log_message("Warning: Failed to get token count after processing: " + std::string(e.what()));
                 actual_tokens_added = 0;
             }
             
@@ -370,9 +429,13 @@ private:
             actual_tokens_added = 0;
         }
         
-        // Restore original context
+        // Restore original context with error handling
         if (!original_context.empty() && original_context != context_id) {
-            switch_context_safely(original_context);
+            try {
+                switch_context_safely(original_context);
+            } catch (const std::exception& e) {
+                log_message("Warning: Failed to restore original context: " + std::string(e.what()));
+            }
         }
         
         return success;

@@ -1,22 +1,13 @@
 // LuminaChat.cpp - Main application file for LuminaChat with wxWidgets GUI
 // Handles initialization, UI setup, and main application logic
 //
-// File Specific Directives:
-// Manages all wxWidgets GUI components and application lifecycle.
-//
 // Project Settings:
 // C++ Language Standard: ISO C++20 Standard (/std:c++20)
 // C Language Standard: ISO C17 (2018) Standard (/std:c17)
-// Character Set: Use Unicode Character Set
-// Whole Program Optimization: Use Link Time Code Generation
 // Optimization: Maximum Optimization (Favor Speed) (/O2)
-// Enable Intrinsic Functions: Yes (/Oi)
 // Favor Size or Speed: Favor fast code (/Ot)
-// Whole Program Optimization: Yes (/GL)
-// Enable String Pooling: Yes (/GF)
 // Runtime Library: Multi-threaded DLL (/MD)
 // Enable Run-Time Type Information (RTTI) YES (/GR)
-// Link Time Code Generation: Use Link Time Code Generation (/LTCG)
 //
 // CRITICAL CODING DIRECTIVES:
 // 1. Minimalism & Performance: Deliver lean, efficient solutions that avoid unnecessary bloat.
@@ -146,15 +137,7 @@ public:
     bool success = false;
 
     ModelWorkerThread(wxEvtHandler* parent, LlamaManager* manager, Operation op)
-        : wxThread(wxTHREAD_DETACHED)
-        , parent(parent)
-        , llama_manager(manager)
-        , operation(op)
-        , context_size(0)
-        , gpu_layers(0)
-        , predict_tokens(0)
-    {
-    }
+        : wxThread(wxTHREAD_DETACHED), parent(parent), llama_manager(manager), operation(op) {}
 
     void SetModelParams(const std::string& path, int32_t ctx, int32_t gpu, int32_t pred, const std::string& tmpl) {
         model_path = path;
@@ -1308,9 +1291,9 @@ void discord_manager_log_callback(const std::string& message) {
 // ADDED: Settings manager log callback implementation after LuminaChatFrame
 void settings_manager_log_callback(const std::string& message) {
     if (g_main_frame) {
-        g_main_frame->AppendToLogsThreadSafe(wxString::FromUTF8(message + "\n"));
+        g_main_frame->AppendToLogsThreadSafe(wxString::FromUTF8("[Settings] " + message + "\n"));
     } else {
-        std::cout << "[SettingsManager] " << message << std::endl;
+        std::cout << "[Settings] " << message << std::endl;
     }
 }
 
@@ -1368,3 +1351,7 @@ wxIMPLEMENT_APP(LuminaChatApp);
 int32_t main(int32_t argc, char* argv[]) {
     return wxEntry(argc, argv);
 }
+
+//
+//  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODE DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!
+//
