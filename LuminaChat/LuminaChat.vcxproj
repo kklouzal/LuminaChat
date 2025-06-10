@@ -141,6 +141,7 @@
     <ClCompile Include="LuminaChat.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="DiscordHistoryLoader.hpp" />
     <ClInclude Include="DiscordManager.hpp" />
     <ClInclude Include="LlamaManager.hpp" />
     <ClInclude Include="SettingsManager.hpp" />
