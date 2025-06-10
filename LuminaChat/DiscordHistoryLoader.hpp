@@ -81,7 +81,6 @@ private:
     std::function<void(const std::string&)> log_callback;
     
     // Channel configuration
-    const std::unordered_set<uint64_t>* allowed_channels;
     const std::unordered_set<uint64_t>* isolated_channels;
     const std::unordered_set<uint64_t>* shared_history_channels;
     
@@ -106,10 +105,6 @@ private:
     
     // Check if channel should have history backfilled
     bool should_backfill_channel(uint64_t channel_id) const {
-        if (!allowed_channels || allowed_channels->find(channel_id) == allowed_channels->end()) {
-            return false;
-        }
-        
         // Always backfill isolated channels
         if (isolated_channels && isolated_channels->find(channel_id) != isolated_channels->end()) {
             return true;
@@ -556,7 +551,7 @@ public:
     void set_channel_configuration(const std::unordered_set<uint64_t>* allowed,
                                   const std::unordered_set<uint64_t>* isolated,
                                   const std::unordered_set<uint64_t>* shared_history) {
-        allowed_channels = allowed;
+        // Ignore allowed parameter (all channels are now allowed)
         isolated_channels = isolated;
         shared_history_channels = shared_history;
     }

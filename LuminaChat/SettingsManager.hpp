@@ -117,7 +117,7 @@ public:
     static void SaveSettings(const std::string& model_path, int32_t context_size, int32_t gpu_layers, 
                            int32_t predict_tokens, const std::string& chat_template, 
                            const std::string& identity_directive, const std::string& other_directives,
-                           const std::string& discord_bot_token, const std::string& discord_channel_ids,
+                           const std::string& discord_bot_token,
                            const std::string& discord_isolated_channel_ids, const std::string& discord_shared_history_channel_ids,
                            bool discord_allow_dms) {
         std::string filepath = GetSettingsFilePath();
@@ -146,7 +146,6 @@ public:
             // [Discord] section
             file << "[Discord]" << std::endl;
             file << "BotToken=" << EscapeString(discord_bot_token) << std::endl;
-            file << "ChannelIds=" << EscapeString(discord_channel_ids) << std::endl;
             file << "IsolatedChannelIds=" << EscapeString(discord_isolated_channel_ids) << std::endl;
             file << "SharedHistoryChannelIds=" << EscapeString(discord_shared_history_channel_ids) << std::endl;
             file << "AllowDMs=" << (discord_allow_dms ? "1" : "0") << std::endl;
@@ -162,7 +161,7 @@ public:
     static void LoadSettings(std::string& model_path, int32_t& context_size, int32_t& gpu_layers, 
                            int32_t& predict_tokens, std::string& chat_template, 
                            std::string& identity_directive, std::string& other_directives,
-                           std::string& discord_bot_token, std::string& discord_channel_ids,
+                           std::string& discord_bot_token,
                            std::string& discord_isolated_channel_ids, std::string& discord_shared_history_channel_ids,
                            bool& discord_allow_dms) {
         std::string filepath = GetSettingsFilePath();
@@ -249,10 +248,6 @@ public:
                             discord_bot_token = UnescapeString(value);
                             loaded_count++;
                             log_message("Loaded BotToken: " + std::string(discord_bot_token.empty() ? "(empty)" : "configured"));
-                        } else if (key == "ChannelIds") {
-                            discord_channel_ids = UnescapeString(value);
-                            loaded_count++;
-                            log_message("Loaded ChannelIds: " + discord_channel_ids);
                         } else if (key == "IsolatedChannelIds") {
                             discord_isolated_channel_ids = UnescapeString(value);
                             loaded_count++;
@@ -265,6 +260,10 @@ public:
                             discord_allow_dms = (value == "1" || value == "true" || value == "True" || value == "TRUE");
                             loaded_count++;
                             log_message("Loaded AllowDMs: " + std::string(discord_allow_dms ? "true" : "false"));
+                        }
+                        // Legacy support: ignore old ChannelIds setting if present
+                        else if (key == "ChannelIds") {
+                            log_message("Ignored legacy ChannelIds setting (no longer used)");
                         }
                     } else {
                         log_message("Unknown section/setting: [" + current_section + "] " + key + "=" + value);

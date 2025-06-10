@@ -93,11 +93,10 @@ private:
     // ADDED: History loader integration
     std::unique_ptr<DiscordHistoryLoader> history_loader;
     
-    // ADDED: Channel filtering
-    std::unordered_set<uint64_t> allowed_channels;
-    std::unordered_set<uint64_t> isolated_channels; // ADDED: Channels that get isolated contexts
-    std::unordered_set<uint64_t> shared_history_channels; // ADDED: Shared channels that pull message history
-    bool allow_dms = true; // ADDED: Setting to enable/disable DM handling
+    // UPDATED: Channel filtering - removed allowed_channels
+    std::unordered_set<uint64_t> isolated_channels;
+    std::unordered_set<uint64_t> shared_history_channels;
+    bool allow_dms = true;
     mutable std::mutex channel_mutex;
     
     // Message handling - made mutable for const methods
@@ -187,9 +186,8 @@ private:
                 return;
             }
             
-            // For DMs, always allow processing when enabled (don't check allowed channels)
-            // For guild messages, check if channel is allowed
-            if (!is_dm && !is_channel_allowed(event.msg.channel_id)) {
+            // FIXED: For guild channels, only respond if channel is in our configured lists
+            if (!is_dm && !is_channel_configured(event.msg.channel_id)) {
                 return;
             }
             
@@ -373,44 +371,13 @@ private:
         }
     }
     
-    // ADDED: Parse channel IDs from comma-separated string
-    void parse_channel_ids(const std::string& channel_ids_str) {
-        std::lock_guard<std::mutex> lock(channel_mutex);
-        allowed_channels.clear();
-        
-        if (channel_ids_str.empty()) {
-            return; // Empty means allow all channels
-        }
-        
-        std::stringstream ss(channel_ids_str);
-        std::string id_str;
-        
-        while (std::getline(ss, id_str, ',')) {
-            // Trim whitespace
-            id_str.erase(0, id_str.find_first_not_of(" \t\n\r"));
-            id_str.erase(id_str.find_last_not_of(" \t\n\r") + 1);
-            
-            if (!id_str.empty()) {
-                try {
-                    uint64_t channel_id = std::stoull(id_str);
-                    allowed_channels.insert(channel_id);
-                    log_message("Added allowed channel: " + std::to_string(channel_id));
-                } catch (const std::exception& e) {
-                    log_message("Warning: Invalid channel ID '" + id_str + "': " + e.what());
-                }
-            }
-        }
-        
-        log_message("Configured " + std::to_string(allowed_channels.size()) + " allowed channels");
-    }
-    
-    // ADDED: Parse channel IDs from comma-separated string (overloaded for isolated channels)
+    // UPDATED: Parse isolated channel IDs
     void parse_isolated_channel_ids(const std::string& channel_ids_str) {
         std::lock_guard<std::mutex> lock(channel_mutex);
         isolated_channels.clear();
         
         if (channel_ids_str.empty()) {
-            return; // Empty means no isolated channels
+            return;
         }
         
         std::stringstream ss(channel_ids_str);
@@ -479,10 +446,12 @@ private:
         return shared_history_channels.count(channel_id) > 0;
     }
 
-    // ADDED: Check if channel is allowed
-    bool is_channel_allowed(uint64_t channel_id) const {
+    // FIXED: Replace is_channel_allowed with proper channel filtering
+    bool is_channel_configured(uint64_t channel_id) const {
         std::lock_guard<std::mutex> lock(channel_mutex);
-        return allowed_channels.empty() || allowed_channels.count(channel_id) > 0;
+        // Channel is configured if it's in either isolated channels or shared history channels
+        return isolated_channels.count(channel_id) > 0 || 
+               shared_history_channels.count(channel_id) > 0;
     }
     
     // ADDED: Check if channel should use isolated context
@@ -669,11 +638,6 @@ public:
         return true;
     }
     
-    // ADDED: Method to set allowed channels
-    void set_allowed_channels(const std::string& channel_ids) {
-        parse_channel_ids(channel_ids);
-    }
-    
     // ADDED: Method to set isolated channels
     void set_isolated_channels(const std::string& channel_ids) {
         parse_isolated_channel_ids(channel_ids);
@@ -706,7 +670,7 @@ public:
             // Configure history loader
             if (history_loader && bot) {
                 history_loader->configure(bot.get(), manager, main_context_id);
-                history_loader->set_channel_configuration(&allowed_channels, &isolated_channels, &shared_history_channels);
+                history_loader->set_channel_configuration(nullptr, &isolated_channels, &shared_history_channels);
                 history_loader->set_log_callback([this](const std::string& msg) { log_message(msg); });
             }
         } else {
@@ -765,7 +729,7 @@ public:
             // Configure history loader with bot instance
             if (history_loader && llama_manager) {
                 history_loader->configure(bot.get(), llama_manager, main_context_id);
-                history_loader->set_channel_configuration(&allowed_channels, &isolated_channels, &shared_history_channels);
+                history_loader->set_channel_configuration(nullptr, &isolated_channels, &shared_history_channels);
                 history_loader->set_log_callback([this](const std::string& msg) { log_message(msg); });
             }
             
