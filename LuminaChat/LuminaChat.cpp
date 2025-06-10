@@ -418,15 +418,12 @@ public:
         // Help text for Discord settings
         wxStaticText* discord_help = new wxStaticText(discord_panel, wxID_ANY, 
             "Instructions:\n"
-            "1. Create a Discord application at https://discord.com/developers/applications\n"
-            "2. Create a bot and copy the token above\n"
-            "3. Right-click Discord channels and 'Copy ID' to get channel IDs\n"
-            "4. Separate multiple channel IDs with commas (e.g., 123456789,987654321)\n"
-            "5. Bot will ONLY respond in channels listed in either 'Isolated Context' or 'Shared Context' lists\n"
-            "6. Channels in 'Isolated Context' get their own separate context (shared by all users in that channel)\n"
-            "7. Channels in 'Shared Context' use the shared main context and get message history backfilled\n"
-            "8. Direct Messages (DMs) use individual isolated contexts when enabled (one per user for privacy)\n"
-            "9. When DMs are disabled, users will receive an auto-reply explaining the feature is turned off");
+            "1. Create a Discord Bot application at https://discord.com/developers/applications and paste your authentication token above\n"
+            "2. Right-click Discord channels and 'Copy ID' to get channel IDs\n"
+            "3. Separate multiple channel IDs with commas (e.g., 123456789,987654321)\n"
+            "4. Bot will ONLY respond in channels listed in either 'Isolated Context' or 'Shared Context' lists\n"
+            "5. Direct Messages (DMs) use individual isolated contexts when enabled (one per user for privacy)\n"
+            "6. When DMs are disabled, users will receive an auto-reply explaining the feature is turned off");
         discord_help->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_ITALIC, wxFONTWEIGHT_NORMAL));
         discord_sizer->Add(discord_help, 1, wxEXPAND | wxALL, 5);
         
