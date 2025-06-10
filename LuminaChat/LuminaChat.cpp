@@ -575,10 +575,6 @@ private:
     } ui;
     
     ModelWorkerThread* worker_thread{nullptr};
-    
-    // Cached constants
-    //static constexpr const char* TITLE_BASE = "LuminaChat";
-    static constexpr const char* DEFAULT_CONTEXT_ID = "main_chat";
 
 public:
     LuminaChatFrame() : wxFrame(nullptr, wxID_ANY, "LuminaChat", wxDefaultPosition, wxSize(800, 600)) {
@@ -1169,12 +1165,6 @@ private:
         }
     }
 };
-
-// Static member definitions
-//const wxString LuminaChatFrame::TITLE_BASE = "LuminaChat";
-//const wxString LuminaChatFrame::READY_STATUS = "Ready";
-//const wxString LuminaChatFrame::LOADING_STATUS = "Loading model...";
-//const wxString LuminaChatFrame::DEFAULT_CONTEXT_ID = "main_chat";
 
 // Implementation of wxLogStreamBuffer::FlushBuffer
 void wxLogStreamBuffer::FlushBuffer() {
