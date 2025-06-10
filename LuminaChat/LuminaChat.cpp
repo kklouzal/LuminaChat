@@ -1126,6 +1126,11 @@ private:
                 return;
             }
             
+            // Set up logging integration
+            discord_manager->set_log_callback([this](const std::string& msg) {
+                AppendToLogsThreadSafe(wxString::FromUTF8("[Discord] " + msg + "\n"));
+            });
+            
             // Set up integration with LlamaManager
             discord_manager->set_llama_manager(llama_manager.get());
             discord_manager->set_main_context_id(DEFAULT_CONTEXT_ID);
@@ -1139,30 +1144,32 @@ private:
                 discord_btn->SetLabel("Disconnect Discord");
                 AddSystemMessage("Discord bot connecting...");
                 
-                // Start a timer to periodically report backfill status
+                // Simple backfill monitoring
                 std::thread([this]() {
                     bool backfill_started = false;
-                    for (int i = 0; i < 60; ++i) { // Check for up to 60 seconds
-                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                    
+                    for (int i = 0; i < 120; ++i) { // Check for up to 120 seconds (2 minutes)
+                        std::this_thread::sleep_for(std::chrono::seconds(5));
                         if (discord_manager) {
                             auto status = discord_manager->get_backfill_status();
                             
                             if (status.in_progress) {
                                 if (!backfill_started) {
-                                    std::cout << "Chat history backfill started for accessible channels..." << std::endl;
+                                    std::cout << "Chat history backfill started with " << status.total_workers 
+                                             << " workers for accessible channels..." << std::endl;
                                     backfill_started = true;
                                 }
                                 
-                                if (i % 5 == 0 && status.channels_processed > 0) // Report every 5 seconds
-                                    std::cout << "Backfill progress: " << status.channels_complete 
-                                             << "/" << status.channels_processed << " channels processed, " 
-                                             << status.total_messages_fetched << " messages fetched" << std::endl;
-                            } else if (backfill_started || status.total_messages_fetched > 0) {
-                                std::cout << "Chat history backfill completed: " 
-                                         << status.total_messages_fetched << " messages processed from " 
-                                         << status.channels_processed << " accessible channels" << std::endl;
+                                if (i % 3 == 0 && status.active_workers >= 0) { // Report every 15 seconds
+                                    std::cout << "Backfill progress: " << status.active_workers 
+                                             << " workers active, processing " << status.context_usage.size() 
+                                             << " contexts" << std::endl;
+                                }
+                            } else if (backfill_started || !status.context_usage.empty()) {
+                                std::cout << "Chat history backfill completed for " 
+                                         << status.context_usage.size() << " contexts" << std::endl;
                                 break;
-                            } else if (i > 10) { // Give some time to backfill to start
+                            } else if (i > 4) { // Give time for backfill to start
                                 if (discord_pull_history) {
                                     std::cout << "No accessible channels found for history backfill" << std::endl;
                                 } else {

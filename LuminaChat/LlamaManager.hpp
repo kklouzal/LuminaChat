@@ -1247,6 +1247,11 @@ public:
         return true;
     }
 
+    // ADDED: Set log callback method
+    void set_log_callback(std::function<void(const std::string&)> callback) {
+        log_callback = callback;
+    }
+
     // ADDED: Get actual tokenized length of current message history
     int32_t get_message_history_token_count() const {
         if (!current_context || !model || !vocab) return 0;

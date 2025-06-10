@@ -80,6 +80,9 @@ private:
     // UPDATED: Core Discord bot components with actual D++ implementation
     std::unique_ptr<dpp::cluster> bot;
     
+    // ADDED: Mutex to protect all D++ API calls (shared with history loader)
+    mutable std::mutex discord_api_mutex;
+    
     // Configuration and state
     DiscordBotConfig config;
     std::atomic<bool> is_running{false};
@@ -683,11 +686,22 @@ public:
         if (manager) {
             log_message("LlamaManager integration enabled");
             
-            // Configure history loader
+            // Set log callback for LlamaManager
+            if (log_callback) {
+                manager->set_log_callback([this](const std::string& msg) { 
+                    log_message("[LlamaManager] " + msg); 
+                });
+            }
+            
+            // UPDATED: Configure history loader with Discord API mutex
             if (history_loader && bot) {
                 history_loader->configure(bot.get(), manager, main_context_id);
                 history_loader->set_channel_configuration(nullptr, &isolated_channels, &shared_history_channels);
                 history_loader->set_log_callback([this](const std::string& msg) { log_message(msg); });
+                history_loader->set_history_settings(pull_message_history, history_fill_percentage);
+                
+                // ADDED: Share Discord API mutex with history loader
+                // Note: We'll need to modify DiscordHistoryLoader to accept the mutex reference
             }
         } else {
             log_message("LlamaManager integration disabled");
@@ -768,8 +782,11 @@ public:
         }
         
         try {
-            // Start the bot
-            bot->start(dpp::st_return);
+            // PROTECTED: Start the bot with mutex protection
+            {
+                std::lock_guard<std::mutex> lock(discord_api_mutex);
+                bot->start(dpp::st_return);
+            }
             
             is_running = true;
             should_stop = false;
@@ -777,16 +794,20 @@ public:
             log_message("Discord bot started successfully");
             
             // Start chat history backfill after a short delay to ensure connection (only if enabled)
-            if (pull_message_history) {
+            if (pull_message_history && llama_manager) {
                 std::thread([this]() {
-                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                    std::this_thread::sleep_for(std::chrono::seconds(5)); // Increased delay for worker system
                     if (is_connected && llama_manager && history_loader) {
-                        log_message("Starting chat history backfill (enabled in settings)...");
+                        log_message("Starting chat history backfill with worker system...");
                         history_loader->start_backfill();
                     }
                 }).detach();
             } else {
-                log_message("Chat history backfill disabled in settings");
+                if (!pull_message_history) {
+                    log_message("Chat history backfill disabled in settings");
+                } else {
+                    log_message("Chat history backfill skipped - LlamaManager not available");
+                }
             }
             
             return true;
@@ -804,7 +825,9 @@ public:
         should_stop = true;
         
         try {
+            // PROTECTED: Shutdown the bot with mutex protection
             if (bot) {
+                std::lock_guard<std::mutex> lock(discord_api_mutex);
                 bot->shutdown();
                 bot.reset();
             }
@@ -863,7 +886,7 @@ public:
         };
     }
     
-    // UPDATED: Message sending with actual D++ implementation
+    // UPDATED: Message sending with mutex protection
     bool send_message(uint64_t channel_id, const std::string& message) {
         if (!is_running || !is_connected || !bot) {
             log_message("Error: Bot not running or not connected");
@@ -878,6 +901,9 @@ public:
         try {
             // Split long messages if needed (Discord has 2000 char limit)
             std::vector<std::string> message_parts = split_message(message, 2000);
+            
+            // PROTECTED: All D++ API calls must be protected by mutex
+            std::lock_guard<std::mutex> lock(discord_api_mutex);
             
             for (const auto& part : message_parts) {
                 dpp::message msg(channel_id, part);
