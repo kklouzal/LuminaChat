@@ -97,6 +97,8 @@ private:
     std::unordered_set<uint64_t> isolated_channels;
     std::unordered_set<uint64_t> shared_history_channels;
     bool allow_dms = true;
+    bool pull_message_history = true;
+    int32_t history_fill_percentage = 50;
     mutable std::mutex channel_mutex;
     
     // Message handling - made mutable for const methods
@@ -661,6 +663,20 @@ public:
         log_message("Set main shared context ID: " + context_id);
     }
     
+    // ADDED: Method to set history settings
+    void set_history_settings(bool pull_history, int32_t fill_percentage) {
+        std::lock_guard<std::mutex> lock(channel_mutex);
+        pull_message_history = pull_history;
+        history_fill_percentage = std::clamp(fill_percentage, 10, 80);
+        log_message("History settings: Pull=" + std::string(pull_history ? "Enabled" : "Disabled") + 
+                   ", Fill=" + std::to_string(history_fill_percentage) + "%");
+        
+        // Update history loader if available
+        if (history_loader) {
+            history_loader->set_history_settings(pull_message_history, history_fill_percentage);
+        }
+    }
+    
     // Integration with LlamaManager
     void set_llama_manager(LlamaManager* manager) {
         llama_manager = manager;
@@ -760,13 +776,18 @@ public:
             
             log_message("Discord bot started successfully");
             
-            // Start chat history backfill after a short delay to ensure connection
-            std::thread([this]() {
-                std::this_thread::sleep_for(std::chrono::seconds(3));
-                if (is_connected && llama_manager && history_loader) {
-                    history_loader->start_backfill();
-                }
-            }).detach();
+            // Start chat history backfill after a short delay to ensure connection (only if enabled)
+            if (pull_message_history) {
+                std::thread([this]() {
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                    if (is_connected && llama_manager && history_loader) {
+                        log_message("Starting chat history backfill (enabled in settings)...");
+                        history_loader->start_backfill();
+                    }
+                }).detach();
+            } else {
+                log_message("Chat history backfill disabled in settings");
+            }
             
             return true;
         } catch (const std::exception& e) {

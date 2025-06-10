@@ -1132,6 +1132,7 @@ private:
             discord_manager->set_isolated_channels(discord_isolated_channel_ids);
             discord_manager->set_shared_history_channels(discord_shared_history_channel_ids);
             discord_manager->set_allow_dms(discord_allow_dms);
+            discord_manager->set_history_settings(discord_pull_history, discord_history_fill_percentage);
             
             // Start bot
             if (discord_manager->start()) {
@@ -1162,7 +1163,11 @@ private:
                                          << status.channels_processed << " accessible channels" << std::endl;
                                 break;
                             } else if (i > 10) { // Give some time to backfill to start
-                                std::cout << "No accessible channels found for history backfill or backfill disabled" << std::endl;
+                                if (discord_pull_history) {
+                                    std::cout << "No accessible channels found for history backfill" << std::endl;
+                                } else {
+                                    std::cout << "Message history backfill disabled in settings" << std::endl;
+                                }
                                 break;
                             }
                         }

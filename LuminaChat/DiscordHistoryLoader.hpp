@@ -84,6 +84,10 @@ private:
     const std::unordered_set<uint64_t>* isolated_channels;
     const std::unordered_set<uint64_t>* shared_history_channels;
     
+    // History settings
+    bool history_enabled = true;
+    int32_t context_fill_percentage = 50;
+    
     // Backfill state
     std::atomic<bool> backfill_in_progress{false};
     std::unordered_map<uint64_t, ChannelBackfillState> channel_backfill_state;
@@ -93,8 +97,8 @@ private:
     
     // Constants
     static constexpr int32_t MESSAGES_PER_FETCH = 10;
-    static constexpr float MAX_CONTEXT_FILL_RATIO = 0.5f;
-    
+    static constexpr float BASE_MAX_CONTEXT_FILL_RATIO = 0.01f; // 1% per percentage point
+
     // Helper to estimate token count
     int32_t estimate_message_tokens(const std::string& username, const std::string& content) const {
         const int32_t base_overhead = 50;
@@ -326,7 +330,7 @@ private:
                    std::to_string(accuracy) + "% accuracy)");
     }
     
-    // Enhanced context capacity tracking with actual token validation
+    // Enhanced context capacity tracking with configurable fill percentage
     bool check_and_update_context_capacity(const std::string& context_id, uint64_t channel_id, const std::vector<HistoryMessage>& messages) {
         std::lock_guard<std::mutex> lock(context_backfill_mutex);
         
@@ -338,7 +342,9 @@ private:
             
             if (llama_manager) {
                 int32_t context_size = llama_manager->get_context_size();
-                info.capacity_limit = static_cast<int32_t>(context_size * MAX_CONTEXT_FILL_RATIO);
+                // Use configurable percentage instead of fixed 50%
+                float fill_ratio = BASE_MAX_CONTEXT_FILL_RATIO * context_fill_percentage;
+                info.capacity_limit = static_cast<int32_t>(context_size * fill_ratio);
                 
                 // Get actual current usage for this context
                 std::string original_context = llama_manager->get_active_context();
@@ -352,14 +358,16 @@ private:
                     info.estimated_tokens = 0;
                 }
             } else {
-                info.capacity_limit = static_cast<int32_t>(2048 * MAX_CONTEXT_FILL_RATIO);
+                float fill_ratio = BASE_MAX_CONTEXT_FILL_RATIO * context_fill_percentage;
+                info.capacity_limit = static_cast<int32_t>(2048 * fill_ratio);
                 info.estimated_tokens = 0;
             }
             
             context_backfill_info[context_id] = info;
             log_message("Initialized backfill tracking for context '" + context_id + 
-                       "' (limit: " + std::to_string(info.capacity_limit) + " tokens, " +
-                       "current: " + std::to_string(info.estimated_tokens) + " tokens)");
+                       "' (limit: " + std::to_string(info.capacity_limit) + " tokens @ " +
+                       std::to_string(context_fill_percentage) + "%, current: " + 
+                       std::to_string(info.estimated_tokens) + " tokens)");
         }
         
         auto& info = context_backfill_info[context_id];
@@ -488,7 +496,7 @@ private:
                 }
                 
                 float usage_percent = (float)actual_usage / info.capacity_limit * 100.0f;
-                float target_percent = MAX_CONTEXT_FILL_RATIO * 100.0f;
+                float target_percent = BASE_MAX_CONTEXT_FILL_RATIO * context_fill_percentage * 100.0f;
                 
                 log_message("Final backfill for context '" + context_id + "': " +
                            std::to_string(actual_usage) + "/" +
@@ -496,7 +504,7 @@ private:
                            std::to_string(usage_percent) + "% of " + std::to_string(target_percent) + "% target) across " +
                            std::to_string(info.associated_channels.size()) + " channels");
                 
-                // Warn if we didn't reach a reasonable fill level
+                // Warn if we didn't reach a reasonable fill level (less than 10% of target)
                 if (usage_percent < (target_percent * 0.1f)) {
                     log_message("Warning: Context '" + context_id + "' has very low usage after backfill - " +
                                "may indicate insufficient message history in channels");
@@ -560,14 +568,27 @@ public:
         log_callback = callback;
     }
     
+    // ADDED: Set history settings
+    void set_history_settings(bool enabled, int32_t fill_percentage) {
+        history_enabled = enabled;
+        context_fill_percentage = std::clamp(fill_percentage, 10, 80);
+        log_message("History loader settings updated: Enabled=" + std::string(enabled ? "true" : "false") + 
+                   ", Fill=" + std::to_string(context_fill_percentage) + "%");
+    }
+    
     // Main backfill control
     void start_backfill() {
+        if (!history_enabled) {
+            log_message("Message history backfill is disabled in settings");
+            return;
+        }
+        
         if (backfill_in_progress || !bot || !llama_manager) {
             return;
         }
         
         backfill_in_progress = true;
-        log_message("Starting chat history backfill...");
+        log_message("Starting chat history backfill with " + std::to_string(context_fill_percentage) + "% context fill target...");
         
         {
             std::lock_guard<std::mutex> lock(backfill_mutex);
