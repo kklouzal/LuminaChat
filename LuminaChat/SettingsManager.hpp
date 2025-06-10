@@ -119,7 +119,7 @@ public:
                            const std::string& identity_directive, const std::string& other_directives,
                            const std::string& discord_bot_token,
                            const std::string& discord_isolated_channel_ids, const std::string& discord_shared_history_channel_ids,
-                           bool discord_allow_dms) {
+                           bool discord_allow_dms, bool discord_pull_history, int32_t discord_history_fill_percentage) {
         std::string filepath = GetSettingsFilePath();
         std::ofstream file(filepath);
         
@@ -149,6 +149,8 @@ public:
             file << "IsolatedChannelIds=" << EscapeString(discord_isolated_channel_ids) << std::endl;
             file << "SharedHistoryChannelIds=" << EscapeString(discord_shared_history_channel_ids) << std::endl;
             file << "AllowDMs=" << (discord_allow_dms ? "1" : "0") << std::endl;
+            file << "PullHistory=" << (discord_pull_history ? "1" : "0") << std::endl;
+            file << "HistoryFillPercentage=" << discord_history_fill_percentage << std::endl;
             
             file.close();
             
@@ -163,7 +165,7 @@ public:
                            std::string& identity_directive, std::string& other_directives,
                            std::string& discord_bot_token,
                            std::string& discord_isolated_channel_ids, std::string& discord_shared_history_channel_ids,
-                           bool& discord_allow_dms) {
+                           bool& discord_allow_dms, bool& discord_pull_history, int32_t& discord_history_fill_percentage) {
         std::string filepath = GetSettingsFilePath();
         std::ifstream file(filepath);
         
@@ -173,6 +175,8 @@ public:
         if (gpu_layers == 0) gpu_layers = 0;
         if (predict_tokens == 0) predict_tokens = 256;
         discord_allow_dms = true; // Default to true
+        discord_pull_history = true; // Default to true
+        discord_history_fill_percentage = 50; // Default to 50%
         
         if (file.is_open()) {
             log_message("Loading settings from: " + filepath);
@@ -260,6 +264,14 @@ public:
                             discord_allow_dms = (value == "1" || value == "true" || value == "True" || value == "TRUE");
                             loaded_count++;
                             log_message("Loaded AllowDMs: " + std::string(discord_allow_dms ? "true" : "false"));
+                        } else if (key == "PullHistory") {
+                            discord_pull_history = (value == "1" || value == "true" || value == "True" || value == "TRUE");
+                            loaded_count++;
+                            log_message("Loaded PullHistory: " + std::string(discord_pull_history ? "true" : "false"));
+                        } else if (key == "HistoryFillPercentage") {
+                            discord_history_fill_percentage = ValidateInt32(value, 50, 10, 80);
+                            loaded_count++;
+                            log_message("Loaded HistoryFillPercentage: " + std::to_string(discord_history_fill_percentage) + "%");
                         }
                         // Legacy support: ignore old ChannelIds setting if present
                         else if (key == "ChannelIds") {

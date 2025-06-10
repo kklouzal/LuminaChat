@@ -249,6 +249,9 @@ private:
     wxTextCtrl* discord_isolated_channel_ids_text;
     wxTextCtrl* discord_shared_history_channel_ids_text;
     wxCheckBox* discord_allow_dms_checkbox;
+    wxCheckBox* discord_pull_history_checkbox;
+    wxSlider* discord_history_fill_slider;
+    wxStaticText* discord_history_percentage_label;
     
     // References to settings
     std::string& model_path_ref;
@@ -262,6 +265,8 @@ private:
     std::string& discord_isolated_channel_ids_ref;
     std::string& discord_shared_history_channel_ids_ref;
     bool& discord_allow_dms_ref;
+    bool& discord_pull_history_ref;
+    int32_t& discord_history_fill_percentage_ref;
 
     // Validation helper
     bool ValidateAndSetInt32(wxTextCtrl* control, int32_t& target, int32_t default_val, 
@@ -283,14 +288,15 @@ public:
                   int32_t& predict_tokens, std::string& chat_template, std::string& identity_directive, 
                   std::string& other_directives, std::string& discord_bot_token,
                   std::string& discord_isolated_channel_ids, std::string& discord_shared_history_channel_ids,
-                  bool& discord_allow_dms) 
+                  bool& discord_allow_dms, bool& discord_pull_history, int32_t& discord_history_fill_percentage) 
         : wxDialog(parent, wxID_ANY, "Settings", wxDefaultPosition, wxSize(700, 600)),
           model_path_ref(model_path), context_size_ref(context_size), gpu_layers_ref(gpu_layers), 
           predict_tokens_ref(predict_tokens), chat_template_ref(chat_template),
           identity_directive_ref(identity_directive), other_directives_ref(other_directives),
           discord_bot_token_ref(discord_bot_token),
           discord_isolated_channel_ids_ref(discord_isolated_channel_ids), discord_shared_history_channel_ids_ref(discord_shared_history_channel_ids),
-          discord_allow_dms_ref(discord_allow_dms) {
+          discord_allow_dms_ref(discord_allow_dms), discord_pull_history_ref(discord_pull_history),
+          discord_history_fill_percentage_ref(discord_history_fill_percentage) {
         
         wxNotebook* notebook = new wxNotebook(this, wxID_ANY);
         
@@ -395,9 +401,26 @@ public:
         discord_sizer->Add(discord_allow_dms_checkbox, 0, wxALL, 5);
         discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "When unchecked, the bot will auto-reply to DMs that the feature is disabled"), 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
         
+        // Pull Message History checkbox with slider on same line
+        wxBoxSizer* history_sizer = new wxBoxSizer(wxHORIZONTAL);
+        
+        discord_pull_history_checkbox = new wxCheckBox(discord_panel, wxID_ANY, "Pull Message History");
+        discord_pull_history_checkbox->SetValue(discord_pull_history);
+        history_sizer->Add(discord_pull_history_checkbox, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 20);
+        
+        discord_history_fill_slider = new wxSlider(discord_panel, wxID_ANY, discord_history_fill_percentage, 10, 80, 
+                                                   wxDefaultPosition, wxSize(120, -1), wxSL_HORIZONTAL | wxSL_LABELS);
+        history_sizer->Add(discord_history_fill_slider, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
+        
+        discord_history_percentage_label = new wxStaticText(discord_panel, wxID_ANY, wxString::Format("%d%%", discord_history_fill_percentage));
+        history_sizer->Add(discord_history_percentage_label, 0, wxALIGN_CENTER_VERTICAL);
+        
+        discord_sizer->Add(history_sizer, 0, wxALL, 5);
+        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "When checked, the bot will auto-pull message history to backfill its context history up to the specified percentage"), 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
+        
         // Isolated Context Channel IDs
         discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Isolated Context Channel IDs (comma separated):"), 0, wxALL, 5);
-        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Channels that get their own separate context (each channel gets its own context)"), 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
+        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Channels that get their own separate context (multiple isolated contexts, adheres to message history settings)"), 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
         
         discord_isolated_channel_ids_text = new wxTextCtrl(discord_panel, wxID_ANY, wxString::FromUTF8(discord_isolated_channel_ids), 
                                                            wxDefaultPosition, wxSize(-1, 60), 
@@ -407,7 +430,7 @@ public:
         
         // Shared Context Channel IDs
         discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Shared Context Channel IDs (comma separated):"), 0, wxALL, 5);
-        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Channels that share the main application context (with message history backfill)"), 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
+        discord_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Channels that share the main application context (singular shared context, adheres to message history settings)"), 0, wxLEFT | wxRIGHT | wxBOTTOM, 5);
         
         discord_shared_history_channel_ids_text = new wxTextCtrl(discord_panel, wxID_ANY, wxString::FromUTF8(discord_shared_history_channel_ids), 
                                                                  wxDefaultPosition, wxSize(-1, 60), 
@@ -422,8 +445,7 @@ public:
             "2. Right-click Discord channels and 'Copy ID' to get channel IDs\n"
             "3. Separate multiple channel IDs with commas (e.g., 123456789,987654321)\n"
             "4. Bot will ONLY respond in channels listed in either 'Isolated Context' or 'Shared Context' lists\n"
-            "5. Direct Messages (DMs) use individual isolated contexts when enabled (one per user for privacy)\n"
-            "6. When DMs are disabled, users will receive an auto-reply explaining the feature is turned off");
+            "5. Direct Messages (DMs) use individual isolated contexts when enabled (one per user for privacy)");
         discord_help->SetFont(wxFont(8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_ITALIC, wxFONTWEIGHT_NORMAL));
         discord_sizer->Add(discord_help, 1, wxEXPAND | wxALL, 5);
         
@@ -471,7 +493,11 @@ private:
         discord_bot_token_ref = discord_bot_token_text->GetValue().ToUTF8().data();
         discord_isolated_channel_ids_ref = discord_isolated_channel_ids_text->GetValue().ToUTF8().data();
         discord_shared_history_channel_ids_ref = discord_shared_history_channel_ids_text->GetValue().ToUTF8().data();
+        
+        // Get checkbox and slider values
         discord_allow_dms_ref = discord_allow_dms_checkbox->GetValue();
+        discord_pull_history_ref = discord_pull_history_checkbox->GetValue();
+        discord_history_fill_percentage_ref = discord_history_fill_slider->GetValue();
         
         // Validate isolated channel IDs format if provided
         if (!discord_isolated_channel_ids_ref.empty()) {
@@ -498,7 +524,8 @@ private:
                                     predict_tokens_ref, chat_template_ref, 
                                     identity_directive_ref, other_directives_ref,
                                     discord_bot_token_ref,
-                                    discord_isolated_channel_ids_ref, discord_shared_history_channel_ids_ref, discord_allow_dms_ref);
+                                    discord_isolated_channel_ids_ref, discord_shared_history_channel_ids_ref, 
+                                    discord_allow_dms_ref, discord_pull_history_ref, discord_history_fill_percentage_ref);
         
         EndModal(wxID_OK);
     }
@@ -556,6 +583,8 @@ private:
     std::string discord_isolated_channel_ids;
     std::string discord_shared_history_channel_ids;
     bool discord_allow_dms = true;
+    bool discord_pull_history = true;
+    int32_t discord_history_fill_percentage = 50;
 
     // State
     bool is_started;
@@ -594,7 +623,8 @@ public:
         SettingsManager::LoadSettings(model_path, context_size, gpu_layers, predict_tokens, 
                                     chat_template, identity_directive, other_directives,
                                     discord_bot_token, discord_isolated_channel_ids, 
-                                    discord_shared_history_channel_ids, discord_allow_dms);
+                                    discord_shared_history_channel_ids, discord_allow_dms,
+                                    discord_pull_history, discord_history_fill_percentage);
         
         CreateUI();
         
@@ -688,7 +718,8 @@ private:
             SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, 
                                         chat_template, identity_directive, other_directives,
                                         discord_bot_token, discord_isolated_channel_ids, 
-                                        discord_shared_history_channel_ids, discord_allow_dms); // ADDED: Save new setting
+                                        discord_shared_history_channel_ids, discord_allow_dms,
+                                        discord_pull_history, discord_history_fill_percentage);
         }
     }
 
@@ -997,7 +1028,8 @@ private:
                     SettingsManager::SaveSettings(model_path, context_size, gpu_layers, predict_tokens, 
                                                 chat_template, identity_directive, other_directives,
                                                 discord_bot_token, discord_isolated_channel_ids, 
-                                                discord_shared_history_channel_ids, discord_allow_dms);
+                                                discord_shared_history_channel_ids, discord_allow_dms,
+                                                discord_pull_history, discord_history_fill_percentage);
                     std::cout << "Loaded chat template from model" << std::endl;
                 }
             } else {
@@ -1146,7 +1178,8 @@ private:
         SettingsDialog dialog(this, model_path, context_size, gpu_layers, predict_tokens, 
                             chat_template, identity_directive, other_directives,
                             discord_bot_token, discord_isolated_channel_ids, 
-                            discord_shared_history_channel_ids, discord_allow_dms);
+                            discord_shared_history_channel_ids, discord_allow_dms,
+                            discord_pull_history, discord_history_fill_percentage);
         if (dialog.ShowModal() == wxID_OK) {
             UpdateWindowTitle();
             
