@@ -371,6 +371,10 @@ private:
                     log_message("Error: Batch token count exceeds batch size limit");
                     return false;
                 }
+
+                if (!current_context->batch.embd) {
+                    log_message("Error: embd null");
+                }
                 
                 // FIXED: Add comprehensive error checking for decode operation with try-catch
                 try {
