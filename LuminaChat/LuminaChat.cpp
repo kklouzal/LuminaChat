@@ -194,7 +194,8 @@ private:
         llama_manager->set_gpu_layers(config.gpu_layers);
         llama_manager->set_predict_tokens(config.predict_tokens);
         
-        if (should_stop || !llama_manager->load_model(config.model_path, parent)) return false;
+        // Use "main_model" as the default model ID
+        if (should_stop || !llama_manager->load_model(config.model_path, "main_model", parent)) return false;
         
         if (!config.chat_template.empty()) {
             llama_manager->set_custom_chat_template(config.chat_template);
@@ -1068,7 +1069,7 @@ private:
             
             // Create main chat context with system prompt from settings
             std::string combined_prompt = GetCombinedSystemPrompt();
-            if (!llama_manager->create_context("main_chat", combined_prompt)) {
+            if (!llama_manager->create_context("main_chat", "main_model", combined_prompt)) {
                 LLAMA_LOG_ERROR("Failed to create main chat context");
                 success = false;
             } else {
