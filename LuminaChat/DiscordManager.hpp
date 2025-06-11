@@ -37,7 +37,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
-#include <functional>
 #include <string_view>
 #include <sstream>
 #include <dpp/dpp.h>

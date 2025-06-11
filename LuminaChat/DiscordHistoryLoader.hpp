@@ -38,7 +38,6 @@
 #include <thread>
 #include <algorithm>
 #include <future>
-#include <sstream>
 
 #include <dpp/dpp.h>
 #include "LogHandler.hpp"
@@ -101,7 +100,6 @@ private:
     // Constants
     static constexpr int32_t MESSAGES_PER_FETCH = 10;
     static constexpr float BASE_MAX_CONTEXT_FILL_RATIO = 0.01f;
-    static constexpr int32_t MAX_RETRIES = 3;
     
     bool should_backfill_channel(uint64_t channel_id) const {
         return (isolated_channels && isolated_channels->count(channel_id)) ||

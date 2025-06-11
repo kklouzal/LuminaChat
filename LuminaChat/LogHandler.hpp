@@ -46,8 +46,7 @@ enum class LogComponent {
     DISCORD_HISTORY,
     SETTINGS_MANAGER,
     SUMMARIZER_MANAGER,
-    UI,
-    GENERAL
+    UI
 };
 
 class LogHandler {
@@ -71,7 +70,6 @@ private:
             case LogComponent::SETTINGS_MANAGER: return "Settings";
             case LogComponent::SUMMARIZER_MANAGER: return "Summarizer";
             case LogComponent::UI: return "UI";
-            case LogComponent::GENERAL: return "General";
             default: return "Unknown";
         }
     }

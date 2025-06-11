@@ -34,7 +34,6 @@
 #include <thread>
 #include <chrono>
 #include <unordered_map>
-#include <list>
 #include <string_view>
 #include "llama-cpp.h"
 #include "LogHandler.hpp"

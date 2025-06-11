@@ -40,8 +40,6 @@
 #include <cstdint>
 #include <memory>
 #include <atomic>
-#include <iostream>
-#include <streambuf>
 #include <thread>
 #include <chrono>
 #include "LlamaManager.hpp"
