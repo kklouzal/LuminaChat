@@ -1036,35 +1036,41 @@ private:
                 ui.discord_btn->SetLabel("Disconnect Discord");
                 AddSystemMessage("Discord bot connecting...");
                 
-                // Simple backfill monitoring
+                // UPDATED: Simplified backfill monitoring for new structure
                 std::thread([this]() {
-                    bool backfill_started = false;
+                    bool backfill_reported = false;
                     
-                    for (int i = 0; i < 120; ++i) { // Check for up to 120 seconds (2 minutes)
+                    for (int i = 0; i < 60; ++i) { // Check for up to 5 minutes
                         std::this_thread::sleep_for(std::chrono::seconds(5));
+                        
                         if (discord_manager) {
                             auto status = discord_manager->get_backfill_status();
                             
-                            if (status.in_progress) {
-                                if (!backfill_started) {
-                                    DISCORD_HISTORY_LOG("Chat history backfill started with " + std::to_string(status.total_workers) + 
-                                                       " workers for accessible channels...");
-                                    backfill_started = true;
-                                }
-                                
-                                if (i % 3 == 0 && status.active_workers >= 0) { // Report every 15 seconds
-                                    DISCORD_HISTORY_LOG("Backfill progress: " + std::to_string(status.active_workers) + 
-                                                       " workers active, processing " + std::to_string(status.context_usage.size()) + 
-                                                       " contexts");
-                                }
-                            } else if (backfill_started || !status.context_usage.empty()) {
-                                DISCORD_HISTORY_LOG("Chat history backfill completed for " + 
-                                                   std::to_string(status.context_usage.size()) + " contexts");
+                            if (status.in_progress && !backfill_reported) {
+                                DISCORD_HISTORY_LOG("Chat history backfill started for " + 
+                                                   std::to_string(status.total_channels) + " configured channels...");
+                                backfill_reported = true;
+                            }
+                            
+                            if (status.in_progress && i % 3 == 0) { // Report every 15 seconds
+                                DISCORD_HISTORY_LOG("Backfill progress: " + 
+                                                   std::to_string(status.completed_channels) + "/" + 
+                                                   std::to_string(status.total_channels) + " channels completed, " +
+                                                   std::to_string(status.total_messages_fetched) + " messages fetched");
+                            }
+                            
+                            if (!status.in_progress && backfill_reported) {
+                                DISCORD_HISTORY_LOG("Chat history backfill completed: " + 
+                                                   std::to_string(status.total_messages_fetched) + 
+                                                   " messages fetched from " + 
+                                                   std::to_string(status.total_channels) + " channels");
                                 break;
-                            } else if (i > 4) { // Give time for backfill to start
-                                if (config.discord_pull_history) {
+                            }
+                            
+                            if (!status.in_progress && i > 4) { // Give time for backfill to start
+                                if (config.discord_pull_history && status.total_channels == 0) {
                                     DISCORD_HISTORY_LOG("No accessible channels found for history backfill");
-                                } else {
+                                } else if (!config.discord_pull_history) {
                                     DISCORD_HISTORY_LOG("Message history backfill disabled in settings");
                                 }
                                 break;

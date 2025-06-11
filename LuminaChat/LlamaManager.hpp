@@ -143,6 +143,11 @@ private:
         }
         
         const int32_t n_batch = llama_n_batch(current_context->context);
+        if (n_batch <= 0) {
+            log_message("Error: Invalid batch size: " + std::to_string(n_batch));
+            return false;
+        }
+        
         manage_batch(true); // Clear batch
         
         // FIXED: Validate sequence IDs
@@ -151,21 +156,33 @@ private:
             return false;
         }
         
+        // FIXED: Use n_batch as the capacity limit instead of n_tokens_alloc
         for (size_t i = 0; i < tokens.size() && current_context->batch.n_tokens < n_batch; ++i) {
-            // FIXED: Check position bounds
+            // FIXED: Check position bounds more carefully
             int32_t pos = start_pos + static_cast<int32_t>(i);
-            if (pos >= n_ctx) {
-                log_message("Warning: Token position " + std::to_string(pos) + " exceeds context size " + std::to_string(n_ctx));
+            if (pos >= n_ctx || pos < 0) {
+                log_message("Warning: Token position " + std::to_string(pos) + " exceeds context bounds [0, " + std::to_string(n_ctx) + ")");
+                break;
+            }
+            
+            // FIXED: Validate token value
+            if (tokens[i] < 0) {
+                log_message("Error: Invalid token value " + std::to_string(tokens[i]) + " at position " + std::to_string(i));
+                return false;
+            }
+            
+            // FIXED: Ensure we don't exceed batch array bounds using n_batch
+            if (current_context->batch.n_tokens >= n_batch) {
+                log_message("Warning: Batch capacity exceeded, stopping token addition");
                 break;
             }
             
             current_context->batch.token[current_context->batch.n_tokens] = tokens[i];
             current_context->batch.pos[current_context->batch.n_tokens] = pos;
-            current_context->batch.n_seq_id[current_context->batch.n_tokens] = static_cast<int32_t>(seq_ids.size());
+            current_context->batch.n_seq_id[current_context->batch.n_tokens] = static_cast<int32_t>(std::min(seq_ids.size(), size_t(8)));
             
-            // FIXED: Use safe bounds checking without undefined constant
-            const size_t max_seq_ids = 8; // Reasonable limit for sequence IDs
-            for (size_t j = 0; j < seq_ids.size() && j < max_seq_ids; ++j) {
+            // FIXED: Safe sequence ID copying with bounds check
+            for (size_t j = 0; j < std::min(seq_ids.size(), size_t(8)); ++j) {
                 current_context->batch.seq_id[current_context->batch.n_tokens][j] = seq_ids[j];
             }
             
@@ -258,8 +275,7 @@ private:
         }
         
         if (tokens.empty()) {
-            // FIXED: Distinguish between intentionally empty and problematic empty
-            return true; // Empty tokens are valid (e.g., whitespace-only content)
+            return true; // Empty tokens are valid
         }
         
         const int32_t n_batch = calculate_optimal_batch_size();
@@ -274,17 +290,24 @@ private:
         int32_t max_threshold = static_cast<int32_t>(n_ctx * 0.9f);
         if (!is_incremental) current_context->n_past = 0; // Reset for full context rebuild
         
-        // FIXED: Use model-based token validation instead of undefined function
-        for (size_t i = 0; i < tokens.size(); ++i) {
-            if (tokens[i] < 0) {
-                log_message("Error: Invalid token at position " + std::to_string(i) + ": " + std::to_string(tokens[i]));
-                return false;
+        // FIXED: Validate n_past bounds before processing
+        if (current_context->n_past < 0) {
+            log_message("Error: Invalid n_past value: " + std::to_string(current_context->n_past));
+            current_context->n_past = 0;
+        }
+        
+        if (current_context->n_past >= n_ctx) {
+            log_message("Error: n_past exceeds context size, resetting");
+            current_context->n_past = 0;
+            if (current_context->context) {
+                llama_kv_self_clear(current_context->context);
             }
         }
         
-        // FIXED: Better overflow protection
-        if (current_context->n_past < 0 || tokens.size() > static_cast<size_t>(std::numeric_limits<int32_t>::max() - current_context->n_past)) {
-            log_message("Error: Token addition would cause integer overflow");
+        // FIXED: Safer overflow check
+        const size_t max_safe_add = static_cast<size_t>(std::numeric_limits<int32_t>::max() - current_context->n_past);
+        if (tokens.size() > max_safe_add) {
+            log_message("Error: Token addition would cause overflow");
             return false;
         }
         
@@ -292,7 +315,9 @@ private:
             if (is_incremental) {
                 log_message("Context would exceed 90% (" + std::to_string(current_context->n_past + tokens.size()) + 
                            "/" + std::to_string(n_ctx) + " tokens), triggering pruning...");
-                llama_kv_self_clear(current_context->context);
+                if (current_context->context) {
+                    llama_kv_self_clear(current_context->context);
+                }
                 current_context->n_past = 0;
                 prune_message_history(0.6f);
                 return false;
@@ -304,14 +329,30 @@ private:
         
         // Process in optimal chunks with better error handling
         for (size_t start = 0; start < tokens.size(); start += n_batch) {
-            size_t end = std::min(start + n_batch, tokens.size());
+            size_t end = std::min(start + static_cast<size_t>(n_batch), tokens.size());
             std::vector<llama_token> chunk(tokens.begin() + start, tokens.begin() + end);
             
             bool output_logits = is_incremental && (end == tokens.size());
             
             if (add_tokens_to_batch(chunk, current_context->n_past, seq_ids, output_logits)) {
-                if (current_context->batch.n_tokens > 0 && llama_decode(current_context->context, current_context->batch) != 0) {
-                    log_message("Error: Failed to decode batch at position " + std::to_string(current_context->n_past));
+                // FIXED: Validate batch state before decode
+                if (current_context->batch.n_tokens <= 0) {
+                    log_message("Warning: Empty batch after token addition");
+                    continue;
+                }
+                
+                // FIXED: Use n_batch for validation instead of n_tokens_alloc
+                const int32_t n_batch = llama_n_batch(current_context->context);
+                if (current_context->batch.n_tokens > n_batch) {
+                    log_message("Error: Batch token count exceeds batch size limit");
+                    return false;
+                }
+                
+                // FIXED: Add error checking for decode operation
+                int decode_result = llama_decode(current_context->context, current_context->batch);
+                if (decode_result != 0) {
+                    log_message("Error: Failed to decode batch at position " + std::to_string(current_context->n_past) + 
+                               " (error code: " + std::to_string(decode_result) + ")");
                     return false;
                 }
                 current_context->n_past += static_cast<int32_t>(chunk.size());
@@ -1129,10 +1170,19 @@ public:
         }
 
         int32_t batch_size = calculate_optimal_batch_size();
+        if (batch_size <= 0) {
+            log_message("Error: Invalid batch size for initialization: " + std::to_string(batch_size));
+            return false;
+        }
         
+        // FIXED: Use safer batch initialization without checking non-existent members
         current_context->batch = llama_batch_init(batch_size, 0, 1);
-        if (current_context->batch.token == nullptr) {
-            log_message("Error: Failed to initialize batch with size " + std::to_string(batch_size));
+        if (current_context->batch.token == nullptr || 
+            current_context->batch.pos == nullptr || 
+            current_context->batch.n_seq_id == nullptr ||
+            current_context->batch.seq_id == nullptr ||
+            current_context->batch.logits == nullptr) {
+            log_message("Error: Failed to initialize batch arrays with size " + std::to_string(batch_size));
             return false;
         }
 
