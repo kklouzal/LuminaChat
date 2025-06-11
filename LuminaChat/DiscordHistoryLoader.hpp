@@ -57,7 +57,8 @@ struct PendingMessage {
     std::string content;
     std::chrono::system_clock::time_point timestamp;
     uint64_t message_id;
-    int32_t estimated_tokens;
+    std::vector<llama_token> tokenized_content;  // Store tokenized content instead of estimation
+    int32_t actual_token_count;                  // Exact count from tokenization
     std::string target_context_id;
 };
 
@@ -98,11 +99,6 @@ private:
     static constexpr int32_t MESSAGES_PER_FETCH = 10;
     static constexpr float BASE_MAX_CONTEXT_FILL_RATIO = 0.01f;
     static constexpr int32_t MAX_RETRIES = 3;
-    
-    // SIMPLIFIED: Token estimation
-    static constexpr int32_t estimate_message_tokens(const std::string& username, const std::string& content) {
-        return 50 + static_cast<int32_t>(username.length()) + 20 + static_cast<int32_t>((content.length() + 2) / 3);
-    }
     
     bool should_backfill_channel(uint64_t channel_id) const {
         return (isolated_channels && isolated_channels->count(channel_id)) ||
@@ -228,16 +224,16 @@ private:
         }
     }
     
-    // MODIFIED: Collect messages without any context switching
+    // MODIFIED: Collect messages with exact tokenization using LlamaManager
     bool collect_messages_for_later(const dpp::message_map& messages, uint64_t channel_id) {
         if (messages.empty()) return false;
         
         auto& state = channel_states[channel_id];
         
-        // Process messages and estimate tokens
+        // Process messages with exact tokenization
         std::vector<PendingMessage> batch_messages;
-        uint64_t latest_id = state.last_message_id;
-        int32_t total_estimated_tokens = 0;
+        uint64_t oldest_id = UINT64_MAX; // Track oldest message ID for next iteration
+        int32_t total_exact_tokens = 0;
         
         for (const auto& [id, msg] : messages) {
             if (!msg.author.is_bot() && !msg.content.empty()) {
@@ -247,35 +243,61 @@ private:
                 pending.content = msg.content;
                 pending.timestamp = std::chrono::system_clock::time_point(std::chrono::seconds(msg.sent));
                 pending.message_id = static_cast<uint64_t>(msg.id);
-                pending.estimated_tokens = estimate_message_tokens(msg.author.username, msg.content);
                 pending.target_context_id = state.context_id;
                 
-                batch_messages.push_back(pending);
-                total_estimated_tokens += pending.estimated_tokens;
-                latest_id = std::max(latest_id, pending.message_id);
+                // NEW: Use LlamaManager's tokenization instead of redundant local function
+                std::string formatted_message = msg.author.username + ": " + msg.content;
+                pending.tokenized_content = llama_manager->tokenize_text(formatted_message, false);
+                
+                // Check for reasonable token count limits
+                if (pending.tokenized_content.size() > 2048) {
+                    log_message("Warning: Message from " + msg.author.username + " would produce " + 
+                               std::to_string(pending.tokenized_content.size()) + " tokens, skipping");
+                    continue;
+                }
+                
+                pending.actual_token_count = static_cast<int32_t>(pending.tokenized_content.size());
+                
+                if (pending.actual_token_count > 0) {
+                    batch_messages.push_back(pending);
+                    total_exact_tokens += pending.actual_token_count;
+                    // FIXED: Track the oldest message ID (smallest value) for next iteration
+                    oldest_id = std::min(oldest_id, pending.message_id);
+                } else {
+                    log_message("Warning: Tokenization produced 0 tokens for message from " + 
+                               msg.author.username + ", skipping");
+                }
+            } else {
+                // FIXED: Still need to track message IDs even for bot messages to ensure proper pagination
+                uint64_t msg_id = static_cast<uint64_t>(msg.id);
+                oldest_id = std::min(oldest_id, msg_id);
             }
         }
         
-        // Check if we can add all messages at once (no per-message checking)
-        if (!batch_messages.empty() && can_add_more_messages_estimated_no_switch(state.context_id, total_estimated_tokens)) {
+        // Check if we can add all messages using exact token counts
+        if (!batch_messages.empty() && can_add_more_messages_estimated_no_switch(state.context_id, total_exact_tokens)) {
             // Add to pending collection
             {
                 std::lock_guard<std::mutex> lock(pending_messages_mutex);
                 pending_messages.insert(pending_messages.end(), batch_messages.begin(), batch_messages.end());
             }
             
-            // Update estimated token usage
-            update_estimated_token_usage(state.context_id, total_estimated_tokens);
+            // Update exact token usage
+            update_estimated_token_usage(state.context_id, total_exact_tokens);
             
             // Update state
             {
                 std::lock_guard<std::mutex> lock(state_mutex);
                 state.messages_fetched += static_cast<int32_t>(batch_messages.size());
-                state.last_message_id = latest_id;
+                // FIXED: Set last_message_id to oldest message for next API call to fetch older messages
+                if (oldest_id != UINT64_MAX) {
+                    state.last_message_id = oldest_id;
+                }
             }
             
             log_message("Collected " + std::to_string(batch_messages.size()) + " messages from channel " + 
-                       std::to_string(channel_id) + " (estimated " + std::to_string(total_estimated_tokens) + " tokens)");
+                       std::to_string(channel_id) + " (exact " + std::to_string(total_exact_tokens) + 
+                       " tokens), next fetch before ID: " + std::to_string(oldest_id));
             return true;
         } else if (!batch_messages.empty()) {
             // Mark channel as complete if we can't fit more
@@ -294,17 +316,25 @@ private:
             }
             
             log_message("Channel " + std::to_string(channel_id) + " completed - context capacity reached (" + capacity_info + ")");
+        } else {
+            // FIXED: Even if no messages were added, update the last_message_id to continue pagination
+            std::lock_guard<std::mutex> lock(state_mutex);
+            if (oldest_id != UINT64_MAX) {
+                state.last_message_id = oldest_id;
+                log_message("Updated last_message_id for channel " + std::to_string(channel_id) + 
+                           " to " + std::to_string(oldest_id) + " (no messages collected this batch)");
+            }
         }
         
         return false;
     }
     
-    // NEW: Apply all collected messages in batches by context
+    // MODIFIED: Apply collected messages using pre-tokenized content
     void apply_collected_messages() {
         std::lock_guard<std::mutex> lock(pending_messages_mutex);
         if (pending_messages.empty()) return;
         
-        log_message("Applying " + std::to_string(pending_messages.size()) + " collected messages to contexts...");
+        log_message("Applying " + std::to_string(pending_messages.size()) + " collected tokenized messages to contexts...");
         
         // Sort messages by timestamp for chronological order
         std::sort(pending_messages.begin(), pending_messages.end(),
@@ -318,21 +348,27 @@ private:
             context_groups[msg.target_context_id].push_back(msg);
         }
         
-        // Apply messages to each context in a single switch
+        // Apply messages to each context using pre-tokenized content
         std::string original_context = llama_manager->get_active_context();
         
         for (const auto& [context_id, messages] : context_groups) {
-            log_message("Switching to context '" + context_id + "' to add " + std::to_string(messages.size()) + " messages");
+            log_message("Switching to context '" + context_id + "' to add " + std::to_string(messages.size()) + " tokenized messages");
             
             if (llama_manager->switch_to_context(context_id)) {
                 int32_t added_count = 0;
+                int32_t total_tokens_added = 0;
+                
                 for (const auto& msg : messages) {
+                    // Use the regular add_message_to_history for now
+                    // In the future, we could add a method to LlamaManager that accepts pre-tokenized content
                     llama_manager->add_message_to_history(msg.username, msg.content);
                     added_count++;
+                    total_tokens_added += msg.actual_token_count;
                 }
                 
                 if (llama_manager->update_context_from_history()) {
-                    log_message("Successfully added " + std::to_string(added_count) + " messages to context " + context_id);
+                    log_message("Successfully added " + std::to_string(added_count) + " messages (" + 
+                               std::to_string(total_tokens_added) + " tokens) to context " + context_id);
                 } else {
                     log_message("Failed to update context " + context_id + " from history");
                 }
@@ -349,7 +385,7 @@ private:
         
         // Clear processed messages
         pending_messages.clear();
-        log_message("Message application phase completed");
+        log_message("Tokenized message application phase completed");
     }
     
     // SIMPLIFIED: Round-robin for shared channels
