@@ -279,6 +279,13 @@ private:
             }
             
             std::string context_id = "discord_dm_" + std::to_string(user_id);
+            
+            // FIXED: Check if context already exists before trying to create
+            if (llama_manager && llama_manager->has_context(context_id)) {
+                user_contexts[user_id] = context_id;
+                return context_id;
+            }
+            
             if (llama_manager && llama_manager->create_context(context_id, "")) {
                 user_contexts[user_id] = context_id;
                 return context_id;
@@ -290,6 +297,13 @@ private:
             }
             
             std::string context_id = "discord_channel_" + std::to_string(channel_id);
+            
+            // FIXED: Check if context already exists before trying to create
+            if (llama_manager && llama_manager->has_context(context_id)) {
+                channel_contexts[channel_id] = context_id;
+                return context_id;
+            }
+            
             if (llama_manager && llama_manager->create_context(context_id, "")) {
                 channel_contexts[channel_id] = context_id;
                 return context_id;

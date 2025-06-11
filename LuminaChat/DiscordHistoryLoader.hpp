@@ -51,6 +51,16 @@ struct ChannelState {
     bool is_isolated = false;
 };
 
+struct PendingMessage {
+    uint64_t channel_id;
+    std::string username;
+    std::string content;
+    std::chrono::system_clock::time_point timestamp;
+    uint64_t message_id;
+    int32_t estimated_tokens;
+    std::string target_context_id;
+};
+
 class DiscordHistoryLoader {
 private:
     // Core dependencies
@@ -71,6 +81,15 @@ private:
     std::vector<uint64_t> shared_channels_list; // For round-robin
     size_t shared_channel_index = 0;
     mutable std::mutex state_mutex;
+    
+    // New: Message collection phase
+    std::vector<PendingMessage> pending_messages;
+    std::mutex pending_messages_mutex;
+    
+    // New: Track capacity per context to avoid repeated switching
+    std::unordered_map<std::string, int32_t> context_capacity_limits;
+    std::unordered_map<std::string, int32_t> context_current_tokens;
+    std::mutex capacity_mutex;
     
     // State
     std::atomic<bool> backfill_in_progress{false};
@@ -98,33 +117,70 @@ private:
         DISCORD_HISTORY_LOG(message);
     }
     
-    // SIMPLIFIED: Direct context switching and capacity checking
-    bool can_add_more_messages(const std::string& context_id) {
-        if (!llama_manager) return false;
+    // NEW: Initialize context capacities once at start
+    void initialize_context_capacities() {
+        std::lock_guard<std::mutex> lock(capacity_mutex);
+        context_capacity_limits.clear();
+        context_current_tokens.clear();
+        
+        if (!llama_manager) return;
         
         std::string original_context = llama_manager->get_active_context();
-        bool result = false;
         
-        if (llama_manager->switch_to_context(context_id)) {
-            int32_t current_tokens = llama_manager->get_message_history_token_count();
-            int32_t context_size = llama_manager->get_context_size();
-            float fill_ratio = BASE_MAX_CONTEXT_FILL_RATIO * context_fill_percentage;
-            int32_t capacity_limit = static_cast<int32_t>(context_size * fill_ratio);
-            
-            result = current_tokens < capacity_limit;
-            
-            if (!original_context.empty()) {
-                llama_manager->switch_to_context(original_context);
+        // Get unique context IDs
+        std::unordered_set<std::string> unique_contexts;
+        for (const auto& [channel_id, state] : channel_states) {
+            unique_contexts.insert(state.context_id);
+        }
+        
+        // Initialize capacity data for each context
+        for (const std::string& context_id : unique_contexts) {
+            if (llama_manager->switch_to_context(context_id)) {
+                int32_t current_tokens = llama_manager->get_message_history_token_count();
+                int32_t context_size = llama_manager->get_context_size();
+                float fill_ratio = BASE_MAX_CONTEXT_FILL_RATIO * context_fill_percentage;
+                int32_t capacity_limit = static_cast<int32_t>(context_size * fill_ratio);
+                
+                context_current_tokens[context_id] = current_tokens;
+                context_capacity_limits[context_id] = capacity_limit;
+                
+                log_message("Context '" + context_id + "' capacity: " + std::to_string(current_tokens) + 
+                           "/" + std::to_string(capacity_limit) + " tokens");
             }
         }
         
-        return result;
+        // Restore original context
+        if (!original_context.empty()) {
+            llama_manager->switch_to_context(original_context);
+        }
+        
+        log_message("Initialized capacity tracking for " + std::to_string(unique_contexts.size()) + " contexts");
+    }
+    
+    // SIMPLIFIED: Check capacity without context switching
+    bool can_add_more_messages_estimated_no_switch(const std::string& context_id, int32_t additional_tokens) {
+        std::lock_guard<std::mutex> lock(capacity_mutex);
+        
+        auto capacity_it = context_capacity_limits.find(context_id);
+        auto current_it = context_current_tokens.find(context_id);
+        
+        if (capacity_it == context_capacity_limits.end() || current_it == context_current_tokens.end()) {
+            return false; // Unknown context
+        }
+        
+        return (current_it->second + additional_tokens) < capacity_it->second;
+    }
+    
+    // NEW: Update estimated token usage without context switching
+    void update_estimated_token_usage(const std::string& context_id, int32_t additional_tokens) {
+        std::lock_guard<std::mutex> lock(capacity_mutex);
+        context_current_tokens[context_id] += additional_tokens;
     }
     
     // SIMPLIFIED: Direct message fetching and processing
     bool process_channel_batch(uint64_t channel_id) {
         auto& state = channel_states[channel_id];
-        if (state.fetch_complete || !can_add_more_messages(state.context_id)) {
+        if (state.fetch_complete) {
             return false;
         }
         
@@ -152,7 +208,7 @@ private:
                         return;
                     }
                     
-                    success = add_messages_to_context(messages, channel_id);
+                    success = collect_messages_for_later(messages, channel_id);
                     promise->set_value(success);
                     
                 } catch (const std::exception& e) {
@@ -172,58 +228,128 @@ private:
         }
     }
     
-    bool add_messages_to_context(const dpp::message_map& messages, uint64_t channel_id) {
-        if (!llama_manager || messages.empty()) return false;
+    // MODIFIED: Collect messages without any context switching
+    bool collect_messages_for_later(const dpp::message_map& messages, uint64_t channel_id) {
+        if (messages.empty()) return false;
         
         auto& state = channel_states[channel_id];
         
-        // Switch to appropriate context
-        std::string original_context = llama_manager->get_active_context();
-        if (!llama_manager->switch_to_context(state.context_id)) {
-            log_message("Failed to switch to context: " + state.context_id);
-            return false;
-        }
+        // Process messages and estimate tokens
+        std::vector<PendingMessage> batch_messages;
+        uint64_t latest_id = state.last_message_id;
+        int32_t total_estimated_tokens = 0;
         
-        // Process messages in chronological order
-        std::vector<std::pair<std::chrono::system_clock::time_point, dpp::message>> sorted_messages;
         for (const auto& [id, msg] : messages) {
             if (!msg.author.is_bot() && !msg.content.empty()) {
-                sorted_messages.emplace_back(
-                    std::chrono::system_clock::time_point(std::chrono::seconds(msg.sent)), msg
-                );
+                PendingMessage pending;
+                pending.channel_id = channel_id;
+                pending.username = msg.author.username;
+                pending.content = msg.content;
+                pending.timestamp = std::chrono::system_clock::time_point(std::chrono::seconds(msg.sent));
+                pending.message_id = static_cast<uint64_t>(msg.id);
+                pending.estimated_tokens = estimate_message_tokens(msg.author.username, msg.content);
+                pending.target_context_id = state.context_id;
+                
+                batch_messages.push_back(pending);
+                total_estimated_tokens += pending.estimated_tokens;
+                latest_id = std::max(latest_id, pending.message_id);
             }
         }
         
-        std::sort(sorted_messages.begin(), sorted_messages.end(),
-            [](const auto& a, const auto& b) { return a.first < b.first; });
-        
-        // Add messages to context
-        int32_t added_count = 0;
-        uint64_t latest_id = state.last_message_id;
-        
-        for (const auto& [timestamp, msg] : sorted_messages) {
-            llama_manager->add_message_to_history(msg.author.username, msg.content);
-            added_count++;
-            // FIXED: Ensure both arguments to std::max are the same type
-            latest_id = std::max(latest_id, static_cast<uint64_t>(msg.id));
+        // Check if we can add all messages at once (no per-message checking)
+        if (!batch_messages.empty() && can_add_more_messages_estimated_no_switch(state.context_id, total_estimated_tokens)) {
+            // Add to pending collection
+            {
+                std::lock_guard<std::mutex> lock(pending_messages_mutex);
+                pending_messages.insert(pending_messages.end(), batch_messages.begin(), batch_messages.end());
+            }
+            
+            // Update estimated token usage
+            update_estimated_token_usage(state.context_id, total_estimated_tokens);
+            
+            // Update state
+            {
+                std::lock_guard<std::mutex> lock(state_mutex);
+                state.messages_fetched += static_cast<int32_t>(batch_messages.size());
+                state.last_message_id = latest_id;
+            }
+            
+            log_message("Collected " + std::to_string(batch_messages.size()) + " messages from channel " + 
+                       std::to_string(channel_id) + " (estimated " + std::to_string(total_estimated_tokens) + " tokens)");
+            return true;
+        } else if (!batch_messages.empty()) {
+            // Mark channel as complete if we can't fit more
+            std::lock_guard<std::mutex> lock(state_mutex);
+            channel_states[channel_id].fetch_complete = true;
+            
+            // Get current capacity info for logging
+            std::string capacity_info = "unknown";
+            {
+                std::lock_guard<std::mutex> cap_lock(capacity_mutex);
+                auto current_it = context_current_tokens.find(state.context_id);
+                auto capacity_it = context_capacity_limits.find(state.context_id);
+                if (current_it != context_current_tokens.end() && capacity_it != context_capacity_limits.end()) {
+                    capacity_info = std::to_string(current_it->second) + "/" + std::to_string(capacity_it->second);
+                }
+            }
+            
+            log_message("Channel " + std::to_string(channel_id) + " completed - context capacity reached (" + capacity_info + ")");
         }
         
-        bool success = llama_manager->update_context_from_history();
+        return false;
+    }
+    
+    // NEW: Apply all collected messages in batches by context
+    void apply_collected_messages() {
+        std::lock_guard<std::mutex> lock(pending_messages_mutex);
+        if (pending_messages.empty()) return;
         
-        if (success) {
-            std::lock_guard<std::mutex> lock(state_mutex);
-            state.messages_fetched += added_count;
-            state.last_message_id = latest_id;
+        log_message("Applying " + std::to_string(pending_messages.size()) + " collected messages to contexts...");
+        
+        // Sort messages by timestamp for chronological order
+        std::sort(pending_messages.begin(), pending_messages.end(),
+            [](const PendingMessage& a, const PendingMessage& b) {
+                return a.timestamp < b.timestamp;
+            });
+        
+        // Group messages by target context
+        std::unordered_map<std::string, std::vector<PendingMessage>> context_groups;
+        for (const auto& msg : pending_messages) {
+            context_groups[msg.target_context_id].push_back(msg);
+        }
+        
+        // Apply messages to each context in a single switch
+        std::string original_context = llama_manager->get_active_context();
+        
+        for (const auto& [context_id, messages] : context_groups) {
+            log_message("Switching to context '" + context_id + "' to add " + std::to_string(messages.size()) + " messages");
             
-            log_message("Added " + std::to_string(added_count) + " messages to context " + state.context_id);
+            if (llama_manager->switch_to_context(context_id)) {
+                int32_t added_count = 0;
+                for (const auto& msg : messages) {
+                    llama_manager->add_message_to_history(msg.username, msg.content);
+                    added_count++;
+                }
+                
+                if (llama_manager->update_context_from_history()) {
+                    log_message("Successfully added " + std::to_string(added_count) + " messages to context " + context_id);
+                } else {
+                    log_message("Failed to update context " + context_id + " from history");
+                }
+            } else {
+                log_message("Failed to switch to context " + context_id);
+            }
         }
         
         // Restore original context
         if (!original_context.empty()) {
             llama_manager->switch_to_context(original_context);
+            log_message("Restored original context: " + original_context);
         }
         
-        return success;
+        // Clear processed messages
+        pending_messages.clear();
+        log_message("Message application phase completed");
     }
     
     // SIMPLIFIED: Round-robin for shared channels
@@ -235,30 +361,66 @@ private:
         return channel_id;
     }
     
-    // SIMPLIFIED: Main processing loop
+    // MODIFIED: Updated main processing loop with proper isolated vs shared handling
     void process_all_channels() {
         const int32_t MAX_ITERATIONS = 1000;
         int32_t iteration = 0;
         
+        // Initialize context capacities once
+        log_message("Initializing context capacity tracking...");
+        initialize_context_capacities();
+        
+        // Phase 1: Collect all messages
+        log_message("Phase 1: Collecting messages from all channels...");
+        
         while (backfill_in_progress && iteration < MAX_ITERATIONS) {
             bool made_progress = false;
             
-            // Process isolated channels
-            for (const auto& [channel_id, state] : channel_states) {
-                if (state.is_isolated && !state.fetch_complete) {
-                    if (process_channel_batch(channel_id)) {
-                        made_progress = true;
+            // Process isolated channels sequentially to completion
+            // Since each has its own context, we can fill them completely without affecting others
+            std::vector<uint64_t> isolated_channels_to_process;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex);
+                for (const auto& [channel_id, state] : channel_states) {
+                    if (state.is_isolated && !state.fetch_complete) {
+                        isolated_channels_to_process.push_back(channel_id);
                     }
                 }
             }
             
-            // Process one shared channel (round-robin)
+            // Process all isolated channels until complete or no progress
+            for (uint64_t channel_id : isolated_channels_to_process) {
+                auto it = channel_states.find(channel_id);
+                if (it != channel_states.end() && !it->second.fetch_complete) {
+                    log_message("Processing isolated channel " + std::to_string(channel_id) + " to completion...");
+                    
+                    // Keep processing this isolated channel until it's done
+                    while (!it->second.fetch_complete && backfill_in_progress) {
+                        if (process_channel_batch(channel_id)) {
+                            made_progress = true;
+                            // Small delay between batches for rate limiting
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        } else {
+                            break; // Channel completed or error
+                        }
+                    }
+                    
+                    if (it->second.fetch_complete) {
+                        log_message("Completed isolated channel " + std::to_string(channel_id));
+                    }
+                }
+            }
+            
+            // Process shared channels using round-robin (only one batch per iteration)
+            // This ensures fair distribution of the main context among shared channels
             if (!shared_channels_list.empty()) {
                 uint64_t channel_id = get_next_shared_channel();
                 auto it = channel_states.find(channel_id);
                 if (it != channel_states.end() && !it->second.fetch_complete) {
                     if (process_channel_batch(channel_id)) {
                         made_progress = true;
+                        log_message("Processed batch for shared channel " + std::to_string(channel_id) + 
+                                   " (round-robin)");
                     }
                 }
             }
@@ -268,19 +430,33 @@ private:
             if (!made_progress) {
                 // Check if all channels are complete
                 bool all_complete = true;
-                for (const auto& [channel_id, state] : channel_states) {
-                    if (!state.fetch_complete) {
-                        all_complete = false;
-                        break;
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex);
+                    for (const auto& [channel_id, state] : channel_states) {
+                        if (!state.fetch_complete) {
+                            all_complete = false;
+                            break;
+                        }
                     }
                 }
                 
-                if (all_complete) break;
+                if (all_complete) {
+                    log_message("All channels completed");
+                    break;
+                }
+                
+                // If no progress but channels remain, wait and try again
+                log_message("No progress made, waiting before retry...");
                 std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             } else {
+                // Short delay between iterations when making progress
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
             }
         }
+        
+        // Phase 2: Apply all collected messages
+        log_message("Phase 2: Applying collected messages to contexts...");
+        apply_collected_messages();
         
         backfill_in_progress = false;
         log_message("Chat history backfill completed");
