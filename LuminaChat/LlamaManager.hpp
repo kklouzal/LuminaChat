@@ -50,12 +50,13 @@ private:
         const llama_vocab* vocab;
         int32_t n_ctx;
         int32_t n_gpu_layers;
+        int32_t n_predict; // Add predict tokens to model info
         std::string model_path;
         std::string custom_chat_template;
         bool model_loaded;
         
         ModelInfo() : model(nullptr), vocab(nullptr), n_ctx(2048), n_gpu_layers(0), 
-                     model_loaded(false) {}
+                     n_predict(256), model_loaded(false) {}
         
         ~ModelInfo() {
             if (model) {
@@ -109,10 +110,7 @@ private:
     std::string active_context_id;
     ContextInfo* current_context;
     
-    // Legacy model settings for compatibility
-    int32_t n_ctx;
-    int32_t n_predict;
-    int32_t n_gpu_layers;
+    // Legacy compatibility - only keep model_loaded flag
     bool model_loaded;
     
     // Template and cache management
@@ -567,9 +565,7 @@ private:
     }
 
 public:
-    LlamaManager() : current_context(nullptr),
-                     n_ctx(2048), n_predict(256), n_gpu_layers(0), model_loaded(false),
-                     token_cache(1024) {}
+    LlamaManager() : current_context(nullptr), model_loaded(false), token_cache(1024) {}
 
     ~LlamaManager() {
         cleanup();
@@ -581,21 +577,10 @@ public:
         return true;
     }
 
-    // Set configuration parameters
-    void set_context_size(int32_t context_size) {
-        n_ctx = context_size;
-    }
-    
-    void set_gpu_layers(int32_t gpu_layers) {
-        n_gpu_layers = gpu_layers;
-    }
-    
-    void set_predict_tokens(int32_t predict_tokens) {
-        n_predict = predict_tokens;
-    }
-
-    // Load .gguf model file and create ModelInfo
-    bool load_model(const std::string& model_path, const std::string& model_id = "", void* progress_callback_user_data = nullptr) {
+    // Load .gguf model file and create ModelInfo with specific parameters
+    bool load_model(const std::string& model_path, const std::string& model_id = "", 
+                   int32_t context_size = 2048, int32_t gpu_layers = 0, int32_t predict_tokens = 256,
+                   void* progress_callback_user_data = nullptr) {
         if (!std::filesystem::exists(model_path)) {
             LLAMA_LOG("Error: Model file does not exist: " + model_path);
             return false;
@@ -610,9 +595,9 @@ public:
 
         auto model_info = std::make_unique<ModelInfo>();
         
-        // Set up model parameters
+        // Set up model parameters with provided values
         llama_model_params model_params = llama_model_default_params();
-        model_params.n_gpu_layers = n_gpu_layers; // Use current setting as default
+        model_params.n_gpu_layers = gpu_layers;
         
         // Set progress callback if user data is provided
         if (progress_callback_user_data) {
@@ -629,8 +614,9 @@ public:
 
         model_info->vocab = llama_model_get_vocab(model_info->model);
         model_info->model_path = model_path;
-        model_info->n_ctx = n_ctx; // Use current setting as default
-        model_info->n_gpu_layers = n_gpu_layers;
+        model_info->n_ctx = context_size;
+        model_info->n_gpu_layers = gpu_layers;
+        model_info->n_predict = predict_tokens; // Store predict tokens in model info
         model_info->model_loaded = true;
         
         models[actual_model_id] = std::move(model_info);
@@ -641,7 +627,8 @@ public:
         // Clear caches when new model is loaded
         clear_caches();
         
-        LLAMA_LOG("Model loaded successfully: " + model_path + " as '" + actual_model_id + "'");
+        LLAMA_LOG("Model loaded successfully: " + model_path + " as '" + actual_model_id + 
+                  "' (ctx:" + std::to_string(context_size) + ", gpu:" + std::to_string(gpu_layers) + ")");
         return true;
     }
 
@@ -1058,7 +1045,7 @@ public:
         // Generate response using unified functions
         std::string response;
         const int32_t safety_margin = 32; // Reserve space for potential special tokens
-        const int32_t max_new_tokens = std::min(n_predict, model_info->n_ctx - current_context->n_past - safety_margin);
+        const int32_t max_new_tokens = std::min(model_info->n_predict, model_info->n_ctx - current_context->n_past - safety_margin);
         response.reserve(max_new_tokens * 4);
         
         if (max_new_tokens <= 0) {
@@ -1352,10 +1339,10 @@ public:
         current_context->message_cache_dirty = true;
     }
 
-    // MOVED: Get context size for capacity calculations
+    // MOVED: Get context size for capacity calculations - now uses model-specific value
     int32_t get_context_size() const {
         ModelInfo* model_info = get_current_model_info();
-        return model_info ? model_info->n_ctx : n_ctx;
+        return model_info ? model_info->n_ctx : 2048; // Default fallback
     }
 
     // MOVED: Get current context token usage
@@ -1410,7 +1397,7 @@ public:
         if (!apply_template_optimized(false, formatted_content)) {
             return 0;
         }
-        
+
         // Tokenize and return count
         std::vector<llama_token> tokens = process_text_to_tokens(formatted_content, true);
         return static_cast<int32_t>(tokens.size());

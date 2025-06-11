@@ -190,12 +190,10 @@ private:
         
         llama_log_set(llama_log_callback, parent);
         
-        llama_manager->set_context_size(config.context_size);
-        llama_manager->set_gpu_layers(config.gpu_layers);
-        llama_manager->set_predict_tokens(config.predict_tokens);
-        
-        // Use "main_model" as the default model ID
-        if (should_stop || !llama_manager->load_model(config.model_path, "main_model", parent)) return false;
+        // Use "main_model" as the default model ID and pass all parameters to load_model
+        if (should_stop || !llama_manager->load_model(config.model_path, "main_model", 
+                                                     config.context_size, config.gpu_layers, 
+                                                     config.predict_tokens, parent)) return false;
         
         if (!config.chat_template.empty()) {
             llama_manager->set_custom_chat_template(config.chat_template);
