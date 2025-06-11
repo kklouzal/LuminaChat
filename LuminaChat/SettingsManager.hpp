@@ -117,7 +117,9 @@ public:
                            const std::string& identity_directive, const std::string& other_directives,
                            const std::string& discord_bot_token,
                            const std::string& discord_isolated_channel_ids, const std::string& discord_shared_history_channel_ids,
-                           bool discord_allow_dms, bool discord_pull_history, int32_t discord_history_fill_percentage) {
+                           bool discord_allow_dms, bool discord_pull_history, int32_t discord_history_fill_percentage,
+                           const std::string& summarizer_model_path, int32_t summarizer_context_size, int32_t summarizer_gpu_layers,
+                           int32_t summarizer_predict_tokens, const std::string& summarizer_system_prompt, const std::string& summarizer_chat_template) {
         std::string filepath = GetSettingsFilePath();
         std::ofstream file(filepath);
         
@@ -149,6 +151,16 @@ public:
             file << "AllowDMs=" << (discord_allow_dms ? "1" : "0") << std::endl;
             file << "PullHistory=" << (discord_pull_history ? "1" : "0") << std::endl;
             file << "HistoryFillPercentage=" << discord_history_fill_percentage << std::endl;
+            file << std::endl;
+            
+            // [Summarizer] section
+            file << "[Summarizer]" << std::endl;
+            file << "ModelPath=" << EscapeString(summarizer_model_path) << std::endl;
+            file << "ContextSize=" << summarizer_context_size << std::endl;
+            file << "GpuLayers=" << summarizer_gpu_layers << std::endl;
+            file << "PredictTokens=" << summarizer_predict_tokens << std::endl;
+            file << "SystemPrompt=" << EscapeString(summarizer_system_prompt) << std::endl;
+            file << "ChatTemplate=" << EscapeString(summarizer_chat_template) << std::endl;
             
             file.close();
             
@@ -163,7 +175,9 @@ public:
                            std::string& identity_directive, std::string& other_directives,
                            std::string& discord_bot_token,
                            std::string& discord_isolated_channel_ids, std::string& discord_shared_history_channel_ids,
-                           bool& discord_allow_dms, bool& discord_pull_history, int32_t& discord_history_fill_percentage) {
+                           bool& discord_allow_dms, bool& discord_pull_history, int32_t& discord_history_fill_percentage,
+                           std::string& summarizer_model_path, int32_t& summarizer_context_size, int32_t& summarizer_gpu_layers,
+                           int32_t& summarizer_predict_tokens, std::string& summarizer_system_prompt, std::string& summarizer_chat_template) {
         std::string filepath = GetSettingsFilePath();
         std::ifstream file(filepath);
         
@@ -175,6 +189,15 @@ public:
         discord_allow_dms = true; // Default to true
         discord_pull_history = true; // Default to true
         discord_history_fill_percentage = 50; // Default to 50%
+        
+        // Summarizer defaults
+        if (summarizer_context_size == 0) summarizer_context_size = 1024;
+        if (summarizer_gpu_layers == 0) summarizer_gpu_layers = 0;
+        if (summarizer_predict_tokens == 0) summarizer_predict_tokens = 128;
+        if (summarizer_system_prompt.empty()) {
+            summarizer_system_prompt = "You are a helpful AI assistant that provides concise summaries. "
+                                     "Focus on key points and maintain clarity while keeping responses brief.";
+        }
         
         if (file.is_open()) {
             log_message("Loading settings from: " + filepath);
@@ -274,6 +297,32 @@ public:
                         // Legacy support: ignore old ChannelIds setting if present
                         else if (key == "ChannelIds") {
                             log_message("Ignored legacy ChannelIds setting (no longer used)");
+                        }
+                    } else if (current_section == "Summarizer") {
+                        if (key == "ModelPath") {
+                            summarizer_model_path = UnescapeString(value);
+                            loaded_count++;
+                            log_message("Loaded Summarizer ModelPath: " + std::string(summarizer_model_path.empty() ? "(empty)" : "configured"));
+                        } else if (key == "ContextSize") {
+                            summarizer_context_size = ValidateInt32(value, 1024, 1, 32768);
+                            loaded_count++;
+                            log_message("Loaded Summarizer ContextSize: " + std::to_string(summarizer_context_size));
+                        } else if (key == "GpuLayers") {
+                            summarizer_gpu_layers = ValidateInt32(value, 0, 0, 999);
+                            loaded_count++;
+                            log_message("Loaded Summarizer GpuLayers: " + std::to_string(summarizer_gpu_layers));
+                        } else if (key == "PredictTokens") {
+                            summarizer_predict_tokens = ValidateInt32(value, 128, 1, 2048);
+                            loaded_count++;
+                            log_message("Loaded Summarizer PredictTokens: " + std::to_string(summarizer_predict_tokens));
+                        } else if (key == "SystemPrompt") {
+                            summarizer_system_prompt = UnescapeString(value);
+                            loaded_count++;
+                            log_message("Loaded Summarizer SystemPrompt: " + std::string(summarizer_system_prompt.empty() ? "(empty)" : "configured"));
+                        } else if (key == "ChatTemplate") {
+                            summarizer_chat_template = UnescapeString(value);
+                            loaded_count++;
+                            log_message("Loaded Summarizer ChatTemplate: " + std::string(summarizer_chat_template.empty() ? "(empty)" : "configured"));
                         }
                     } else {
                         log_message("Unknown section/setting: [" + current_section + "] " + key + "=" + value);

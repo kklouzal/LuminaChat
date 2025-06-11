@@ -35,6 +35,7 @@
 #include <wx/gauge.h>
 #include <wx/checkbox.h>
 #include <wx/slider.h>
+#include <wx/scrolwin.h>
 #include <string>
 #include <cstdint>
 #include <memory>
@@ -250,6 +251,14 @@ private:
         wxCheckBox* pull_history;
         wxSlider* history_percentage;
         wxStaticText* percentage_label;
+        
+        // Summarizer settings
+        wxTextCtrl* summarizer_model_path;
+        wxTextCtrl* summarizer_context_size;
+        wxTextCtrl* summarizer_gpu_layers;
+        wxTextCtrl* summarizer_predict_tokens;
+        wxTextCtrl* summarizer_system_prompt;
+        wxTextCtrl* summarizer_chat_template;
     } ctrls;
     
     // Configuration references - const to prevent modification
@@ -267,6 +276,12 @@ private:
         bool& discord_allow_dms;
         bool& discord_pull_history;
         int32_t& discord_history_percentage;
+        std::string& summarizer_model_path;
+        int32_t& summarizer_context_size;
+        int32_t& summarizer_gpu_layers;
+        int32_t& summarizer_predict_tokens;
+        std::string& summarizer_system_prompt;
+        std::string& summarizer_chat_template;
     } config;
 
     // Cached UI elements
@@ -278,11 +293,15 @@ public:
                   int32_t& predict_tokens, std::string& chat_template, std::string& identity_directive, 
                   std::string& other_directives, std::string& discord_bot_token,
                   std::string& discord_isolated_channels, std::string& discord_shared_channels,
-                  bool& discord_allow_dms, bool& discord_pull_history, int32_t& discord_history_percentage) 
+                  bool& discord_allow_dms, bool& discord_pull_history, int32_t& discord_history_percentage,
+                  std::string& summarizer_model_path, int32_t& summarizer_context_size, int32_t& summarizer_gpu_layers,
+                  int32_t& summarizer_predict_tokens, std::string& summarizer_system_prompt, std::string& summarizer_chat_template) 
         : wxDialog(parent, wxID_ANY, "Settings", wxDefaultPosition, wxSize(700, 600))
         , config{model_path, context_size, gpu_layers, predict_tokens, chat_template,
                 identity_directive, other_directives, discord_bot_token, discord_isolated_channels,
-                discord_shared_channels, discord_allow_dms, discord_pull_history, discord_history_percentage} {
+                discord_shared_channels, discord_allow_dms, discord_pull_history, discord_history_percentage,
+                summarizer_model_path, summarizer_context_size, summarizer_gpu_layers, summarizer_predict_tokens,
+                summarizer_system_prompt, summarizer_chat_template} {
         
         InitializeUI();
         BindEvents();
@@ -295,6 +314,7 @@ private:
         CreateModelSettingsTab(notebook);
         CreateSystemPromptTab(notebook);
         CreateChatTemplateTab(notebook);
+        CreateSummarizerTab(notebook);
         CreateDiscordSettingsTab(notebook);
         
         // Dialog layout
@@ -311,103 +331,190 @@ private:
     
     void CreateModelSettingsTab(wxNotebook* notebook) {
         auto* panel = new wxPanel(notebook);
+        auto* scrolled = new wxScrolledWindow(panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL);
+        scrolled->SetScrollRate(0, 20);
+        
         auto* sizer = new wxBoxSizer(wxVERTICAL);
         
         // Model file path with browse button
-        sizer->Add(new wxStaticText(panel, wxID_ANY, "Model File Path:"), 0, wxALL, 5);
+        sizer->Add(new wxStaticText(scrolled, wxID_ANY, "Model File Path:"), 0, wxALL, 5);
         
         auto* path_sizer = new wxBoxSizer(wxHORIZONTAL);
-        ctrls.model_path = new wxTextCtrl(panel, wxID_ANY, config.model_path, wxDefaultPosition, wxDefaultSize, wxTE_READONLY);
-        auto* browse_btn = new wxButton(panel, static_cast<int>(EventId::BROWSE_MODEL), "Browse...");
+        ctrls.model_path = new wxTextCtrl(scrolled, wxID_ANY, config.model_path, wxDefaultPosition, wxDefaultSize, wxTE_READONLY);
+        auto* browse_btn = new wxButton(scrolled, static_cast<int>(EventId::BROWSE_MODEL), "Browse...");
         
         path_sizer->Add(ctrls.model_path, 1, wxEXPAND | wxRIGHT, 5);
         path_sizer->Add(browse_btn, 0, wxALIGN_CENTER_VERTICAL);
         sizer->Add(path_sizer, 0, wxEXPAND | wxALL, 5);
         
         // Numeric settings with validation hints
-        AddNumericSetting(panel, sizer, "Context Size (tokens):", ctrls.context_size, config.context_size);
-        AddNumericSetting(panel, sizer, "GPU Offload Layers (0 = CPU only):", ctrls.gpu_layers, config.gpu_layers);
-        AddNumericSetting(panel, sizer, "Max Prediction Tokens:", ctrls.predict_tokens, config.predict_tokens);
+        AddNumericSetting(scrolled, sizer, "Context Size (tokens):", ctrls.context_size, config.context_size);
+        AddNumericSetting(scrolled, sizer, "GPU Offload Layers (0 = CPU only):", ctrls.gpu_layers, config.gpu_layers);
+        AddNumericSetting(scrolled, sizer, "Max Prediction Tokens:", ctrls.predict_tokens, config.predict_tokens);
         
-        panel->SetSizer(sizer);
+        scrolled->SetSizer(sizer);
+        
+        auto* panel_sizer = new wxBoxSizer(wxVERTICAL);
+        panel_sizer->Add(scrolled, 1, wxEXPAND);
+        panel->SetSizer(panel_sizer);
+        
         notebook->AddPage(panel, "Model Settings");
     }
     
-    void AddNumericSetting(wxPanel* panel, wxBoxSizer* sizer, const wxString& label, 
+    void AddNumericSetting(wxWindow* parent, wxBoxSizer* sizer, const wxString& label, 
                           wxTextCtrl*& control, int32_t value) {
-        sizer->Add(new wxStaticText(panel, wxID_ANY, label), 0, wxALL, 5);
-        control = new wxTextCtrl(panel, wxID_ANY, wxString::Format("%d", value));
+        sizer->Add(new wxStaticText(parent, wxID_ANY, label), 0, wxALL, 5);
+        control = new wxTextCtrl(parent, wxID_ANY, wxString::Format("%d", value));
         sizer->Add(control, 0, wxEXPAND | wxALL, 5);
     }
     
     void CreateSystemPromptTab(wxNotebook* notebook) {
         auto* panel = new wxPanel(notebook);
+        auto* scrolled = new wxScrolledWindow(panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL);
+        scrolled->SetScrollRate(0, 20);
+        
         auto* sizer = new wxBoxSizer(wxVERTICAL);
         
         // Identity Directive (1/3 height)
-        sizer->Add(new wxStaticText(panel, wxID_ANY, "Identity Directive:"), 0, wxALL, 5);
-        ctrls.identity_directive = new wxTextCtrl(panel, wxID_ANY, wxString::FromUTF8(config.identity_directive), 
-                                               wxDefaultPosition, wxDefaultSize, 
+        sizer->Add(new wxStaticText(scrolled, wxID_ANY, "Identity Directive:"), 0, wxALL, 5);
+        ctrls.identity_directive = new wxTextCtrl(scrolled, wxID_ANY, wxString::FromUTF8(config.identity_directive), 
+                                               wxDefaultPosition, wxSize(-1, 100), 
                                                wxTE_MULTILINE | wxTE_WORDWRAP);
         ctrls.identity_directive->SetFont(monospace_font);
-        sizer->Add(ctrls.identity_directive, 1, wxEXPAND | wxALL, 5);
+        sizer->Add(ctrls.identity_directive, 0, wxEXPAND | wxALL, 5);
         
         // Other Directives (2/3 height)
-        sizer->Add(new wxStaticText(panel, wxID_ANY, "Other Directives:"), 0, wxALL, 5);
-        ctrls.other_directives = new wxTextCtrl(panel, wxID_ANY, wxString::FromUTF8(config.other_directives), 
-                                             wxDefaultPosition, wxDefaultSize, 
+        sizer->Add(new wxStaticText(scrolled, wxID_ANY, "Other Directives:"), 0, wxALL, 5);
+        ctrls.other_directives = new wxTextCtrl(scrolled, wxID_ANY, wxString::FromUTF8(config.other_directives), 
+                                             wxDefaultPosition, wxSize(-1, 200), 
                                              wxTE_MULTILINE | wxTE_WORDWRAP);
         ctrls.other_directives->SetFont(monospace_font);
-        sizer->Add(ctrls.other_directives, 2, wxEXPAND | wxALL, 5);
+        sizer->Add(ctrls.other_directives, 0, wxEXPAND | wxALL, 5);
         
-        panel->SetSizer(sizer);
+        scrolled->SetSizer(sizer);
+        
+        auto* panel_sizer = new wxBoxSizer(wxVERTICAL);
+        panel_sizer->Add(scrolled, 1, wxEXPAND);
+        panel->SetSizer(panel_sizer);
+        
         notebook->AddPage(panel, "System Prompt");
     }
     
     void CreateChatTemplateTab(wxNotebook* notebook) {
         auto* panel = new wxPanel(notebook);
+        auto* scrolled = new wxScrolledWindow(panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL);
+        scrolled->SetScrollRate(0, 20);
+        
         auto* sizer = new wxBoxSizer(wxVERTICAL);
         
-        sizer->Add(new wxStaticText(panel, wxID_ANY, "Chat Template (Jinja2 format):"), 0, wxALL, 5);
-        sizer->Add(new wxStaticText(panel, wxID_ANY, "Leave empty to use model's default template"), 0, wxALL, 5);
+        sizer->Add(new wxStaticText(scrolled, wxID_ANY, "Chat Template (Jinja2 format):"), 0, wxALL, 5);
+        sizer->Add(new wxStaticText(scrolled, wxID_ANY, "Leave empty to use model's default template"), 0, wxALL, 5);
         
-        ctrls.chat_template = new wxTextCtrl(panel, wxID_ANY, wxString::FromUTF8(config.chat_template), 
-                                           wxDefaultPosition, wxDefaultSize, 
+        ctrls.chat_template = new wxTextCtrl(scrolled, wxID_ANY, wxString::FromUTF8(config.chat_template), 
+                                           wxDefaultPosition, wxSize(-1, 200), 
                                            wxTE_MULTILINE | wxTE_WORDWRAP);
         ctrls.chat_template->SetFont(monospace_font);
         
-        sizer->Add(ctrls.chat_template, 1, wxEXPAND | wxALL, 5);
+        sizer->Add(ctrls.chat_template, 0, wxEXPAND | wxALL, 5);
         
         // Add helpful text
-        wxStaticText* help_text = new wxStaticText(panel, wxID_ANY, 
+        wxStaticText* help_text = new wxStaticText(scrolled, wxID_ANY, 
             "Common variables: {{ messages }}, {{ add_generation_prompt }}\n"
             "Example: {% for message in messages %}{{ message.role }}: {{ message.content }}{% endfor %}");
         help_text->SetFont(help_font);
         sizer->Add(help_text, 0, wxALL, 5);
         
-        panel->SetSizer(sizer);
+        scrolled->SetSizer(sizer);
+        
+        auto* panel_sizer = new wxBoxSizer(wxVERTICAL);
+        panel_sizer->Add(scrolled, 1, wxEXPAND);
+        panel->SetSizer(panel_sizer);
+        
         notebook->AddPage(panel, "Chat Template");
+    }
+    
+    void CreateSummarizerTab(wxNotebook* notebook) {
+        auto* panel = new wxPanel(notebook);
+        auto* scrolled = new wxScrolledWindow(panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL);
+        scrolled->SetScrollRate(0, 20);
+        
+        auto* sizer = new wxBoxSizer(wxVERTICAL);
+        
+        // Model file path with browse button
+        sizer->Add(new wxStaticText(scrolled, wxID_ANY, "Summarization Model File Path:"), 0, wxALL, 5);
+        
+        auto* path_sizer = new wxBoxSizer(wxHORIZONTAL);
+        ctrls.summarizer_model_path = new wxTextCtrl(scrolled, wxID_ANY, config.summarizer_model_path, 
+                                                   wxDefaultPosition, wxDefaultSize, wxTE_READONLY);
+        auto* browse_btn = new wxButton(scrolled, static_cast<int>(EventId::BROWSE_MODEL) + 100, "Browse...");
+        
+        path_sizer->Add(ctrls.summarizer_model_path, 1, wxEXPAND | wxRIGHT, 5);
+        path_sizer->Add(browse_btn, 0, wxALIGN_CENTER_VERTICAL);
+        sizer->Add(path_sizer, 0, wxEXPAND | wxALL, 5);
+        
+        // Numeric settings
+        AddNumericSetting(scrolled, sizer, "Context Size (tokens):", ctrls.summarizer_context_size, config.summarizer_context_size);
+        AddNumericSetting(scrolled, sizer, "GPU Offload Layers (0 = CPU only):", ctrls.summarizer_gpu_layers, config.summarizer_gpu_layers);
+        AddNumericSetting(scrolled, sizer, "Max Prediction Tokens:", ctrls.summarizer_predict_tokens, config.summarizer_predict_tokens);
+        
+        // System Prompt
+        sizer->Add(new wxStaticText(scrolled, wxID_ANY, "System Prompt:"), 0, wxALL, 5);
+        ctrls.summarizer_system_prompt = new wxTextCtrl(scrolled, wxID_ANY, wxString::FromUTF8(config.summarizer_system_prompt), 
+                                                      wxDefaultPosition, wxSize(-1, 120), 
+                                                      wxTE_MULTILINE | wxTE_WORDWRAP);
+        ctrls.summarizer_system_prompt->SetFont(monospace_font);
+        sizer->Add(ctrls.summarizer_system_prompt, 0, wxEXPAND | wxALL, 5);
+        
+        // Chat Template
+        sizer->Add(new wxStaticText(scrolled, wxID_ANY, "Chat Template (leave empty to use model default):"), 0, wxALL, 5);
+        ctrls.summarizer_chat_template = new wxTextCtrl(scrolled, wxID_ANY, wxString::FromUTF8(config.summarizer_chat_template), 
+                                                       wxDefaultPosition, wxSize(-1, 120), 
+                                                       wxTE_MULTILINE | wxTE_WORDWRAP);
+        ctrls.summarizer_chat_template->SetFont(monospace_font);
+        sizer->Add(ctrls.summarizer_chat_template, 0, wxEXPAND | wxALL, 5);
+        
+        scrolled->SetSizer(sizer);
+        
+        auto* panel_sizer = new wxBoxSizer(wxVERTICAL);
+        panel_sizer->Add(scrolled, 1, wxEXPAND);
+        panel->SetSizer(panel_sizer);
+        
+        notebook->AddPage(panel, "Summarizer");
+        
+        // Bind browse button event
+        browse_btn->Bind(wxEVT_COMMAND_BUTTON_CLICKED, [this](wxCommandEvent&) {
+            wxFileDialog file_dialog(this, "Choose Summarizer Model File", "", "", 
+                                    "GGUF files (*.gguf)|*.gguf|All files (*.*)|*.*",
+                                    wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+            
+            if (file_dialog.ShowModal() == wxID_OK) {
+                ctrls.summarizer_model_path->SetValue(file_dialog.GetPath());
+            }
+        });
     }
     
     void CreateDiscordSettingsTab(wxNotebook* notebook) {
         auto* panel = new wxPanel(notebook);
+        auto* scrolled = new wxScrolledWindow(panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL);
+        scrolled->SetScrollRate(0, 20);
+        
         auto* sizer = new wxBoxSizer(wxVERTICAL);
         
         // Streamlined Discord settings creation
-        AddTextSetting(panel, sizer, "Discord Bot Token:", ctrls.bot_token, config.discord_bot_token, wxTE_PASSWORD);
+        AddTextSetting(scrolled, sizer, "Discord Bot Token:", ctrls.bot_token, config.discord_bot_token, wxTE_PASSWORD);
         
-        ctrls.allow_dms = new wxCheckBox(panel, wxID_ANY, "Allow Direct Messages");
+        ctrls.allow_dms = new wxCheckBox(scrolled, wxID_ANY, "Allow Direct Messages");
         ctrls.allow_dms->SetValue(config.discord_allow_dms);
         sizer->Add(ctrls.allow_dms, 0, wxALL, 5);
         
         // History settings in horizontal layout
         auto* history_sizer = new wxBoxSizer(wxHORIZONTAL);
-        ctrls.pull_history = new wxCheckBox(panel, wxID_ANY, "Pull Message History");
+        ctrls.pull_history = new wxCheckBox(scrolled, wxID_ANY, "Pull Message History");
         ctrls.pull_history->SetValue(config.discord_pull_history);
         
-        ctrls.history_percentage = new wxSlider(panel, wxID_ANY, config.discord_history_percentage, 
+        ctrls.history_percentage = new wxSlider(scrolled, wxID_ANY, config.discord_history_percentage, 
                                                10, 80, wxDefaultPosition, wxSize(120, -1));
-        ctrls.percentage_label = new wxStaticText(panel, wxID_ANY, 
+        ctrls.percentage_label = new wxStaticText(scrolled, wxID_ANY, 
                                                  wxString::Format("%d%%", config.discord_history_percentage));
         
         history_sizer->Add(ctrls.pull_history, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 20);
@@ -415,25 +522,30 @@ private:
         history_sizer->Add(ctrls.percentage_label, 0, wxALIGN_CENTER_VERTICAL);
         sizer->Add(history_sizer, 0, wxALL, 5);
         
-        AddTextSetting(panel, sizer, "Isolated Context Channels:", ctrls.isolated_channels, 
+        AddTextSetting(scrolled, sizer, "Isolated Context Channels:", ctrls.isolated_channels, 
                       config.discord_isolated_channels, wxTE_MULTILINE);
-        AddTextSetting(panel, sizer, "Shared Context Channels:", ctrls.shared_channels, 
+        AddTextSetting(scrolled, sizer, "Shared Context Channels:", ctrls.shared_channels, 
                       config.discord_shared_channels, wxTE_MULTILINE);
         
-        panel->SetSizer(sizer);
+        scrolled->SetSizer(sizer);
+        
+        auto* panel_sizer = new wxBoxSizer(wxVERTICAL);
+        panel_sizer->Add(scrolled, 1, wxEXPAND);
+        panel->SetSizer(panel_sizer);
+        
         notebook->AddPage(panel, "Discord Settings");
     }
     
     // Helper method to reduce code duplication
-    void AddTextSetting(wxPanel* panel, wxBoxSizer* sizer, const wxString& label, 
+    void AddTextSetting(wxWindow* parent, wxBoxSizer* sizer, const wxString& label, 
                        wxTextCtrl*& control, const std::string& value, long style = 0) {
-        sizer->Add(new wxStaticText(panel, wxID_ANY, label), 0, wxALL, 5);
-        control = new wxTextCtrl(panel, wxID_ANY, wxString::FromUTF8(value), 
-                                wxDefaultPosition, wxDefaultSize, style);
+        sizer->Add(new wxStaticText(parent, wxID_ANY, label), 0, wxALL, 5);
+        control = new wxTextCtrl(parent, wxID_ANY, wxString::FromUTF8(value), 
+                                wxDefaultPosition, (style & wxTE_MULTILINE) ? wxSize(-1, 80) : wxDefaultSize, style);
         if (style & wxTE_MULTILINE) {
             control->SetFont(monospace_font);
         }
-        sizer->Add(control, (style & wxTE_MULTILINE) ? 1 : 0, wxEXPAND | wxALL, 5);
+        sizer->Add(control, 0, wxEXPAND | wxALL, 5);
     }
     
     void BindEvents() {
@@ -499,17 +611,28 @@ private:
         config.discord_pull_history = ctrls.pull_history->GetValue();
         config.discord_history_percentage = ctrls.history_percentage->GetValue();
         
-        // Save settings
+        // Summarizer settings
+        config.summarizer_model_path = ctrls.summarizer_model_path->GetValue().ToStdString();
+        ValidateNumeric(ctrls.summarizer_context_size, config.summarizer_context_size, 1, 32768, 1024, "summarizer context size");
+        ValidateNumeric(ctrls.summarizer_gpu_layers, config.summarizer_gpu_layers, 0, 999, 0, "summarizer GPU layers");
+        ValidateNumeric(ctrls.summarizer_predict_tokens, config.summarizer_predict_tokens, 1, 2048, 128, "summarizer prediction tokens");
+        config.summarizer_system_prompt = ctrls.summarizer_system_prompt->GetValue().ToUTF8().data();
+        config.summarizer_chat_template = ctrls.summarizer_chat_template->GetValue().ToUTF8().data();
+        
+        // Save settings with all parameters
         SettingsManager::SaveSettings(config.model_path, config.context_size, config.gpu_layers, 
                                     config.predict_tokens, config.chat_template, 
                                     config.identity_directive, config.other_directives,
                                     config.discord_bot_token, config.discord_isolated_channels, 
                                     config.discord_shared_channels, config.discord_allow_dms, 
-                                    config.discord_pull_history, config.discord_history_percentage);
+                                    config.discord_pull_history, config.discord_history_percentage,
+                                    config.summarizer_model_path, config.summarizer_context_size,
+                                    config.summarizer_gpu_layers, config.summarizer_predict_tokens,
+                                    config.summarizer_system_prompt, config.summarizer_chat_template);
         
         EndModal(wxID_OK);
     }
-    
+
     // Optimized channel ID validation
     std::string ValidateChannelIds(const std::string& input) {
         if (input.empty()) return {};
@@ -556,7 +679,9 @@ private:
         std::string model_path, chat_template;
         std::string identity_directive, other_directives;
         std::string discord_token, discord_isolated_channels, discord_shared_channels;
+        std::string summarizer_model_path, summarizer_system_prompt, summarizer_chat_template;
         int32_t context_size{2048}, gpu_layers{0}, predict_tokens{256};
+        int32_t summarizer_context_size{1024}, summarizer_gpu_layers{0}, summarizer_predict_tokens{128};
         int32_t discord_history_percentage{50};
         bool discord_allow_dms{true}, discord_pull_history{true};
     } config;
@@ -620,7 +745,10 @@ private:
                                     config.identity_directive, config.other_directives,
                                     config.discord_token, config.discord_isolated_channels, 
                                     config.discord_shared_channels, config.discord_allow_dms,
-                                    config.discord_pull_history, config.discord_history_percentage);
+                                    config.discord_pull_history, config.discord_history_percentage,
+                                    config.summarizer_model_path, config.summarizer_context_size,
+                                    config.summarizer_gpu_layers, config.summarizer_predict_tokens,
+                                    config.summarizer_system_prompt, config.summarizer_chat_template);
     }
     
     void CreateUI() {
@@ -865,7 +993,10 @@ private:
                                         config.identity_directive, config.other_directives,
                                         config.discord_token, config.discord_isolated_channels, 
                                         config.discord_shared_channels, config.discord_allow_dms,
-                                        config.discord_pull_history, config.discord_history_percentage);
+                                        config.discord_pull_history, config.discord_history_percentage,
+                                        config.summarizer_model_path, config.summarizer_context_size,
+                                        config.summarizer_gpu_layers, config.summarizer_predict_tokens,
+                                        config.summarizer_system_prompt, config.summarizer_chat_template);
         }
 
         is_processing = true;
@@ -926,7 +1057,10 @@ private:
                                                 config.identity_directive, config.other_directives,
                                                 config.discord_token, config.discord_isolated_channels, 
                                                 config.discord_shared_channels, config.discord_allow_dms,
-                                                config.discord_pull_history, config.discord_history_percentage);
+                                                config.discord_pull_history, config.discord_history_percentage,
+                                                config.summarizer_model_path, config.summarizer_context_size,
+                                                config.summarizer_gpu_layers, config.summarizer_predict_tokens,
+                                                config.summarizer_system_prompt, config.summarizer_chat_template);
                     LLAMA_LOG("Loaded chat template from model");
                 }
             } else {
@@ -1089,7 +1223,10 @@ private:
                             config.chat_template, config.identity_directive, config.other_directives,
                             config.discord_token, config.discord_isolated_channels, 
                             config.discord_shared_channels, config.discord_allow_dms,
-                            config.discord_pull_history, config.discord_history_percentage);
+                            config.discord_pull_history, config.discord_history_percentage,
+                            config.summarizer_model_path, config.summarizer_context_size,
+                            config.summarizer_gpu_layers, config.summarizer_predict_tokens,
+                            config.summarizer_system_prompt, config.summarizer_chat_template);
         if (dialog.ShowModal() == wxID_OK) {
             UpdateWindowTitle();
             

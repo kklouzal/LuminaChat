@@ -45,6 +45,7 @@ enum class LogComponent {
     DISCORD_MANAGER,
     DISCORD_HISTORY,
     SETTINGS_MANAGER,
+    SUMMARIZER_MANAGER,
     UI,
     GENERAL
 };
@@ -68,6 +69,7 @@ private:
             case LogComponent::DISCORD_MANAGER: return "Discord";
             case LogComponent::DISCORD_HISTORY: return "DiscordHistory";
             case LogComponent::SETTINGS_MANAGER: return "Settings";
+            case LogComponent::SUMMARIZER_MANAGER: return "Summarizer";
             case LogComponent::UI: return "UI";
             case LogComponent::GENERAL: return "General";
             default: return "Unknown";
@@ -202,6 +204,10 @@ public:
         log(level, LogComponent::SETTINGS_MANAGER, message);
     }
     
+    static void summarizer_log(const std::string& message, LogLevel level = LogLevel::INF) {
+        log(level, LogComponent::SUMMARIZER_MANAGER, message);
+    }
+    
     static void ui_log(const std::string& message, LogLevel level = LogLevel::INF) {
         log(level, LogComponent::UI, message);
     }
@@ -224,6 +230,8 @@ public:
 #define DISCORD_LOG_ERROR(message) LogHandler::discord_log(message, LogLevel::ERR)
 #define DISCORD_HISTORY_LOG(message) LogHandler::discord_history_log(message)
 #define SETTINGS_LOG(message) LogHandler::settings_log(message)
+#define SUMMARIZER_LOG(message) LogHandler::summarizer_log(message)
+#define SUMMARIZER_LOG_ERROR(message) LogHandler::summarizer_log(message, LogLevel::ERR)
 #define UI_LOG(message) LogHandler::ui_log(message)
 
 //
