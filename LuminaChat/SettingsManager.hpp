@@ -92,11 +92,6 @@ private:
         }
     }
 
-    // Helper function for thread-safe logging
-    static void log_message(const std::string& message) {
-        SETTINGS_LOG(message);
-    }
-
 public:
     static std::string GetSettingsFilePath() {
         // Get the directory where the executable is located
@@ -108,7 +103,7 @@ public:
         wxFileName configFile(appDir, "luminachat.ini");
         std::string filepath = configFile.GetFullPath().ToStdString();
         
-        log_message("Settings file path: " + filepath);
+        SETTINGS_LOG("Settings file path: " + filepath);
         return filepath;
     }
     
@@ -164,9 +159,9 @@ public:
             
             file.close();
             
-            log_message("Settings saved to: " + filepath);
+            SETTINGS_LOG("Settings saved to: " + filepath);
         } else {
-            log_message("Error: Failed to save settings to: " + filepath);
+            SETTINGS_LOG("Error: Failed to save settings to: " + filepath);
         }
     }
     
@@ -200,7 +195,7 @@ public:
         }
         
         if (file.is_open()) {
-            log_message("Loading settings from: " + filepath);
+            SETTINGS_LOG("Loading settings from: " + filepath);
             std::string line;
             std::string current_section;
             int loaded_count = 0;
@@ -218,7 +213,7 @@ public:
                 // Check for section headers
                 if (line[0] == '[' && line.back() == ']') {
                     current_section = line.substr(1, line.length() - 2);
-                    log_message("Reading section: [" + current_section + "]");
+                    SETTINGS_LOG("Reading section: [" + current_section + "]");
                     continue;
                 }
                 
@@ -238,102 +233,102 @@ public:
                         if (key == "ModelPath") {
                             model_path = UnescapeString(value);
                             loaded_count++;
-                            log_message("Loaded ModelPath: " + std::string(model_path.empty() ? "(empty)" : "configured"));
+                            SETTINGS_LOG("Loaded ModelPath: " + std::string(model_path.empty() ? "(empty)" : "configured"));
                         } else if (key == "ContextSize") {
                             context_size = ValidateInt32(value, 2048, 1, 131072);
                             loaded_count++;
-                            log_message("Loaded ContextSize: " + std::to_string(context_size));
+                            SETTINGS_LOG("Loaded ContextSize: " + std::to_string(context_size));
                         } else if (key == "GpuLayers") {
                             gpu_layers = ValidateInt32(value, 0, 0, 999);
                             loaded_count++;
-                            log_message("Loaded GpuLayers: " + std::to_string(gpu_layers));
+                            SETTINGS_LOG("Loaded GpuLayers: " + std::to_string(gpu_layers));
                         } else if (key == "PredictTokens") {
                             predict_tokens = ValidateInt32(value, 256, 1, 4096);
                             loaded_count++;
-                            log_message("Loaded PredictTokens: " + std::to_string(predict_tokens));
+                            SETTINGS_LOG("Loaded PredictTokens: " + std::to_string(predict_tokens));
                         }
                     } else if (current_section == "ChatTemplate") {
                         if (key == "Template") {
                             chat_template = UnescapeString(value);
                             loaded_count++;
-                            log_message("Loaded ChatTemplate: " + std::string(chat_template.empty() ? "(empty)" : "configured"));
+                            SETTINGS_LOG("Loaded ChatTemplate: " + std::string(chat_template.empty() ? "(empty)" : "configured"));
                         }
                     } else if (current_section == "SystemPrompt") {
                         if (key == "IdentityDirective") {
                             identity_directive = UnescapeString(value);
                             loaded_count++;
-                            log_message("Loaded IdentityDirective: " + std::string(identity_directive.empty() ? "(empty)" : "configured"));
+                            SETTINGS_LOG("Loaded IdentityDirective: " + std::string(identity_directive.empty() ? "(empty)" : "configured"));
                         } else if (key == "OtherDirectives") {
                             other_directives = UnescapeString(value);
                             loaded_count++;
-                            log_message("Loaded OtherDirectives: " + std::string(other_directives.empty() ? "(empty)" : "configured"));
+                            SETTINGS_LOG("Loaded OtherDirectives: " + std::string(other_directives.empty() ? "(empty)" : "configured"));
                         }
                     } else if (current_section == "Discord") {
                         if (key == "BotToken") {
                             discord_bot_token = UnescapeString(value);
                             loaded_count++;
-                            log_message("Loaded BotToken: " + std::string(discord_bot_token.empty() ? "(empty)" : "configured"));
+                            SETTINGS_LOG("Loaded BotToken: " + std::string(discord_bot_token.empty() ? "(empty)" : "configured"));
                         } else if (key == "IsolatedChannelIds") {
                             discord_isolated_channel_ids = UnescapeString(value);
                             loaded_count++;
-                            log_message("Loaded IsolatedChannelIds: " + discord_isolated_channel_ids);
+                            SETTINGS_LOG("Loaded IsolatedChannelIds: " + discord_isolated_channel_ids);
                         } else if (key == "SharedHistoryChannelIds") {
                             discord_shared_history_channel_ids = UnescapeString(value);
                             loaded_count++;
-                            log_message("Loaded SharedHistoryChannelIds: " + discord_shared_history_channel_ids);
+                            SETTINGS_LOG("Loaded SharedHistoryChannelIds: " + discord_shared_history_channel_ids);
                         } else if (key == "AllowDMs") {
                             discord_allow_dms = (value == "1" || value == "true" || value == "True" || value == "TRUE");
                             loaded_count++;
-                            log_message("Loaded AllowDMs: " + std::string(discord_allow_dms ? "true" : "false"));
+                            SETTINGS_LOG("Loaded AllowDMs: " + std::string(discord_allow_dms ? "true" : "false"));
                         } else if (key == "PullHistory") {
                             discord_pull_history = (value == "1" || value == "true" || value == "True" || value == "TRUE");
                             loaded_count++;
-                            log_message("Loaded PullHistory: " + std::string(discord_pull_history ? "true" : "false"));
+                            SETTINGS_LOG("Loaded PullHistory: " + std::string(discord_pull_history ? "true" : "false"));
                         } else if (key == "HistoryFillPercentage") {
                             discord_history_fill_percentage = ValidateInt32(value, 50, 10, 80);
                             loaded_count++;
-                            log_message("Loaded HistoryFillPercentage: " + std::to_string(discord_history_fill_percentage) + "%");
+                            SETTINGS_LOG("Loaded HistoryFillPercentage: " + std::to_string(discord_history_fill_percentage) + "%");
                         }
                         // Legacy support: ignore old ChannelIds setting if present
                         else if (key == "ChannelIds") {
-                            log_message("Ignored legacy ChannelIds setting (no longer used)");
+                            SETTINGS_LOG("Ignored legacy ChannelIds setting (no longer used)");
                         }
                     } else if (current_section == "Summarizer") {
                         if (key == "ModelPath") {
                             summarizer_model_path = UnescapeString(value);
                             loaded_count++;
-                            log_message("Loaded Summarizer ModelPath: " + std::string(summarizer_model_path.empty() ? "(empty)" : "configured"));
+                            SETTINGS_LOG("Loaded Summarizer ModelPath: " + std::string(summarizer_model_path.empty() ? "(empty)" : "configured"));
                         } else if (key == "ContextSize") {
                             summarizer_context_size = ValidateInt32(value, 1024, 1, 32768);
                             loaded_count++;
-                            log_message("Loaded Summarizer ContextSize: " + std::to_string(summarizer_context_size));
+                            SETTINGS_LOG("Loaded Summarizer ContextSize: " + std::to_string(summarizer_context_size));
                         } else if (key == "GpuLayers") {
                             summarizer_gpu_layers = ValidateInt32(value, 0, 0, 999);
                             loaded_count++;
-                            log_message("Loaded Summarizer GpuLayers: " + std::to_string(summarizer_gpu_layers));
+                            SETTINGS_LOG("Loaded Summarizer GpuLayers: " + std::to_string(summarizer_gpu_layers));
                         } else if (key == "PredictTokens") {
                             summarizer_predict_tokens = ValidateInt32(value, 128, 1, 2048);
                             loaded_count++;
-                            log_message("Loaded Summarizer PredictTokens: " + std::to_string(summarizer_predict_tokens));
+                            SETTINGS_LOG("Loaded Summarizer PredictTokens: " + std::to_string(summarizer_predict_tokens));
                         } else if (key == "SystemPrompt") {
                             summarizer_system_prompt = UnescapeString(value);
                             loaded_count++;
-                            log_message("Loaded Summarizer SystemPrompt: " + std::string(summarizer_system_prompt.empty() ? "(empty)" : "configured"));
+                            SETTINGS_LOG("Loaded Summarizer SystemPrompt: " + std::string(summarizer_system_prompt.empty() ? "(empty)" : "configured"));
                         } else if (key == "ChatTemplate") {
                             summarizer_chat_template = UnescapeString(value);
                             loaded_count++;
-                            log_message("Loaded Summarizer ChatTemplate: " + std::string(summarizer_chat_template.empty() ? "(empty)" : "configured"));
+                            SETTINGS_LOG("Loaded Summarizer ChatTemplate: " + std::string(summarizer_chat_template.empty() ? "(empty)" : "configured"));
                         }
                     } else {
-                        log_message("Unknown section/setting: [" + current_section + "] " + key + "=" + value);
+                        SETTINGS_LOG("Unknown section/setting: [" + current_section + "] " + key + "=" + value);
                     }
                 }
             }
             file.close();
             
-            log_message("Settings loading complete. Loaded " + std::to_string(loaded_count) + " settings.");
+            SETTINGS_LOG("Settings loading complete. Loaded " + std::to_string(loaded_count) + " settings.");
         } else {
-            log_message("Settings file not found: " + filepath + " (using defaults)");
+            SETTINGS_LOG("Settings file not found: " + filepath + " (using defaults)");
         }
     }
 };

@@ -107,7 +107,7 @@ private:
         
         bot->on_ready([this](const dpp::ready_t& event) {
             is_connected = true;
-            log_message("Discord bot ready! Logged in as: " + bot->me.username);
+            DISCORD_LOG("Discord bot ready! Logged in as: " + bot->me.username);
         });
         
         bot->on_message_create([this](const dpp::message_create_t& event) {
@@ -116,14 +116,14 @@ private:
         
         bot->on_log([this](const dpp::log_t& event) {
             if (event.severity >= dpp::ll_warning) {
-                log_message("[D++] " + event.message);
+                DISCORD_LOG("[D++] " + event.message);
             }
         });
         
         bot->on_guild_create([this](const dpp::guild_create_t& event) {
             if (!is_connected) {
                 is_connected = true;
-                log_message("Discord bot connected to guild: " + event.created.name);
+                DISCORD_LOG("Discord bot connected to guild: " + event.created.name);
             }
         });
     }
@@ -198,10 +198,6 @@ private:
         return parts;
     }
     
-    void log_message(const std::string& message) const {
-        DISCORD_LOG(message);
-    }
-    
     void parse_channel_ids(const std::string& channel_ids_str, std::unordered_set<uint64_t>& target_set) {
         std::lock_guard<std::mutex> lock(channel_config_mutex);
         target_set.clear();
@@ -216,7 +212,7 @@ private:
                 try {
                     target_set.insert(std::stoull(id_str));
                 } catch (const std::exception&) {
-                    log_message("Warning: Invalid channel ID '" + id_str + "'");
+                    DISCORD_LOG("Warning: Invalid channel ID '" + id_str + "'");
                 }
             }
         }
@@ -388,7 +384,7 @@ public:
             
             return true;
         } catch (const std::exception& e) {
-            log_message("Error: Failed to initialize Discord bot: " + std::string(e.what()));
+            DISCORD_LOG("Error: Failed to initialize Discord bot: " + std::string(e.what()));
             return false;
         }
     }
@@ -413,7 +409,7 @@ public:
             
             return true;
         } catch (const std::exception& e) {
-            log_message("Error: Failed to start Discord bot: " + std::string(e.what()));
+            DISCORD_LOG("Error: Failed to start Discord bot: " + std::string(e.what()));
             return false;
         }
     }
@@ -449,7 +445,7 @@ public:
             last_activity = std::chrono::system_clock::now();
             return true;
         } catch (const std::exception& e) {
-            log_message("Error sending message: " + std::string(e.what()));
+            DISCORD_LOG("Error sending message: " + std::string(e.what()));
             return false;
         }
     }

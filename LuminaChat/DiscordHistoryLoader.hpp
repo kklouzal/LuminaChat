@@ -110,10 +110,6 @@ private:
         return isolated_channels && isolated_channels->count(channel_id);
     }
     
-    void log_message(const std::string& message) const {
-        DISCORD_HISTORY_LOG(message);
-    }
-    
     // NEW: Initialize context capacities once at start
     void initialize_context_capacities() {
         std::lock_guard<std::mutex> lock(capacity_mutex);
@@ -141,7 +137,7 @@ private:
                 context_current_tokens[context_id] = current_tokens;
                 context_capacity_limits[context_id] = capacity_limit;
                 
-                log_message("Context '" + context_id + "' capacity: " + std::to_string(current_tokens) + 
+                DISCORD_HISTORY_LOG("Context '" + context_id + "' capacity: " + std::to_string(current_tokens) + 
                            "/" + std::to_string(capacity_limit) + " tokens");
             }
         }
@@ -151,7 +147,7 @@ private:
             llama_manager->switch_to_context(original_context);
         }
         
-        log_message("Initialized capacity tracking for " + std::to_string(unique_contexts.size()) + " contexts");
+        DISCORD_HISTORY_LOG("Initialized capacity tracking for " + std::to_string(unique_contexts.size()) + " contexts");
     }
     
     // SIMPLIFIED: Check capacity without context switching
@@ -181,7 +177,7 @@ private:
             return false;
         }
         
-        log_message("Fetching messages from channel " + std::to_string(channel_id));
+        DISCORD_HISTORY_LOG("Fetching messages from channel " + std::to_string(channel_id));
         
         auto promise = std::make_shared<std::promise<bool>>();
         auto future = promise->get_future();
@@ -192,7 +188,7 @@ private:
                 
                 try {
                     if (callback.is_error()) {
-                        log_message("Error fetching messages for channel " + std::to_string(channel_id));
+                        DISCORD_HISTORY_LOG("Error fetching messages for channel " + std::to_string(channel_id));
                         promise->set_value(false);
                         return;
                     }
@@ -209,7 +205,7 @@ private:
                     promise->set_value(success);
                     
                 } catch (const std::exception& e) {
-                    log_message("Exception processing channel " + std::to_string(channel_id) + ": " + e.what());
+                    DISCORD_HISTORY_LOG("Exception processing channel " + std::to_string(channel_id) + ": " + e.what());
                     promise->set_value(false);
                 }
             });
@@ -252,7 +248,7 @@ private:
                 
                 // Check for reasonable token count limits
                 if (pending.tokenized_content.size() > 2048) {
-                    log_message("Warning: Message from " + msg.author.username + " would produce " + 
+                    DISCORD_HISTORY_LOG("Warning: Message from " + msg.author.username + " would produce " + 
                                std::to_string(pending.tokenized_content.size()) + " tokens, skipping");
                     continue;
                 }
@@ -265,7 +261,7 @@ private:
                     // FIXED: Track the oldest message ID (smallest value) for next iteration
                     oldest_id = std::min(oldest_id, pending.message_id);
                 } else {
-                    log_message("Warning: Tokenization produced 0 tokens for message from " + 
+                    DISCORD_HISTORY_LOG("Warning: Tokenization produced 0 tokens for message from " + 
                                msg.author.username + ", skipping");
                 }
             } else {
@@ -296,7 +292,7 @@ private:
                 }
             }
             
-            log_message("Collected " + std::to_string(batch_messages.size()) + " messages from channel " + 
+            DISCORD_HISTORY_LOG("Collected " + std::to_string(batch_messages.size()) + " messages from channel " + 
                        std::to_string(channel_id) + " (exact " + std::to_string(total_exact_tokens) + 
                        " tokens), next fetch before ID: " + std::to_string(oldest_id));
             return true;
@@ -316,13 +312,13 @@ private:
                 }
             }
             
-            log_message("Channel " + std::to_string(channel_id) + " completed - context capacity reached (" + capacity_info + ")");
+            DISCORD_HISTORY_LOG("Channel " + std::to_string(channel_id) + " completed - context capacity reached (" + capacity_info + ")");
         } else {
             // FIXED: Even if no messages were added, update the last_message_id to continue pagination
             std::lock_guard<std::mutex> lock(state_mutex);
             if (oldest_id != UINT64_MAX) {
                 state.last_message_id = oldest_id;
-                log_message("Updated last_message_id for channel " + std::to_string(channel_id) + 
+                DISCORD_HISTORY_LOG("Updated last_message_id for channel " + std::to_string(channel_id) + 
                            " to " + std::to_string(oldest_id) + " (no messages collected this batch)");
             }
         }
@@ -335,7 +331,7 @@ private:
         std::lock_guard<std::mutex> lock(pending_messages_mutex);
         if (pending_messages.empty()) return;
         
-        log_message("Applying " + std::to_string(pending_messages.size()) + " collected tokenized messages to contexts...");
+        DISCORD_HISTORY_LOG("Applying " + std::to_string(pending_messages.size()) + " collected tokenized messages to contexts...");
         
         // Sort messages by timestamp for chronological order
         std::sort(pending_messages.begin(), pending_messages.end(),
@@ -353,7 +349,7 @@ private:
         std::string original_context = llama_manager->get_active_context();
         
         for (const auto& [context_id, messages] : context_groups) {
-            log_message("Switching to context '" + context_id + "' to add " + std::to_string(messages.size()) + " tokenized messages");
+            DISCORD_HISTORY_LOG("Switching to context '" + context_id + "' to add " + std::to_string(messages.size()) + " tokenized messages");
             
             if (llama_manager->switch_to_context(context_id)) {
                 int32_t added_count = 0;
@@ -368,25 +364,25 @@ private:
                 }
                 
                 if (llama_manager->update_context_from_history()) {
-                    log_message("Successfully added " + std::to_string(added_count) + " messages (" + 
+                    DISCORD_HISTORY_LOG("Successfully added " + std::to_string(added_count) + " messages (" + 
                                std::to_string(total_tokens_added) + " tokens) to context " + context_id);
                 } else {
-                    log_message("Failed to update context " + context_id + " from history");
+                    DISCORD_HISTORY_LOG("Failed to update context " + context_id + " from history");
                 }
             } else {
-                log_message("Failed to switch to context " + context_id);
+                DISCORD_HISTORY_LOG("Failed to switch to context " + context_id);
             }
         }
         
         // Restore original context
         if (!original_context.empty()) {
             llama_manager->switch_to_context(original_context);
-            log_message("Restored original context: " + original_context);
+            DISCORD_HISTORY_LOG("Restored original context: " + original_context);
         }
         
         // Clear processed messages
         pending_messages.clear();
-        log_message("Tokenized message application phase completed");
+        DISCORD_HISTORY_LOG("Tokenized message application phase completed");
     }
     
     // SIMPLIFIED: Round-robin for shared channels
@@ -404,11 +400,11 @@ private:
         int32_t iteration = 0;
         
         // Initialize context capacities once
-        log_message("Initializing context capacity tracking...");
+        DISCORD_HISTORY_LOG("Initializing context capacity tracking...");
         initialize_context_capacities();
         
         // Phase 1: Collect all messages
-        log_message("Phase 1: Collecting messages from all channels...");
+        DISCORD_HISTORY_LOG("Phase 1: Collecting messages from all channels...");
         
         while (backfill_in_progress && iteration < MAX_ITERATIONS) {
             bool made_progress = false;
@@ -429,7 +425,7 @@ private:
             for (uint64_t channel_id : isolated_channels_to_process) {
                 auto it = channel_states.find(channel_id);
                 if (it != channel_states.end() && !it->second.fetch_complete) {
-                    log_message("Processing isolated channel " + std::to_string(channel_id) + " to completion...");
+                    DISCORD_HISTORY_LOG("Processing isolated channel " + std::to_string(channel_id) + " to completion...");
                     
                     // Keep processing this isolated channel until it's done
                     while (!it->second.fetch_complete && backfill_in_progress) {
@@ -443,7 +439,7 @@ private:
                     }
                     
                     if (it->second.fetch_complete) {
-                        log_message("Completed isolated channel " + std::to_string(channel_id));
+                        DISCORD_HISTORY_LOG("Completed isolated channel " + std::to_string(channel_id));
                     }
                 }
             }
@@ -456,7 +452,7 @@ private:
                 if (it != channel_states.end() && !it->second.fetch_complete) {
                     if (process_channel_batch(channel_id)) {
                         made_progress = true;
-                        log_message("Processed batch for shared channel " + std::to_string(channel_id) + 
+                        DISCORD_HISTORY_LOG("Processed batch for shared channel " + std::to_string(channel_id) + 
                                    " (round-robin)");
                     }
                 }
@@ -478,12 +474,12 @@ private:
                 }
                 
                 if (all_complete) {
-                    log_message("All channels completed");
+                    DISCORD_HISTORY_LOG("All channels completed");
                     break;
                 }
                 
                 // If no progress but channels remain, wait and try again
-                log_message("No progress made, waiting before retry...");
+                DISCORD_HISTORY_LOG("No progress made, waiting before retry...");
                 std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             } else {
                 // Short delay between iterations when making progress
@@ -492,11 +488,11 @@ private:
         }
         
         // Phase 2: Apply all collected messages
-        log_message("Phase 2: Applying collected messages to contexts...");
+        DISCORD_HISTORY_LOG("Phase 2: Applying collected messages to contexts...");
         apply_collected_messages();
         
         backfill_in_progress = false;
-        log_message("Chat history backfill completed");
+        DISCORD_HISTORY_LOG("Chat history backfill completed");
     }
 
 public:
@@ -532,12 +528,12 @@ public:
         if (!history_enabled || backfill_in_progress || !bot || !llama_manager) return;
         
         backfill_in_progress = true;
-        log_message("Starting simplified chat history backfill...");
+        DISCORD_HISTORY_LOG("Starting simplified chat history backfill...");
         
         // Get channels and setup states
         bot->current_user_get_guilds([this](const dpp::confirmation_callback_t& callback) {
             if (callback.is_error()) {
-                log_message("Error getting guilds: " + callback.get_error().human_readable);
+                DISCORD_HISTORY_LOG("Error getting guilds: " + callback.get_error().human_readable);
                 backfill_in_progress = false;
                 return;
             }
@@ -577,7 +573,7 @@ public:
                                 }
                                 
                                 channel_states[channel_id] = state;
-                                log_message("Configured channel " + std::to_string(channel_id) + 
+                                DISCORD_HISTORY_LOG("Configured channel " + std::to_string(channel_id) + 
                                            " for " + (state.is_isolated ? "isolated" : "shared") + " context");
                             }
                         }
