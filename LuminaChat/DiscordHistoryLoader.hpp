@@ -12,6 +12,18 @@
 // Favor Size or Speed: Favor fast code (/Ot)
 // Runtime Library: Multi-threaded DLL (/MD)
 // Enable Run-Time Type Information (RTTI) YES (/GR)
+//
+// CRITICAL CODING DIRECTIVES:
+// 1. Minimalism & Performance: Deliver lean, efficient solutions that avoid unnecessary bloat.
+// 2. Consistent Coding Style: Maintain uniform style and structure for clear, maintainable code.
+// 3. Clear Documentation: Provide concise comments explaining complex logic and key decisions.
+// 4. Eliminate Redundancy: Remove unused, obsolete, and legacy code along with excess includes.
+// 5. Optimize Function Structure: Adjust function boundaries to reduce overlap and clarify responsibilities.
+// 6. Preserve Core Functionality: Streamline code while safeguarding essential features.
+// 7. Cross-Platform Standards: Use fixed-width types and proper initialization to ensure portability.
+// 8. Smart Caching: Cache frequently used variables to reduce repeated allocations.
+// 9. Ensure Logical Consistency: Review code flow to maintain coherent, error-free execution.
+// 10. Continuous Refinement: Regularly refactor and verify that updates preserve stable functionality.
 #pragma once
 
 #include <string>
@@ -52,13 +64,13 @@ struct ChannelState {
 };
 
 struct PendingMessage {
-    uint64_t channel_id;
+    uint64_t channel_id = 0;
     std::string username;
     std::string content;
     std::chrono::system_clock::time_point timestamp;
-    uint64_t message_id;
+    uint64_t message_id = 0;
     std::vector<llama_token> tokenized_content;  // Store tokenized content instead of estimation
-    int32_t actual_token_count;                  // Exact count from tokenization
+    int32_t actual_token_count = 0;              // Exact count from tokenization
     std::string target_context_id;
 };
 
@@ -617,3 +629,7 @@ public:
     
     bool is_in_progress() const { return backfill_in_progress; }
 };
+
+//
+//  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODE DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!
+//

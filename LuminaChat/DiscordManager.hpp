@@ -230,7 +230,7 @@ private:
             if (!id_str.empty()) {
                 try {
                     target_set.insert(std::stoull(id_str));
-                } catch (const std::exception& e) {
+                } catch (const std::exception&) {
                     log_message("Warning: Invalid channel ID '" + id_str + "'");
                 }
             }

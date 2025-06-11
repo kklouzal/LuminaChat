@@ -67,7 +67,7 @@ private:
         mutable bool message_cache_dirty = true;
         mutable std::vector<llama_chat_message> message_cache;
         
-        ContextInfo() : context(nullptr), sampler(nullptr), batch_initialized(false), 
+        ContextInfo() : context(nullptr), sampler(nullptr), batch{}, batch_initialized(false), 
                        n_past(0), prev_len(0) {}
     };
     
