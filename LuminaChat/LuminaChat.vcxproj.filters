@@ -29,5 +29,14 @@
     <ClInclude Include="SettingsManager.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="DiscordHistoryLoader.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="LogHandler.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TokenCache.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
