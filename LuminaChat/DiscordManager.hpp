@@ -49,27 +49,14 @@
 struct DiscordBotConfig {
     std::string bot_token;
     std::string application_id;
-    uint64_t guild_id = 0;  // 0 = global commands
+    uint64_t guild_id = 0;
     bool auto_reconnect = true;
-    bool enable_message_cache = true;
-    uint32_t message_cache_size = 100;
     uint32_t rate_limit_buffer_ms = 100;
-};
-
-// Discord message context for tracking conversations
-struct DiscordMessageContext {
-    uint64_t user_id;
-    uint64_t channel_id;
-    uint64_t guild_id;
-    std::string username;
-    std::string channel_name;
-    std::chrono::system_clock::time_point timestamp;
-    bool is_dm;
 };
 
 class DiscordManager {
 private:
-    // Core components - consolidated
+    // Core components
     std::unique_ptr<dpp::cluster> bot;
     std::unique_ptr<DiscordHistoryLoader> history_loader;
     LlamaManager* llama_manager;
@@ -78,32 +65,31 @@ private:
     DiscordBotConfig config;
     std::string main_context_id;
     
-    // State - using atomic where possible
+    // State
     std::atomic<bool> is_running{false};
     std::atomic<bool> is_connected{false};
     std::atomic<bool> should_stop{false};
     
-    // Channel configuration - consolidated mutex
+    // Channel configuration
     std::unordered_set<uint64_t> isolated_channels;
     std::unordered_set<uint64_t> shared_history_channels;
     bool allow_dms = true;
     bool pull_message_history = true;
     int32_t history_fill_percentage = 50;
-    mutable std::mutex channel_config_mutex; // Renamed for clarity
+    mutable std::mutex channel_config_mutex;
     
-    // Message and context management - consolidated
-    std::unordered_map<uint64_t, std::vector<DiscordMessageContext>> user_conversations;
+    // Context management
     std::unordered_map<uint64_t, std::string> user_contexts;
     std::unordered_map<uint64_t, std::string> channel_contexts;
     std::unordered_map<uint64_t, std::chrono::system_clock::time_point> last_response_time;
-    mutable std::mutex data_mutex; // Single mutex for all data structures
+    mutable std::mutex data_mutex;
     
-    // Performance tracking - atomic only
+    // Performance tracking
     std::atomic<uint64_t> total_messages_processed{0};
     std::atomic<uint64_t> total_responses_sent{0};
     std::chrono::system_clock::time_point last_activity;
     
-    // Constants - cached for performance
+    // Constants
     static constexpr std::chrono::milliseconds MIN_RESPONSE_INTERVAL{2000};
     static constexpr size_t MAX_MESSAGE_LENGTH = 2000;
     static constexpr int32_t MAX_CONTEXT_FILL_PERCENTAGE = 80;
@@ -331,7 +317,6 @@ private:
         
         user_contexts.clear();
         channel_contexts.clear();
-        user_conversations.clear();
         last_response_time.clear();
     }
 
@@ -477,7 +462,6 @@ public:
     struct BotStatistics {
         uint64_t messages_processed;
         uint64_t responses_sent;
-        uint64_t active_conversations;
         bool is_running;
         bool is_connected;
         std::chrono::system_clock::time_point last_activity;
@@ -488,7 +472,6 @@ public:
         return {
             total_messages_processed.load(),
             total_responses_sent.load(),
-            user_conversations.size(),
             is_running.load(),
             is_connected.load(),
             last_activity

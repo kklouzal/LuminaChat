@@ -230,7 +230,7 @@ private:
 // Optimized Settings Dialog with better validation and organization
 class SettingsDialog : public wxDialog {
 private:
-    // Consolidated control structures for better organization
+    // Control structures
     struct Controls {
         // Model settings
         wxTextCtrl* model_path;
@@ -261,7 +261,7 @@ private:
         wxTextCtrl* summarizer_chat_template;
     } ctrls;
     
-    // Configuration references - const to prevent modification
+    // Configuration references
     struct ConfigRefs {
         std::string& model_path;
         int32_t& context_size;
@@ -284,7 +284,7 @@ private:
         std::string& summarizer_chat_template;
     } config;
 
-    // Cached UI elements
+    // UI elements
     const wxFont monospace_font{9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL};
     const wxFont help_font{8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_ITALIC, wxFONTWEIGHT_NORMAL};
 

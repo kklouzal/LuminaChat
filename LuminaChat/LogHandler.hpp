@@ -211,13 +211,9 @@ public:
     static void ui_log(const std::string& message, LogLevel level = LogLevel::INF) {
         log(level, LogComponent::UI, message);
     }
-    
-    static void general_log(const std::string& message, LogLevel level = LogLevel::INF) {
-        log(level, LogComponent::GENERAL, message);
-    }
 };
 
-// Macro shortcuts for easier logging
+// Essential macros only
 #define LOG_DEBUG(component, message) LogHandler::debug(LogComponent::component, message)
 #define LOG_INFO(component, message) LogHandler::info(LogComponent::component, message)
 #define LOG_WARNING(component, message) LogHandler::warning(LogComponent::component, message)

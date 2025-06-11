@@ -48,7 +48,7 @@ private:
     llama_model* model;
     const llama_vocab* vocab;
     
-    // REFACTOR: Multi-context support
+    // Multi-context support
     struct ContextInfo {
         llama_context* context;
         llama_sampler* sampler;
@@ -59,12 +59,11 @@ private:
         std::vector<std::pair<std::string, std::string>> message_history;
         std::string system_message;
         
-        // Per-context performance tracking
-        int64_t total_prompt_tokens = 0;
+        // Performance tracking
         int64_t total_generation_tokens = 0;
         int64_t last_decode_time_us = 0;
         
-        // Per-context cache state
+        // Cache state
         mutable bool message_cache_dirty = true;
         mutable std::vector<llama_chat_message> message_cache;
         
@@ -76,42 +75,19 @@ private:
     std::string active_context_id;
     ContextInfo* current_context;
     
-    // Remove old single-context members that are now per-context
-    // llama_context* context; - REMOVED
-    // llama_sampler* sampler; - REMOVED
-    // llama_batch batch; - REMOVED
-    // bool batch_initialized; - REMOVED
-    // int32_t n_past; - REMOVED
-    // std::vector<std::pair<std::string, std::string>> message_history; - REMOVED
-    // int32_t prev_len; - REMOVED
-    // std::string system_message; - REMOVED
-    
-    // Keep model-level settings
+    // Model settings
     int32_t n_ctx;
     int32_t n_predict;
     int32_t n_gpu_layers;
     bool model_loaded;
     
-    // Global performance tracking (aggregated across all contexts)
-    // int64_t total_prompt_tokens = 0; - REMOVED (now per-context)
-    // int64_t total_generation_tokens = 0; - REMOVED (now per-context)
-    // int64_t last_decode_time_us = 0; - REMOVED (now per-context)
-    
-    // Keep shared template and cache management (model-level)
+    // Template and cache management
     std::string custom_chat_template;
     mutable std::string template_buffer;
-
-    // Replace old cache implementation with TokenCache
     mutable TokenCache token_cache;
     
-    // Pre-allocated working buffers to avoid repeated allocations
-    mutable std::vector<char> token_buffer;
+    // Working buffers
     mutable std::string temp_string_buffer;
-    mutable std::vector<llama_token> temp_token_buffer;
-    
-    // Cache for formatted templates to avoid repeated template application
-    mutable std::string last_template_key;
-    mutable std::string last_template_result;
 
     // Unified batch management
     void manage_batch(bool clear_only = true) {
@@ -1134,7 +1110,6 @@ public:
 
     // Get performance statistics
     struct PerformanceStats {
-        int64_t total_prompt_tokens;
         int64_t total_generation_tokens;
         int64_t last_decode_time_us;
         float average_tokens_per_second;
@@ -1142,7 +1117,7 @@ public:
     
     PerformanceStats get_performance_stats() const {
         if (!current_context) {
-            return {0, 0, 0, 0.0f};
+            return {0, 0, 0.0f};
         }
         
         float avg_tps = 0.0f;
@@ -1151,7 +1126,6 @@ public:
         }
         
         return {
-            current_context->total_prompt_tokens,
             current_context->total_generation_tokens,
             current_context->last_decode_time_us,
             avg_tps
@@ -1167,7 +1141,6 @@ public:
     void reset_timings() {
         if (!current_context) return;
         
-        current_context->total_prompt_tokens = 0;
         current_context->total_generation_tokens = 0;
         current_context->last_decode_time_us = 0;
     }
@@ -1372,38 +1345,19 @@ public:
     }
 
 private:
-    // REFACTOR: Update helper methods to use current context
     int32_t calculate_optimal_batch_size() const {
         if (!current_context || !current_context->context) {
-            log_message("Warning: Context not available for batch size calculation");
             return 512;
         }
         
         int32_t n_batch = llama_n_batch(current_context->context);
         int32_t available_ctx = n_ctx - current_context->n_past;
         
-        // Ensure we have reasonable bounds
-        int32_t min_batch = 1;
-        int32_t max_batch = 512;
-        
-        // Use smaller of configured batch size, available context, and max limit
-        int32_t optimal = std::min({n_batch, available_ctx, max_batch});
-        
-        // Ensure we don't return 0 or negative values
-        return std::max(optimal, min_batch);
-    }
-
-    void cleanup_batch() {
-        if (current_context && current_context->batch_initialized) {
-            llama_batch_free(current_context->batch);
-            current_context->batch_initialized = false;
-        }
+        return std::max(1, std::min({n_batch, available_ctx, 512}));
     }
     
     void clear_caches() const {
         token_cache.clear();
-        last_template_key.clear();
-        last_template_result.clear();
     }
 };
 

@@ -45,16 +45,7 @@
 
 class LlamaManager;
 
-// SIMPLIFIED: Remove complex worker structures, keep only essential ones
-struct HistoryMessage {
-    uint64_t message_id;
-    uint64_t user_id;
-    uint64_t channel_id;
-    std::string username;
-    std::string content;
-    std::chrono::system_clock::time_point timestamp;
-};
-
+// Essential structures only
 struct ChannelState {
     uint64_t last_message_id = 0;
     bool fetch_complete = false;
@@ -69,8 +60,8 @@ struct PendingMessage {
     std::string content;
     std::chrono::system_clock::time_point timestamp;
     uint64_t message_id = 0;
-    std::vector<llama_token> tokenized_content;  // Store tokenized content instead of estimation
-    int32_t actual_token_count = 0;              // Exact count from tokenization
+    std::vector<llama_token> tokenized_content;
+    int32_t actual_token_count = 0;
     std::string target_context_id;
 };
 
@@ -89,17 +80,17 @@ private:
     bool history_enabled = true;
     int32_t context_fill_percentage = 50;
     
-    // SIMPLIFIED: Direct channel processing
+    // Channel processing
     std::unordered_map<uint64_t, ChannelState> channel_states;
-    std::vector<uint64_t> shared_channels_list; // For round-robin
+    std::vector<uint64_t> shared_channels_list;
     size_t shared_channel_index = 0;
     mutable std::mutex state_mutex;
     
-    // New: Message collection phase
+    // Message collection
     std::vector<PendingMessage> pending_messages;
     std::mutex pending_messages_mutex;
     
-    // New: Track capacity per context to avoid repeated switching
+    // Capacity tracking
     std::unordered_map<std::string, int32_t> context_capacity_limits;
     std::unordered_map<std::string, int32_t> context_current_tokens;
     std::mutex capacity_mutex;
