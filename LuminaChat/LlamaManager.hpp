@@ -38,6 +38,7 @@
 #include <string_view>
 #include "llama-cpp.h"
 #include "LogHandler.hpp"
+#include "TokenCache.hpp"
 
 // Forward declare the progress callback function
 bool model_loading_progress_callback(float progress, void *user_data);
@@ -100,13 +101,8 @@ private:
     std::string custom_chat_template;
     mutable std::string template_buffer;
 
-    // Cache for tokenization results with hit ratio tracking
-    mutable std::unordered_map<std::string, std::vector<llama_token>> token_cache;
-    mutable std::list<std::string> token_cache_lru;  // Track access order for LRU eviction
-    mutable std::unordered_map<std::string, std::list<std::string>::iterator> token_cache_lru_map;  // Fast lookup in LRU list
-    mutable size_t max_cache_size = 1024; // Limit cache size
-    mutable size_t cache_hits = 0;
-    mutable size_t cache_requests = 0;
+    // Replace old cache implementation with TokenCache
+    mutable TokenCache token_cache;
     
     // Pre-allocated working buffers to avoid repeated allocations
     mutable std::vector<char> token_buffer;
@@ -199,7 +195,7 @@ private:
         return add_tokens_to_batch({token}, pos, seq_ids, output_logits);
     }
 
-    // Unified tokenization with caching - Final fixes for robust token handling
+    // Unified tokenization with caching - Updated to use TokenCache
     std::vector<llama_token> process_text_to_tokens(const std::string& text, bool add_special = true) const {
         if (text.empty()) return {};
         
@@ -209,24 +205,21 @@ private:
             return {};
         }
         
-        cache_requests++;
         std::string cache_key = text + (add_special ? ":s" : ":n");
         
         // Check cache first
-        auto it = token_cache.find(cache_key);
-        if (it != token_cache.end()) {
-            cache_hits++;
-            update_lru_access(cache_key);
-            return it->second;
+        std::vector<llama_token> cached_tokens = token_cache.get(cache_key);
+        if (!cached_tokens.empty()) {
+            return cached_tokens;
         }
         
-        // Get required buffer size for tokenization - FIXED: Handle edge case
+        // Get required buffer size for tokenization
         const int32_t n_tokens_required = -llama_tokenize(vocab, text.c_str(), text.size(), nullptr, 0, add_special, true);
         if (n_tokens_required <= 0) {
-            // FIXED: Don't treat empty tokenization as warning for whitespace-only text
+            // Don't treat empty tokenization as warning for whitespace-only text
             if (std::all_of(text.begin(), text.end(), [](char c) { return std::isspace(c); })) {
                 // Cache empty result for whitespace-only strings
-                add_to_token_cache(cache_key, {});
+                token_cache.put(cache_key, {});
                 return {};
             }
             log_message("Warning: Text tokenization failed or resulted in 0 tokens: '" + 
@@ -234,7 +227,7 @@ private:
             return {};
         }
         
-        // FIXED: Add bounds checking for extremely large token counts
+        // Add bounds checking for extremely large token counts
         if (n_tokens_required > n_ctx) {
             log_message("Error: Text would produce " + std::to_string(n_tokens_required) + 
                        " tokens, exceeding context limit of " + std::to_string(n_ctx));
@@ -251,7 +244,7 @@ private:
             return {};
         }
         
-        // FIXED: Handle case where actual tokens is 0 but expected was > 0
+        // Handle case where actual tokens is 0 but expected was > 0
         if (n_tokens_actual == 0 && n_tokens_required > 0) {
             log_message("Warning: Expected " + std::to_string(n_tokens_required) + " tokens but got 0");
             tokens.clear();
@@ -262,7 +255,7 @@ private:
         }
         
         // Cache the result
-        add_to_token_cache(cache_key, tokens);
+        token_cache.put(cache_key, tokens);
         
         return tokens;
     }
@@ -548,7 +541,8 @@ private:
 
 public:
     LlamaManager() : model(nullptr), vocab(nullptr), current_context(nullptr),
-                     n_ctx(2048), n_predict(256), n_gpu_layers(0), model_loaded(false) {}
+                     n_ctx(2048), n_predict(256), n_gpu_layers(0), model_loaded(false),
+                     token_cache(1024) {}
 
     ~LlamaManager() {
         cleanup();
@@ -1284,7 +1278,6 @@ public:
         std::string().swap(template_buffer);
         std::string().swap(custom_chat_template);
         
-        reset_cache_stats();
         log_message("Cleanup completed");
     }
 
@@ -1358,6 +1351,15 @@ public:
         return static_cast<int32_t>(tokens.size());
     }
 
+    // Direct access to token cache - no pass-through methods needed
+    const TokenCache& get_token_cache() const {
+        return token_cache;
+    }
+    
+    TokenCache& get_token_cache() {
+        return token_cache;
+    }
+
 public:
     // ADDED: Accessor for model to enable external tokenization
     const llama_model* get_model() const {
@@ -1370,48 +1372,6 @@ public:
     }
 
 private:
-    // LRU cache management helpers
-    void update_lru_access(const std::string& key) const {
-        auto lru_it = token_cache_lru_map.find(key);
-        if (lru_it != token_cache_lru_map.end()) {
-            token_cache_lru.splice(token_cache_lru.begin(), token_cache_lru, lru_it->second);
-        }
-    }
-
-    // ADDED: Optimized LRU cache management
-    void add_to_token_cache(const std::string& key, const std::vector<llama_token>& tokens) const {
-        // Pre-emptive cleanup if approaching limit
-        if (token_cache.size() >= max_cache_size * 0.9f) {
-            trim_token_cache();
-        }
-        
-        // Check if key already exists (update case)
-        auto existing = token_cache.find(key);
-        if (existing != token_cache.end()) {
-            existing->second = tokens;
-            update_lru_access(key);
-            return;
-        }
-        
-        // Add new entry
-        token_cache[key] = tokens;
-        token_cache_lru.push_front(key);
-        token_cache_lru_map[key] = token_cache_lru.begin();
-    }
-    
-    // ADDED: More aggressive cache trimming for better memory management
-    void trim_token_cache() const {
-        // Remove 25% of entries when trimming to reduce frequency
-        size_t target_size = static_cast<size_t>(max_cache_size * 0.75f);
-        
-        while (token_cache.size() > target_size && !token_cache_lru.empty()) {
-            std::string lru_key = token_cache_lru.back();
-            token_cache_lru.pop_back();
-            token_cache_lru_map.erase(lru_key);
-            token_cache.erase(lru_key);
-        }
-    }
-
     // REFACTOR: Update helper methods to use current context
     int32_t calculate_optimal_batch_size() const {
         if (!current_context || !current_context->context) {
@@ -1442,17 +1402,8 @@ private:
     
     void clear_caches() const {
         token_cache.clear();
-        token_cache_lru.clear();
-        token_cache_lru_map.clear();
         last_template_key.clear();
         last_template_result.clear();
-        cache_hits = 0;
-        cache_requests = 0;
-    }
-    
-    void reset_cache_stats() const {
-        cache_hits = 0;
-        cache_requests = 0;
     }
 };
 
