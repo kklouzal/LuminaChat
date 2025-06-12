@@ -42,6 +42,7 @@
 #include <wx/slider.h>
 #include <wx/scrolwin.h>
 #include <wx/timer.h>
+#include <wx/datetime.h>
 #include <string>
 #include <cstdint>
 #include <memory>
@@ -104,6 +105,7 @@ enum class EventId : int32_t {
     INPUT_TEXT,
     BROWSE_MODEL,
     CONNECT_DISCORD,
+    PRUNE_SUMMARIZE,
     MODEL_LOADED,
     RESPONSE_READY,
     PROGRESS_UPDATE,
@@ -712,22 +714,22 @@ private:
     std::atomic<bool> is_started{false}, is_processing{false}, context_created{false};
     
     // Context monitoring timer
-    wxTimer* context_monitor_timer;
-      // UI controls with better organization
+    wxTimer* context_monitor_timer;    // UI controls with better organization
     struct UIControls {
-        wxButton *start_btn, *stop_btn, *settings_btn, *discord_btn;
+        wxButton *start_btn, *stop_btn, *settings_btn, *discord_btn, *prune_btn;
         wxGauge* progress_bar;
         wxGauge* context_progress_bar;
         wxStaticText *progress_label, *timings_label, *context_label;
         wxRichTextCtrl* chat_history;
-        wxTextCtrl *input_text, *logs_text;
+        wxTextCtrl *input_text, *logs_text, *summaries_text;
         wxNotebook* notebook;
         wxPanel* main_panel;
     } ui;
     
     ModelWorkerThread* worker_thread{nullptr};
 
-public:    LuminaChatFrame() : wxFrame(nullptr, wxID_ANY, "LuminaChat", wxDefaultPosition, wxSize(800, 600)) {
+public:
+    LuminaChatFrame() : wxFrame(nullptr, wxID_ANY, "LuminaChat", wxDefaultPosition, wxSize(800, 600)) {
         g_main_frame = this;
         
         llama_manager = std::make_unique<LlamaManager>();
@@ -735,10 +737,18 @@ public:    LuminaChatFrame() : wxFrame(nullptr, wxID_ANY, "LuminaChat", wxDefaul
         
         // Initialize context monitoring timer
         context_monitor_timer = new wxTimer(this, static_cast<int>(EventId::CONTEXT_MONITOR_TIMER));
-        
-        // Set up unified logging
+          // Set up unified logging
         LogHandler::set_output_callback([this](const std::string& msg) {
             AppendToLogsThreadSafe(wxString::FromUTF8(msg));
+        });
+        
+        // Set up summary logging callbacks
+        llama_manager->set_summary_input_callback([this](const std::string& input) {
+            AppendSummaryInput(wxString::FromUTF8(input));
+        });
+        
+        llama_manager->set_summary_output_callback([this](const std::string& output) {
+            AppendSummaryOutput(wxString::FromUTF8(output));
         });
         
         LoadConfiguration();
@@ -767,6 +777,30 @@ public:    LuminaChatFrame() : wxFrame(nullptr, wxID_ANY, "LuminaChat", wxDefaul
         }
     }
 
+    void AppendToSummariesThreadSafe(const wxString& message) {
+        if (!message.IsEmpty()) {
+            CallAfter([this, message]() {
+                if (ui.summaries_text) {
+                    ui.summaries_text->AppendText(message);
+                    ui.summaries_text->SetInsertionPointEnd();
+                }
+            });
+        }
+    }
+
+    void AppendSummaryInput(const wxString& input) {
+        wxString timestamp = wxDateTime::Now().Format("%H:%M:%S");
+        wxString formatted = wxString::Format("[%s] INPUT:\n%s\n\n", timestamp, input);
+        AppendToSummariesThreadSafe(formatted);
+    }
+    
+    void AppendSummaryOutput(const wxString& output) {
+        wxString timestamp = wxDateTime::Now().Format("%H:%M:%S");
+        wxString formatted = wxString::Format("[%s] OUTPUT:\n%s\n\n%s\n\n", 
+                                            timestamp, output, wxString(60, '-'));
+        AppendToSummariesThreadSafe(formatted);
+    }
+
 private:
     void LoadConfiguration() {
         SettingsManager::LoadSettings(config.model_path, config.context_size, config.gpu_layers, 
@@ -791,13 +825,13 @@ private:
         SetMinSize(wxSize(600, 400));
         AddWelcomeMessage();
     }
-    
-    void CreateToolbar() {
+      void CreateToolbar() {
         ui.start_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::START), "Start");
         ui.stop_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::STOP), "Stop");
         ui.settings_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::SETTINGS), "Settings");
         ui.discord_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::CONNECT_DISCORD), "Connect Discord");
-    }    void CreateStatusArea() {
+        ui.prune_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::PRUNE_SUMMARIZE), "Prune && Summarize");
+    }void CreateStatusArea() {
         ui.progress_label = new wxStaticText(ui.main_panel, wxID_ANY, "Ready");
         ui.progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, wxSize(-1, 20));
         ui.progress_bar->Hide();
@@ -807,11 +841,11 @@ private:
         
         ui.timings_label = new wxStaticText(ui.main_panel, wxID_ANY, "");
     }
-    
-    void CreateNotebook() {
+      void CreateNotebook() {
         ui.notebook = new wxNotebook(ui.main_panel, wxID_ANY);
         
         CreateChatTab();
+        CreateSummariesTab();
         CreateLogsTab();
     }
     
@@ -830,6 +864,29 @@ private:
         panel->SetSizer(sizer);
         ui.notebook->AddPage(panel, "Chat");
     }
+      void CreateSummariesTab() {
+        auto* panel = new wxPanel(ui.notebook);
+        auto* sizer = new wxBoxSizer(wxVERTICAL);
+        
+        ui.summaries_text = new wxTextCtrl(panel, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
+                                         wxTE_MULTILINE | wxTE_READONLY | wxTE_WORDWRAP);
+        ui.summaries_text->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+        
+        // Add initial welcome message with helpful information
+        ui.summaries_text->SetValue("Summary Monitor - Track summarization inputs and outputs\n"
+                                   "============================================================\n\n"
+                                   "This tab shows when the AI summarizes old conversation messages\n"
+                                   "to make room for new ones when the context gets full.\n\n"
+                                   "INPUT: Shows the messages being summarized\n"
+                                   "OUTPUT: Shows the generated summary\n\n"
+                                   "Note: Summarization requires a summary model to be configured\n"
+                                   "in the Settings -> Summarizer tab.\n\n"
+                                   "Waiting for first summarization...\n\n");
+        
+        sizer->Add(ui.summaries_text, 1, wxEXPAND | wxALL, 5);
+        panel->SetSizer(sizer);
+        ui.notebook->AddPage(panel, "Summaries");
+    }
     
     void CreateLogsTab() {
         auto* panel = new wxPanel(ui.notebook);
@@ -847,7 +904,8 @@ private:
         toolbar_sizer->Add(ui.start_btn, 0, wxRIGHT, 5);
         toolbar_sizer->Add(ui.stop_btn, 0, wxRIGHT, 5);  
         toolbar_sizer->Add(ui.settings_btn, 0, wxRIGHT, 5);
-        toolbar_sizer->Add(ui.discord_btn, 0);
+        toolbar_sizer->Add(ui.discord_btn, 0, wxRIGHT, 5);
+        toolbar_sizer->Add(ui.prune_btn, 0);
         toolbar_sizer->AddStretchSpacer();
         
         // Context monitoring area - fixed sizing and spacing
@@ -869,12 +927,12 @@ private:
         main_sizer->Add(ui.notebook, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
         
         ui.main_panel->SetSizer(main_sizer);
-    }
-      void BindEvents() {
+    }      void BindEvents() {
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnStart, this, static_cast<int>(EventId::START));
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnStop, this, static_cast<int>(EventId::STOP));
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnSettings, this, static_cast<int>(EventId::SETTINGS));
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnConnectDiscord, this, static_cast<int>(EventId::CONNECT_DISCORD));
+        Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnPruneSummarize, this, static_cast<int>(EventId::PRUNE_SUMMARIZE));
         Bind(wxEVT_COMMAND_TEXT_ENTER, &LuminaChatFrame::OnInputEnter, this, static_cast<int>(EventId::INPUT_TEXT));
         
         Bind(wxEVT_MODEL_LOADED, &LuminaChatFrame::OnModelLoaded, this);
@@ -930,8 +988,7 @@ private:
             worker_thread = nullptr;
         }
     }
-    
-    void UpdateButtonStates() noexcept {
+      void UpdateButtonStates() noexcept {
         const bool started = is_started.load();
         const bool processing = is_processing.load();
         
@@ -939,6 +996,7 @@ private:
         if (ui.stop_btn) ui.stop_btn->Enable(started);
         if (ui.input_text) ui.input_text->Enable(started && !processing);
         if (ui.settings_btn) ui.settings_btn->Enable(!processing);
+        if (ui.prune_btn) ui.prune_btn->Enable(started && !processing);
         
         UpdateDiscordButtonState();
     }
@@ -996,8 +1054,7 @@ private:
     void AddWelcomeMessage() {
         AddSystemMessage("Welcome to LuminaChat!\nClick 'Settings' to select a model, then 'Start' to begin.");
     }
-    
-    std::string GetCombinedSystemPrompt() const {
+      std::string GetCombinedSystemPrompt() const {
         if (config.identity_directive.empty() && config.other_directives.empty()) {
             return {};
         }
@@ -1012,6 +1069,46 @@ private:
     }
     
     // Optimized event handler methods
+    void OnPruneSummarize(wxCommandEvent& event) {
+        if (!is_started || is_processing || !llama_manager) {
+            wxMessageBox("Please start the model first.", "Model Not Started", 
+                        wxOK | wxICON_WARNING);
+            return;
+        }
+        
+        // Check if there's a conversation to prune
+        if (llama_manager->get_message_count() < 3) {
+            wxMessageBox("Need at least 3 messages in the conversation to prune.", 
+                        "Insufficient Messages", wxOK | wxICON_INFORMATION);
+            return;
+        }
+        
+        // Check if summarization is available
+        if (!llama_manager->is_summarization_available()) {
+            wxMessageBox("Summarization is not available. Please configure a summary model in Settings.", 
+                        "Summarization Unavailable", wxOK | wxICON_WARNING);
+            return;
+        }
+        
+        try {
+            // Show progress
+            AddSystemMessage("Starting prune and summarize (keeping 90% of context)...");
+            
+            // Perform pruning with 90% keep ratio (10% prune)
+            bool success = llama_manager->prune_conversation_with_summary(0.9f);
+            
+            if (success) {
+                AddSystemMessage("Context pruned and summarized successfully.");
+                UpdateContextProgress();
+            } else {
+                AddSystemMessage("Failed to prune and summarize context.");
+            }
+            
+        } catch (const std::exception& e) {
+            AddSystemMessage(wxString::Format("Error during pruning: %s", e.what()));
+        }
+    }
+    
     void OnStart(wxCommandEvent& event) {
         if (config.model_path.empty()) {
             wxMessageBox("Please select a model file in Settings first.", "No Model Selected", 
@@ -1121,7 +1218,7 @@ private:
                         "You are a helpful assistant that summarizes conversations concisely and accurately." : 
                         config.summarizer_system_prompt;
                     
-                    if (llama_manager->create_context("summary_context", "summary_model", summary_prompt)) {
+                    if (llama_manager->create_context("summary_context", "summary_model", summary_prompt, true)) {
                         LLAMA_LOG("Summary context created successfully with summarizer model");
                         // Note: Summarizer chat template was already set during model loading
                     } else {
