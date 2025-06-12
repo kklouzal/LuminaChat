@@ -54,6 +54,7 @@ private:
     struct ModelInfo {
         llama_model* model;
         const llama_vocab* vocab;
+        llama_sampler* sampler;
         int32_t n_ctx;
         int32_t n_gpu_layers;
         int32_t n_predict;
@@ -61,10 +62,14 @@ private:
         std::string custom_chat_template;
         bool model_loaded;
         
-        ModelInfo() : model(nullptr), vocab(nullptr), n_ctx(2048), n_gpu_layers(0), 
+        ModelInfo() : model(nullptr), vocab(nullptr), sampler(nullptr), n_ctx(2048), n_gpu_layers(0), 
                      n_predict(256), model_loaded(false) {}
         
         ~ModelInfo() {
+            if (sampler) {
+                llama_sampler_free(sampler);
+                sampler = nullptr;
+            }
             if (model) {
                 llama_model_free(model);
                 model = nullptr;
@@ -88,7 +93,6 @@ private:
     // Multi-context support
     struct ContextInfo {
         llama_context* context;
-        llama_sampler* sampler;
         llama_batch batch;
         bool batch_initialized;
         int32_t n_past;
@@ -107,7 +111,7 @@ private:
         // Reference to associated model
         ModelInfo* model_info;
         
-        ContextInfo() : context(nullptr), sampler(nullptr), batch{}, batch_initialized(false), 
+        ContextInfo() : context(nullptr), batch{}, batch_initialized(false), 
                        n_past(0), prev_len(0), model_info(nullptr) {}
     };
     
@@ -531,12 +535,13 @@ private:
 
     // REFACTOR: Update context validation
     bool validate_and_recover_sampler() {
-        if (!current_context) {
-            LLAMA_LOG("Error: No active context for sampler validation");
+        ModelInfo* model_info = get_current_model_info();
+        if (!model_info) {
+            LLAMA_LOG("Error: No model info available for sampler validation");
             return false;
         }
         
-        if (current_context->sampler) {
+        if (model_info->sampler) {
             return true; // Sampler is valid
         }
         
@@ -545,17 +550,17 @@ private:
         // Attempt to recreate a basic greedy sampler
         auto sparams = llama_sampler_chain_default_params();
         sparams.no_perf = false;
-        current_context->sampler = llama_sampler_chain_init(sparams);
+        model_info->sampler = llama_sampler_chain_init(sparams);
         
-        if (!current_context->sampler) {
+        if (!model_info->sampler) {
             LLAMA_LOG("CRITICAL: Failed to recover sampler!");
             return false;
         }
         
         // Add basic greedy sampling
-        llama_sampler_chain_add(current_context->sampler, llama_sampler_init_greedy());
+        llama_sampler_chain_add(model_info->sampler, llama_sampler_init_greedy());
         
-        if (!current_context->sampler) {
+        if (!model_info->sampler) {
             LLAMA_LOG("CRITICAL: Sampler became NULL after adding greedy sampler during recovery!");
             return false;
         }
@@ -630,6 +635,18 @@ public:
             LLAMA_LOG("Custom chat template stored for model '" + actual_model_id + "'");
         }
         
+        // Initialize default sampler for the model
+        auto sparams = llama_sampler_chain_default_params();
+        sparams.no_perf = false;
+        model_info->sampler = llama_sampler_chain_init(sparams);
+        
+        if (!model_info->sampler) {
+            LLAMA_LOG("Error: Failed to create sampler for model '" + actual_model_id + "'");
+            return false;
+        }
+        
+        llama_sampler_chain_add(model_info->sampler, llama_sampler_init_greedy());
+        
         models[actual_model_id] = std::move(model_info);
         
         // Update legacy flags for compatibility
@@ -691,19 +708,7 @@ public:
         }
         context_info->batch_initialized = true;
         
-        // Initialize sampler
-        auto sparams = llama_sampler_chain_default_params();
-        sparams.no_perf = false;
-        context_info->sampler = llama_sampler_chain_init(sparams);
-        
-        if (!context_info->sampler) {
-            LLAMA_LOG("Error: Failed to create sampler for context '" + context_id + "'");
-            llama_batch_free(context_info->batch);
-            llama_free(context_info->context);
-            return false;
-        }
-        
-        llama_sampler_chain_add(context_info->sampler, llama_sampler_init_greedy());
+        // Don't initialize sampler here - it's now part of the model
         
         // SIMPLIFIED: Always use provided system prompt, or copy from main context if empty
         std::string prompt_to_use = system_prompt;
@@ -750,9 +755,6 @@ public:
         }
         
         // Clean up the context
-        if (it->second->sampler) {
-            llama_sampler_free(it->second->sampler);
-        }
         if (it->second->batch_initialized) {
             llama_batch_free(it->second->batch);
         }
@@ -924,52 +926,53 @@ public:
 
     // FIXED: Enhanced sampler configuration with runtime validation
     void configure_sampler(float temperature = 0.8f, float min_p = 0.05f, float top_p = 0.9f, int32_t top_k = 40) {
-        if (!current_context) {
-            LLAMA_LOG("Error: No active context for sampler configuration");
+        ModelInfo* model_info = get_current_model_info();
+        if (!model_info) {
+            LLAMA_LOG("Error: No model info available for sampler configuration");
             return;
         }
         
-        LLAMA_LOG("Configuring sampler for context '" + active_context_id + "'");
+        LLAMA_LOG("Configuring sampler for model '" + model_info->model_path + "'");
         
-        if (current_context->sampler) {
-            llama_sampler_free(current_context->sampler);
-            current_context->sampler = nullptr;
+        if (model_info->sampler) {
+            llama_sampler_free(model_info->sampler);
+            model_info->sampler = nullptr;
         }
         
         auto sparams = llama_sampler_chain_default_params();
         sparams.no_perf = false;
-        current_context->sampler = llama_sampler_chain_init(sparams);
+        model_info->sampler = llama_sampler_chain_init(sparams);
         
-        if (!current_context->sampler) {
+        if (!model_info->sampler) {
             LLAMA_LOG("Error: Failed to create sampler chain");
             return;
         }
         
         // FIXED: Add sampling strategies without checking return values incorrectly
         if (top_k > 0) {
-            llama_sampler_chain_add(current_context->sampler, llama_sampler_init_top_k(top_k));
+            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_top_k(top_k));
         }
         
         if (top_p < 1.0f) {
-            llama_sampler_chain_add(current_context->sampler, llama_sampler_init_top_p(top_p, 1));
+            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_top_p(top_p, 1));
         }
         
         if (min_p > 0.0f) {
-            llama_sampler_chain_add(current_context->sampler, llama_sampler_init_min_p(min_p, 1));
+            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_min_p(min_p, 1));
         }
         
         if (temperature > 0.0f) {
-            llama_sampler_chain_add(current_context->sampler, llama_sampler_init_temp(temperature));
-            llama_sampler_chain_add(current_context->sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_temp(temperature));
+            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
         } else {
-            llama_sampler_chain_add(current_context->sampler, llama_sampler_init_greedy());
+            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_greedy());
         }
         
         // FIXED: Only validate final sampler state
-        if (!current_context->sampler) {
+        if (!model_info->sampler) {
             LLAMA_LOG("Error: Sampler became null during configuration");
         } else {
-            LLAMA_LOG("Sampler reconfigured successfully for context '" + active_context_id + "'");
+            LLAMA_LOG("Sampler reconfigured successfully for model");
         }
     }
 
@@ -1046,7 +1049,7 @@ public:
         }
 
         // FIXED: Enhanced validation before generation loop
-        if (!current_context->sampler) {
+        if (!model_info->sampler) {
             LLAMA_LOG("CRITICAL: Sampler is null before generation loop after validation!");
             return "Error: Sampler validation failed";
         }
@@ -1071,7 +1074,7 @@ public:
         // Enhanced generation loop with model-specific vocab checking
         while (n_generated < max_new_tokens) {
             // FIXED: Validate sampler on every iteration to catch when it becomes null
-            if (!current_context->sampler) {
+            if (!model_info->sampler) {
                 LLAMA_LOG("CRITICAL: Sampler became null during generation at token " + std::to_string(n_generated));
                 return "Error: Sampler failed during generation";
             }
@@ -1089,7 +1092,7 @@ public:
             
             llama_token new_token;
             try {
-                new_token = llama_sampler_sample(current_context->sampler, current_context->context, -1);
+                new_token = llama_sampler_sample(model_info->sampler, current_context->context, -1);
             } catch (const std::exception& e) {
                 LLAMA_LOG("Exception during token sampling: " + std::string(e.what()));
                 return "Error: Exception during token generation";
@@ -1138,7 +1141,7 @@ public:
             n_generated++;
             
             // FIXED: Periodic sampler validation during long generation
-            if (n_generated % 10 == 0 && !current_context->sampler) {
+            if (n_generated % 10 == 0 && !model_info->sampler) {
                 LLAMA_LOG("CRITICAL: Sampler became null during long generation at token " + std::to_string(n_generated));
                 return "Error: Sampler failed during long generation";
             }
@@ -1167,7 +1170,7 @@ public:
         }
 
         // FIXED: Final sampler validation
-        if (!current_context->sampler) {
+        if (!model_info->sampler) {
             LLAMA_LOG("WARNING: Sampler is NULL at end of generation!");
         }
 
@@ -1293,10 +1296,6 @@ public:
         
         // Clean up all contexts
         for (auto& [id, context_info] : contexts) {
-            if (context_info->sampler) {
-                llama_sampler_free(context_info->sampler);
-                context_info->sampler = nullptr;
-            }
             if (context_info->batch_initialized) {
                 llama_batch_free(context_info->batch);
                 context_info->batch_initialized = false;

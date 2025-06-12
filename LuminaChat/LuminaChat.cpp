@@ -41,6 +41,7 @@
 #include <wx/checkbox.h>
 #include <wx/slider.h>
 #include <wx/scrolwin.h>
+#include <wx/timer.h>
 #include <string>
 #include <cstdint>
 #include <memory>
@@ -105,7 +106,8 @@ enum class EventId : int32_t {
     CONNECT_DISCORD,
     MODEL_LOADED,
     RESPONSE_READY,
-    PROGRESS_UPDATE
+    PROGRESS_UPDATE,
+    CONTEXT_MONITOR_TIMER
 };
 
 // Custom events for thread communication
@@ -706,16 +708,17 @@ private:
         int32_t summarizer_context_size{1024}, summarizer_gpu_layers{0}, summarizer_predict_tokens{128};
         int32_t discord_history_percentage{50};
         bool discord_allow_dms{true}, discord_pull_history{true};
-    } config;
-
-    // State management
+    } config;    // State management
     std::atomic<bool> is_started{false}, is_processing{false}, context_created{false};
     
-    // UI controls with better organization
+    // Context monitoring timer
+    wxTimer* context_monitor_timer;
+      // UI controls with better organization
     struct UIControls {
         wxButton *start_btn, *stop_btn, *settings_btn, *discord_btn;
         wxGauge* progress_bar;
-        wxStaticText *progress_label, *timings_label;
+        wxGauge* context_progress_bar;
+        wxStaticText *progress_label, *timings_label, *context_label;
         wxRichTextCtrl* chat_history;
         wxTextCtrl *input_text, *logs_text;
         wxNotebook* notebook;
@@ -724,12 +727,14 @@ private:
     
     ModelWorkerThread* worker_thread{nullptr};
 
-public:
-    LuminaChatFrame() : wxFrame(nullptr, wxID_ANY, "LuminaChat", wxDefaultPosition, wxSize(800, 600)) {
+public:    LuminaChatFrame() : wxFrame(nullptr, wxID_ANY, "LuminaChat", wxDefaultPosition, wxSize(800, 600)) {
         g_main_frame = this;
         
         llama_manager = std::make_unique<LlamaManager>();
         discord_manager = std::make_unique<DiscordManager>();
+        
+        // Initialize context monitoring timer
+        context_monitor_timer = new wxTimer(this, static_cast<int>(EventId::CONTEXT_MONITOR_TIMER));
         
         // Set up unified logging
         LogHandler::set_output_callback([this](const std::string& msg) {
@@ -741,9 +746,11 @@ public:
         SetupConsoleRedirection();
         UpdateButtonStates();
         BindEvents();
-    }
-
-    ~LuminaChatFrame() {
+    }    ~LuminaChatFrame() {
+        if (context_monitor_timer) {
+            context_monitor_timer->Stop();
+            delete context_monitor_timer;
+        }
         RestoreConsoleStreams();
         CleanupWorkerThread();
         g_main_frame = nullptr;
@@ -790,12 +797,14 @@ private:
         ui.stop_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::STOP), "Stop");
         ui.settings_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::SETTINGS), "Settings");
         ui.discord_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::CONNECT_DISCORD), "Connect Discord");
-    }
-    
-    void CreateStatusArea() {
+    }    void CreateStatusArea() {
         ui.progress_label = new wxStaticText(ui.main_panel, wxID_ANY, "Ready");
         ui.progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, wxSize(-1, 20));
         ui.progress_bar->Hide();
+        
+        ui.context_label = new wxStaticText(ui.main_panel, wxID_ANY, "Context: N/A", wxDefaultPosition, wxSize(120, -1));
+        ui.context_progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, wxSize(200, 15));
+        
         ui.timings_label = new wxStaticText(ui.main_panel, wxID_ANY, "");
     }
     
@@ -833,15 +842,19 @@ private:
         sizer->Add(ui.logs_text, 1, wxEXPAND | wxALL, 5);
         panel->SetSizer(sizer);
         ui.notebook->AddPage(panel, "Logs");
-    }
-    
-    void LayoutComponents() {
+    }    void LayoutComponents() {
         auto* toolbar_sizer = new wxBoxSizer(wxHORIZONTAL);
         toolbar_sizer->Add(ui.start_btn, 0, wxRIGHT, 5);
         toolbar_sizer->Add(ui.stop_btn, 0, wxRIGHT, 5);  
         toolbar_sizer->Add(ui.settings_btn, 0, wxRIGHT, 5);
         toolbar_sizer->Add(ui.discord_btn, 0);
         toolbar_sizer->AddStretchSpacer();
+        
+        // Context monitoring area - fixed sizing and spacing
+        auto* context_sizer = new wxBoxSizer(wxHORIZONTAL);
+        context_sizer->Add(ui.context_label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
+        context_sizer->Add(ui.context_progress_bar, 0, wxALIGN_CENTER_VERTICAL);
+        context_sizer->AddStretchSpacer();
         
         auto* status_sizer = new wxBoxSizer(wxHORIZONTAL);
         status_sizer->Add(ui.progress_label, 0, wxALIGN_CENTER_VERTICAL);
@@ -850,14 +863,14 @@ private:
         
         auto* main_sizer = new wxBoxSizer(wxVERTICAL);
         main_sizer->Add(toolbar_sizer, 0, wxEXPAND | wxALL, 10);
+        main_sizer->Add(context_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
         main_sizer->Add(status_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT, 10);
         main_sizer->Add(ui.progress_bar, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
         main_sizer->Add(ui.notebook, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
         
         ui.main_panel->SetSizer(main_sizer);
     }
-    
-    void BindEvents() {
+      void BindEvents() {
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnStart, this, static_cast<int>(EventId::START));
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnStop, this, static_cast<int>(EventId::STOP));
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnSettings, this, static_cast<int>(EventId::SETTINGS));
@@ -867,6 +880,9 @@ private:
         Bind(wxEVT_MODEL_LOADED, &LuminaChatFrame::OnModelLoaded, this);
         Bind(wxEVT_RESPONSE_READY, &LuminaChatFrame::OnResponseReady, this);
         Bind(wxEVT_PROGRESS_UPDATE, &LuminaChatFrame::OnProgressUpdate, this);
+        
+        // Bind context monitoring timer
+        Bind(wxEVT_TIMER, &LuminaChatFrame::OnContextMonitorTimer, this, static_cast<int>(EventId::CONTEXT_MONITOR_TIMER));
     }
     
     void SetupConsoleRedirection() {
@@ -1114,9 +1130,13 @@ private:
                 }
             }
         }
-        
-        if (success) {
+          if (success) {
             is_started = true;
+            
+            // Start context monitoring timer (update every 2 seconds)
+            if (context_monitor_timer) {
+                context_monitor_timer->Start(2000);
+            }
             
             // Connect Discord manager to LlamaManager when model is loaded
             if (discord_manager && discord_manager->is_bot_running()) {
@@ -1137,11 +1157,15 @@ private:
         
         UpdateButtonStates();
     }
-    
-    void OnStop(wxCommandEvent& event) {
+      void OnStop(wxCommandEvent& event) {
         if (worker_thread) {
             worker_thread->RequestStop();
             worker_thread = nullptr;
+        }
+        
+        // Stop context monitoring timer
+        if (context_monitor_timer) {
+            context_monitor_timer->Stop();
         }
         
         // Hide progress bar if visible with proper layout update
@@ -1150,6 +1174,10 @@ private:
             ui.progress_label->SetLabel("Ready");
             ui.main_panel->Layout();
         }
+          // Reset context progress display
+        ui.context_label->SetLabel("Buffer: N/A");
+        ui.context_progress_bar->SetValue(0);
+        ui.context_progress_bar->SetForegroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_HIGHLIGHT));
         
         // Disconnect Discord manager from LlamaManager when model is stopped
         if (discord_manager && discord_manager->is_bot_running()) {
@@ -1304,8 +1332,7 @@ private:
             AddSystemMessage("Error: Failed to start response generation thread");
         }
     }
-    
-    void OnResponseReady(wxCommandEvent& event) {
+      void OnResponseReady(wxCommandEvent& event) {
         is_processing = false;
         worker_thread = nullptr; // Thread is detached and will clean itself up
         
@@ -1319,6 +1346,9 @@ private:
             
             // Update timings after successful inference
             UpdateTimingsDisplay();
+            
+            // Update context progress immediately after response
+            UpdateContextProgress();
         }
         
         UpdateButtonStates();
@@ -1327,9 +1357,7 @@ private:
         // Auto-scroll to bottom
         ui.chat_history->SetInsertionPointEnd();
         ui.chat_history->ShowPosition(ui.chat_history->GetLastPosition());
-    }
-
-    void UpdateTimingsDisplay() {
+    }    void UpdateTimingsDisplay() {
         if (!is_started || !llama_manager) {
             return;
         }
@@ -1338,10 +1366,59 @@ private:
         auto timings = llama_manager->get_timings();
         if (timings.n_eval > 0) {
             double tokens_per_sec = 1000.0 * timings.n_eval / timings.t_eval_ms;
-            ui.timings_label->SetLabel(wxString::Format("%.2f tok/s (%d tokens in %.2fms)", 
-                                                   tokens_per_sec, 
-                                                   timings.n_eval, 
-                                                   timings.t_eval_ms));
+            
+            // Get additional statistics for comprehensive display
+            auto perf_stats = llama_manager->get_performance_stats();
+            
+            ui.timings_label->SetLabel(wxString::Format("Generated: %d tokens, %.2f tok/s (%.2fms)", 
+                                                       timings.n_eval, 
+                                                       tokens_per_sec,
+                                                       timings.t_eval_ms));
+        } else {
+            ui.timings_label->SetLabel("");
+        }
+    }
+    
+    void OnContextMonitorTimer(wxTimerEvent& event) {
+        UpdateContextProgress();
+    }    void UpdateContextProgress() {
+        if (!is_started || !llama_manager || !context_created || !llama_manager->has_context("main_chat")) {
+            ui.context_label->SetLabel("Buffer: N/A");
+            ui.context_progress_bar->SetValue(0);
+            return;
+        }
+        
+        // Switch to main_chat context to get usage info
+        if (!llama_manager->switch_to_context("main_chat")) {
+            ui.context_label->SetLabel("Buffer: Error");
+            ui.context_progress_bar->SetValue(0);
+            return;
+        }
+        
+        // Get context usage information
+        int32_t context_size = llama_manager->get_context_size();
+        int32_t context_usage = llama_manager->get_context_usage();
+        
+        if (context_size > 0) {
+            float usage_percentage = static_cast<float>(context_usage) / static_cast<float>(context_size) * 100.0f;
+            int32_t progress_value = static_cast<int32_t>(usage_percentage);
+            
+            ui.context_progress_bar->SetValue(std::min(progress_value, 100));
+            
+            // More descriptive label showing context buffer usage vs conversation tokens
+            ui.context_label->SetLabel(wxString::Format("Buffer: %d/%d", context_usage, context_size));
+            
+            // Change color based on usage (visual feedback)
+            if (usage_percentage > 90.0f) {
+                ui.context_progress_bar->SetForegroundColour(wxColour(255, 0, 0)); // Red
+            } else if (usage_percentage > 75.0f) {
+                ui.context_progress_bar->SetForegroundColour(wxColour(255, 165, 0)); // Orange
+            } else {
+                ui.context_progress_bar->SetForegroundColour(wxColour(0, 128, 0)); // Green
+            }
+        } else {
+            ui.context_label->SetLabel("Buffer: 0/0");
+            ui.context_progress_bar->SetValue(0);
         }
     }
 };
