@@ -114,7 +114,6 @@ private:
     bool model_loaded;
     
     // Template and cache management
-    std::string custom_chat_template;
     mutable std::string template_buffer;
     mutable TokenCache token_cache;
     
@@ -580,7 +579,7 @@ public:
     // Load .gguf model file and create ModelInfo with specific parameters
     bool load_model(const std::string& model_path, const std::string& model_id = "", 
                    int32_t context_size = 2048, int32_t gpu_layers = 0, int32_t predict_tokens = 256,
-                   void* progress_callback_user_data = nullptr) {
+                   void* progress_callback_user_data = nullptr, const std::string& chat_template = "") {
         if (!std::filesystem::exists(model_path)) {
             LLAMA_LOG("Error: Model file does not exist: " + model_path);
             return false;
@@ -618,6 +617,12 @@ public:
         model_info->n_gpu_layers = gpu_layers;
         model_info->n_predict = predict_tokens; // Store predict tokens in model info
         model_info->model_loaded = true;
+        
+        // Store custom chat template if provided
+        if (!chat_template.empty()) {
+            model_info->custom_chat_template = chat_template;
+            LLAMA_LOG("Custom chat template stored for model '" + actual_model_id + "'");
+        }
         
         models[actual_model_id] = std::move(model_info);
         
@@ -836,29 +841,10 @@ public:
         return tmpl ? std::string(tmpl) : "";
     }
     
-    // Set custom chat template for current context's model
-    void set_custom_chat_template(const std::string& template_str) {
-        ModelInfo* model_info = get_current_model_info();
-        if (model_info) {
-            model_info->custom_chat_template = template_str;
-        } else {
-            custom_chat_template = template_str; // Fallback for compatibility
-        }
-    }
-    
-    // Get current chat template from current context's model
+    // Get current chat template from current context's model only
     const char* get_current_chat_template() const {
         ModelInfo* model_info = get_current_model_info();
-        if (model_info) {
-            return model_info->get_chat_template();
-        }
-        
-        // Fallback for compatibility
-        if (!custom_chat_template.empty()) {
-            return custom_chat_template.c_str();
-        }
-        
-        return nullptr;
+        return model_info ? model_info->get_chat_template() : nullptr;
     }
 
     // Enhanced context update with better tokenization handling - FIXED recursion issue
@@ -1326,7 +1312,6 @@ public:
         
         // Efficient memory cleanup
         std::string().swap(template_buffer);
-        std::string().swap(custom_chat_template);
         
         LLAMA_LOG("Cleanup completed");
     }

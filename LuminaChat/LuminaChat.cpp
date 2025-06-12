@@ -135,9 +135,14 @@ private:
         std::string input_username{"User"};
         std::string chat_template;
         std::string result;
+        std::string summarizer_model_path;
+        std::string summarizer_chat_template;
         int32_t context_size{2048};
         int32_t gpu_layers{0};
         int32_t predict_tokens{256};
+        int32_t summarizer_context_size{1024};
+        int32_t summarizer_gpu_layers{0};
+        int32_t summarizer_predict_tokens{128};
         
         Config() { 
             result.reserve(2048);
@@ -154,12 +159,19 @@ public:
     ModelWorkerThread(wxEvtHandler* parent_handler, LlamaManager* manager, Operation op)
         : wxThread(wxTHREAD_DETACHED), llama_manager(manager), parent(parent_handler), operation(op) {}
 
-    void SetModelParams(std::string path, int32_t ctx, int32_t gpu, int32_t pred, std::string tmpl) {
+    void SetModelParams(std::string path, int32_t ctx, int32_t gpu, int32_t pred, std::string tmpl,
+                       std::string sum_path = "", int32_t sum_ctx = 1024, int32_t sum_gpu = 0, int32_t sum_pred = 128,
+                       std::string sum_tmpl = "") {
         config.model_path = std::move(path);
         config.context_size = ctx;
         config.gpu_layers = gpu;
         config.predict_tokens = pred;
         config.chat_template = std::move(tmpl);
+        config.summarizer_model_path = std::move(sum_path);
+        config.summarizer_context_size = sum_ctx;
+        config.summarizer_gpu_layers = sum_gpu;
+        config.summarizer_predict_tokens = sum_pred;
+        config.summarizer_chat_template = std::move(sum_tmpl);
     }
 
     void SetInput(std::string input, std::string username = "User") {
@@ -190,13 +202,21 @@ private:
         
         llama_log_set(llama_log_callback, parent);
         
-        // Use "main_model" as the default model ID and pass all parameters to load_model
+        // Load main model with "main_model" ID and chat template
         if (should_stop || !llama_manager->load_model(config.model_path, "main_model", 
                                                      config.context_size, config.gpu_layers, 
-                                                     config.predict_tokens, parent)) return false;
+                                                     config.predict_tokens, parent, config.chat_template)) return false;
         
-        if (!config.chat_template.empty()) {
-            llama_manager->set_custom_chat_template(config.chat_template);
+        // Load summarizer model if path is provided and different from main model
+        if (!config.summarizer_model_path.empty() && config.summarizer_model_path != config.model_path) {
+            if (should_stop || !llama_manager->load_model(config.summarizer_model_path, "summary_model",
+                                                         config.summarizer_context_size, config.summarizer_gpu_layers,
+                                                         config.summarizer_predict_tokens, parent, config.summarizer_chat_template)) {
+                LLAMA_LOG("Warning: Failed to load summarizer model, continuing with main model only");
+                // Don't return false - main model is loaded successfully
+            } else {
+                LLAMA_LOG("Summarizer model loaded successfully");
+            }
         }
         
         return true;
@@ -1008,7 +1028,10 @@ private:
         
         worker_thread = new ModelWorkerThread(this, llama_manager.get(), ModelWorkerThread::Operation::LOAD_MODEL);
         worker_thread->SetModelParams(config.model_path, config.context_size, config.gpu_layers, 
-                                     config.predict_tokens, config.chat_template);
+                                     config.predict_tokens, config.chat_template,
+                                     config.summarizer_model_path, config.summarizer_context_size,
+                                     config.summarizer_gpu_layers, config.summarizer_predict_tokens,
+                                     config.summarizer_chat_template);
         
         if (worker_thread->Run() != wxTHREAD_NO_ERROR) {
             delete worker_thread;
@@ -1044,7 +1067,7 @@ private:
         bool success = event.GetInt() == 1;
         
         if (success) {
-            // Handle chat template first
+            // Handle chat template first - only save model template if no custom template was provided
             if (config.chat_template.empty()) {
                 std::string model_template = llama_manager->get_model_chat_template();
                 if (!model_template.empty()) {
@@ -1058,11 +1081,8 @@ private:
                                                 config.summarizer_model_path, config.summarizer_context_size,
                                                 config.summarizer_gpu_layers, config.summarizer_predict_tokens,
                                                 config.summarizer_system_prompt, config.summarizer_chat_template);
-                    LLAMA_LOG("Loaded chat template from model");
+                    LLAMA_LOG("Saved model's default chat template to settings");
                 }
-            } else {
-                llama_manager->set_custom_chat_template(config.chat_template);
-                LLAMA_LOG("Using custom chat template");
             }
             
             // Create main chat context with system prompt from settings
@@ -1073,6 +1093,20 @@ private:
             } else {
                 context_created = true;
                 LLAMA_LOG("Main chat context created with system prompt");
+                
+                // Create summary context if summarizer model is loaded
+                if (!config.summarizer_model_path.empty() && config.summarizer_model_path != config.model_path) {
+                    std::string summary_prompt = config.summarizer_system_prompt.empty() ? 
+                        "You are a helpful assistant that summarizes conversations concisely and accurately." : 
+                        config.summarizer_system_prompt;
+                    
+                    if (llama_manager->create_context("summary_context", "summary_model", summary_prompt)) {
+                        LLAMA_LOG("Summary context created successfully with summarizer model");
+                        // Note: Summarizer chat template was already set during model loading
+                    } else {
+                        LLAMA_LOG("Warning: Failed to create summary context, summarization features may be limited");
+                    }
+                }
             }
         }
         
@@ -1362,12 +1396,9 @@ public:
 };
 
 wxIMPLEMENT_APP(LuminaChatApp);
-
-// Cross-platform entry point
-int32_t main(int32_t argc, char* argv[]) {
+// Cross-platform entry point* argv[]) {
+int32_t main(int32_t argc, char* argv[]) {   return wxEntry(argc, argv);
     return wxEntry(argc, argv);
 }
 
-//
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODE DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!
-//
