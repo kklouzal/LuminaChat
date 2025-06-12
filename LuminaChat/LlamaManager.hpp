@@ -110,9 +110,8 @@ private:
         
         // Reference to associated model
         ModelInfo* model_info;
-        
-        // Special flag for contexts that should reset after each generation
-        // Primarily used for summary models that don't need persistent context
+          // Special flag for contexts that should reset before each generation
+        // Primarily used for summary models that need a clean slate for each task
         bool reset_after_generation = false;
         
         ContextInfo() : context(nullptr), batch{}, batch_initialized(false), 
@@ -1018,7 +1017,24 @@ public:
         return contexts.find(context_id) != contexts.end();
     }
     
-    // Set the reset after generation flag for a specific context
+    // Get context size for a specific context without switching
+    int32_t get_context_size_for(const std::string& context_id) const {
+        auto it = contexts.find(context_id);
+        if (it == contexts.end() || !it->second || !it->second->model_info) {
+            return 0;
+        }
+        return it->second->model_info->n_ctx;
+    }
+    
+    // Get context usage for a specific context without switching
+    int32_t get_context_usage_for(const std::string& context_id) const {
+        auto it = contexts.find(context_id);
+        if (it == contexts.end() || !it->second) {
+            return 0;
+        }
+        return it->second->n_past;
+    }
+      // Set the reset before generation flag for a specific context
     bool set_context_reset_flag(const std::string& context_id, bool reset_after_generation) {
         auto it = contexts.find(context_id);
         if (it == contexts.end()) {
@@ -1027,7 +1043,7 @@ public:
         }
         
         it->second->reset_after_generation = reset_after_generation;
-        LLAMA_LOG("Set reset_after_generation flag to " + std::string(reset_after_generation ? "true" : "false") + 
+        LLAMA_LOG("Set reset_before_generation flag to " + std::string(reset_after_generation ? "true" : "false") + 
                   " for context '" + context_id + "'");
         return true;
     }
@@ -1236,6 +1252,12 @@ public:
         }
 
         if (input.empty()) return "Error: Empty input";
+
+        // Check if context should be reset before generation (for summary contexts and similar)
+        if (current_context->reset_after_generation) {
+            LLAMA_LOG("Resetting context '" + active_context_id + "' before generation (reset_after_generation flag is set)");
+            clear_conversation();
+        }
 
         // Validate conversation state before proceeding
         if (!validate_conversation_state()) {
@@ -1472,12 +1494,6 @@ public:
         }        // FIXED: Final sampler validation
         if (!model_info->sampler) {
             LLAMA_LOG("WARNING: Sampler is NULL at end of generation!");
-        }
-
-        // Check if context should be reset after generation
-        if (current_context->reset_after_generation && !response.empty()) {
-            LLAMA_LOG("Resetting context '" + active_context_id + "' after generation (reset_after_generation flag is set)");
-            clear_conversation();
         }
 
         return response;

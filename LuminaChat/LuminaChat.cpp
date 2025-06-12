@@ -1485,16 +1485,9 @@ private:
             return;
         }
         
-        // Switch to main_chat context to get usage info
-        if (!llama_manager->switch_to_context("main_chat")) {
-            ui.context_label->SetLabel("Buffer: Error");
-            ui.context_progress_bar->SetValue(0);
-            return;
-        }
-        
-        // Get context usage information
-        int32_t context_size = llama_manager->get_context_size();
-        int32_t context_usage = llama_manager->get_context_usage();
+        // Get context usage information directly without switching contexts
+        int32_t context_size = llama_manager->get_context_size_for("main_chat");
+        int32_t context_usage = llama_manager->get_context_usage_for("main_chat");
         
         if (context_size > 0) {
             float usage_percentage = static_cast<float>(context_usage) / static_cast<float>(context_size) * 100.0f;
