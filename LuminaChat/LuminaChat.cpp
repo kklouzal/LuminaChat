@@ -9,16 +9,21 @@
 // Enable Run-Time Type Information (RTTI) YES (/GR)
 //
 // CRITICAL CODING DIRECTIVES:
-// 1. Minimalism & Performance: Deliver lean, efficient solutions that avoid unnecessary bloat.
-// 2. Consistent Coding Style: Maintain uniform style and structure for clear, maintainable code.
-// 3. Clear Documentation: Provide concise comments explaining complex logic and key decisions.
-// 4. Eliminate Redundancy: Remove unused, obsolete, and legacy code along with excess includes.
-// 5. Optimize Function Structure: Adjust function boundaries to reduce overlap and clarify responsibilities.
-// 6. Preserve Core Functionality: Streamline code while safeguarding essential features.
-// 7. Cross-Platform Standards: Use fixed-width types and proper initialization to ensure portability.
-// 8. Smart Caching: Cache frequently used variables to reduce repeated allocations.
-// 9. Ensure Logical Consistency: Review code flow to maintain coherent, error-free execution.
-// 10. Continuous Refinement: Regularly refactor and verify that updates preserve stable functionality.
+// 1.  Minimalism & Performance: Deliver lean, efficient solutions; do not create or preserve unused helpers or wrappers.
+// 2.  Consistent Style: Adopt a uniform coding style and structure for clarity and maintainability.
+// 3.  Documentation: Write concise comments that explain complex logic and key design decisions.
+// 4.  Redundancy Elimination: Remove unused, obsolete, and legacy code—including unneeded interfaces and includes.
+// 5.  Function Boundaries: Define clear responsibilities; reduce overlap and avoid unnecessary layers.
+// 6.  Core Preservation: Streamline code while safeguarding essential features; favor direct access over extra abstractions.
+// 7.  Cross-Platform Portability: Use fixed-width types and proper initialization to guarantee identical behavior everywhere.
+// 8.  Smart Caching: Cache frequently used values to minimize allocations and improve performance.
+// 9.  Logical Consistency: Verify code flow to ensure coherent, error-free execution paths.
+// 10. Continuous Refinement: Regularly refactor and confirm that updates preserve stable functionality.
+// 11. Const-Correctness & Immutability: Mark variables, parameters, and methods as const wherever possible.
+// 12. RAII & Resource Safety: Encapsulate resource acquisition/release in constructors/destructors or smart pointers.
+// 13. Zero Magic & Strong Typing: Replace magic literals with named constants, enums, or constexpr; prefer scoped enums.
+// 14. Standard Library Preference: Favor STL algorithms and containers over custom loops and buffers.
+// 15. Thread Safety: Define and document thread-safety contracts; protect shared state with mutexes, atomics, or thread-safe containers.
 
 #include <wx/wx.h>
 #include <wx/filedlg.h>

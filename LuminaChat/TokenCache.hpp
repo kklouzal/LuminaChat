@@ -1,12 +1,31 @@
 // TokenCache.hpp - header-only implementation for token caching with LRU eviction
 // Provides efficient caching of tokenization results to avoid repeated expensive tokenization operations.
 //
+// Project Settings:
+// C++ Language Standard: ISO C++20 Standard (/std:c++20)
+// C Language Standard: ISO C17 (2018) Standard (/std:c17)
+// Optimization: Maximum Optimization (Favor Speed) (/O2)
+// Favor Size or Speed: Favor fast code (/Ot)
+// Runtime Library: Multi-threaded DLL (/MD)
+// Enable Run-Time Type Information (RTTI) YES (/GR)
+//
 // CRITICAL CODING DIRECTIVES:
-// 1. Minimalism & Performance: Deliver lean, efficient solutions that avoid unnecessary bloat.
-// 2. Consistent Coding Style: Maintain uniform style and structure for clear, maintainable code.
-// 3. Clear Documentation: Provide concise comments explaining complex logic and key decisions.
-// 4. Smart Caching: Cache frequently used variables to reduce repeated allocations.
-// 5. Cross-Platform Standards: Use fixed-width types and proper initialization to ensure portability.
+// 1.  Minimalism & Performance: Deliver lean, efficient solutions; do not create or preserve unused helpers or wrappers.
+// 2.  Redundancy Elimination: Remove unused, obsolete, and legacy code—including unneeded interfaces and includes.
+// 3.  Consistent Style: Adopt a uniform coding style and structure for clarity and maintainability.
+// 4.  Documentation: Write concise comments that explain complex logic and key design decisions.
+// 5.  Zero Magic & Strong Typing: Replace magic literals with named constants, enums, or constexpr; prefer scoped enums.
+// 6.  Function Boundaries: Define clear responsibilities; reduce overlap and avoid unnecessary layers.
+// 7.  Core Preservation: Streamline code while safeguarding essential features; favor direct access over extra abstractions.
+// 8.  Const-Correctness & Immutability: Mark variables, parameters, and methods as const wherever possible.
+// 9.  RAII & Resource Safety: Encapsulate resource acquisition/release in constructors/destructors or smart pointers.
+// 10. Standard Library Preference: Favor STL algorithms and containers over custom loops and buffers.
+// 11. Cross-Platform Portability: Use fixed-width types and proper initialization to guarantee identical behavior everywhere.
+// 12. Thread Safety: Define and document thread-safety contracts; protect shared state with mutexes, atomics, or thread-safe containers.
+// 13. Smart Caching: Cache frequently used values to minimize allocations and improve performance.
+// 14. Logical Consistency: Verify code flow to ensure coherent, error-free execution paths.
+// 15. Continuous Refinement: Regularly refactor and confirm that updates preserve stable functionality.
+
 #pragma once
 
 #include <unordered_map>
