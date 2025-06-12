@@ -76,6 +76,7 @@ private:
     dpp::cluster* bot = nullptr;
     LlamaManager* llama_manager = nullptr;
     std::string main_context_id;
+    std::string model_id; // NEW: Store model ID for context creation
     
     // Channel configuration
     const std::unordered_set<uint64_t>* isolated_channels = nullptr;
@@ -248,7 +249,7 @@ private:
                 pending.message_id = static_cast<uint64_t>(msg.id);
                 pending.target_context_id = state.context_id;
                 
-                // NEW: Use LlamaManager's tokenization instead of redundant local function
+                // FIXED: Use LlamaManager's new public tokenization method
                 std::string formatted_message = msg.author.username + ": " + msg.content;
                 pending.tokenized_content = llama_manager->tokenize_text(formatted_message, false);
                 
@@ -264,14 +265,14 @@ private:
                 if (pending.actual_token_count > 0) {
                     batch_messages.push_back(pending);
                     total_exact_tokens += pending.actual_token_count;
-                    // FIXED: Track the oldest message ID (smallest value) for next iteration
+                    // Track the oldest message ID (smallest value) for next iteration
                     oldest_id = std::min(oldest_id, pending.message_id);
                 } else {
                     DISCORD_HISTORY_LOG("Warning: Tokenization produced 0 tokens for message from " + 
                                msg.author.username + ", skipping");
                 }
             } else {
-                // FIXED: Still need to track message IDs even for bot messages to ensure proper pagination
+                // Still need to track message IDs even for bot messages to ensure proper pagination
                 uint64_t msg_id = static_cast<uint64_t>(msg.id);
                 oldest_id = std::min(oldest_id, msg_id);
             }
@@ -512,10 +513,11 @@ public:
     DiscordHistoryLoader() = default;
     ~DiscordHistoryLoader() = default;
     
-    void configure(dpp::cluster* discord_bot, LlamaManager* llama_mgr, const std::string& main_ctx_id) {
+    void configure(dpp::cluster* discord_bot, LlamaManager* llama_mgr, const std::string& main_ctx_id, const std::string& model_identifier = "") {
         bot = discord_bot;
         llama_manager = llama_mgr;
         main_context_id = main_ctx_id;
+        model_id = model_identifier; // NEW: Store model ID
     }
     
     void set_channel_configuration(const std::unordered_set<uint64_t>* allowed,
@@ -555,6 +557,19 @@ public:
         shared_channels_list.clear();
         shared_channel_index = 0;
         
+        // FIXED: Validate prerequisites before proceeding
+        if (model_id.empty()) {
+            DISCORD_HISTORY_LOG("Error: No model_id configured for context creation");
+            backfill_in_progress = false;
+            return;
+        }
+        
+        if (!llama_manager) {
+            DISCORD_HISTORY_LOG("Error: No LlamaManager configured");
+            backfill_in_progress = false;
+            return;
+        }
+        
         auto process_guilds = [this, guilds]() {
             for (const auto& [guild_id, guild] : guilds) {
                 bot->channels_get(guild_id, [this, guild_id](const dpp::confirmation_callback_t& callback) {
@@ -569,20 +584,44 @@ public:
                                 
                                 if (state.is_isolated) {
                                     state.context_id = "discord_channel_" + std::to_string(channel_id);
-                                    // Create isolated context if needed
-                                    if (!llama_manager->has_context(state.context_id)) {
-                                        llama_manager->create_context(state.context_id, "");
+                                    
+                                    // FIXED: Validate model_id and create context with proper error handling
+                                    if (!model_id.empty()) {
+                                        if (!llama_manager->has_context(state.context_id)) {
+                                            if (llama_manager->create_context(state.context_id, model_id, "")) {
+                                                DISCORD_HISTORY_LOG("Created isolated context '" + state.context_id + 
+                                                           "' with model '" + model_id + "'");
+                                            } else {
+                                                DISCORD_HISTORY_LOG("Error: Failed to create isolated context '" + 
+                                                           state.context_id + "' with model '" + model_id + "'");
+                                                continue; // Skip this channel if context creation failed
+                                            }
+                                        } else {
+                                            DISCORD_HISTORY_LOG("Using existing isolated context '" + state.context_id + "'");
+                                        }
+                                    } else {
+                                        DISCORD_HISTORY_LOG("Error: Cannot create isolated context - no model_id");
+                                        continue; // Skip this channel
                                     }
                                 } else {
                                     state.context_id = main_context_id;
                                     shared_channels_list.push_back(channel_id);
+                                    
+                                    // FIXED: Validate main context exists
+                                    if (!llama_manager->has_context(main_context_id)) {
+                                        DISCORD_HISTORY_LOG("Error: Main context '" + main_context_id + "' does not exist");
+                                        continue; // Skip this channel
+                                    }
                                 }
                                 
                                 channel_states[channel_id] = state;
                                 DISCORD_HISTORY_LOG("Configured channel " + std::to_string(channel_id) + 
-                                           " for " + (state.is_isolated ? "isolated" : "shared") + " context");
+                                           " for " + (state.is_isolated ? "isolated" : "shared") + " context: " + state.context_id);
                             }
                         }
+                    } else {
+                        DISCORD_HISTORY_LOG("Error getting channels for guild " + std::to_string(guild_id) + 
+                                   ": " + callback.get_error().human_readable);
                     }
                 });
             }
@@ -591,6 +630,16 @@ public:
             std::thread([this]() {
                 std::this_thread::sleep_for(std::chrono::seconds(2));
                 if (backfill_in_progress) {
+                    // FIXED: Validate we have channels to process before starting
+                    {
+                        std::lock_guard<std::mutex> lock(state_mutex);
+                        if (channel_states.empty()) {
+                            DISCORD_HISTORY_LOG("No channels configured for backfill, stopping");
+                            backfill_in_progress = false;
+                            return;
+                        }
+                        DISCORD_HISTORY_LOG("Starting backfill for " + std::to_string(channel_states.size()) + " channels");
+                    }
                     process_all_channels();
                 }
             }).detach();

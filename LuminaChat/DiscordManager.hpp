@@ -69,6 +69,7 @@ private:
     // Configuration
     DiscordBotConfig config;
     std::string main_context_id;
+    std::string model_id = "main_model"; // FIXED: Set default model_id
     
     // State
     std::atomic<bool> is_running{false};
@@ -267,13 +268,14 @@ private:
             
             std::string context_id = "discord_dm_" + std::to_string(user_id);
             
-            // FIXED: Check if context already exists before trying to create
+            // Check if context already exists before trying to create
             if (llama_manager && llama_manager->has_context(context_id)) {
                 user_contexts[user_id] = context_id;
                 return context_id;
             }
             
-            if (llama_manager && llama_manager->create_context(context_id, "")) {
+            // FIXED: Use new API with model_id parameter
+            if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, "")) {
                 user_contexts[user_id] = context_id;
                 return context_id;
             }
@@ -285,13 +287,14 @@ private:
             
             std::string context_id = "discord_channel_" + std::to_string(channel_id);
             
-            // FIXED: Check if context already exists before trying to create
+            // Check if context already exists before trying to create
             if (llama_manager && llama_manager->has_context(context_id)) {
                 channel_contexts[channel_id] = context_id;
                 return context_id;
             }
             
-            if (llama_manager && llama_manager->create_context(context_id, "")) {
+            // FIXED: Use new API with model_id parameter
+            if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, "")) {
                 channel_contexts[channel_id] = context_id;
                 return context_id;
             }
@@ -351,6 +354,11 @@ public:
         main_context_id = context_id;
     }
     
+    // NEW: Set model ID for context creation
+    void set_model_id(const std::string& model_identifier) {
+        model_id = model_identifier.empty() ? "main_model" : model_identifier; // FIXED: Ensure non-empty
+    }
+    
     void set_history_settings(bool pull_history, int32_t fill_percentage) {
         std::lock_guard<std::mutex> lock(channel_config_mutex);
         pull_message_history = pull_history;
@@ -364,8 +372,13 @@ public:
     void set_llama_manager(LlamaManager* manager) {
         llama_manager = manager;
         if (manager) {
+            // FIXED: Ensure model_id is set before configuring history loader
+            if (model_id.empty()) {
+                model_id = "main_model";
+            }
+            
             if (history_loader && bot) {
-                history_loader->configure(bot.get(), manager, main_context_id);
+                history_loader->configure(bot.get(), manager, main_context_id, model_id);
                 history_loader->set_channel_configuration(nullptr, &isolated_channels, &shared_history_channels);
                 history_loader->set_history_settings(pull_message_history, history_fill_percentage);
             }
@@ -383,7 +396,12 @@ public:
             setup_event_handlers();
             
             if (history_loader && llama_manager) {
-                history_loader->configure(bot.get(), llama_manager, main_context_id);
+                // FIXED: Ensure model_id is set before configuring history loader
+                if (model_id.empty()) {
+                    model_id = "main_model";
+                }
+                
+                history_loader->configure(bot.get(), llama_manager, main_context_id, model_id);
                 history_loader->set_channel_configuration(nullptr, &isolated_channels, &shared_history_channels);
                 history_loader->set_history_settings(pull_message_history, history_fill_percentage);
             }
