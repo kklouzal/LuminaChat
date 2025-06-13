@@ -533,15 +533,35 @@ private:
         }
           return (result > 0) ? std::string(temp_string_buffer.data(), result) : "";
     }
-    
-    // Add summary to the 5-slot chronological summary system
+      // Add summary to the 5-slot chronological summary system
     void add_summary_to_slots(const std::string& new_summary) {
         if (!current_context || new_summary.empty()) return;
         
-        // If we're at capacity (5 slots), remove the oldest (first) summary
+        // If we're at capacity (5 slots), implement rollover summarization
         if (current_context->summary_slots.size() >= ContextInfo::MAX_SUMMARY_SLOTS) {
-            current_context->summary_slots.erase(current_context->summary_slots.begin());
-            LLAMA_LOG("Removed oldest summary to make room for new one (slot system at capacity)");
+            LLAMA_LOG("Summary slots at capacity, performing rollover summarization");
+            
+            // Get the two oldest summaries (slots 0 and 1)
+            std::string oldest_summary = current_context->summary_slots[0];
+            std::string second_oldest_summary = current_context->summary_slots[1];
+            
+            // Create a combined summary from the two oldest
+            std::vector<std::pair<std::string, std::string>> rollover_messages;
+            rollover_messages.emplace_back("system", "Previous summary 1: " + oldest_summary);
+            rollover_messages.emplace_back("system", "Previous summary 2: " + second_oldest_summary);
+            
+            std::string combined_summary = summarize_messages(rollover_messages);
+            
+            if (!combined_summary.empty()) {
+                // Remove the two oldest summaries and replace with the combined one
+                current_context->summary_slots.erase(current_context->summary_slots.begin(), current_context->summary_slots.begin() + 2);
+                current_context->summary_slots.insert(current_context->summary_slots.begin(), combined_summary);
+                LLAMA_LOG("Rollover summarization successful - combined 2 oldest summaries into 1");
+            } else {
+                // Fallback: just remove the oldest if rollover summarization fails
+                current_context->summary_slots.erase(current_context->summary_slots.begin());
+                LLAMA_LOG("Rollover summarization failed, removed oldest summary");
+            }
         }
         
         // Add new summary to the end (newest position)
@@ -591,8 +611,7 @@ private:
         // Add system message if present
         if (has_system) {
             new_history.emplace_back(std::move(current_context->message_history[0]));
-        }
-          // Handle 5-slot summary system
+        }        // Handle 5-slot summary system
         if (!summary.empty()) {
             // Add new summary to the slot system
             add_summary_to_slots(summary);
@@ -617,11 +636,9 @@ private:
                                     " older messages removed due to context limits]");
         }
         
-        // Add all summary slots as system messages in chronological order
-        for (size_t i = 0; i < current_context->summary_slots.size(); ++i) {
-            std::string slot_prefix = "Summary " + std::to_string(i + 1) + " (oldest to newest): ";
-            new_history.emplace_back("system", slot_prefix + current_context->summary_slots[i]);
-        }
+        // FIXED: Do NOT add summary slots to message history during regular pruning
+        // Summary slots are maintained separately and only used for rollover summarization
+        // The actual summaries are not part of the conversation context
         
         // Add the recent messages to keep
         for (size_t i = prune_end_idx; i < current_context->message_history.size(); ++i) {
@@ -675,19 +692,18 @@ private:
           // Create summarization request
         std::string summarization_request = "Please provide a concise summary of the following conversation:\n\n" + 
                                           content_to_summarize + 
-                                          "\nSummary:";
-          // Log the input to the summaries tab
+                                          "\nSummary:";        // Log the input to the summaries tab
         if (summary_input_callback) {
-            // Use a simplified view of the input for the UI
+            // Show full content for better debugging and visibility
             std::string ui_input = "Summarizing " + std::to_string(messages_to_summarize.size()) + " messages:\n";
+            ui_input += std::string(50, '=') + "\n";
+            
             for (const auto& [role, content] : messages_to_summarize) {
-                // Truncate very long messages for display
-                std::string display_content = content.length() > 100 ? 
-                    content.substr(0, 100) + "..." : content;
-                ui_input += role + ": " + display_content + "\n";
+                ui_input += role + ": " + content + "\n\n";
             }
+            ui_input += std::string(50, '=') + "\n";
             summary_input_callback(ui_input);
-        }          // Generate summary using the summary context
+        }// Generate summary using the summary context
         std::string summary;
         try {
             summary = generate_response(summarization_request, "user");
@@ -702,19 +718,14 @@ private:
                 }
                 
                 summary = ""; // Treat as failed summarization
-            } else if (!summary.empty()) {
-                // Clean up the summary (remove any extra whitespace, newlines)
+            } else if (!summary.empty()) {                // Clean up the summary (remove any extra whitespace, newlines)
                 size_t start = summary.find_first_not_of(" \t\n\r");
                 size_t end = summary.find_last_not_of(" \t\n\r");
                 if (start != std::string::npos && end != std::string::npos) {
                     summary = summary.substr(start, end - start + 1);
                 }
                 
-                // Ensure reasonable length
-                const size_t max_summary_length = LlamaConstants::MAX_SUMMARY_LENGTH;
-                if (summary.length() > max_summary_length) {
-                    summary = summary.substr(0, max_summary_length - 3) + "...";
-                }
+                // Note: No artificial length limit - let the AI determine appropriate summary length
                   // Log the output to the summaries tab
                 if (summary_output_callback) {
                     summary_output_callback(summary);

@@ -1136,15 +1136,11 @@ private:
         } else {
             message << "Summaries (chronological order, oldest to newest):\n";
             message << wxString(50, '=') << "\n\n";
-            
-            for (size_t i = 0; i < summary_info.summaries.size(); ++i) {
+              for (size_t i = 0; i < summary_info.summaries.size(); ++i) {
                 message << wxString::Format("Slot %zu:\n", i + 1);
                 
-                // Truncate very long summaries for display
+                // Show full summary without truncation
                 wxString summary_text = wxString::FromUTF8(summary_info.summaries[i]);
-                if (summary_text.length() > 200) {
-                    summary_text = summary_text.Left(200) + "...";
-                }
                 
                 message << summary_text << "\n\n";
                 message << wxString(30, '-') << "\n\n";
