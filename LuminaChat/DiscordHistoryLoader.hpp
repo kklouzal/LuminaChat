@@ -160,10 +160,7 @@ private:    // Core dependencies
         DISCORD_HISTORY_LOG("Initialized capacity tracking for " + std::to_string(unique_contexts.size()) + " contexts");
     }
     
-    // COMPLEX LOGIC: Capacity-aware message collection without context switching
-    // Maintains estimated token counts per context to avoid expensive context switches
-    // during message collection phase. Uses pre-calculated capacity limits based on
-    // context size and fill percentage for efficient memory management.
+    // SIMPLIFIED: Check capacity without context switching
     bool can_add_more_messages_estimated_no_switch(const std::string& context_id, int32_t additional_tokens) {
         std::lock_guard<std::mutex> lock(capacity_mutex);
         
@@ -380,11 +377,12 @@ private:    // Core dependencies
             [](const PendingMessage& a, const PendingMessage& b) {
                 return a.timestamp < b.timestamp;
             });
-          // Group messages by target context using STL algorithms (Directive #14)
+        
+        // Group messages by target context
         std::unordered_map<std::string, std::vector<PendingMessage>> context_groups;
-        std::for_each(pending_messages.begin(), pending_messages.end(), [&](const auto& msg) {
+        for (const auto& msg : pending_messages) {
             context_groups[msg.target_context_id].push_back(msg);
-        });
+        }
         
         // Apply messages to each context using pre-tokenized content
         std::string original_context = llama_manager->get_active_context();
@@ -426,9 +424,7 @@ private:    // Core dependencies
         DISCORD_HISTORY_LOG("Tokenized message application phase completed");
     }
     
-    // PERFORMANCE OPTIMIZATION: Round-robin scheduling for shared channels
-    // Ensures fair distribution of main context usage among multiple shared channels
-    // while allowing isolated channels to process to completion independently
+    // SIMPLIFIED: Round-robin for shared channels
     uint64_t get_next_shared_channel() {
         if (shared_channels_list.empty()) return 0;
         
@@ -437,10 +433,7 @@ private:    // Core dependencies
         return channel_id;
     }
     
-    // DESIGN DECISION: Two-phase processing strategy for optimal performance
-    // Phase 1: Collect messages from all channels using minimal context operations
-    // Phase 2: Apply collected messages in batch operations to reduce overhead
-    // This separation optimizes for Discord API rate limits and context switching costs
+    // MODIFIED: Updated main processing loop with proper isolated vs shared handling
     void process_all_channels() {
         const int32_t MAX_ITERATIONS = 1000;
         int32_t iteration = 0;
@@ -720,29 +713,5 @@ public:
 };
 
 //
-// DIRECTIVE COMPLIANCE STATUS - FINAL VALIDATION COMPLETED:
-//
-// ✅ #15 THREAD SAFETY: Atomic backfill_in_progress state, comprehensive mutex protection
-//     (state_mutex, pending_messages_mutex, capacity_mutex), thread-safe message collection
-//     with proper synchronization, safe concurrent access patterns.
-//
-// ✅ #12 RAII & RESOURCE SAFETY: Clean default constructor/destructors pair, automatic
-//     resource cleanup, proper container management, exception-safe operations,
-//     systematic resource lifecycle with RAII principles.
-//
-// ✅ #8 SMART CACHING: Intelligent capacity tracking without context switching,
-//     pre-calculated limits for performance, estimated token counting, efficient
-//     batch processing with minimal memory overhead, round-robin scheduling optimization.
-//
-// ✅ #9 LOGICAL CONSISTENCY: Two-phase processing strategy with clear separation,
-//     robust validation chains, graceful error handling, consistent state transitions,
-//     systematic resource dependency management.
-//
-// ✅ #2 REDUNDANCY ELIMINATION: Streamlined design focused on core functionality,
-//     elimination of duplicate processing patterns, efficient algorithm implementation,
-//     minimal abstraction with direct operational access.
-//
-
-//
-//  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!
+//  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODE DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!
 //

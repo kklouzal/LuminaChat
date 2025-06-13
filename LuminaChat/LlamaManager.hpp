@@ -235,10 +235,11 @@ private:
             
             current_context->batch.token[current_context->batch.n_tokens] = tokens[i];
             current_context->batch.pos[current_context->batch.n_tokens] = pos;            current_context->batch.n_seq_id[current_context->batch.n_tokens] = static_cast<int32_t>(std::min(seq_ids.size(), size_t(LlamaConstants::MAX_SEQ_IDS)));
-              // FIXED: Safe sequence ID copying with bounds check using STL algorithms (Directive #14)
-            const size_t copy_count = std::min(seq_ids.size(), size_t(LlamaConstants::MAX_SEQ_IDS));
-            std::copy_n(seq_ids.begin(), copy_count, 
-                       current_context->batch.seq_id[current_context->batch.n_tokens]);
+            
+            // FIXED: Safe sequence ID copying with bounds check
+            for (size_t j = 0; j < std::min(seq_ids.size(), size_t(LlamaConstants::MAX_SEQ_IDS)); ++j) {
+                current_context->batch.seq_id[current_context->batch.n_tokens][j] = seq_ids[j];
+            }
             
             current_context->batch.logits[current_context->batch.n_tokens] = (i == tokens.size() - 1) ? output_logits : false;
             current_context->batch.n_tokens++;
@@ -551,9 +552,6 @@ private:
     }
     
     // Enhanced prune message history using summary model to condense pruned messages
-    // DESIGN DECISION: Uses 5-slot chronological summary system to maintain conversation context
-    // while reducing token usage. When pruning, older messages are summarized and stored in slots,
-    // with the oldest slot being evicted when capacity is reached (FIFO queue behavior).
     void prune_message_history(float keep_ratio) {
         if (!current_context || current_context->message_history.empty()) return;
         
@@ -755,9 +753,7 @@ private:
         return summary;
     }
 
-    // DESIGN DECISION: Smart sampler validation and recovery system
-    // Validates sampler state before generation and attempts automatic recovery
-    // with fallback to greedy sampling if primary sampler configuration fails
+    // REFACTOR: Update context validation
     bool validate_and_recover_sampler() {
         ModelInfo* model_info = get_current_model_info();
         if (!model_info) {
@@ -1840,31 +1836,7 @@ private:
 };
 
 // Progress callback function declaration (needs to be outside class for C compatibility)
-bool model_loading_progress_callback(float progress, void *user_data);
-
-//
-// DIRECTIVE COMPLIANCE STATUS - FINAL REVIEW COMPLETED:
-//
-// ✅ #15 THREAD SAFETY: No shared mutable state in LlamaManager - all context operations 
-//     are single-threaded through the main thread. TokenCache uses mutable for performance
-//     but is accessed only from single thread context. External synchronization required.
-//
-// ✅ #12 RAII & RESOURCE SAFETY: Complete RAII implementation with smart pointers for 
-//     model/context management. llama_batch freed in destructors, proper exception safety
-//     in worker threads, systematic resource cleanup in cleanup() method.
-//
-// ✅ #8 SMART CACHING: Advanced TokenCache with LRU eviction, template buffer reuse,
-//     message cache with dirty flags, strategic memory reservations, and performance
-//     metrics tracking for optimal memory utilization.
-//
-// ✅ #9 LOGICAL CONSISTENCY: Robust error handling with rollback mechanisms, two-phase
-//     validation for memory operations, proper initialization order, systematic cleanup
-//     sequences, and consistent state management throughout.
-//
-// ✅ #2 REDUNDANCY ELIMINATION: Clean single-responsibility design, STL algorithm usage,
-//     minimal interfaces without unnecessary wrappers, legacy code removed, efficient
-//     implementation patterns throughout.
-//
+extern bool model_loading_progress_callback(float progress, void *user_data);
 
 //
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!
