@@ -1067,12 +1067,18 @@ private:
         
         return combined;
     }
-    
-    // Optimized event handler methods
+      // Optimized event handler methods
     void OnPruneSummarize(wxCommandEvent& event) {
         if (!is_started || is_processing || !llama_manager) {
             wxMessageBox("Please start the model first.", "Model Not Started", 
                         wxOK | wxICON_WARNING);
+            return;
+        }
+        
+        // Ensure we're using the main chat context
+        if (!llama_manager->switch_to_context("main_chat")) {
+            wxMessageBox("Failed to switch to main chat context.", "Context Error", 
+                        wxOK | wxICON_ERROR);
             return;
         }
         
@@ -1234,11 +1240,11 @@ private:
             if (context_monitor_timer) {
                 context_monitor_timer->Start(2000);
             }
-            
-            // Connect Discord manager to LlamaManager when model is loaded
+              // Connect Discord manager to LlamaManager when model is loaded
             if (discord_manager && discord_manager->is_bot_running()) {
                 discord_manager->set_llama_manager(llama_manager.get());
                 discord_manager->set_main_context_id("main_chat");
+                discord_manager->set_model_id("main_model");
                 DISCORD_LOG("Discord bot connected to loaded model");
             }
             
@@ -1317,10 +1323,10 @@ private:
                 AddSystemMessage("Failed to configure Discord bot");
                 return;
             }
-            
-            // Set up integration with LlamaManager
+              // Set up integration with LlamaManager
             discord_manager->set_llama_manager(llama_manager.get());
             discord_manager->set_main_context_id("main_chat");
+            discord_manager->set_model_id("main_model");
             discord_manager->set_isolated_channels(config.discord_isolated_channels);
             discord_manager->set_shared_history_channels(config.discord_shared_channels);
             discord_manager->set_allow_dms(config.discord_allow_dms);
@@ -1396,14 +1402,18 @@ private:
                            "Settings Updated", wxOK | wxICON_INFORMATION);
             }
         }
-    }
-
-    void OnInputEnter(wxCommandEvent& event) {
+    }    void OnInputEnter(wxCommandEvent& event) {
         if (!is_started || is_processing) return;
         
         // Check if context is created
         if (!context_created) {
             AddSystemMessage("Error: Chat context not available. Please restart the model.");
+            return;
+        }
+        
+        // Ensure we're using the main chat context before processing the message
+        if (!llama_manager->switch_to_context("main_chat")) {
+            AddSystemMessage("Error: Failed to switch to main chat context.");
             return;
         }
         

@@ -71,12 +71,15 @@ struct PendingMessage {
 };
 
 class DiscordHistoryLoader {
-private:
-    // Core dependencies
+private:    // Core dependencies
     dpp::cluster* bot = nullptr;
     LlamaManager* llama_manager = nullptr;
     std::string main_context_id;
     std::string model_id; // NEW: Store model ID for context creation
+    
+    // Bot identification for recognizing own messages
+    uint64_t bot_user_id = 0;
+    std::string bot_username;
     
     // Channel configuration
     const std::unordered_set<uint64_t>* isolated_channels = nullptr;
@@ -237,25 +240,54 @@ private:
         // Process messages with exact tokenization
         std::vector<PendingMessage> batch_messages;
         uint64_t oldest_id = UINT64_MAX; // Track oldest message ID for next iteration
-        int32_t total_exact_tokens = 0;
-        
-        for (const auto& [id, msg] : messages) {
-            if (!msg.author.is_bot() && !msg.content.empty()) {
+        int32_t total_exact_tokens = 0;          for (const auto& [id, msg] : messages) {
+            // Check if this is a user message OR our bot's own message
+            bool is_our_bot = msg.author.is_bot() && (static_cast<uint64_t>(msg.author.id) == bot_user_id);
+            
+            // For bot messages, allow empty content if there are embeds; for user messages, content must be non-empty
+            bool has_content = !msg.content.empty();
+            bool has_embed_content = is_our_bot && !msg.embeds.empty() && !msg.embeds[0].description.empty();
+            bool should_process = (!msg.author.is_bot() || is_our_bot) && (has_content || has_embed_content);
+            
+            if (should_process) {
                 PendingMessage pending;
                 pending.channel_id = channel_id;
-                pending.username = msg.author.username;
-                pending.content = msg.content;
+                
+                // Use "assistant" role for our bot's messages, username for user messages
+                if (is_our_bot) {
+                    pending.username = "assistant";
+                } else {
+                    pending.username = msg.author.username;
+                }
+                
+                // For bot messages, extract content from embeds if they exist, otherwise use regular content
+                std::string actual_content = msg.content;
+                if (is_our_bot && !msg.embeds.empty()) {
+                    // Extract content from the first embed's description
+                    const auto& embed = msg.embeds[0];
+                    if (!embed.description.empty()) {
+                        actual_content = embed.description;
+                    }
+                }
+                
+                pending.content = actual_content;
                 pending.timestamp = std::chrono::system_clock::time_point(std::chrono::seconds(msg.sent));
                 pending.message_id = static_cast<uint64_t>(msg.id);
                 pending.target_context_id = state.context_id;
                 
                 // FIXED: Use LlamaManager's new public tokenization method
-                std::string formatted_message = msg.author.username + ": " + msg.content;
+                std::string formatted_message;
+                if (is_our_bot) {
+                    // For bot messages, don't include username prefix since it's "assistant"
+                    formatted_message = actual_content;
+                } else {
+                    formatted_message = msg.author.username + ": " + actual_content;
+                }
                 pending.tokenized_content = llama_manager->tokenize_text(formatted_message, false);
                 
                 // Check for reasonable token count limits
                 if (pending.tokenized_content.size() > 2048) {
-                    DISCORD_HISTORY_LOG("Warning: Message from " + msg.author.username + " would produce " + 
+                    DISCORD_HISTORY_LOG("Warning: Message from " + (is_our_bot ? "bot" : msg.author.username) + " would produce " + 
                                std::to_string(pending.tokenized_content.size()) + " tokens, skipping");
                     continue;
                 }
@@ -269,10 +301,10 @@ private:
                     oldest_id = std::min(oldest_id, pending.message_id);
                 } else {
                     DISCORD_HISTORY_LOG("Warning: Tokenization produced 0 tokens for message from " + 
-                               msg.author.username + ", skipping");
+                               (is_our_bot ? "bot" : msg.author.username) + ", skipping");
                 }
             } else {
-                // Still need to track message IDs even for bot messages to ensure proper pagination
+                // Still need to track message IDs even for other bot messages to ensure proper pagination
                 uint64_t msg_id = static_cast<uint64_t>(msg.id);
                 oldest_id = std::min(oldest_id, msg_id);
             }
@@ -512,12 +544,18 @@ public:
 
     DiscordHistoryLoader() = default;
     ~DiscordHistoryLoader() = default;
-    
-    void configure(dpp::cluster* discord_bot, LlamaManager* llama_mgr, const std::string& main_ctx_id, const std::string& model_identifier = "") {
+      void configure(dpp::cluster* discord_bot, LlamaManager* llama_mgr, const std::string& main_ctx_id, const std::string& model_identifier = "") {
         bot = discord_bot;
         llama_manager = llama_mgr;
         main_context_id = main_ctx_id;
         model_id = model_identifier; // NEW: Store model ID
+    }
+    
+    // NEW: Set bot identification information for recognizing own messages
+    void set_bot_identity(uint64_t user_id, const std::string& username) {
+        bot_user_id = user_id;
+        bot_username = username;
+        DISCORD_HISTORY_LOG("Bot identity set: ID=" + std::to_string(user_id) + ", Username=" + username);
     }
     
     void set_channel_configuration(const std::unordered_set<uint64_t>* allowed,
@@ -581,16 +619,26 @@ public:
                             if (channel.is_text_channel() && should_backfill_channel(channel_id)) {
                                 ChannelState state;
                                 state.is_isolated = is_isolated_channel(channel_id);
-                                
-                                if (state.is_isolated) {
+                                  if (state.is_isolated) {
                                     state.context_id = "discord_channel_" + std::to_string(channel_id);
                                     
-                                    // FIXED: Validate model_id and create context with proper error handling
+                                    // FIXED: Validate model_id and create context with proper system prompt
                                     if (!model_id.empty()) {
                                         if (!llama_manager->has_context(state.context_id)) {
-                                            if (llama_manager->create_context(state.context_id, model_id, "")) {
+                                            // Get system prompt from main context
+                                            std::string system_prompt;
+                                            std::string original_context = llama_manager->get_active_context();
+                                            if (llama_manager->switch_to_context(main_context_id)) {
+                                                system_prompt = llama_manager->get_current_system_message();
+                                                // Restore original context
+                                                if (!original_context.empty() && original_context != main_context_id) {
+                                                    llama_manager->switch_to_context(original_context);
+                                                }
+                                            }
+                                            
+                                            if (llama_manager->create_context(state.context_id, model_id, system_prompt)) {
                                                 DISCORD_HISTORY_LOG("Created isolated context '" + state.context_id + 
-                                                           "' with model '" + model_id + "'");
+                                                           "' with model '" + model_id + "' and system prompt");
                                             } else {
                                                 DISCORD_HISTORY_LOG("Error: Failed to create isolated context '" + 
                                                            state.context_id + "' with model '" + model_id + "'");

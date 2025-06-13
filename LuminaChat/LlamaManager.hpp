@@ -395,10 +395,6 @@ private:
                     LLAMA_LOG("Error: Batch token count exceeds batch size limit");
                     return false;
                 }
-
-                if (!current_context->batch.embd) {
-                    LLAMA_LOG("Error: embd null");
-                }
                 
                 // FIXED: Add comprehensive error checking for decode operation with try-catch
                 try {
@@ -1025,14 +1021,19 @@ public:
         }
         return it->second->model_info->n_ctx;
     }
-    
-    // Get context usage for a specific context without switching
+      // Get context usage for a specific context without switching
     int32_t get_context_usage_for(const std::string& context_id) const {
         auto it = contexts.find(context_id);
         if (it == contexts.end() || !it->second) {
             return 0;
         }
         return it->second->n_past;
+    }
+    
+    // Get the system message from the current context
+    std::string get_current_system_message() const {
+        if (!current_context) return "";
+        return current_context->system_message;
     }
       // Set the reset before generation flag for a specific context
     bool set_context_reset_flag(const std::string& context_id, bool reset_after_generation) {

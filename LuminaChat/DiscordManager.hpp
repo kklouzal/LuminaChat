@@ -108,13 +108,17 @@ public:
         return history_loader ? history_loader->get_status() : BackfillStatus{};
     }
 
-private:
-    void setup_event_handlers() {
+private:    void setup_event_handlers() {
         if (!bot) return;
         
         bot->on_ready([this](const dpp::ready_t& event) {
             is_connected = true;
             DISCORD_LOG("Discord bot ready! Logged in as: " + bot->me.username);
+            
+            // Pass bot identity to history loader for recognizing own messages
+            if (history_loader) {
+                history_loader->set_bot_identity(static_cast<uint64_t>(bot->me.id), bot->me.username);
+            }
         });
         
         bot->on_message_create([this](const dpp::message_create_t& event) {
@@ -234,8 +238,7 @@ private:
         std::lock_guard<std::mutex> lock(channel_config_mutex);
         return isolated_channels.count(channel_id) > 0;
     }
-    
-    bool is_rate_limited(uint64_t user_id) {
+      bool is_rate_limited(uint64_t user_id) {
         std::lock_guard<std::mutex> lock(data_mutex);
         auto now = std::chrono::system_clock::now();
         auto it = last_response_time.find(user_id);
@@ -246,6 +249,27 @@ private:
         
         last_response_time[user_id] = now;
         return false;
+    }
+      // FIXED: Get system prompt from main context for new Discord contexts
+    std::string get_system_prompt_for_new_context() const {
+        if (!llama_manager || main_context_id.empty()) return "";
+        
+        // Store the original context to restore it later
+        std::string original_context = llama_manager->get_active_context();
+        std::string system_prompt;
+        
+        // Switch to main context temporarily to get its system message
+        if (llama_manager->switch_to_context(main_context_id)) {
+            // Get the system message from the main context
+            system_prompt = llama_manager->get_current_system_message();
+            
+            // Restore original context if needed
+            if (!original_context.empty() && original_context != main_context_id) {
+                llama_manager->switch_to_context(original_context);
+            }
+        }
+        
+        return system_prompt;
     }
     
     std::string get_or_create_user_context(uint64_t user_id, const std::string& username, 
@@ -273,9 +297,9 @@ private:
                 user_contexts[user_id] = context_id;
                 return context_id;
             }
-            
-            // FIXED: Use new API with model_id parameter
-            if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, "")) {
+              // FIXED: Use new API with model_id parameter and proper system prompt
+            std::string system_prompt = get_system_prompt_for_new_context();
+            if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, system_prompt)) {
                 user_contexts[user_id] = context_id;
                 return context_id;
             }
@@ -292,15 +316,41 @@ private:
                 channel_contexts[channel_id] = context_id;
                 return context_id;
             }
-            
-            // FIXED: Use new API with model_id parameter
-            if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, "")) {
+              // FIXED: Use new API with model_id parameter and proper system prompt
+            std::string system_prompt = get_system_prompt_for_new_context();
+            if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, system_prompt)) {
                 channel_contexts[channel_id] = context_id;
                 return context_id;
             }
         }
+          return "";
+    }
+    
+    // Helper function to get context ID for a specific channel/user
+    std::string get_context_for_channel(uint64_t channel_id, uint64_t user_id = 0, uint64_t guild_id = 0) const {
+        const bool is_dm = (guild_id == 0);
+        const bool is_isolated_chan = is_isolated_channel(channel_id);
         
-        return "";
+        // Use shared main context for regular channels
+        if (!is_isolated_chan && !is_dm) {
+            return main_context_id;
+        }
+        
+        std::lock_guard<std::mutex> lock(data_mutex);
+        
+        if (is_dm && user_id != 0) {
+            auto it = user_contexts.find(user_id);
+            if (it != user_contexts.end()) {
+                return it->second;
+            }
+        } else if (is_isolated_chan) {
+            auto it = channel_contexts.find(channel_id);
+            if (it != channel_contexts.end()) {
+                return it->second;
+            }
+        }
+        
+        return main_context_id; // Fallback to main context
     }
     
     void cleanup_contexts() {
@@ -452,14 +502,36 @@ public:
         is_connected = false;
         cleanup_contexts();
     }
-    
-    bool send_message(uint64_t channel_id, const std::string& message) {
+      bool send_message(uint64_t channel_id, const std::string& message) {
         if (!is_running || !is_connected || !bot || message.empty()) return false;
         
         try {
             auto message_parts = split_message(message);
             for (const auto& part : message_parts) {
-                bot->message_create(dpp::message(channel_id, part));
+                // Get context information for this channel
+                std::string context_id = get_context_for_channel(channel_id, 0, 0);
+                std::string footer_text = "🤖 LuminaChat AI";
+                
+                if (llama_manager && !context_id.empty()) {
+                    int32_t context_usage = llama_manager->get_context_usage_for(context_id);
+                    int32_t context_size = llama_manager->get_context_size_for(context_id);
+                    
+                    if (context_size > 0) {
+                        footer_text += " • Context: " + std::to_string(context_usage) + "/" + std::to_string(context_size);
+                    }
+                }
+                
+                // Create a nice looking embed for bot responses
+                dpp::embed embed = dpp::embed()
+                    .set_color(0x00ff9f)  // Nice green color
+                    .set_description(part)
+                    .set_footer(dpp::embed_footer().set_text(footer_text))
+                    .set_timestamp(time(nullptr));
+                
+                dpp::message msg(channel_id, "");
+                msg.add_embed(embed);
+                bot->message_create(msg);
+                
                 if (message_parts.size() > 1) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 }
