@@ -591,15 +591,10 @@ public:
 
     ~LlamaManager() noexcept {
         cleanup();
-    }
-
-    // Initialize llama.cpp backend
+    }    // Initialize llama.cpp backend
     bool initialize() {
         ggml_backend_load_all();
-        return true;    }    // Set callbacks for summary logging
-    void set_summary_input_callback(std::function<void(const std::string&)> callback);
-    
-    void set_summary_output_callback(std::function<void(const std::string&)> callback);
+        return true;    }
 
     // Load .gguf model file and create ModelInfo with specific parameters
     bool load_model(const std::string& model_path, const std::string& model_id = "", 
@@ -1522,18 +1517,6 @@ inline bool LlamaManager::is_summarization_available() const {
     bool available = summarizer ? summarizer->is_summarization_available() : false;
     LLAMA_LOG("Summarization available: " + std::string(available ? "true" : "false"));
     return available;
-}
-
-inline void LlamaManager::set_summary_input_callback(std::function<void(const std::string&)> callback) {
-    if (summarizer) {
-        summarizer->set_summary_input_callback(std::move(callback));
-    }
-}
-
-inline void LlamaManager::set_summary_output_callback(std::function<void(const std::string&)> callback) {
-    if (summarizer) {
-        summarizer->set_summary_output_callback(std::move(callback));
-    }
 }
 
 // Progress callback function declaration (needs to be outside class for C compatibility)

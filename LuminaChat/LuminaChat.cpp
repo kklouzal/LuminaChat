@@ -737,19 +737,9 @@ public:
         discord_manager = std::make_unique<DiscordManager>();
         
         // Initialize context monitoring timer
-        context_monitor_timer = new wxTimer(this, static_cast<int>(EventId::CONTEXT_MONITOR_TIMER));
-          // Set up unified logging
+        context_monitor_timer = new wxTimer(this, static_cast<int>(EventId::CONTEXT_MONITOR_TIMER));        // Set up unified logging
         LogHandler::set_output_callback([this](const std::string& msg) {
             AppendToLogsThreadSafe(wxString::FromUTF8(msg));
-        });
-        
-        // Set up summary logging callbacks
-        llama_manager->set_summary_input_callback([this](const std::string& input) {
-            AppendSummaryInput(wxString::FromUTF8(input));
-        });
-        
-        llama_manager->set_summary_output_callback([this](const std::string& output) {
-            AppendSummaryOutput(wxString::FromUTF8(output));
         });
         
         LoadConfiguration();
