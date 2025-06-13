@@ -32,7 +32,6 @@
 
 #pragma once
 
-#include <iostream>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -74,12 +73,24 @@ namespace LlamaConstants {
     constexpr float DEFAULT_MIN_P = 0.05f;
     constexpr float DEFAULT_TOP_P = 0.9f;
     constexpr int32_t DEFAULT_TOP_K = 40;
-    
-    // Context management
+      // Context management
     constexpr float MAX_CONTEXT_USAGE = 0.90f;
     constexpr float TARGET_CONTEXT_USAGE = 0.60f;
+      // String processing constants
+    constexpr size_t MAX_TEXT_PREVIEW_LENGTH = 50;
+    constexpr size_t STRING_RESERVE_MULTIPLIER = 4;
+    constexpr int32_t MAX_RETRY_ATTEMPTS = 2;
+    constexpr size_t MAX_MESSAGE_HISTORY_SIZE = 1000;
+    constexpr float AGGRESSIVE_PRUNING_RATIO = 0.3f;
+    constexpr size_t SUMMARY_CONTENT_RESERVE_SIZE = 4096;
 }
 
+// Thread Safety Contract (Directive #12):
+// This class is NOT thread-safe. External synchronization is required for concurrent access.
+// - All public methods must be called from a single thread or protected by external mutexes
+// - The llama.cpp backend itself has thread-safety limitations that require careful handling
+// - Model loading/unloading operations are particularly sensitive to race conditions
+// - Context switching operations modify shared state and must be serialized
 class LlamaManager {
 private:
     // Model information container
@@ -91,9 +102,9 @@ private:
         int32_t n_gpu_layers;
         int32_t n_predict;
         std::string model_path;
-        std::string custom_chat_template;
-        bool model_loaded;
-          ModelInfo() : model(nullptr), vocab(nullptr), sampler(nullptr), n_ctx(LlamaConstants::DEFAULT_CONTEXT_SIZE), n_gpu_layers(LlamaConstants::DEFAULT_GPU_LAYERS), 
+        std::string custom_chat_template;        bool model_loaded;
+        
+        ModelInfo() : model(nullptr), vocab(nullptr), sampler(nullptr), n_ctx(LlamaConstants::DEFAULT_CONTEXT_SIZE), n_gpu_layers(LlamaConstants::DEFAULT_GPU_LAYERS), 
                      n_predict(LlamaConstants::DEFAULT_PREDICT_TOKENS), model_loaded(false) {}
         
         ~ModelInfo() {
@@ -117,10 +128,10 @@ private:
             if (model) {
                 return llama_model_chat_template(model, nullptr);
             }
-            return nullptr;
-        }
+            return nullptr;        }
     };
-      // Multi-context support
+    
+    // Multi-context support
     struct ContextInfo {
         llama_context* context;
         llama_batch batch;
@@ -133,13 +144,14 @@ private:
         // Performance tracking
         int64_t total_generation_tokens = 0;
         int64_t last_decode_time_us = 0;
-        
-        // Cache state
+          // Cache state
         mutable bool message_cache_dirty = true;
         mutable std::vector<llama_chat_message> message_cache;
-          // Reference to associated model
+        
+        // Reference to associated model
         ModelInfo* model_info;
-          // Special flag for contexts that should reset before each generation
+        
+        // Special flag for contexts that should reset before each generation
         // Primarily used for summary models that need a clean slate for each task
         bool reset_after_generation = false;
         
@@ -158,10 +170,10 @@ private:
     std::unordered_map<std::string, std::unique_ptr<ContextInfo>> contexts;
     std::string active_context_id;
     ContextInfo* current_context;
-    
-    // Legacy compatibility - only keep model_loaded flag
+      // Legacy compatibility - only keep model_loaded flag
     bool model_loaded;
-      // Template and cache management
+    
+    // Template and cache management
     mutable std::string template_buffer;
     mutable TokenCache token_cache;
     
@@ -281,9 +293,8 @@ private:
                 // Cache empty result for whitespace-only strings
                 token_cache.put(cache_key, {});
                 return {};
-            }
-            LLAMA_LOG("Warning: Text tokenization failed or resulted in 0 tokens: '" + 
-                       text.substr(0, 50) + (text.size() > 50 ? "..." : "") + "'");
+            }            LLAMA_LOG("Warning: Text tokenization failed or resulted in 0 tokens: '" + 
+                       text.substr(0, LlamaConstants::MAX_TEXT_PREVIEW_LENGTH) + (text.size() > LlamaConstants::MAX_TEXT_PREVIEW_LENGTH ? "..." : "") + "'");
             return {};
         }
         
@@ -379,12 +390,11 @@ private:
         if (current_context->n_past + static_cast<int32_t>(tokens.size()) > max_threshold) {
             if (is_incremental) {
                 LLAMA_LOG("Context would exceed 90% (" + std::to_string(current_context->n_past + tokens.size()) + 
-                           "/" + std::to_string(model_info->n_ctx) + " tokens), triggering pruning...");
-                if (current_context->context) {
+                           "/" + std::to_string(model_info->n_ctx) + " tokens), triggering pruning...");                if (current_context->context) {
                     llama_kv_self_clear(current_context->context);
                 }
                 current_context->n_past = 0;
-                prune_message_history(0.6f);
+                prune_message_history(LlamaConstants::TARGET_CONTEXT_USAGE);
                 return false;
             } else {
                 LLAMA_LOG("Error: Full context rebuild would exceed context limit");
@@ -484,9 +494,8 @@ private:
             current_context->message_cache = convert_to_llama_messages();
             current_context->message_cache_dirty = false;
         }
-        
-        // Apply template with auto-resize
-        template_buffer.resize(model_info->n_ctx * 4);
+          // Apply template with auto-resize
+        template_buffer.resize(model_info->n_ctx * LlamaConstants::STRING_RESERVE_MULTIPLIER);
         int32_t result_len = llama_chat_apply_template(
             tmpl, current_context->message_cache.data(), current_context->message_cache.size(),
             add_generation_prompt, template_buffer.data(), template_buffer.size()
@@ -681,10 +690,9 @@ private:
             
             return "";
         }
-        
-        // Build the content to summarize
+          // Build the content to summarize
         std::string content_to_summarize;
-        content_to_summarize.reserve(4096); // Reserve reasonable space
+        content_to_summarize.reserve(LlamaConstants::SUMMARY_CONTENT_RESERVE_SIZE); // Reserve reasonable space
         
         for (const auto& [role, content] : messages_to_summarize) {
             content_to_summarize += role + ": " + content + "\n\n";
@@ -833,29 +841,25 @@ private:
             LLAMA_LOG("Warning: Empty message history");
             return true; // This is actually okay
         }
-        
-        // Check for extremely long message history that might cause issues
-        if (current_context->message_history.size() > 1000) {
+          // Check for extremely long message history that might cause issues
+        if (current_context->message_history.size() > LlamaConstants::MAX_MESSAGE_HISTORY_SIZE) {
             LLAMA_LOG("Warning: Very large message history (" + 
                       std::to_string(current_context->message_history.size()) + " messages)");
             
             // Trigger aggressive pruning
-            prune_message_history(0.3f); // Keep only 30%
+            prune_message_history(LlamaConstants::AGGRESSIVE_PRUNING_RATIO); // Keep only 30%
             return false; // Indicate that recovery was needed
         }
         
         return true; // State is valid
-    }
-
-    // Helper to get current model info
-    ModelInfo* get_current_model_info() const {
+    }    // Helper to get current model info
+    ModelInfo* get_current_model_info() const noexcept {
         return current_context ? current_context->model_info : nullptr;
     }
 
-public:
-    LlamaManager() : current_context(nullptr), model_loaded(false), token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE) {}
+public:    LlamaManager() : current_context(nullptr), model_loaded(false), token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE) {}
 
-    ~LlamaManager() {
+    ~LlamaManager() noexcept {
         cleanup();
     }
 
@@ -1072,12 +1076,10 @@ public:
                       [](const auto& pair) { return pair.first; }); // Directive #14: STL algorithms preferred
         return context_list;
     }
-    
-    std::string get_active_context() const {
+      std::string get_active_context() const noexcept {
         return active_context_id;
     }
-    
-    bool has_context(const std::string& context_id) const {
+      bool has_context(const std::string& context_id) const noexcept {
         return contexts.find(context_id) != contexts.end();
     }
     
@@ -1097,13 +1099,13 @@ public:
         }
         return it->second->n_past;
     }
+      // Get the system message from the current context
+    const std::string& get_current_system_message() const noexcept {
+        static const std::string empty_string;
+        if (!current_context) return empty_string;
+        return current_context->system_message;    }
     
-    // Get the system message from the current context
-    std::string get_current_system_message() const {
-        if (!current_context) return "";
-        return current_context->system_message;
-    }
-      // Set the reset before generation flag for a specific context
+    // Set the reset before generation flag for a specific context
     bool set_context_reset_flag(const std::string& context_id, bool reset_after_generation) {
         auto it = contexts.find(context_id);
         if (it == contexts.end()) {
@@ -1227,14 +1229,13 @@ public:
         int32_t max_threshold = static_cast<int32_t>(model_info->n_ctx * 0.9f);
         
         bool context_pruned = false;
-        if (n_ctx_used > max_threshold) {
-            LLAMA_LOG("Context usage at " + std::to_string((float)n_ctx_used / model_info->n_ctx * 100.0f) + 
+        if (n_ctx_used > max_threshold) {            LLAMA_LOG("Context usage at " + std::to_string((float)n_ctx_used / model_info->n_ctx * 100.0f) + 
                        "%, pruning to 60%");
             
             llama_kv_self_clear(current_context->context);
             current_context->n_past = 0;
             current_context->prev_len = 0;
-            prune_message_history(0.6f);
+            prune_message_history(LlamaConstants::TARGET_CONTEXT_USAGE);
             context_pruned = true;
         }
 
@@ -1355,9 +1356,9 @@ public:
         }
 
         current_context->message_history.emplace_back(username, input);
-        current_context->message_cache_dirty = true;// Update context using unified function - with retry logic
+        current_context->message_cache_dirty = true;        // Update context using unified function - with retry logic
         int32_t retry_count = 0;
-        const int32_t max_retries = 2;
+        const int32_t max_retries = LlamaConstants::MAX_RETRY_ATTEMPTS;
         
         while (retry_count < max_retries) {
             if (update_context_with_pruning()) {
@@ -1452,7 +1453,7 @@ public:
         std::string response;
         const int32_t safety_margin = LlamaConstants::TOKEN_SAFETY_MARGIN; // Reserve space for potential special tokens
         const int32_t max_new_tokens = std::min(model_info->n_predict, model_info->n_ctx - current_context->n_past - safety_margin);
-        response.reserve(max_new_tokens * 4);
+        response.reserve(max_new_tokens * LlamaConstants::STRING_RESERVE_MULTIPLIER);
         
         if (max_new_tokens <= 0) {
             return "Error: No space left in context for generation (context: " + 
@@ -1750,16 +1751,14 @@ public:
 
         current_context->message_history.emplace_back(role, content);
         current_context->message_cache_dirty = true;
-    }
-
-    // MOVED: Get context size for capacity calculations - now uses model-specific value
-    int32_t get_context_size() const {
+    }    // MOVED: Get context size for capacity calculations - now uses model-specific value
+    int32_t get_context_size() const noexcept {
         ModelInfo* model_info = get_current_model_info();
         return model_info ? model_info->n_ctx : LlamaConstants::DEFAULT_CONTEXT_SIZE; // Default fallback
     }
 
     // MOVED: Get current context token usage
-    int32_t get_context_usage() const {
+    int32_t get_context_usage() const noexcept {
         if (!current_context) return 0;
         return current_context->n_past;
     }
