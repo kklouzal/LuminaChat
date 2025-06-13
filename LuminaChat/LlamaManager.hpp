@@ -45,7 +45,8 @@
 #include "LogHandler.hpp"
 #include "TokenCache.hpp"
 
-// Forward declare the progress callback function
+// Forward declarations
+class LlamaSummarizer;
 bool model_loading_progress_callback(float progress, void *user_data);
 
 // Constants for configuration and performance (Directive #13: Zero Magic & Strong Typing)
@@ -60,29 +61,30 @@ namespace LlamaConstants {
     constexpr int32_t MAX_BATCH_SIZE = 512;
     constexpr int32_t BATCH_DIVISOR = 4;
     constexpr int32_t MAX_SEQ_IDS = 8;
-    
-    // Safety margins and limits
+      // Safety margins and limits
     constexpr int32_t TOKEN_SAFETY_MARGIN = 32;
     constexpr int32_t BATCH_SAFETY_MARGIN = 128;
     constexpr int32_t MAX_TOKEN_BUFFER_SIZE = 1024;
     constexpr int32_t MAX_SUMMARY_LENGTH = 512;
     constexpr int32_t INITIAL_TOKEN_BUFFER_SIZE = 32;
-    
-    // Sampler defaults
+    constexpr size_t MAX_MESSAGE_HISTORY_SIZE = 1000;
+      // Sampler defaults
     constexpr float DEFAULT_TEMPERATURE = 0.8f;
     constexpr float DEFAULT_MIN_P = 0.05f;
     constexpr float DEFAULT_TOP_P = 0.9f;
     constexpr int32_t DEFAULT_TOP_K = 40;
-      // Context management
-    constexpr float MAX_CONTEXT_USAGE = 0.90f;
-    constexpr float TARGET_CONTEXT_USAGE = 0.60f;
-      // String processing constants
+    
+    // String processing constants
     constexpr size_t MAX_TEXT_PREVIEW_LENGTH = 50;
     constexpr size_t STRING_RESERVE_MULTIPLIER = 4;
     constexpr int32_t MAX_RETRY_ATTEMPTS = 2;
-    constexpr size_t MAX_MESSAGE_HISTORY_SIZE = 1000;
-    constexpr float AGGRESSIVE_PRUNING_RATIO = 0.3f;
-    constexpr size_t SUMMARY_CONTENT_RESERVE_SIZE = 4096;
+}
+
+// Forward declaration of SummarizerConstants (fully defined in LlamaSummarizer.hpp)
+namespace SummarizerConstants {
+    extern const size_t MAX_SUMMARY_SLOTS;
+    extern const float TARGET_CONTEXT_USAGE;
+    extern const float AGGRESSIVE_PRUNING_RATIO;
 }
 
 // Thread Safety Contract (Directive #12):
@@ -154,15 +156,13 @@ private:
         // Special flag for contexts that should reset before each generation
         // Primarily used for summary models that need a clean slate for each task
         bool reset_after_generation = false;
-        
-        // 5-slot summary system: maintains chronological order of conversation summaries
+          // 5-slot summary system: maintains chronological order of conversation summaries
         // When the 6th summary is generated, slot 0 is dropped, slots shift left, and new summary goes to slot 4
         std::vector<std::string> summary_slots;
-        static constexpr size_t MAX_SUMMARY_SLOTS = 5;
         
         ContextInfo() : context(nullptr), batch{}, batch_initialized(false), 
                        n_past(0), prev_len(0), model_info(nullptr) {
-            summary_slots.reserve(MAX_SUMMARY_SLOTS);
+            summary_slots.reserve(SummarizerConstants::MAX_SUMMARY_SLOTS);
         }
     };
     
@@ -176,13 +176,11 @@ private:
     // Template and cache management
     mutable std::string template_buffer;
     mutable TokenCache token_cache;
-    
-    // Working buffers
+      // Working buffers
     mutable std::string temp_string_buffer;
 
-    // Summary logging callbacks
-    std::function<void(const std::string&)> summary_input_callback;
-    std::function<void(const std::string&)> summary_output_callback;
+    // Summarizer for handling conversation summarization
+    std::unique_ptr<LlamaSummarizer> summarizer;
 
     // Unified batch management
     void manage_batch(bool clear_only = true) {
@@ -394,7 +392,7 @@ private:
                     llama_kv_self_clear(current_context->context);
                 }
                 current_context->n_past = 0;
-                prune_message_history(LlamaConstants::TARGET_CONTEXT_USAGE);
+                prune_message_history(SummarizerConstants::TARGET_CONTEXT_USAGE);
                 return false;
             } else {
                 LLAMA_LOG("Error: Full context rebuild would exceed context limit");
@@ -539,240 +537,11 @@ private:
             }
             temp_string_buffer.resize(required_size);
             result = llama_token_to_piece(model_info->vocab, token, temp_string_buffer.data(), temp_string_buffer.size(), 0, true);
-        }
-          return (result > 0) ? std::string(temp_string_buffer.data(), result) : "";
-    }
-      // Add summary to the 5-slot chronological summary system
-    void add_summary_to_slots(const std::string& new_summary) {
-        if (!current_context || new_summary.empty()) return;
-        
-        // If we're at capacity (5 slots), implement rollover summarization
-        if (current_context->summary_slots.size() >= ContextInfo::MAX_SUMMARY_SLOTS) {
-            LLAMA_LOG("Summary slots at capacity, performing rollover summarization");
-            
-            // Get the two oldest summaries (slots 0 and 1)
-            std::string oldest_summary = current_context->summary_slots[0];
-            std::string second_oldest_summary = current_context->summary_slots[1];
-            
-            // Create a combined summary from the two oldest
-            std::vector<std::pair<std::string, std::string>> rollover_messages;
-            rollover_messages.emplace_back("system", "Previous summary 1: " + oldest_summary);
-            rollover_messages.emplace_back("system", "Previous summary 2: " + second_oldest_summary);
-            
-            std::string combined_summary = summarize_messages(rollover_messages);
-            
-            if (!combined_summary.empty()) {
-                // Remove the two oldest summaries and replace with the combined one
-                current_context->summary_slots.erase(current_context->summary_slots.begin(), current_context->summary_slots.begin() + 2);
-                current_context->summary_slots.insert(current_context->summary_slots.begin(), combined_summary);
-                LLAMA_LOG("Rollover summarization successful - combined 2 oldest summaries into 1");
-            } else {
-                // Fallback: just remove the oldest if rollover summarization fails
-                current_context->summary_slots.erase(current_context->summary_slots.begin());
-                LLAMA_LOG("Rollover summarization failed, removed oldest summary");
-            }
-        }
-        
-        // Add new summary to the end (newest position)
-        current_context->summary_slots.push_back(new_summary);
-        
-        LLAMA_LOG("Added new summary to slot " + std::to_string(current_context->summary_slots.size()) + 
-                  " of " + std::to_string(ContextInfo::MAX_SUMMARY_SLOTS));
-    }
-    
-    // Enhanced prune message history using summary model to condense pruned messages
-    void prune_message_history(float keep_ratio) {
-        if (!current_context || current_context->message_history.empty()) return;
-        
-        // Always keep system message if present
-        bool has_system = !current_context->message_history.empty() && current_context->message_history[0].first == "system";
-        size_t system_offset = has_system ? 1 : 0;
-        
-        // Calculate how many non-system messages to keep
-        size_t total_messages = current_context->message_history.size() - system_offset;
-        size_t messages_to_keep = std::max(size_t(2), static_cast<size_t>(total_messages * keep_ratio));
-        
-        if (messages_to_keep >= total_messages) {
-            return;
-        }
-        
-        // Extract messages to be pruned (everything except system message and messages to keep)
-        size_t prune_start_idx = system_offset;
-        size_t prune_end_idx = current_context->message_history.size() - messages_to_keep;
-        
-        if (prune_end_idx <= prune_start_idx) {
-            return; // Nothing to prune
-        }
-        
-        // Collect messages to be summarized
-        std::vector<std::pair<std::string, std::string>> messages_to_summarize;
-        for (size_t i = prune_start_idx; i < prune_end_idx; ++i) {
-            messages_to_summarize.emplace_back(current_context->message_history[i]);
-        }        // Attempt to summarize using summary context
-        std::string summary = summarize_messages(messages_to_summarize);
-        
-        // Calculate how many messages were summarized for logging
-        size_t summarized_count = prune_end_idx - prune_start_idx;
-          // Build new message history
-        std::vector<std::pair<std::string, std::string>> new_history;
-        new_history.reserve(system_offset + ContextInfo::MAX_SUMMARY_SLOTS + messages_to_keep);
-        
-        // Add system message if present
-        if (has_system) {
-            new_history.emplace_back(std::move(current_context->message_history[0]));
-        }        // Handle 5-slot summary system
-        if (!summary.empty()) {
-            // Add new summary to the slot system
-            add_summary_to_slots(summary);
-            LLAMA_LOG("Successfully created summary for " + std::to_string(summarized_count) + " pruned messages");
-            LLAMA_LOG("Summary slots now contain " + std::to_string(current_context->summary_slots.size()) + " summaries");
-        } else {
-            // Fallback: keep more messages if summarization failed
-            LLAMA_LOG("Warning: Summarization failed or unavailable, keeping more messages instead");
-            
-            // Keep up to half of the messages that would have been pruned
-            size_t fallback_keep = std::min(summarized_count / 2, size_t(3)); // Keep at least 1, max 3
-            size_t fallback_start = prune_end_idx - fallback_keep;
-            
-            for (size_t i = fallback_start; i < prune_end_idx; ++i) {
-                if (i < current_context->message_history.size()) {
-                    new_history.emplace_back(std::move(current_context->message_history[i]));
-                }
-            }
-            
-            // Add a system message explaining what happened
-            new_history.emplace_back("system", "[Note: " + std::to_string(summarized_count - fallback_keep) + 
-                                    " older messages removed due to context limits]");
-        }
-        
-        // FIXED: Do NOT add summary slots to message history during regular pruning
-        // Summary slots are maintained separately and only used for rollover summarization
-        // The actual summaries are not part of the conversation context
-        
-        // Add the recent messages to keep
-        for (size_t i = prune_end_idx; i < current_context->message_history.size(); ++i) {
-            new_history.emplace_back(std::move(current_context->message_history[i]));
-        }
-          current_context->message_history = std::move(new_history);
-        current_context->message_cache_dirty = true;
-        
-        LLAMA_LOG("Pruned " + std::to_string(summarized_count) + " messages into summary. " +
-                  "New history has " + std::to_string(current_context->message_history.size()) + " messages");
+        }          return (result > 0) ? std::string(temp_string_buffer.data(), result) : "";
     }
 
-    // Summarize a collection of messages using the summary context
-    std::string summarize_messages(const std::vector<std::pair<std::string, std::string>>& messages_to_summarize) {
-        if (messages_to_summarize.empty()) {
-            return "";
-        }        // Check if we have a summary context available
-        auto summary_context_it = contexts.find("summary_context");
-        if (summary_context_it == contexts.end()) {
-            LLAMA_LOG("Warning: No summary context available for message summarization");
-            
-            // Log to summaries tab that no context is available
-            if (summary_output_callback) {
-                summary_output_callback("ERROR: No summary context available");
-            }
-            
-            return "";
-        }
-        
-        // Store current context to restore later
-        std::string original_context_id = active_context_id;
-        ContextInfo* original_context = current_context;        // Switch to summary context temporarily
-        if (!switch_to_context("summary_context")) {
-            LLAMA_LOG("Error: Failed to switch to summary context");
-            
-            // Log to summaries tab that context switch failed
-            if (summary_output_callback) {
-                summary_output_callback("ERROR: Failed to switch to summary context");
-            }
-            
-            return "";
-        }
-          // Build the content to summarize
-        std::string content_to_summarize;
-        content_to_summarize.reserve(LlamaConstants::SUMMARY_CONTENT_RESERVE_SIZE); // Reserve reasonable space
-        
-        for (const auto& [role, content] : messages_to_summarize) {
-            content_to_summarize += role + ": " + content + "\n\n";
-        }
-          // Create summarization request
-        std::string summarization_request = "Please provide a concise summary of the following conversation:\n\n" + 
-                                          content_to_summarize + 
-                                          "\nSummary:";        // Log the input to the summaries tab
-        if (summary_input_callback) {
-            // Show full content for better debugging and visibility
-            std::string ui_input = "Summarizing " + std::to_string(messages_to_summarize.size()) + " messages:\n";
-            ui_input += std::string(50, '=') + "\n";
-            
-            for (const auto& [role, content] : messages_to_summarize) {
-                ui_input += role + ": " + content + "\n\n";
-            }
-            ui_input += std::string(50, '=') + "\n";
-            summary_input_callback(ui_input);
-        }// Generate summary using the summary context
-        std::string summary;
-        try {
-            summary = generate_response(summarization_request, "user");
-            
-            // Check if the summary is actually an error message
-            if (!summary.empty() && summary.starts_with("Error:")) {
-                LLAMA_LOG("Summary generation returned error: " + summary);
-                
-                // Log the error to the summaries tab
-                if (summary_output_callback) {
-                    summary_output_callback(summary);
-                }
-                
-                summary = ""; // Treat as failed summarization
-            } else if (!summary.empty()) {                // Clean up the summary (remove any extra whitespace, newlines)
-                size_t start = summary.find_first_not_of(" \t\n\r");
-                size_t end = summary.find_last_not_of(" \t\n\r");
-                if (start != std::string::npos && end != std::string::npos) {
-                    summary = summary.substr(start, end - start + 1);
-                }
-                
-                // Note: No artificial length limit - let the AI determine appropriate summary length
-                  // Log the output to the summaries tab
-                if (summary_output_callback) {
-                    summary_output_callback(summary);
-                }
-            }} catch (const std::exception& e) {
-            LLAMA_LOG("Exception during message summarization: " + std::string(e.what()));
-            summary = "";
-            
-            // Log the error to the summaries tab
-            if (summary_output_callback) {
-                summary_output_callback("ERROR: " + std::string(e.what()));
-            }
-        } catch (...) {
-            LLAMA_LOG("Unknown exception during message summarization");
-            summary = "";
-            
-            // Log the error to the summaries tab
-            if (summary_output_callback) {
-                summary_output_callback("ERROR: Unknown exception during summarization");
-            }
-        }
-        
-        // Restore original context
-        if (!original_context_id.empty() && original_context) {
-            switch_to_context(original_context_id);
-        }
-        
-        if (summary.empty()) {
-            LLAMA_LOG("Warning: Message summarization produced empty result");
-        } else {
-            LLAMA_LOG("Successfully summarized " + std::to_string(messages_to_summarize.size()) + 
-                      " messages into " + std::to_string(summary.length()) + " character summary");
-        }
-        
-        return summary;
-    }
-
-    // REFACTOR: Update context validation
-    bool validate_and_recover_sampler() {
+    // Validate and recover sampler if needed
+    bool validate_and_recover_sampler() const {
         ModelInfo* model_info = get_current_model_info();
         if (!model_info) {
             LLAMA_LOG("Error: No model info available for sampler validation");
@@ -840,15 +609,18 @@ private:
         if (current_context->message_history.empty()) {
             LLAMA_LOG("Warning: Empty message history");
             return true; // This is actually okay
-        }
-          // Check for extremely long message history that might cause issues
+        }        // Check for extremely long message history that might cause issues
         if (current_context->message_history.size() > LlamaConstants::MAX_MESSAGE_HISTORY_SIZE) {
             LLAMA_LOG("Warning: Very large message history (" + 
                       std::to_string(current_context->message_history.size()) + " messages)");
-            
-            // Trigger aggressive pruning
-            prune_message_history(LlamaConstants::AGGRESSIVE_PRUNING_RATIO); // Keep only 30%
-            return false; // Indicate that recovery was needed
+              // Only trigger aggressive pruning if we're not already in a summary context
+            if (active_context_id != "summary_context") {
+                // Trigger aggressive pruning
+                prune_message_history(SummarizerConstants::AGGRESSIVE_PRUNING_RATIO); // Keep only 30%
+                return false; // Indicate that recovery was needed
+            } else {
+                LLAMA_LOG("Skipping pruning for summary context");
+            }
         }
         
         return true; // State is valid
@@ -857,7 +629,10 @@ private:
         return current_context ? current_context->model_info : nullptr;
     }
 
-public:    LlamaManager() : current_context(nullptr), model_loaded(false), token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE) {}
+public:
+    LlamaManager() : current_context(nullptr), model_loaded(false), token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE) {
+        summarizer = std::make_unique<LlamaSummarizer>(this);
+    }
 
     ~LlamaManager() noexcept {
         cleanup();
@@ -866,17 +641,10 @@ public:    LlamaManager() : current_context(nullptr), model_loaded(false), token
     // Initialize llama.cpp backend
     bool initialize() {
         ggml_backend_load_all();
-        return true;
-    }
-
-    // Set callbacks for summary logging
-    void set_summary_input_callback(std::function<void(const std::string&)> callback) {
-        summary_input_callback = std::move(callback);
-    }
+        return true;    }    // Set callbacks for summary logging
+    void set_summary_input_callback(std::function<void(const std::string&)> callback);
     
-    void set_summary_output_callback(std::function<void(const std::string&)> callback) {
-        summary_output_callback = std::move(callback);
-    }
+    void set_summary_output_callback(std::function<void(const std::string&)> callback);
 
     // Load .gguf model file and create ModelInfo with specific parameters
     bool load_model(const std::string& model_path, const std::string& model_id = "", 
@@ -1024,17 +792,44 @@ public:    LlamaManager() : current_context(nullptr), model_loaded(false), token
         
         return true;
     }
-    
-    bool switch_to_context(const std::string& context_id) {
+      bool switch_to_context(const std::string& context_id) {
         auto it = contexts.find(context_id);
         if (it == contexts.end()) {
             LLAMA_LOG("Error: Context '" + context_id + "' not found");
             return false;
         }
+          // Validate the context before switching
+        if (!it->second || !it->second->context || !it->second->model_info || !it->second->model_info->model) {
+            LLAMA_LOG("Error: Context '" + context_id + "' has invalid state");
+            return false;
+        }
+        
+        // Validate the sampler for this context's model
+        if (!it->second->model_info->sampler) {
+            LLAMA_LOG("Warning: Context '" + context_id + "' has no sampler, attempting to create one");
+            // Try to create a sampler for this model
+            it->second->model_info->sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            if (it->second->model_info->sampler) {
+                llama_sampler_chain_add(it->second->model_info->sampler, 
+                                       llama_sampler_init_temp(LlamaConstants::DEFAULT_TEMPERATURE));
+                llama_sampler_chain_add(it->second->model_info->sampler, 
+                                       llama_sampler_init_min_p(LlamaConstants::DEFAULT_MIN_P, 1));
+                llama_sampler_chain_add(it->second->model_info->sampler, 
+                                       llama_sampler_init_top_k(LlamaConstants::DEFAULT_TOP_K));
+                llama_sampler_chain_add(it->second->model_info->sampler, 
+                                       llama_sampler_init_top_p(LlamaConstants::DEFAULT_TOP_P, 1));
+                llama_sampler_chain_add(it->second->model_info->sampler, 
+                                       llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+                LLAMA_LOG("Created new sampler for context '" + context_id + "'");
+            } else {
+                LLAMA_LOG("Error: Failed to create sampler for context '" + context_id + "'");
+                return false;
+            }
+        }
         
         active_context_id = context_id;
         current_context = it->second.get();
-        LLAMA_LOG("Switched to context '" + context_id + "'");
+        LLAMA_LOG("Switched to context '" + context_id + "' (model: " + current_context->model_info->model_path + ")");
         return true;
     }
     
@@ -1130,39 +925,14 @@ public:    LlamaManager() : current_context(nullptr), model_loaded(false), token
         current_context->n_past = 0;
         current_context->prev_len = 0;
         
-        LLAMA_LOG("Cleared conversation history and summary slots");
-    }
+        LLAMA_LOG("Cleared conversation history and summary slots");    }    // Bridge method for message history pruning with summarization
+    void prune_message_history(float keep_ratio);
 
     // Manually trigger message history pruning with summarization
-    bool prune_conversation_with_summary(float keep_ratio = 0.6f) {
-        if (!current_context || current_context->message_history.empty()) {
-            LLAMA_LOG("Warning: No active context or empty message history for pruning");
-            return false;
-        }
-        
-        size_t original_message_count = current_context->message_history.size();
-        
-        // Perform pruning with summarization
-        prune_message_history(keep_ratio);
-        
-        // Update context after pruning
-        bool success = update_context_from_history();
-        
-        if (success) {
-            LLAMA_LOG("Manual pruning completed successfully. Messages: " + 
-                      std::to_string(original_message_count) + " -> " + 
-                      std::to_string(current_context->message_history.size()));
-        } else {
-            LLAMA_LOG("Warning: Context update failed after manual pruning");
-        }
-        
-        return success;
-    }
+    bool prune_conversation_with_summary(float keep_ratio = 0.6f);
 
     // Check if summarization is available (summary context exists)
-    bool is_summarization_available() const {
-        return contexts.find("summary_context") != contexts.end();
-    }
+    bool is_summarization_available() const;
 
     // Get current message count (useful for determining when pruning might be needed)
     size_t get_message_count() const {
@@ -1175,29 +945,15 @@ public:    LlamaManager() : current_context(nullptr), model_loaded(false), token
         for (const auto& msg : current_context->message_history) {
             messages.push_back({ msg.first.c_str(), msg.second.c_str() });
         }
-        return messages;
-    }
-    
-    // Get information about the current summary slots
+        return messages;    }
+      // Forward declaration for summary slot info - implementation after LlamaSummarizer include
     struct SummarySlotInfo {
         size_t total_slots;
         size_t used_slots;
-        std::vector<std::string> summaries; // In chronological order (oldest to newest)
+        std::vector<std::string> summaries;
     };
     
-    SummarySlotInfo get_summary_slot_info() const {
-        SummarySlotInfo info;
-        info.total_slots = ContextInfo::MAX_SUMMARY_SLOTS;
-        
-        if (current_context) {
-            info.used_slots = current_context->summary_slots.size();
-            info.summaries = current_context->summary_slots;
-        } else {
-            info.used_slots = 0;
-        }
-        
-        return info;
-    }
+    SummarySlotInfo get_summary_slot_info() const;
 
     // Get the model's default chat template
     std::string get_model_chat_template() const {
@@ -1224,18 +980,21 @@ public:    LlamaManager() : current_context(nullptr), model_loaded(false), token
             return false;
         }
 
-        // Check and handle pruning first
+        // Skip pruning for summary contexts - they manage their own state
+        bool is_summary_context = (active_context_id == "summary_context");
+        
+        // Check and handle pruning first (but not for summary contexts)
         int32_t n_ctx_used = current_context->n_past;
         int32_t max_threshold = static_cast<int32_t>(model_info->n_ctx * 0.9f);
         
         bool context_pruned = false;
-        if (n_ctx_used > max_threshold) {            LLAMA_LOG("Context usage at " + std::to_string((float)n_ctx_used / model_info->n_ctx * 100.0f) + 
+        if (!is_summary_context && n_ctx_used > max_threshold) {            LLAMA_LOG("Context usage at " + std::to_string((float)n_ctx_used / model_info->n_ctx * 100.0f) + 
                        "%, pruning to 60%");
             
             llama_kv_self_clear(current_context->context);
             current_context->n_past = 0;
             current_context->prev_len = 0;
-            prune_message_history(LlamaConstants::TARGET_CONTEXT_USAGE);
+            prune_message_history(SummarizerConstants::TARGET_CONTEXT_USAGE);
             context_pruned = true;
         }
 
@@ -1247,8 +1006,9 @@ public:    LlamaManager() : current_context(nullptr), model_loaded(false), token
         }
 
         int32_t new_len = static_cast<int32_t>(formatted_content.length());        // FIXED: If context was pruned, prev_len is 0 with messages (reset context), or prev_len > new_len, rebuild from scratch
+        // BUT for summary contexts with reset_after_generation=true, this is normal behavior
         if (context_pruned || current_context->prev_len > new_len || 
-            (current_context->prev_len == 0 && !current_context->message_history.empty())) {
+            (current_context->prev_len == 0 && !current_context->message_history.empty() && !is_summary_context)) {
             // Rebuild context - use add_special=true for full context
             std::vector<llama_token> tokens = process_text_to_tokens(formatted_content, true);
             if (tokens.empty()) {
@@ -1576,8 +1336,7 @@ public:    LlamaManager() : current_context(nullptr), model_loaded(false), token
                        std::to_string(current_context->last_decode_time_us / 1000.0f) + "ms (" + 
                        std::to_string(tokens_per_second) + " t/s)");
         }        
-        
-        // FIXED: Store the response before clearing context if reset_after_generation is set
+          // FIXED: Store the response before clearing context if reset_after_generation is set
         std::string final_response = response;
           // FIXED: Reset context after generation if flag is set (for summary contexts)
         if (current_context->reset_after_generation) {
@@ -1592,6 +1351,7 @@ public:    LlamaManager() : current_context(nullptr), model_loaded(false), token
                 current_context->system_message = saved_system_message;
                 current_context->message_history.emplace_back("system", saved_system_message);
                 current_context->message_cache_dirty = true;
+                LLAMA_LOG("Restored system message for next summarization task");
             }
         }
         // FIXED: Final sampler validation
@@ -1853,9 +1613,75 @@ private:
         return std::max(1, std::min({n_batch, available_ctx, 512}));
     }
       void clear_caches() const {
-        token_cache.clear();
-    }
+        token_cache.clear();    }
 };
+
+// Include LlamaSummarizer implementation after class declaration to avoid circular dependency
+#include "LlamaSummarizer.hpp"
+
+// Implementation of methods that depend on LlamaSummarizer
+inline LlamaManager::SummarySlotInfo LlamaManager::get_summary_slot_info() const {
+    if (!current_context || !summarizer) {
+        return {SummarizerConstants::MAX_SUMMARY_SLOTS, 0, {}};
+    }
+    auto summarizer_info = summarizer->get_summary_slot_info(current_context->summary_slots);
+    return {summarizer_info.total_slots, summarizer_info.used_slots, summarizer_info.summaries};
+}
+
+inline void LlamaManager::prune_message_history(float keep_ratio) {
+    if (!current_context || !summarizer) return;
+    summarizer->prune_message_history(current_context->message_history, current_context->summary_slots, keep_ratio);
+}
+
+inline bool LlamaManager::prune_conversation_with_summary(float keep_ratio) {
+    if (!current_context || current_context->message_history.empty()) {
+        LLAMA_LOG("Warning: No active context or empty message history for pruning");
+        return false;
+    }
+    
+    // Don't prune summary contexts
+    if (active_context_id == "summary_context") {
+        LLAMA_LOG("Skipping pruning for summary context");
+        return true;
+    }
+    
+    size_t original_message_count = current_context->message_history.size();
+    LLAMA_LOG("Starting pruning with " + std::to_string(original_message_count) + " messages, keep_ratio=" + std::to_string(keep_ratio));
+    
+    // Perform pruning with summarization
+    prune_message_history(keep_ratio);
+    
+    // Update context after pruning
+    bool success = update_context_from_history();
+    
+    if (success) {
+        LLAMA_LOG("Manual pruning completed successfully. Messages: " + 
+                  std::to_string(original_message_count) + " -> " + 
+                  std::to_string(current_context->message_history.size()));
+    } else {
+        LLAMA_LOG("Warning: Context update failed after manual pruning");
+    }
+    
+    return success;
+}
+
+inline bool LlamaManager::is_summarization_available() const {
+    bool available = summarizer ? summarizer->is_summarization_available() : false;
+    LLAMA_LOG("Summarization available: " + std::string(available ? "true" : "false"));
+    return available;
+}
+
+inline void LlamaManager::set_summary_input_callback(std::function<void(const std::string&)> callback) {
+    if (summarizer) {
+        summarizer->set_summary_input_callback(std::move(callback));
+    }
+}
+
+inline void LlamaManager::set_summary_output_callback(std::function<void(const std::string&)> callback) {
+    if (summarizer) {
+        summarizer->set_summary_output_callback(std::move(callback));
+    }
+}
 
 // Progress callback function declaration (needs to be outside class for C compatibility)
 extern bool model_loading_progress_callback(float progress, void *user_data);
