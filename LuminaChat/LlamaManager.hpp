@@ -687,11 +687,10 @@ private:
                 ui_input += role + ": " + display_content + "\n";
             }
             summary_input_callback(ui_input);
-        }
-          // Generate summary using the summary context
+        }          // Generate summary using the summary context
         std::string summary;
         try {
-            summary = generate_response(summarization_request, "system");
+            summary = generate_response(summarization_request, "user");
             
             // Check if the summary is actually an error message
             if (!summary.empty() && summary.starts_with("Error:")) {
@@ -1235,10 +1234,9 @@ public:
             return false;
         }
 
-        int32_t new_len = static_cast<int32_t>(formatted_content.length());
-
-        // FIXED: If context was pruned, always rebuild from scratch
-        if (context_pruned || current_context->prev_len > new_len) {
+        int32_t new_len = static_cast<int32_t>(formatted_content.length());        // FIXED: If context was pruned, prev_len is 0 with messages (reset context), or prev_len > new_len, rebuild from scratch
+        if (context_pruned || current_context->prev_len > new_len || 
+            (current_context->prev_len == 0 && !current_context->message_history.empty())) {
             // Rebuild context - use add_special=true for full context
             std::vector<llama_token> tokens = process_text_to_tokens(formatted_content, true);
             if (tokens.empty()) {
@@ -1249,11 +1247,12 @@ public:
             
             if (process_context_tokens(tokens, false)) {
                 current_context->prev_len = new_len;
-                LLAMA_LOG("Context rebuilt successfully after pruning with " + 
-                           std::to_string(tokens.size()) + " tokens");
+                LLAMA_LOG("Context rebuilt successfully with " + 
+                           std::to_string(tokens.size()) + " tokens (reset_context=" + 
+                           std::string((current_context->prev_len == 0) ? "true" : "false") + ")");
                 return true;
             }
-            LLAMA_LOG("Error: Failed to rebuild context after pruning");
+            LLAMA_LOG("Error: Failed to rebuild context");
             return false;
         }
 
@@ -1330,15 +1329,7 @@ public:
             return "Error: Model components not properly initialized or no active context";
         }
 
-        if (input.empty()) return "Error: Empty input";
-
-        // Check if context should be reset before generation (for summary contexts and similar)
-        if (current_context->reset_after_generation) {
-            LLAMA_LOG("Resetting context '" + active_context_id + "' before generation (reset_after_generation flag is set)");
-            clear_conversation();
-        }
-
-        // Validate conversation state before proceeding
+        if (input.empty()) return "Error: Empty input";        // Validate conversation state before proceeding
         if (!validate_conversation_state()) {
             LLAMA_LOG("Conversation state required recovery, retrying...");
         }
@@ -1346,16 +1337,14 @@ public:
         // FIXED: Validate sampler before proceeding and attempt recovery if needed
         if (!validate_and_recover_sampler()) {
             return "Error: Sampler validation/recovery failed";
-        }
-
-        // Setup conversation
+        }        // Setup conversation - ensure system message is in history if context is empty
         if (current_context->message_history.empty() && !current_context->system_message.empty()) {
             current_context->message_history.emplace_back("system", current_context->system_message);
             current_context->message_cache_dirty = true;
         }
 
         current_context->message_history.emplace_back(username, input);
-        current_context->message_cache_dirty = true;        // Update context using unified function - with retry logic
+        current_context->message_cache_dirty = true;// Update context using unified function - with retry logic
         int32_t retry_count = 0;
         const int32_t max_retries = 2;
         
@@ -1418,16 +1407,20 @@ public:
                 
                 return "Error: Context recovery failed. The conversation history may have become too complex. Try starting a new conversation.";
             }
-        }
-
-        // Prepare for generation using unified template function
+        }        // Prepare for generation using unified template function
         std::string generation_content;
         if (!apply_template_optimized(true, generation_content)) {
             return "Error: Failed to apply generation template";
         }
 
-        // Process generation prompt using unified tokenization
-        std::string generation_prompt = generation_content.substr(current_context->prev_len);
+        // FIXED: Handle generation prompt correctly for reset contexts
+        // For contexts with reset_after_generation (like summary contexts), prev_len starts at 0
+        // so we need to process the incremental content only if there's actually new content
+        std::string generation_prompt;
+        if (current_context->prev_len < static_cast<int32_t>(generation_content.length())) {
+            generation_prompt = generation_content.substr(current_context->prev_len);
+        }
+        
         if (!generation_prompt.empty()) {
             // For generation prompts, typically don't add special tokens
             std::vector<llama_token> prompt_tokens = process_text_to_tokens(generation_prompt, false);
@@ -1438,6 +1431,10 @@ public:
             } else {
                 LLAMA_LOG("Warning: Generation prompt produced no tokens");
             }
+        } else {
+            LLAMA_LOG("No new generation prompt content to process (prev_len=" + 
+                      std::to_string(current_context->prev_len) + ", total_len=" + 
+                      std::to_string(generation_content.length()) + ")");
         }
 
         // Generate response using unified functions
@@ -1461,10 +1458,10 @@ public:
             LLAMA_LOG("Error: Context is null before generation");
             return "Error: Context not properly initialized";
         }
-        
-        // FIXED: Validate that we have logits available for sampling
-        if (current_context->n_past == 0) {
-            LLAMA_LOG("Error: No tokens processed yet, cannot generate");
+          // FIXED: Validate that we have logits available for sampling
+        // For reset contexts, we might start with n_past=0 if the context was just created/reset
+        if (current_context->n_past == 0 && current_context->message_history.empty()) {
+            LLAMA_LOG("Error: Context is completely empty, cannot generate");
             return "Error: Context is empty, cannot generate response";
         }
 
@@ -1553,9 +1550,7 @@ public:
         // Update timing and history
         auto decode_end = std::chrono::high_resolution_clock::now();
         current_context->last_decode_time_us = std::chrono::duration_cast<std::chrono::microseconds>(decode_end - decode_start).count();
-        current_context->total_generation_tokens += n_generated;
-
-        if (!response.empty()) {
+        current_context->total_generation_tokens += n_generated;        if (!response.empty()) {
             current_context->message_history.emplace_back("assistant", response);
             current_context->message_cache_dirty = true;
             
@@ -1563,19 +1558,36 @@ public:
             if (apply_template_optimized(false, updated_content)) {
                 current_context->prev_len = static_cast<int32_t>(updated_content.length());
             }
-        }
-
-        if (n_generated > 0) {
+        }        if (n_generated > 0) {
             float tokens_per_second = (float)n_generated / ((float)current_context->last_decode_time_us / 1000000.0f);
             LLAMA_LOG("Generated " + std::to_string(n_generated) + " tokens in " + 
                        std::to_string(current_context->last_decode_time_us / 1000.0f) + "ms (" + 
                        std::to_string(tokens_per_second) + " t/s)");
-        }        // FIXED: Final sampler validation
+        }        
+        
+        // FIXED: Store the response before clearing context if reset_after_generation is set
+        std::string final_response = response;
+          // FIXED: Reset context after generation if flag is set (for summary contexts)
+        if (current_context->reset_after_generation) {
+            LLAMA_LOG("Resetting context '" + active_context_id + "' after generation (reset_after_generation flag is set)");
+            
+            // For summary contexts, preserve the system message but clear everything else
+            std::string saved_system_message = current_context->system_message;
+            clear_conversation();
+            
+            // Restore the system message for the next summarization task
+            if (!saved_system_message.empty()) {
+                current_context->system_message = saved_system_message;
+                current_context->message_history.emplace_back("system", saved_system_message);
+                current_context->message_cache_dirty = true;
+            }
+        }
+        // FIXED: Final sampler validation
         if (!model_info->sampler) {
             LLAMA_LOG("WARNING: Sampler is NULL at end of generation!");
         }
 
-        return response;
+        return final_response;
     }
 
     // Get performance statistics
