@@ -106,6 +106,7 @@ enum class EventId : int32_t {
     BROWSE_MODEL,
     CONNECT_DISCORD,
     PRUNE_SUMMARIZE,
+    VIEW_SUMMARY_SLOTS,
     MODEL_LOADED,
     RESPONSE_READY,
     PROGRESS_UPDATE,
@@ -716,7 +717,7 @@ private:
     // Context monitoring timer
     wxTimer* context_monitor_timer;    // UI controls with better organization
     struct UIControls {
-        wxButton *start_btn, *stop_btn, *settings_btn, *discord_btn, *prune_btn;
+        wxButton *start_btn, *stop_btn, *settings_btn, *discord_btn, *prune_btn, *summary_slots_btn;
         wxGauge* progress_bar;
         wxGauge* context_progress_bar;
         wxStaticText *progress_label, *timings_label, *context_label;
@@ -824,13 +825,13 @@ private:
         
         SetMinSize(wxSize(600, 400));
         AddWelcomeMessage();
-    }
-      void CreateToolbar() {
+    }      void CreateToolbar() {
         ui.start_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::START), "Start");
         ui.stop_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::STOP), "Stop");
         ui.settings_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::SETTINGS), "Settings");
         ui.discord_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::CONNECT_DISCORD), "Connect Discord");
         ui.prune_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::PRUNE_SUMMARIZE), "Prune && Summarize");
+        ui.summary_slots_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::VIEW_SUMMARY_SLOTS), "View Summaries");
     }void CreateStatusArea() {
         ui.progress_label = new wxStaticText(ui.main_panel, wxID_ANY, "Ready");
         ui.progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, wxSize(-1, 20));
@@ -901,11 +902,11 @@ private:
         ui.notebook->AddPage(panel, "Logs");
     }    void LayoutComponents() {
         auto* toolbar_sizer = new wxBoxSizer(wxHORIZONTAL);
-        toolbar_sizer->Add(ui.start_btn, 0, wxRIGHT, 5);
-        toolbar_sizer->Add(ui.stop_btn, 0, wxRIGHT, 5);  
+        toolbar_sizer->Add(ui.start_btn, 0, wxRIGHT, 5);        toolbar_sizer->Add(ui.stop_btn, 0, wxRIGHT, 5);  
         toolbar_sizer->Add(ui.settings_btn, 0, wxRIGHT, 5);
         toolbar_sizer->Add(ui.discord_btn, 0, wxRIGHT, 5);
-        toolbar_sizer->Add(ui.prune_btn, 0);
+        toolbar_sizer->Add(ui.prune_btn, 0, wxRIGHT, 5);
+        toolbar_sizer->Add(ui.summary_slots_btn, 0);
         toolbar_sizer->AddStretchSpacer();
         
         // Context monitoring area - fixed sizing and spacing
@@ -931,8 +932,8 @@ private:
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnStart, this, static_cast<int>(EventId::START));
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnStop, this, static_cast<int>(EventId::STOP));
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnSettings, this, static_cast<int>(EventId::SETTINGS));
-        Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnConnectDiscord, this, static_cast<int>(EventId::CONNECT_DISCORD));
-        Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnPruneSummarize, this, static_cast<int>(EventId::PRUNE_SUMMARIZE));
+        Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnConnectDiscord, this, static_cast<int>(EventId::CONNECT_DISCORD));        Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnPruneSummarize, this, static_cast<int>(EventId::PRUNE_SUMMARIZE));
+        Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnViewSummarySlots, this, static_cast<int>(EventId::VIEW_SUMMARY_SLOTS));
         Bind(wxEVT_COMMAND_TEXT_ENTER, &LuminaChatFrame::OnInputEnter, this, static_cast<int>(EventId::INPUT_TEXT));
         
         Bind(wxEVT_MODEL_LOADED, &LuminaChatFrame::OnModelLoaded, this);
@@ -991,12 +992,12 @@ private:
       void UpdateButtonStates() noexcept {
         const bool started = is_started.load();
         const bool processing = is_processing.load();
-        
-        if (ui.start_btn) ui.start_btn->Enable(!started && !processing);
+          if (ui.start_btn) ui.start_btn->Enable(!started && !processing);
         if (ui.stop_btn) ui.stop_btn->Enable(started);
         if (ui.input_text) ui.input_text->Enable(started && !processing);
         if (ui.settings_btn) ui.settings_btn->Enable(!processing);
         if (ui.prune_btn) ui.prune_btn->Enable(started && !processing);
+        if (ui.summary_slots_btn) ui.summary_slots_btn->Enable(started && !processing);
         
         UpdateDiscordButtonState();
     }
@@ -1110,9 +1111,50 @@ private:
                 AddSystemMessage("Failed to prune and summarize context.");
             }
             
-        } catch (const std::exception& e) {
-            AddSystemMessage(wxString::Format("Error during pruning: %s", e.what()));
+        } catch (const std::exception& e) {            AddSystemMessage(wxString::Format("Error during pruning: %s", e.what()));
         }
+    }
+    
+    void OnViewSummarySlots(wxCommandEvent& event) {
+        if (!is_started || !llama_manager) {
+            wxMessageBox("Please start the model first.", "Model Not Started", 
+                        wxOK | wxICON_WARNING);
+            return;
+        }
+        
+        auto summary_info = llama_manager->get_summary_slot_info();
+        
+        wxString message;
+        message << "Summary Slot System Status:\n\n";
+        message << wxString::Format("Used slots: %zu / %zu\n\n", summary_info.used_slots, summary_info.total_slots);
+        
+        if (summary_info.used_slots == 0) {
+            message << "No summaries generated yet.\n\n";
+            message << "Summaries are created automatically when the conversation\n";
+            message << "becomes too long and needs to be pruned to make room\n";
+            message << "for new messages.";
+        } else {
+            message << "Summaries (chronological order, oldest to newest):\n";
+            message << wxString(50, '=') << "\n\n";
+            
+            for (size_t i = 0; i < summary_info.summaries.size(); ++i) {
+                message << wxString::Format("Slot %zu:\n", i + 1);
+                
+                // Truncate very long summaries for display
+                wxString summary_text = wxString::FromUTF8(summary_info.summaries[i]);
+                if (summary_text.length() > 200) {
+                    summary_text = summary_text.Left(200) + "...";
+                }
+                
+                message << summary_text << "\n\n";
+                message << wxString(30, '-') << "\n\n";
+            }
+            
+            message << "When slot " << summary_info.total_slots + 1 << " is needed, slot 1 will be\n";
+            message << "automatically removed and all slots will shift left.";
+        }
+        
+        wxMessageBox(message, "Summary Slots", wxOK | wxICON_INFORMATION);
     }
     
     void OnStart(wxCommandEvent& event) {
@@ -1502,11 +1544,17 @@ private:
         if (context_size > 0) {
             float usage_percentage = static_cast<float>(context_usage) / static_cast<float>(context_size) * 100.0f;
             int32_t progress_value = static_cast<int32_t>(usage_percentage);
+              ui.context_progress_bar->SetValue(std::min(progress_value, 100));
             
-            ui.context_progress_bar->SetValue(std::min(progress_value, 100));
+            // Get summary slot information
+            auto summary_info = llama_manager->get_summary_slot_info();
             
-            // More descriptive label showing context buffer usage vs conversation tokens
-            ui.context_label->SetLabel(wxString::Format("Buffer: %d/%d", context_usage, context_size));
+            // More descriptive label showing context buffer usage and summary slots
+            wxString label = wxString::Format("Buffer: %d/%d", context_usage, context_size);
+            if (summary_info.used_slots > 0) {
+                label += wxString::Format(" | Summaries: %zu/%zu", summary_info.used_slots, summary_info.total_slots);
+            }
+            ui.context_label->SetLabel(label);
             
             // Change color based on usage (visual feedback)
             if (usage_percentage > 90.0f) {

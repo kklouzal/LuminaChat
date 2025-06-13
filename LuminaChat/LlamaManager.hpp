@@ -107,15 +107,21 @@ private:
         // Cache state
         mutable bool message_cache_dirty = true;
         mutable std::vector<llama_chat_message> message_cache;
-        
-        // Reference to associated model
+          // Reference to associated model
         ModelInfo* model_info;
           // Special flag for contexts that should reset before each generation
         // Primarily used for summary models that need a clean slate for each task
         bool reset_after_generation = false;
         
+        // 5-slot summary system: maintains chronological order of conversation summaries
+        // When the 6th summary is generated, slot 0 is dropped, slots shift left, and new summary goes to slot 4
+        std::vector<std::string> summary_slots;
+        static constexpr size_t MAX_SUMMARY_SLOTS = 5;
+        
         ContextInfo() : context(nullptr), batch{}, batch_initialized(false), 
-                       n_past(0), prev_len(0), model_info(nullptr) {}
+                       n_past(0), prev_len(0), model_info(nullptr) {
+            summary_slots.reserve(MAX_SUMMARY_SLOTS);
+        }
     };
     
     std::unordered_map<std::string, std::unique_ptr<ModelInfo>> models;
@@ -497,9 +503,27 @@ private:
             temp_string_buffer.resize(required_size);
             result = llama_token_to_piece(model_info->vocab, token, temp_string_buffer.data(), temp_string_buffer.size(), 0, true);
         }
+          return (result > 0) ? std::string(temp_string_buffer.data(), result) : "";
+    }
+    
+    // Add summary to the 5-slot chronological summary system
+    void add_summary_to_slots(const std::string& new_summary) {
+        if (!current_context || new_summary.empty()) return;
         
-        return (result > 0) ? std::string(temp_string_buffer.data(), result) : "";
-    }    // Enhanced prune message history using summary model to condense pruned messages
+        // If we're at capacity (5 slots), remove the oldest (first) summary
+        if (current_context->summary_slots.size() >= ContextInfo::MAX_SUMMARY_SLOTS) {
+            current_context->summary_slots.erase(current_context->summary_slots.begin());
+            LLAMA_LOG("Removed oldest summary to make room for new one (slot system at capacity)");
+        }
+        
+        // Add new summary to the end (newest position)
+        current_context->summary_slots.push_back(new_summary);
+        
+        LLAMA_LOG("Added new summary to slot " + std::to_string(current_context->summary_slots.size()) + 
+                  " of " + std::to_string(ContextInfo::MAX_SUMMARY_SLOTS));
+    }
+    
+    // Enhanced prune message history using summary model to condense pruned messages
     void prune_message_history(float keep_ratio) {
         if (!current_context || current_context->message_history.empty()) return;
         
@@ -532,19 +556,20 @@ private:
         
         // Calculate how many messages were summarized for logging
         size_t summarized_count = prune_end_idx - prune_start_idx;
-        
-        // Build new message history
+          // Build new message history
         std::vector<std::pair<std::string, std::string>> new_history;
-        new_history.reserve(system_offset + 1 + messages_to_keep); // +1 for summary
+        new_history.reserve(system_offset + ContextInfo::MAX_SUMMARY_SLOTS + messages_to_keep);
         
         // Add system message if present
         if (has_system) {
             new_history.emplace_back(std::move(current_context->message_history[0]));
         }
-          // Add summary as a system message if we got one
+          // Handle 5-slot summary system
         if (!summary.empty()) {
-            new_history.emplace_back("system", "Previous conversation summary: " + summary);
+            // Add new summary to the slot system
+            add_summary_to_slots(summary);
             LLAMA_LOG("Successfully created summary for " + std::to_string(summarized_count) + " pruned messages");
+            LLAMA_LOG("Summary slots now contain " + std::to_string(current_context->summary_slots.size()) + " summaries");
         } else {
             // Fallback: keep more messages if summarization failed
             LLAMA_LOG("Warning: Summarization failed or unavailable, keeping more messages instead");
@@ -562,6 +587,12 @@ private:
             // Add a system message explaining what happened
             new_history.emplace_back("system", "[Note: " + std::to_string(summarized_count - fallback_keep) + 
                                     " older messages removed due to context limits]");
+        }
+        
+        // Add all summary slots as system messages in chronological order
+        for (size_t i = 0; i < current_context->summary_slots.size(); ++i) {
+            std::string slot_prefix = "Summary " + std::to_string(i + 1) + " (oldest to newest): ";
+            new_history.emplace_back("system", slot_prefix + current_context->summary_slots[i]);
         }
         
         // Add the recent messages to keep
@@ -1047,9 +1078,7 @@ public:
         LLAMA_LOG("Set reset_before_generation flag to " + std::string(reset_after_generation ? "true" : "false") + 
                   " for context '" + context_id + "'");
         return true;
-    }
-
-    // Clear conversation history
+    }    // Clear conversation history
     void clear_conversation() {
         if (!current_context) return;
         
@@ -1057,9 +1086,12 @@ public:
             llama_kv_self_clear(current_context->context);
         }
         current_context->message_history.clear();
+        current_context->summary_slots.clear(); // Clear summary slots when conversation is cleared
         current_context->message_cache_dirty = true;
         current_context->n_past = 0;
         current_context->prev_len = 0;
+        
+        LLAMA_LOG("Cleared conversation history and summary slots");
     }
 
     // Manually trigger message history pruning with summarization
@@ -1096,9 +1128,7 @@ public:
     // Get current message count (useful for determining when pruning might be needed)
     size_t get_message_count() const {
         return current_context ? current_context->message_history.size() : 0;
-    }
-
-    // Convert message history to llama_chat_message format
+    }    // Convert message history to llama_chat_message format
     std::vector<llama_chat_message> convert_to_llama_messages() const {
         if (!current_context) return {};
         
@@ -1107,6 +1137,27 @@ public:
             messages.push_back({ msg.first.c_str(), msg.second.c_str() });
         }
         return messages;
+    }
+    
+    // Get information about the current summary slots
+    struct SummarySlotInfo {
+        size_t total_slots;
+        size_t used_slots;
+        std::vector<std::string> summaries; // In chronological order (oldest to newest)
+    };
+    
+    SummarySlotInfo get_summary_slot_info() const {
+        SummarySlotInfo info;
+        info.total_slots = ContextInfo::MAX_SUMMARY_SLOTS;
+        
+        if (current_context) {
+            info.used_slots = current_context->summary_slots.size();
+            info.summaries = current_context->summary_slots;
+        } else {
+            info.used_slots = 0;
+        }
+        
+        return info;
     }
 
     // Get the model's default chat template
