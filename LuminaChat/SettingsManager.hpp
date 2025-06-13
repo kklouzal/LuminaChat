@@ -39,21 +39,36 @@
 
 class SettingsManager {
 private:
+    // Named constants to replace magic literals (Directive #5)
+    static constexpr int32_t DEFAULT_CONTEXT_SIZE = 2048;
+    static constexpr int32_t DEFAULT_GPU_LAYERS = 0;
+    static constexpr int32_t DEFAULT_PREDICT_TOKENS = 256;
+    static constexpr int32_t DEFAULT_HISTORY_FILL_PERCENTAGE = 50;
+    static constexpr int32_t DEFAULT_SUMMARIZER_CONTEXT_SIZE = 1024;
+    static constexpr int32_t DEFAULT_SUMMARIZER_PREDICT_TOKENS = 128;
+    
+    // Validation limits
+    static constexpr int32_t MIN_CONTEXT_SIZE = 1;
+    static constexpr int32_t MAX_CONTEXT_SIZE = 131072;
+    static constexpr int32_t MIN_GPU_LAYERS = 0;
+    static constexpr int32_t MAX_GPU_LAYERS = 999;
+    static constexpr int32_t MIN_PREDICT_TOKENS = 1;
+    static constexpr int32_t MAX_PREDICT_TOKENS = 4096;
+    static constexpr int32_t MIN_HISTORY_PERCENTAGE = 10;
+    static constexpr int32_t MAX_HISTORY_PERCENTAGE = 80;
+    static constexpr int32_t MAX_SUMMARIZER_CONTEXT = 32768;
+    static constexpr int32_t MAX_SUMMARIZER_PREDICT = 2048;
+
     static std::string EscapeString(const std::string& input) {
         std::string result;
-        for (char c : input) {
-            if (c == '\n') {
-                result += "\\n";
-            } else if (c == '\r') {
-                result += "\\r";
-            } else if (c == '\t') {
-                result += "\\t";
-            } else if (c == '\\') {
-                result += "\\\\";
-            } else if (c == '=') {
-                result += "\\=";
-            } else {
-                result += c;
+        for (const char c : input) {
+            switch (c) {
+                case '\n': result += "\\n"; break;
+                case '\r': result += "\\r"; break;
+                case '\t': result += "\\t"; break;
+                case '\\': result += "\\\\"; break;
+                case '=': result += "\\="; break;
+                default: result += c; break;
             }
         }
         return result;
@@ -63,23 +78,13 @@ private:
         std::string result;
         for (size_t i = 0; i < input.size(); ++i) {
             if (input[i] == '\\' && i + 1 < input.size()) {
-                if (input[i + 1] == 'n') {
-                    result += '\n';
-                    i++;
-                } else if (input[i + 1] == 'r') {
-                    result += '\r';
-                    i++;
-                } else if (input[i + 1] == 't') {
-                    result += '\t';
-                    i++;
-                } else if (input[i + 1] == '\\') {
-                    result += '\\';
-                    i++;
-                } else if (input[i + 1] == '=') {
-                    result += '=';
-                    i++;
-                } else {
-                    result += input[i];
+                switch (input[i + 1]) {
+                    case 'n': result += '\n'; i++; break;
+                    case 'r': result += '\r'; i++; break;
+                    case 't': result += '\t'; i++; break;
+                    case '\\': result += '\\'; i++; break;
+                    case '=': result += '='; i++; break;
+                    default: result += input[i]; break;
                 }
             } else {
                 result += input[i];
@@ -87,11 +92,10 @@ private:
         }
         return result;
     }
-    
-    // Validate and clamp integer values
-    static int32_t ValidateInt32(const std::string& value, int32_t default_val, int32_t min_val, int32_t max_val) {
+      // Validate and clamp integer values
+    static int32_t ValidateInt32(const std::string& value, const int32_t default_val, const int32_t min_val, const int32_t max_val) {
         try {
-            int32_t result = std::stoi(value);
+            const int32_t result = std::stoi(value);
             return std::clamp(result, min_val, max_val);
         } catch (...) {
             return default_val;
@@ -184,17 +188,17 @@ public:
         
         // Set defaults first
         if (model_path.empty()) model_path = "";
-        if (context_size == 0) context_size = 2048;
-        if (gpu_layers == 0) gpu_layers = 0;
-        if (predict_tokens == 0) predict_tokens = 256;
+        if (context_size == 0) context_size = DEFAULT_CONTEXT_SIZE;
+        if (gpu_layers == 0) gpu_layers = DEFAULT_GPU_LAYERS;
+        if (predict_tokens == 0) predict_tokens = DEFAULT_PREDICT_TOKENS;
         discord_allow_dms = true; // Default to true
         discord_pull_history = true; // Default to true
-        discord_history_fill_percentage = 50; // Default to 50%
+        discord_history_fill_percentage = DEFAULT_HISTORY_FILL_PERCENTAGE; // Default to 50%
         
         // Summarizer defaults
-        if (summarizer_context_size == 0) summarizer_context_size = 1024;
-        if (summarizer_gpu_layers == 0) summarizer_gpu_layers = 0;
-        if (summarizer_predict_tokens == 0) summarizer_predict_tokens = 128;
+        if (summarizer_context_size == 0) summarizer_context_size = DEFAULT_SUMMARIZER_CONTEXT_SIZE;
+        if (summarizer_gpu_layers == 0) summarizer_gpu_layers = DEFAULT_GPU_LAYERS;
+        if (summarizer_predict_tokens == 0) summarizer_predict_tokens = DEFAULT_SUMMARIZER_PREDICT_TOKENS;
         if (summarizer_system_prompt.empty()) {
             summarizer_system_prompt = "You are a helpful AI assistant that provides concise summaries. "
                                      "Focus on key points and maintain clarity while keeping responses brief.";
@@ -241,15 +245,15 @@ public:
                             loaded_count++;
                             SETTINGS_LOG("Loaded ModelPath: " + std::string(model_path.empty() ? "(empty)" : "configured"));
                         } else if (key == "ContextSize") {
-                            context_size = ValidateInt32(value, 2048, 1, 131072);
+                            context_size = ValidateInt32(value, DEFAULT_CONTEXT_SIZE, MIN_CONTEXT_SIZE, MAX_CONTEXT_SIZE);
                             loaded_count++;
                             SETTINGS_LOG("Loaded ContextSize: " + std::to_string(context_size));
                         } else if (key == "GpuLayers") {
-                            gpu_layers = ValidateInt32(value, 0, 0, 999);
+                            gpu_layers = ValidateInt32(value, DEFAULT_GPU_LAYERS, MIN_GPU_LAYERS, MAX_GPU_LAYERS);
                             loaded_count++;
                             SETTINGS_LOG("Loaded GpuLayers: " + std::to_string(gpu_layers));
                         } else if (key == "PredictTokens") {
-                            predict_tokens = ValidateInt32(value, 256, 1, 4096);
+                            predict_tokens = ValidateInt32(value, DEFAULT_PREDICT_TOKENS, MIN_PREDICT_TOKENS, MAX_PREDICT_TOKENS);
                             loaded_count++;
                             SETTINGS_LOG("Loaded PredictTokens: " + std::to_string(predict_tokens));
                         }
@@ -291,7 +295,7 @@ public:
                             loaded_count++;
                             SETTINGS_LOG("Loaded PullHistory: " + std::string(discord_pull_history ? "true" : "false"));
                         } else if (key == "HistoryFillPercentage") {
-                            discord_history_fill_percentage = ValidateInt32(value, 50, 10, 80);
+                            discord_history_fill_percentage = ValidateInt32(value, DEFAULT_HISTORY_FILL_PERCENTAGE, MIN_HISTORY_PERCENTAGE, MAX_HISTORY_PERCENTAGE);
                             loaded_count++;
                             SETTINGS_LOG("Loaded HistoryFillPercentage: " + std::to_string(discord_history_fill_percentage) + "%");
                         }
@@ -305,15 +309,15 @@ public:
                             loaded_count++;
                             SETTINGS_LOG("Loaded Summarizer ModelPath: " + std::string(summarizer_model_path.empty() ? "(empty)" : "configured"));
                         } else if (key == "ContextSize") {
-                            summarizer_context_size = ValidateInt32(value, 1024, 1, 32768);
+                            summarizer_context_size = ValidateInt32(value, DEFAULT_SUMMARIZER_CONTEXT_SIZE, MIN_CONTEXT_SIZE, MAX_SUMMARIZER_CONTEXT);
                             loaded_count++;
                             SETTINGS_LOG("Loaded Summarizer ContextSize: " + std::to_string(summarizer_context_size));
                         } else if (key == "GpuLayers") {
-                            summarizer_gpu_layers = ValidateInt32(value, 0, 0, 999);
+                            summarizer_gpu_layers = ValidateInt32(value, DEFAULT_GPU_LAYERS, MIN_GPU_LAYERS, MAX_GPU_LAYERS);
                             loaded_count++;
                             SETTINGS_LOG("Loaded Summarizer GpuLayers: " + std::to_string(summarizer_gpu_layers));
                         } else if (key == "PredictTokens") {
-                            summarizer_predict_tokens = ValidateInt32(value, 128, 1, 2048);
+                            summarizer_predict_tokens = ValidateInt32(value, DEFAULT_SUMMARIZER_PREDICT_TOKENS, MIN_PREDICT_TOKENS, MAX_SUMMARIZER_PREDICT);
                             loaded_count++;
                             SETTINGS_LOG("Loaded Summarizer PredictTokens: " + std::to_string(summarizer_predict_tokens));
                         } else if (key == "SystemPrompt") {
