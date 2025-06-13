@@ -8,30 +8,28 @@
 // Project Settings:
 // C++ Language Standard: ISO C++20 Standard (/std:c++20)
 // C Language Standard: ISO C17 (2018) Standard (/std:c17)
-// Character Set: Use Unicode Character Set
-// Whole Program Optimization: Use Link Time Code Generation
 // Optimization: Maximum Optimization (Favor Speed) (/O2)
-// Enable Intrinsic Functions: Yes (/Oi)
 // Favor Size or Speed: Favor fast code (/Ot)
-// Whole Program Optimization: Yes (/GL)
-// Enable String Pooling: Yes (/GF)
 // Runtime Library: Multi-threaded DLL (/MD)
 // Enable Run-Time Type Information (RTTI) YES (/GR)
-// Link Time Code Generation: Use Link Time Code Generation (/LTCG)
 //
-// CODING DIRECTIVES:
-// 1. Keep the codebase minimalistic, focused on functionality and efficiency.
-// 2. Stay consistent with similar coding styles and patterns throughout the codebase.
-// 3. Comment code thoroughly, where necessary, to explain complex logic or decisions.
-// 4. Always eliminate unused code, dead code, legacy code, and cleanup includes.
-// 5. Combine or split functions where necessary to eliminate redundancy.
-// 6. Focus on overall codebase reduction without sacrificing functionality.
-// 7. Use consistent _t fixed-width variable types to ensure portability across platforms.
-// 8. Cache frequently used variables to avoid repeated allocations.
-// 9. Ensure there are no logical errors and the execution paths flow as expected.
-// 10. Refactor where necessary to maintain clean code, efficient code, and to conform to the above settings and directives.
-// 11. After making changes, go back and make sure the codebase has been updated to incorporate the new changes and that it still adheres to the coding directives.
-// 12. NEVER BREAK FUNCTIONALITY THAT IS ALREADY WORKING.
+// CRITICAL CODING DIRECTIVES:
+// 1.  Minimalism & Performance: Deliver lean, efficient solutions; do not create or preserve unused helpers or wrappers.
+// 2.  Redundancy Elimination: Remove unused, obsolete, and legacy code—including unneeded interfaces and includes.
+// 3.  Consistent Style: Adopt a uniform coding style and structure for clarity and maintainability.
+// 4.  Documentation: Write concise comments that explain complex logic and key design decisions.
+// 5.  Zero Magic & Strong Typing: Replace magic literals with named constants, enums, or constexpr; prefer scoped enums.
+// 6.  Function Boundaries: Define clear responsibilities; reduce overlap and avoid unnecessary layers.
+// 7.  Core Preservation: Streamline code while safeguarding essential features; favor direct access over extra abstractions.
+// 8.  Const-Correctness & Immutability: Mark variables, parameters, and methods as const wherever possible.
+// 9.  RAII & Resource Safety: Encapsulate resource acquisition/release in constructors/destructors or smart pointers.
+// 10. Standard Library Preference: Favor STL algorithms and containers over custom loops and buffers.
+// 11. Cross-Platform Portability: Use fixed-width types and proper initialization to guarantee identical behavior everywhere.
+// 12. Thread Safety: Define and document thread-safety contracts; protect shared state with mutexes, atomics, or thread-safe containers.
+// 13. Smart Caching: Cache frequently used values to minimize allocations and improve performance.
+// 14. Logical Consistency: Verify code flow to ensure coherent, error-free execution paths.
+// 15. Continuous Refinement: Regularly refactor and confirm that updates preserve stable functionality.
+
 #pragma once
 
 #include <iostream>
@@ -45,526 +43,147 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
-#include <functional>
 #include <string_view>
 #include <sstream>
-
-// ADDED: Include D++ library
 #include <dpp/dpp.h>
 
-// Forward declare the LlamaManager for integration
-class LlamaManager;
-
-// Forward declare log callback function
-void discord_manager_log_callback(const std::string& message);
+#include "DiscordHistoryLoader.hpp"
+#include "LogHandler.hpp"
 
 // Discord bot configuration structure
 struct DiscordBotConfig {
     std::string bot_token;
     std::string application_id;
-    uint64_t guild_id = 0;  // 0 = global commands
+    uint64_t guild_id = 0;
     bool auto_reconnect = true;
-    bool enable_message_cache = true;
-    uint32_t message_cache_size = 100;
     uint32_t rate_limit_buffer_ms = 100;
-};
-
-// Discord message context for tracking conversations
-struct DiscordMessageContext {
-    uint64_t user_id;
-    uint64_t channel_id;
-    uint64_t guild_id;
-    std::string username;
-    std::string channel_name;
-    std::chrono::system_clock::time_point timestamp;
-    bool is_dm;
 };
 
 class DiscordManager {
 private:
-    // UPDATED: Core Discord bot components with actual D++ implementation
+    // Core components
     std::unique_ptr<dpp::cluster> bot;
+    std::unique_ptr<DiscordHistoryLoader> history_loader;
+    LlamaManager* llama_manager;
     
-    // Configuration and state
+    // Configuration
     DiscordBotConfig config;
+    std::string main_context_id;
+    std::string model_id = "main_model"; // FIXED: Set default model_id
+    
+    // State
     std::atomic<bool> is_running{false};
     std::atomic<bool> is_connected{false};
     std::atomic<bool> should_stop{false};
     
-    // Integration with LlamaManager
-    LlamaManager* llama_manager;
+    // Channel configuration
+    std::unordered_set<uint64_t> isolated_channels;
+    std::unordered_set<uint64_t> shared_history_channels;
+    bool allow_dms = true;
+    bool pull_message_history = true;
+    int32_t history_fill_percentage = 50;
+    mutable std::mutex channel_config_mutex;
     
-    // ADDED: Channel filtering
-    std::unordered_set<uint64_t> allowed_channels;
-    mutable std::mutex channel_mutex;
-    
-    // Message handling - made mutable for const methods
-    mutable std::mutex message_mutex;
-    std::unordered_map<uint64_t, std::vector<DiscordMessageContext>> user_conversations;
+    // Context management
+    std::unordered_map<uint64_t, std::string> user_contexts;
+    std::unordered_map<uint64_t, std::string> channel_contexts;
+    std::unordered_map<uint64_t, std::chrono::system_clock::time_point> last_response_time;
+    mutable std::mutex data_mutex;
     
     // Performance tracking
     std::atomic<uint64_t> total_messages_processed{0};
     std::atomic<uint64_t> total_responses_sent{0};
     std::chrono::system_clock::time_point last_activity;
     
-    // ADDED: Response rate limiting
-    std::unordered_map<uint64_t, std::chrono::system_clock::time_point> last_response_time;
-    mutable std::mutex rate_limit_mutex;
-    const std::chrono::milliseconds min_response_interval{2000}; // 2 seconds between responses per user
-    
-    // Helper function for thread-safe logging
-    void log_message(const std::string& message) const {
-        discord_manager_log_callback(message);
-    }
-    
-    // ADDED: Parse channel IDs from comma-separated string
-    void parse_channel_ids(const std::string& channel_ids_str) {
-        std::lock_guard<std::mutex> lock(channel_mutex);
-        allowed_channels.clear();
-        
-        if (channel_ids_str.empty()) {
-            return; // Empty means allow all channels
-        }
-        
-        std::stringstream ss(channel_ids_str);
-        std::string id_str;
-        
-        while (std::getline(ss, id_str, ',')) {
-            // Trim whitespace
-            id_str.erase(0, id_str.find_first_not_of(" \t\n\r"));
-            id_str.erase(id_str.find_last_not_of(" \t\n\r") + 1);
-            
-            if (!id_str.empty()) {
-                try {
-                    uint64_t channel_id = std::stoull(id_str);
-                    allowed_channels.insert(channel_id);
-                    log_message("Added allowed channel: " + std::to_string(channel_id));
-                } catch (const std::exception& e) {
-                    log_message("Warning: Invalid channel ID '" + id_str + "': " + e.what());
-                }
-            }
-        }
-        
-        log_message("Configured " + std::to_string(allowed_channels.size()) + " allowed channels");
-    }
-    
-    // ADDED: Check if channel is allowed
-    bool is_channel_allowed(uint64_t channel_id) const {
-        std::lock_guard<std::mutex> lock(channel_mutex);
-        return allowed_channels.empty() || allowed_channels.count(channel_id) > 0;
-    }
-    
-    // ADDED: Rate limiting check
-    bool is_rate_limited(uint64_t user_id) {
-        std::lock_guard<std::mutex> lock(rate_limit_mutex);
-        auto now = std::chrono::system_clock::now();
-        auto it = last_response_time.find(user_id);
-        
-        if (it != last_response_time.end()) {
-            auto time_since_last = now - it->second;
-            if (time_since_last < min_response_interval) {
-                return true; // Still rate limited
-            }
-        }
-        
-        last_response_time[user_id] = now;
-        return false;
-    }
-    
-    // Message context management
-    void store_message_context(const DiscordMessageContext& context) {
-        std::lock_guard<std::mutex> lock(message_mutex);
-        auto& conversation = user_conversations[context.user_id];
-        conversation.push_back(context);
-        
-        // Limit conversation history per user
-        if (conversation.size() > config.message_cache_size) {
-            conversation.erase(conversation.begin());
-        }
-    }
-    
-    // Get conversation context for a user
-    std::vector<DiscordMessageContext> get_user_context(uint64_t user_id) const {
-        std::lock_guard<std::mutex> lock(message_mutex);
-        auto it = user_conversations.find(user_id);
-        return (it != user_conversations.end()) ? it->second : std::vector<DiscordMessageContext>{};
-    }
+    // Constants
+    static constexpr std::chrono::milliseconds MIN_RESPONSE_INTERVAL{2000};
+    static constexpr size_t MAX_MESSAGE_LENGTH = 2000;
+    static constexpr int32_t MAX_CONTEXT_FILL_PERCENTAGE = 80;
+    static constexpr int32_t MIN_CONTEXT_FILL_PERCENTAGE = 10;
 
 public:
-    DiscordManager() : llama_manager(nullptr) {
-        // Initialize with default configuration
-        config.auto_reconnect = true;
-        config.enable_message_cache = true;
-        config.message_cache_size = 100;
-        config.rate_limit_buffer_ms = 100;
-        
-        last_activity = std::chrono::system_clock::now();
-    }
+    using BackfillStatus = DiscordHistoryLoader::BackfillStatus;
     
-    ~DiscordManager() {
-        shutdown();
-    }
-    
-    // UPDATED: Configuration methods with channel ID parsing
-    bool configure(const DiscordBotConfig& bot_config) {
-        if (is_running) {
-            log_message("Error: Cannot configure while bot is running");
-            return false;
-        }
-        
-        if (bot_config.bot_token.empty()) {
-            log_message("Error: Bot token cannot be empty");
-            return false;
-        }
-        
-        config = bot_config;
-        log_message("Discord bot configuration updated");
-        return true;
-    }
-    
-    // ADDED: Method to set allowed channels
-    void set_allowed_channels(const std::string& channel_ids) {
-        parse_channel_ids(channel_ids);
-    }
-    
-    // Integration with LlamaManager
-    void set_llama_manager(LlamaManager* manager) {
-        llama_manager = manager;
-        if (manager) {
-            log_message("LlamaManager integration enabled");
-        } else {
-            log_message("LlamaManager integration disabled");
-        }
-    }
-    
-    // UPDATED: Bot lifecycle management with actual D++ implementation
-    bool initialize() {
-        if (config.bot_token.empty()) {
-            log_message("Error: Bot token not configured");
-            return false;
-        }
-        
-        try {
-            // Create D++ cluster with intents
-            uint32_t intents = dpp::i_default_intents | dpp::i_message_content;
-            bot = std::make_unique<dpp::cluster>(config.bot_token, intents);
-            
-            // Set up event handlers
-            setup_event_handlers();
-            
-            log_message("Discord bot initialized with D++");
-            return true;
-        } catch (const std::exception& e) {
-            log_message("Error: Failed to initialize Discord bot: " + std::string(e.what()));
-            return false;
-        }
-    }
-    
-    bool start() {
-        if (is_running) {
-            log_message("Warning: Bot is already running");
-            return true;
-        }
-        
-        if (!initialize()) {
-            return false;
-        }
-        
-        try {
-            // Start the bot
-            bot->start(dpp::st_return);
-            
-            is_running = true;
-            should_stop = false;
-            
-            log_message("Discord bot started successfully");
-            return true;
-        } catch (const std::exception& e) {
-            log_message("Error: Failed to start Discord bot: " + std::string(e.what()));
-            return false;
-        }
-    }
-    
-    void shutdown() {
-        if (!is_running) {
-            return;
-        }
-        
-        should_stop = true;
-        
-        try {
-            if (bot) {
-                bot->shutdown();
-                bot.reset();
-            }
-        } catch (const std::exception& e) {
-            log_message("Warning during bot shutdown: " + std::string(e.what()));
-        }
-        
-        is_running = false;
-        is_connected = false;
-        
-        // Clear conversation cache
-        {
-            std::lock_guard<std::mutex> lock(message_mutex);
-            user_conversations.clear();
-        }
-        
-        // Clear rate limiting data
-        {
-            std::lock_guard<std::mutex> lock(rate_limit_mutex);
-            last_response_time.clear();
-        }
-        
-        log_message("Discord bot shutdown complete");
-    }
-    
-    // Status and statistics
-    bool is_bot_running() const {
-        return is_running;
-    }
-    
-    bool is_bot_connected() const {
-        return is_connected;
-    }
-    
-    struct BotStatistics {
-        uint64_t messages_processed;
-        uint64_t responses_sent;
-        uint64_t active_conversations;
-        bool is_running;
-        bool is_connected;
-        std::chrono::system_clock::time_point last_activity;
-    };
-    
-    BotStatistics get_statistics() const {
-        std::lock_guard<std::mutex> lock(message_mutex);
-        return {
-            total_messages_processed.load(),
-            total_responses_sent.load(),
-            user_conversations.size(),
-            is_running.load(),
-            is_connected.load(),
-            last_activity
-        };
-    }
-    
-    // UPDATED: Message sending with actual D++ implementation
-    bool send_message(uint64_t channel_id, const std::string& message) {
-        if (!is_running || !is_connected || !bot) {
-            log_message("Error: Bot not running or not connected");
-            return false;
-        }
-        
-        if (message.empty()) {
-            log_message("Error: Cannot send empty message");
-            return false;
-        }
-        
-        try {
-            // Split long messages if needed (Discord has 2000 char limit)
-            std::vector<std::string> message_parts = split_message(message, 2000);
-            
-            for (const auto& part : message_parts) {
-                dpp::message msg(channel_id, part);
-                bot->message_create(msg);
-                
-                // Small delay between parts to avoid rate limiting
-                if (message_parts.size() > 1) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                }
-            }
-            
-            total_responses_sent++;
-            last_activity = std::chrono::system_clock::now();
-            
-            log_message("Message sent to channel " + std::to_string(channel_id) + ": " + 
-                       message.substr(0, 50) + (message.size() > 50 ? "..." : ""));
-            return true;
-        } catch (const std::exception& e) {
-            log_message("Error sending message: " + std::string(e.what()));
-            return false;
-        }
-    }
-    
-    // Conversation management
-    void clear_user_conversation(uint64_t user_id) {
-        std::lock_guard<std::mutex> lock(message_mutex);
-        user_conversations.erase(user_id);
-        log_message("Cleared conversation for user " + std::to_string(user_id));
-    }
-    
-    void clear_all_conversations() {
-        std::lock_guard<std::mutex> lock(message_mutex);
-        size_t count = user_conversations.size();
-        user_conversations.clear();
-        log_message("Cleared " + std::to_string(count) + " conversations");
-    }
-    
-    // Utility methods
-    std::string get_bot_status() const {
-        if (!is_running) {
-            return "Stopped";
-        } else if (!is_connected) {
-            return "Starting...";
-        } else {
-            return "Connected";
-        }
+    BackfillStatus get_backfill_status() const {
+        return history_loader ? history_loader->get_status() : BackfillStatus{};
     }
 
 private:
-    // UPDATED: Event handlers for D++ integration
     void setup_event_handlers() {
         if (!bot) return;
         
-        // Bot ready event
         bot->on_ready([this](const dpp::ready_t& event) {
-            handle_ready(event);
+            is_connected = true;
+            DISCORD_LOG("Discord bot ready! Logged in as: " + bot->me.username);
         });
         
-        // Message creation event
         bot->on_message_create([this](const dpp::message_create_t& event) {
             handle_message(event);
         });
         
-        // Logging event
         bot->on_log([this](const dpp::log_t& event) {
-            handle_log(event);
+            if (event.severity >= dpp::ll_warning) {
+                DISCORD_LOG("[D++] " + event.message);
+            }
         });
         
-        // Guild create event (for connection status)
         bot->on_guild_create([this](const dpp::guild_create_t& event) {
             if (!is_connected) {
                 is_connected = true;
-                log_message("Discord bot connected to guild: " + event.created.name);
+                DISCORD_LOG("Discord bot connected to guild: " + event.created.name);
             }
         });
-        
-        log_message("Discord event handlers configured");
-    }
-    
-    // ADDED: Event handler implementations
-    void handle_ready(const dpp::ready_t& event) {
-        is_connected = true;
-        log_message("Discord bot ready! Logged in as: " + bot->me.username + "#" + std::to_string(bot->me.discriminator));
-        log_message("Bot is in " + std::to_string(event.guild_count) + " guilds");
     }
     
     void handle_message(const dpp::message_create_t& event) {
-        try {
-            // Ignore messages from bots (including ourselves)
-            if (event.msg.author.is_bot()) {
-                return;
-            }
-            
-            // Check if channel is allowed
-            if (!is_channel_allowed(event.msg.channel_id)) {
-                return;
-            }
-            
-            // Check rate limiting
-            if (is_rate_limited(event.msg.author.id)) {
-                log_message("Rate limited user: " + event.msg.author.username);
-                return;
-            }
-            
-            // Get message content
-            std::string message_content = event.msg.content;
-            if (message_content.empty()) {
-                return;
-            }
-            
-            // Create message context
-            DiscordMessageContext context;
-            context.user_id = event.msg.author.id;
-            context.channel_id = event.msg.channel_id;
-            context.guild_id = event.msg.guild_id;
-            context.username = event.msg.author.username;
-            context.timestamp = std::chrono::system_clock::now();
-            context.is_dm = (event.msg.guild_id == 0);
-            
-            // Try to get channel name
-            if (event.msg.guild_id != 0) {
-                bot->channel_get(event.msg.channel_id, [this, context](const dpp::confirmation_callback_t& callback) mutable {
-                    if (!callback.is_error()) {
-                        auto channel = callback.get<dpp::channel>();
-                        context.channel_name = channel.name;
-                    }
-                });
-            } else {
-                context.channel_name = "DM";
-            }
-            
-            store_message_context(context);
-            
-            log_message("Processing message from " + event.msg.author.username + 
-                       " in " + context.channel_name + ": " + 
-                       message_content.substr(0, 100) + (message_content.size() > 100 ? "..." : ""));
-            
-            // Process message with LlamaManager - pass username
-            std::string response = process_user_message(message_content, event.msg.author.username, event.msg.author.id);
-            
-            if (!response.empty() && !response.starts_with("Error:")) {
-                // Send response
-                send_message(event.msg.channel_id, response);
-            } else if (response.starts_with("Error:")) {
-                log_message("Error processing message: " + response);
-                // Optionally send error message to user
-                send_message(event.msg.channel_id, "I'm having trouble processing your message right now. Please try again later.");
-            }
-            
-        } catch (const std::exception& e) {
-            log_message("Exception in handle_message: " + std::string(e.what()));
+        if (event.msg.author.is_bot() || event.msg.content.empty()) return;
+        
+        const bool is_dm = (event.msg.guild_id == 0);
+        
+        // Early exit for disabled DMs
+        if (is_dm && !allow_dms) {
+            send_message(event.msg.channel_id, 
+                "Sorry, Direct Messages are currently disabled. Please use the appropriate server channels.");
+            return;
+        }
+        
+        // Early exit for unconfigured channels
+        if (!is_dm && !is_channel_configured(event.msg.channel_id)) return;
+        
+        // Rate limiting check
+        if (is_rate_limited(event.msg.author.id)) return;
+        
+        // Process message
+        std::string response = process_user_message(
+            event.msg.content, event.msg.author.username, 
+            event.msg.author.id, event.msg.channel_id, event.msg.guild_id
+        );
+        
+        if (!response.empty() && !response.starts_with("Error:")) {
+            send_message(event.msg.channel_id, response);
         }
     }
     
-    void handle_log(const dpp::log_t& event) {
-        // Filter out verbose logs, only show warnings and errors
-        if (event.severity >= dpp::ll_warning) {
-            std::string severity_str;
-            switch (event.severity) {
-                case dpp::ll_trace: severity_str = "TRACE"; break;
-                case dpp::ll_debug: severity_str = "DEBUG"; break;
-                case dpp::ll_info: severity_str = "INFO"; break;
-                case dpp::ll_warning: severity_str = "WARN"; break;
-                case dpp::ll_error: severity_str = "ERROR"; break;
-                case dpp::ll_critical: severity_str = "CRITICAL"; break;
-                default: severity_str = "UNKNOWN"; break;
-            }
-            
-            log_message("[D++:" + severity_str + "] " + event.message);
-        }
-    }
-    
-    // ADDED: Message processing with LlamaManager integration - updated to accept username
-    std::string process_user_message(const std::string& message, const std::string& username, uint64_t user_id) {
-        if (!llama_manager) {
-            return "Error: AI backend not available";
-        }
+    std::string process_user_message(const std::string& message, const std::string& username, 
+                                   uint64_t user_id, uint64_t channel_id, uint64_t guild_id) {
+        if (!llama_manager) return "Error: AI backend not available";
         
         total_messages_processed++;
         last_activity = std::chrono::system_clock::now();
         
-        try {
-            // Generate response using LlamaManager with username
-            std::string response = llama_manager->generate_response(message, username);
-            
-            if (response.empty()) {
-                return "I'm not sure how to respond to that. Could you try rephrasing your question?";
-            }
-            
-            return response;
-            
-        } catch (const std::exception& e) {
-            log_message("Exception in process_user_message: " + std::string(e.what()));
-            return "Error: Exception occurred while processing message";
+        std::string context_id = get_or_create_user_context(user_id, username, channel_id, guild_id);
+        if (context_id.empty()) return "Error: Failed to access chat context";
+        
+        if (!llama_manager->switch_to_context(context_id)) {
+            return "Error: Failed to access your chat context";
         }
+        
+        std::string response = llama_manager->generate_response(message, username);
+        return response.empty() ? "I'm not sure how to respond to that. Could you try rephrasing?" : response;
     }
     
-    // ADDED: Helper function to split long messages
-    std::vector<std::string> split_message(const std::string& message, size_t max_length) const {
+    std::vector<std::string> split_message(const std::string& message, size_t max_length = MAX_MESSAGE_LENGTH) const {
         std::vector<std::string> parts;
-        
         if (message.length() <= max_length) {
             parts.push_back(message);
             return parts;
@@ -573,27 +192,311 @@ private:
         size_t start = 0;
         while (start < message.length()) {
             size_t end = std::min(start + max_length, message.length());
-            
-            // Try to split at word boundary
             if (end < message.length()) {
                 size_t last_space = message.find_last_of(" \n\t", end);
                 if (last_space != std::string::npos && last_space > start) {
                     end = last_space;
                 }
             }
-            
             parts.push_back(message.substr(start, end - start));
             start = end;
+            while (start < message.length() && std::isspace(message[start])) start++;
+        }
+        return parts;
+    }
+    
+    void parse_channel_ids(const std::string& channel_ids_str, std::unordered_set<uint64_t>& target_set) {
+        std::lock_guard<std::mutex> lock(channel_config_mutex);
+        target_set.clear();
+        
+        std::stringstream ss(channel_ids_str);
+        std::string id_str;
+        while (std::getline(ss, id_str, ',')) {
+            id_str.erase(0, id_str.find_first_not_of(" \t\n\r"));
+            id_str.erase(id_str.find_last_not_of(" \t\n\r") + 1);
             
-            // Skip whitespace at the beginning of next part
-            while (start < message.length() && std::isspace(message[start])) {
-                start++;
+            if (!id_str.empty()) {
+                try {
+                    target_set.insert(std::stoull(id_str));
+                } catch (const std::exception&) {
+                    DISCORD_LOG("Warning: Invalid channel ID '" + id_str + "'");
+                }
+            }
+        }
+    }
+    
+    bool is_channel_configured(uint64_t channel_id) const {
+        std::lock_guard<std::mutex> lock(channel_config_mutex);
+        return isolated_channels.count(channel_id) > 0 || shared_history_channels.count(channel_id) > 0;
+    }
+    
+    bool is_isolated_channel(uint64_t channel_id) const {
+        std::lock_guard<std::mutex> lock(channel_config_mutex);
+        return isolated_channels.count(channel_id) > 0;
+    }
+    
+    bool is_rate_limited(uint64_t user_id) {
+        std::lock_guard<std::mutex> lock(data_mutex);
+        auto now = std::chrono::system_clock::now();
+        auto it = last_response_time.find(user_id);
+        
+        if (it != last_response_time.end() && (now - it->second) < MIN_RESPONSE_INTERVAL) {
+            return true;
+        }
+        
+        last_response_time[user_id] = now;
+        return false;
+    }
+    
+    std::string get_or_create_user_context(uint64_t user_id, const std::string& username, 
+                                         uint64_t channel_id, uint64_t guild_id) {
+        const bool is_dm = (guild_id == 0);
+        const bool is_isolated_chan = is_isolated_channel(channel_id);
+        
+        // Use shared main context for regular channels
+        if (!is_isolated_chan && !is_dm) {
+            return (llama_manager && llama_manager->has_context(main_context_id)) ? main_context_id : "";
+        }
+        
+        std::lock_guard<std::mutex> lock(data_mutex);
+        
+        if (is_dm) {
+            auto it = user_contexts.find(user_id);
+            if (it != user_contexts.end() && llama_manager && llama_manager->has_context(it->second)) {
+                return it->second;
+            }
+            
+            std::string context_id = "discord_dm_" + std::to_string(user_id);
+            
+            // Check if context already exists before trying to create
+            if (llama_manager && llama_manager->has_context(context_id)) {
+                user_contexts[user_id] = context_id;
+                return context_id;
+            }
+            
+            // FIXED: Use new API with model_id parameter
+            if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, "")) {
+                user_contexts[user_id] = context_id;
+                return context_id;
+            }
+        } else if (is_isolated_chan) {
+            auto it = channel_contexts.find(channel_id);
+            if (it != channel_contexts.end() && llama_manager && llama_manager->has_context(it->second)) {
+                return it->second;
+            }
+            
+            std::string context_id = "discord_channel_" + std::to_string(channel_id);
+            
+            // Check if context already exists before trying to create
+            if (llama_manager && llama_manager->has_context(context_id)) {
+                channel_contexts[channel_id] = context_id;
+                return context_id;
+            }
+            
+            // FIXED: Use new API with model_id parameter
+            if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, "")) {
+                channel_contexts[channel_id] = context_id;
+                return context_id;
             }
         }
         
-        return parts;
+        return "";
+    }
+    
+    void cleanup_contexts() {
+        std::lock_guard<std::mutex> lock(data_mutex);
+        
+        if (llama_manager) {
+            for (const auto& [user_id, context_id] : user_contexts) {
+                if (context_id != main_context_id) {
+                    llama_manager->remove_context(context_id);
+                }
+            }
+            for (const auto& [channel_id, context_id] : channel_contexts) {
+                if (context_id != main_context_id) {
+                    llama_manager->remove_context(context_id);
+                }
+            }
+        }
+        
+        user_contexts.clear();
+        channel_contexts.clear();
+        last_response_time.clear();
+    }
+
+public:
+    DiscordManager() : llama_manager(nullptr), history_loader(std::make_unique<DiscordHistoryLoader>()) {
+        last_activity = std::chrono::system_clock::now();
+    }
+    
+    ~DiscordManager() { shutdown(); }
+    
+    bool configure(const DiscordBotConfig& bot_config) {
+        if (is_running || bot_config.bot_token.empty()) return false;
+        config = bot_config;
+        return true;
+    }
+    
+    void set_isolated_channels(const std::string& channel_ids) {
+        parse_channel_ids(channel_ids, isolated_channels);
+    }
+    
+    void set_shared_history_channels(const std::string& channel_ids) {
+        parse_channel_ids(channel_ids, shared_history_channels);
+    }
+    
+    void set_allow_dms(bool allow) {
+        std::lock_guard<std::mutex> lock(channel_config_mutex);
+        allow_dms = allow;
+    }
+    
+    void set_main_context_id(const std::string& context_id) {
+        main_context_id = context_id;
+    }
+    
+    // NEW: Set model ID for context creation
+    void set_model_id(const std::string& model_identifier) {
+        model_id = model_identifier.empty() ? "main_model" : model_identifier; // FIXED: Ensure non-empty
+    }
+    
+    void set_history_settings(bool pull_history, int32_t fill_percentage) {
+        std::lock_guard<std::mutex> lock(channel_config_mutex);
+        pull_message_history = pull_history;
+        history_fill_percentage = std::clamp(fill_percentage, MIN_CONTEXT_FILL_PERCENTAGE, MAX_CONTEXT_FILL_PERCENTAGE);
+        
+        if (history_loader) {
+            history_loader->set_history_settings(pull_message_history, history_fill_percentage);
+        }
+    }
+    
+    void set_llama_manager(LlamaManager* manager) {
+        llama_manager = manager;
+        if (manager) {
+            // FIXED: Ensure model_id is set before configuring history loader
+            if (model_id.empty()) {
+                model_id = "main_model";
+            }
+            
+            if (history_loader && bot) {
+                history_loader->configure(bot.get(), manager, main_context_id, model_id);
+                history_loader->set_channel_configuration(nullptr, &isolated_channels, &shared_history_channels);
+                history_loader->set_history_settings(pull_message_history, history_fill_percentage);
+            }
+        } else {
+            cleanup_contexts();
+        }
+    }
+    
+    bool initialize() {
+        if (config.bot_token.empty()) return false;
+        
+        try {
+            uint32_t intents = dpp::i_default_intents | dpp::i_message_content;
+            bot = std::make_unique<dpp::cluster>(config.bot_token, intents);
+            setup_event_handlers();
+            
+            if (history_loader && llama_manager) {
+                // FIXED: Ensure model_id is set before configuring history loader
+                if (model_id.empty()) {
+                    model_id = "main_model";
+                }
+                
+                history_loader->configure(bot.get(), llama_manager, main_context_id, model_id);
+                history_loader->set_channel_configuration(nullptr, &isolated_channels, &shared_history_channels);
+                history_loader->set_history_settings(pull_message_history, history_fill_percentage);
+            }
+            
+            return true;
+        } catch (const std::exception& e) {
+            DISCORD_LOG("Error: Failed to initialize Discord bot: " + std::string(e.what()));
+            return false;
+        }
+    }
+    
+    bool start() {
+        if (is_running || !initialize()) return false;
+        
+        try {
+            bot->start(dpp::st_return);
+            is_running = true;
+            should_stop = false;
+            
+            // Start history backfill if enabled
+            if (pull_message_history && llama_manager) {
+                std::thread([this]() {
+                    std::this_thread::sleep_for(std::chrono::seconds(5));
+                    if (is_connected && history_loader) {
+                        history_loader->start_backfill();
+                    }
+                }).detach();
+            }
+            
+            return true;
+        } catch (const std::exception& e) {
+            DISCORD_LOG("Error: Failed to start Discord bot: " + std::string(e.what()));
+            return false;
+        }
+    }
+    
+    void shutdown() {
+        if (!is_running) return;
+        
+        should_stop = true;
+        
+        if (bot) {
+            bot->shutdown();
+            bot.reset();
+        }
+        
+        is_running = false;
+        is_connected = false;
+        cleanup_contexts();
+    }
+    
+    bool send_message(uint64_t channel_id, const std::string& message) {
+        if (!is_running || !is_connected || !bot || message.empty()) return false;
+        
+        try {
+            auto message_parts = split_message(message);
+            for (const auto& part : message_parts) {
+                bot->message_create(dpp::message(channel_id, part));
+                if (message_parts.size() > 1) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                }
+            }
+            
+            total_responses_sent++;
+            last_activity = std::chrono::system_clock::now();
+            return true;
+        } catch (const std::exception& e) {
+            DISCORD_LOG("Error sending message: " + std::string(e.what()));
+            return false;
+        }
+    }
+    
+    // Status and statistics
+    bool is_bot_running() const { return is_running; }
+    bool is_bot_connected() const { return is_connected; }
+    
+    struct BotStatistics {
+        uint64_t messages_processed;
+        uint64_t responses_sent;
+        bool is_running;
+        bool is_connected;
+        std::chrono::system_clock::time_point last_activity;
+    };
+    
+    BotStatistics get_statistics() const {
+        std::lock_guard<std::mutex> lock(data_mutex);
+        return {
+            total_messages_processed.load(),
+            total_responses_sent.load(),
+            is_running.load(),
+            is_connected.load(),
+            last_activity
+        };
     }
 };
-
-// Log callback function declaration
-extern void discord_manager_log_callback(const std::string& message);
+//
+//  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!
+//

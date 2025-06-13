@@ -141,8 +141,12 @@
     <ClCompile Include="LuminaChat.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="DiscordHistoryLoader.hpp" />
     <ClInclude Include="DiscordManager.hpp" />
     <ClInclude Include="LlamaManager.hpp" />
+    <ClInclude Include="LogHandler.hpp" />
+    <ClInclude Include="SettingsManager.hpp" />
+    <ClInclude Include="TokenCache.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
