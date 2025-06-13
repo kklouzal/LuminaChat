@@ -87,6 +87,84 @@ namespace SummarizerConstants {
     extern const float AGGRESSIVE_PRUNING_RATIO;
 }
 
+// Model information container
+struct ModelInfo {
+    llama_model* model;
+    const llama_vocab* vocab;
+    llama_sampler* sampler;
+    int32_t n_ctx;
+    int32_t n_gpu_layers;
+    int32_t n_predict;
+    std::string model_path;
+    std::string custom_chat_template;
+    bool model_loaded;
+    
+    ModelInfo() : model(nullptr), vocab(nullptr), sampler(nullptr), 
+                 n_ctx(LlamaConstants::DEFAULT_CONTEXT_SIZE), n_gpu_layers(LlamaConstants::DEFAULT_GPU_LAYERS), 
+                 n_predict(LlamaConstants::DEFAULT_PREDICT_TOKENS), model_loaded(false) {}
+    
+    ~ModelInfo() {
+        if (sampler) {
+            llama_sampler_free(sampler);
+            sampler = nullptr;
+        }
+        if (model) {
+            llama_model_free(model);
+            model = nullptr;
+        }
+        vocab = nullptr;
+        model_loaded = false;
+    }
+    
+    // Get chat template (custom or model default)
+    const char* get_chat_template() const {
+        if (!custom_chat_template.empty()) {
+            return custom_chat_template.c_str();
+        }
+        if (model) {
+            return llama_model_chat_template(model, nullptr);
+        }
+        return nullptr;
+    }
+};
+
+// Multi-context support
+struct ContextInfo {
+    llama_context* context;
+    llama_batch batch;
+    bool batch_initialized;
+    int32_t n_past;
+    int32_t prev_len;
+    std::vector<std::pair<std::string, std::string>> message_history;
+    std::string system_message;
+    
+    // Performance tracking
+    int64_t total_generation_tokens = 0;
+    int64_t last_decode_time_us = 0;
+    
+    // Cache state
+    mutable bool message_cache_dirty = true;
+    mutable std::vector<llama_chat_message> message_cache;
+    
+    // Reference to associated model
+    ModelInfo* model_info;
+    
+    // Special flag for contexts that should reset before each generation
+    // Primarily used for summary models that need a clean slate for each task
+    bool reset_after_generation = false;
+    
+    // 5-slot summary system: maintains chronological order of conversation summaries
+    // When the 6th summary is generated, slot 0 is dropped, slots shift left, and new summary goes to slot 4
+    std::vector<std::string> summary_slots;
+    
+    ContextInfo() : context(nullptr), batch{}, batch_initialized(false), 
+                   n_past(0), prev_len(0), model_info(nullptr) {
+        summary_slots.reserve(SummarizerConstants::MAX_SUMMARY_SLOTS);
+    }
+};
+
+#include "LlamaResponse.hpp"
+
 // Thread Safety Contract (Directive #12):
 // This class is NOT thread-safe. External synchronization is required for concurrent access.
 // - All public methods must be called from a single thread or protected by external mutexes
@@ -95,76 +173,6 @@ namespace SummarizerConstants {
 // - Context switching operations modify shared state and must be serialized
 class LlamaManager {
 private:
-    // Model information container
-    struct ModelInfo {
-        llama_model* model;
-        const llama_vocab* vocab;
-        llama_sampler* sampler;
-        int32_t n_ctx;
-        int32_t n_gpu_layers;
-        int32_t n_predict;
-        std::string model_path;
-        std::string custom_chat_template;        bool model_loaded;
-        
-        ModelInfo() : model(nullptr), vocab(nullptr), sampler(nullptr), n_ctx(LlamaConstants::DEFAULT_CONTEXT_SIZE), n_gpu_layers(LlamaConstants::DEFAULT_GPU_LAYERS), 
-                     n_predict(LlamaConstants::DEFAULT_PREDICT_TOKENS), model_loaded(false) {}
-        
-        ~ModelInfo() {
-            if (sampler) {
-                llama_sampler_free(sampler);
-                sampler = nullptr;
-            }
-            if (model) {
-                llama_model_free(model);
-                model = nullptr;
-            }
-            vocab = nullptr;
-            model_loaded = false;
-        }
-        
-        // Get chat template (custom or model default)
-        const char* get_chat_template() const {
-            if (!custom_chat_template.empty()) {
-                return custom_chat_template.c_str();
-            }
-            if (model) {
-                return llama_model_chat_template(model, nullptr);
-            }
-            return nullptr;        }
-    };
-    
-    // Multi-context support
-    struct ContextInfo {
-        llama_context* context;
-        llama_batch batch;
-        bool batch_initialized;
-        int32_t n_past;
-        int32_t prev_len;
-        std::vector<std::pair<std::string, std::string>> message_history;
-        std::string system_message;
-        
-        // Performance tracking
-        int64_t total_generation_tokens = 0;
-        int64_t last_decode_time_us = 0;
-          // Cache state
-        mutable bool message_cache_dirty = true;
-        mutable std::vector<llama_chat_message> message_cache;
-        
-        // Reference to associated model
-        ModelInfo* model_info;
-        
-        // Special flag for contexts that should reset before each generation
-        // Primarily used for summary models that need a clean slate for each task
-        bool reset_after_generation = false;
-          // 5-slot summary system: maintains chronological order of conversation summaries
-        // When the 6th summary is generated, slot 0 is dropped, slots shift left, and new summary goes to slot 4
-        std::vector<std::string> summary_slots;
-        
-        ContextInfo() : context(nullptr), batch{}, batch_initialized(false), 
-                       n_past(0), prev_len(0), model_info(nullptr) {
-            summary_slots.reserve(SummarizerConstants::MAX_SUMMARY_SLOTS);
-        }
-    };
     
     std::unordered_map<std::string, std::unique_ptr<ModelInfo>> models;
     std::unordered_map<std::string, std::unique_ptr<ContextInfo>> contexts;
@@ -172,12 +180,14 @@ private:
     ContextInfo* current_context;
       // Legacy compatibility - only keep model_loaded flag
     bool model_loaded;
-    
-    // Template and cache management
+      // Template and cache management
     mutable std::string template_buffer;
     mutable TokenCache token_cache;
       // Working buffers
     mutable std::string temp_string_buffer;
+
+    // Response generation handler
+    mutable LlamaResponse response_generator;
 
     // Summarizer for handling conversation summarization
     std::unique_ptr<LlamaSummarizer> summarizer;
@@ -508,72 +518,9 @@ private:
         }
         
         if (result_len > 0) {
-            result = std::string(template_buffer.data(), result_len);
-            return true;
+            result = std::string(template_buffer.data(), result_len);            return true;
         }
         return false;
-    }
-
-    // FIXED: Enhanced token-to-text conversion - Updated to use context's model
-    std::string convert_token_to_text(llama_token token) const {
-        ModelInfo* model_info = get_current_model_info();
-        if (!model_info || !model_info->vocab) {
-            LLAMA_LOG("Error: Vocabulary not available from current context's model");
-            return "";
-        }
-        
-        // FIXED: Simplified token validation - just check for negative values
-        if (token < 0) {
-            LLAMA_LOG("Warning: Token " + std::to_string(token) + " is negative");
-            return "";
-        }
-          temp_string_buffer.resize(LlamaConstants::INITIAL_TOKEN_BUFFER_SIZE);
-        int32_t result = llama_token_to_piece(model_info->vocab, token, temp_string_buffer.data(), temp_string_buffer.size(), 0, true);
-        if (result < 0) {
-            size_t required_size = static_cast<size_t>(-result);
-            if (required_size > LlamaConstants::MAX_TOKEN_BUFFER_SIZE) {
-                LLAMA_LOG("Error: Token conversion requires excessive buffer size: " + std::to_string(required_size));
-                return "";
-            }
-            temp_string_buffer.resize(required_size);
-            result = llama_token_to_piece(model_info->vocab, token, temp_string_buffer.data(), temp_string_buffer.size(), 0, true);
-        }          return (result > 0) ? std::string(temp_string_buffer.data(), result) : "";
-    }
-
-    // Validate and recover sampler if needed
-    bool validate_and_recover_sampler() const {
-        ModelInfo* model_info = get_current_model_info();
-        if (!model_info) {
-            LLAMA_LOG("Error: No model info available for sampler validation");
-            return false;
-        }
-        
-        if (model_info->sampler) {
-            return true; // Sampler is valid
-        }
-        
-        LLAMA_LOG("WARNING: Sampler is NULL, attempting recovery...");
-        
-        // Attempt to recreate a basic greedy sampler
-        auto sparams = llama_sampler_chain_default_params();
-        sparams.no_perf = false;
-        model_info->sampler = llama_sampler_chain_init(sparams);
-        
-        if (!model_info->sampler) {
-            LLAMA_LOG("CRITICAL: Failed to recover sampler!");
-            return false;
-        }
-        
-        // Add basic greedy sampling
-        llama_sampler_chain_add(model_info->sampler, llama_sampler_init_greedy());
-        
-        if (!model_info->sampler) {
-            LLAMA_LOG("CRITICAL: Sampler became NULL after adding greedy sampler during recovery!");
-            return false;
-        }
-        
-        LLAMA_LOG("Sampler recovered successfully with greedy sampling");
-        return true;
     }
 
     // Validate conversation state and attempt recovery if needed
@@ -1126,29 +1073,30 @@ public:
         } else {
             LLAMA_LOG("Sampler reconfigured successfully for model");
         }
-    }    // FIXED: Enhanced generation with sampler validation and recovery
+    }    // Enhanced generation with response delegation to LlamaResponse
     std::string generate_response(const std::string& input, const std::string& username = "Schwi") {
         ModelInfo* model_info = get_current_model_info();
         if (!model_loaded || !model_info || !model_info->model || !current_context || !current_context->context || !model_info->vocab || !current_context->batch_initialized) {
             return "Error: Model components not properly initialized or no active context";
         }
 
-        if (input.empty()) return "Error: Empty input";        // Validate conversation state before proceeding
+        if (input.empty()) return "Error: Empty input";
+
+        // Validate conversation state before proceeding
         if (!validate_conversation_state()) {
             LLAMA_LOG("Conversation state required recovery, retrying...");
         }
 
-        // FIXED: Validate sampler before proceeding and attempt recovery if needed
-        if (!validate_and_recover_sampler()) {
-            return "Error: Sampler validation/recovery failed";
-        }        // Setup conversation - ensure system message is in history if context is empty
+        // Setup conversation - ensure system message is in history if context is empty
         if (current_context->message_history.empty() && !current_context->system_message.empty()) {
             current_context->message_history.emplace_back("system", current_context->system_message);
             current_context->message_cache_dirty = true;
         }
 
         current_context->message_history.emplace_back(username, input);
-        current_context->message_cache_dirty = true;        // Update context using unified function - with retry logic
+        current_context->message_cache_dirty = true;
+
+        // Update context using unified function - with retry logic
         int32_t retry_count = 0;
         const int32_t max_retries = LlamaConstants::MAX_RETRY_ATTEMPTS;
         
@@ -1169,7 +1117,7 @@ public:
                     current_context->message_cache_dirty = true;
                 }
                 
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                std::this_thread::sleep_for(std::chrono::milliseconds(ResponseConstants::RECOVERY_SLEEP_MS));
             } else {
                 // If we still can't update, try to continue with a minimal context
                 LLAMA_LOG("Failed to update context, attempting minimal recovery");
@@ -1211,15 +1159,15 @@ public:
                 
                 return "Error: Context recovery failed. The conversation history may have become too complex. Try starting a new conversation.";
             }
-        }        // Prepare for generation using unified template function
+        }
+
+        // Prepare for generation using unified template function
         std::string generation_content;
         if (!apply_template_optimized(true, generation_content)) {
             return "Error: Failed to apply generation template";
         }
 
-        // FIXED: Handle generation prompt correctly for reset contexts
-        // For contexts with reset_after_generation (like summary contexts), prev_len starts at 0
-        // so we need to process the incremental content only if there's actually new content
+        // Handle generation prompt correctly for reset contexts
         std::string generation_prompt;
         if (current_context->prev_len < static_cast<int32_t>(generation_content.length())) {
             generation_prompt = generation_content.substr(current_context->prev_len);
@@ -1241,206 +1189,19 @@ public:
                       std::to_string(generation_content.length()) + ")");
         }
 
-        // Generate response using unified functions
-        std::string response;
-        const int32_t safety_margin = LlamaConstants::TOKEN_SAFETY_MARGIN; // Reserve space for potential special tokens
-        const int32_t max_new_tokens = std::min(model_info->n_predict, model_info->n_ctx - current_context->n_past - safety_margin);
-        response.reserve(max_new_tokens * LlamaConstants::STRING_RESERVE_MULTIPLIER);
+        // Delegate response generation to LlamaResponse class
+        auto token_adder = [this](llama_token token, int32_t pos, const std::vector<llama_seq_id>& seq_ids, bool output_logits) -> bool {
+            return add_single_token_to_batch(token, pos, seq_ids, output_logits);
+        };
         
-        if (max_new_tokens <= 0) {
-            return "Error: No space left in context for generation (context: " + 
-                   std::to_string(current_context->n_past) + "/" + std::to_string(model_info->n_ctx) + ")";
-        }        // FIXED: Enhanced validation before generation loop
-        if (!model_info->sampler) {
-            LLAMA_LOG("CRITICAL: Sampler is null before generation loop after validation!");
-            return "Error: Sampler validation failed";
-        }
-        
-        if (!current_context->context) {
-            LLAMA_LOG("Error: Context is null before generation");
-            return "Error: Context not properly initialized";
-        }
-        
-        // FIXED: Additional validation after potential pruning
-        // Ensure we have valid logits and the context is in a good state for generation
-        if (current_context->n_past <= 0) {
-            LLAMA_LOG("Error: Context position is invalid for generation: " + std::to_string(current_context->n_past));
-            return "Error: Context not ready for generation after update";
-        }
-          // FIXED: Comprehensive logit validation and recovery
-        float* logits = llama_get_logits(current_context->context);
-        if (!logits && current_context->n_past > 0) {
-            LLAMA_LOG("Warning: No logits available despite context having tokens, attempting recovery decode");
-              // Attempt to get logits by doing a minimal decode operation
-            // This can happen after context rebuilds where the final decode didn't generate logits
-            if (current_context->batch_initialized) {
-                // Create a minimal batch with just the last token position to generate logits
-                if (current_context->n_past > 0) {
-                    // Clear batch and set up for logit generation
-                    current_context->batch.n_tokens = 0;
-                    
-                    // Add a dummy entry to get logits at current position
-                    if (current_context->batch.token && current_context->batch.pos && 
-                        current_context->batch.logits && current_context->batch.seq_id) {
-                        
-                        // We need to process the last token again to get logits
-                        llama_token last_token = llama_vocab_eos(model_info->vocab); // Use EOS as dummy
-                        current_context->batch.token[0] = last_token;
-                        current_context->batch.pos[0] = current_context->n_past - 1;
-                        current_context->batch.logits[0] = 1; // Request logits
-                        current_context->batch.seq_id[0] = 0;
-                        current_context->batch.n_tokens = 1;
-                        
-                        int decode_result = llama_decode(current_context->context, current_context->batch);
-                        if (decode_result == 0) {
-                            logits = llama_get_logits(current_context->context);
-                            if (logits) {
-                                LLAMA_LOG("Successfully recovered logits with dummy decode");
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // Final check
-            if (!logits) {
-                LLAMA_LOG("Error: Could not recover logits for generation");
-                return "Error: Context state invalid - no logits available and recovery failed";
-            }
-        } else if (!logits) {
-            LLAMA_LOG("Error: No logits available and context is empty");
-            return "Error: Context state invalid - no logits available";
-        }
-          // FIXED: Validate that we have logits available for sampling
-        // For reset contexts, we might start with n_past=0 if the context was just created/reset
-        if (current_context->n_past == 0 && current_context->message_history.empty()) {
-            LLAMA_LOG("Error: Context is completely empty, cannot generate");
-            return "Error: Context is empty, cannot generate response";
-        }
-
-        LLAMA_LOG("Starting generation with " + std::to_string(max_new_tokens) + " max tokens, n_past=" + std::to_string(current_context->n_past));
-
-        auto decode_start = std::chrono::high_resolution_clock::now();
-        int32_t n_generated = 0;
-        std::vector<llama_seq_id> seq_ids = {0};
-
-        // Enhanced generation loop with model-specific vocab checking
-        while (n_generated < max_new_tokens) {
-            // FIXED: Validate sampler on every iteration to catch when it becomes null
-            if (!model_info->sampler) {
-                LLAMA_LOG("CRITICAL: Sampler became null during generation at token " + std::to_string(n_generated));
-                return "Error: Sampler failed during generation";
-            }
-            
-            if (!current_context->context) {
-                LLAMA_LOG("CRITICAL: Context became null during generation");
-                return "Error: Context lost during generation";
-            }
-            
-            // FIXED: Validate that n_past is within reasonable bounds
-            if (current_context->n_past <= 0 || current_context->n_past >= model_info->n_ctx) {
-                LLAMA_LOG("Error: Invalid context position during generation: " + std::to_string(current_context->n_past));
-                return "Error: Context position invalid";
-            }
-            
-            llama_token new_token;
-            try {
-                new_token = llama_sampler_sample(model_info->sampler, current_context->context, -1);
-            } catch (const std::exception& e) {
-                LLAMA_LOG("Exception during token sampling: " + std::string(e.what()));
-                return "Error: Exception during token generation";
-            } catch (...) {
-                LLAMA_LOG("Unknown exception during token sampling");
-                return "Error: Unknown exception during generation";
-            }
-            
-            if (new_token < 0) {
-                LLAMA_LOG("Error: Invalid token generated: " + std::to_string(new_token));
-                break;
-            }
-            
-            if (llama_vocab_is_eog(model_info->vocab, new_token)) {
-                LLAMA_LOG("End of generation token encountered");
-                break;
-            }
-
-            // Convert token to text using unified function
-            std::string token_text = convert_token_to_text(new_token);
-            if (token_text.empty()) {
-                LLAMA_LOG("Warning: Empty token text for token " + std::to_string(new_token));
-                continue;
-            }
-            
-            response += token_text;
-
-            // FIXED: Validate batch state before adding token
-            if (!current_context->batch_initialized) {
-                LLAMA_LOG("Error: Batch not initialized during generation");
-                return "Error: Batch system failed";
-            }
-
-            // Process token using unified batch function
-            if (!add_single_token_to_batch(new_token, current_context->n_past, seq_ids, true)) {
-                LLAMA_LOG("Error: Failed to add token to batch during generation");
-                return "Error: Token processing failed";
-            }
-            
-            if (current_context->batch.n_tokens > 0 && llama_decode(current_context->context, current_context->batch) != 0) {
-                LLAMA_LOG("Error: Failed to decode during generation at token " + std::to_string(n_generated));
-                return "Error: Token decode failed";
-            }
-            
-            current_context->n_past++;
-            n_generated++;
-            
-            // FIXED: Periodic sampler validation during long generation
-            if (n_generated % 10 == 0 && !model_info->sampler) {
-                LLAMA_LOG("CRITICAL: Sampler became null during long generation at token " + std::to_string(n_generated));
-                return "Error: Sampler failed during long generation";
-            }
-        }
-
-        // Update timing and history
-        auto decode_end = std::chrono::high_resolution_clock::now();
-        current_context->last_decode_time_us = std::chrono::duration_cast<std::chrono::microseconds>(decode_end - decode_start).count();
-        current_context->total_generation_tokens += n_generated;        if (!response.empty()) {
-            current_context->message_history.emplace_back("assistant", response);
-            current_context->message_cache_dirty = true;
-            
+        auto context_updater = [this]() -> void {
             std::string updated_content;
             if (apply_template_optimized(false, updated_content)) {
                 current_context->prev_len = static_cast<int32_t>(updated_content.length());
             }
-        }        if (n_generated > 0) {
-            float tokens_per_second = (float)n_generated / ((float)current_context->last_decode_time_us / 1000000.0f);
-            LLAMA_LOG("Generated " + std::to_string(n_generated) + " tokens in " + 
-                       std::to_string(current_context->last_decode_time_us / 1000.0f) + "ms (" + 
-                       std::to_string(tokens_per_second) + " t/s)");
-        }        
-          // FIXED: Store the response before clearing context if reset_after_generation is set
-        std::string final_response = response;
-          // FIXED: Reset context after generation if flag is set (for summary contexts)
-        if (current_context->reset_after_generation) {
-            LLAMA_LOG("Resetting context '" + active_context_id + "' after generation (reset_after_generation flag is set)");
-            
-            // For summary contexts, preserve the system message but clear everything else
-            std::string saved_system_message = current_context->system_message;
-            clear_conversation();
-            
-            // Restore the system message for the next summarization task
-            if (!saved_system_message.empty()) {
-                current_context->system_message = saved_system_message;
-                current_context->message_history.emplace_back("system", saved_system_message);
-                current_context->message_cache_dirty = true;
-                LLAMA_LOG("Restored system message for next summarization task");
-            }
-        }
-        // FIXED: Final sampler validation
-        if (!model_info->sampler) {
-            LLAMA_LOG("WARNING: Sampler is NULL at end of generation!");
-        }
+        };
 
-        return final_response;
+        return response_generator.generate_response(input, username, model_info, current_context, token_adder, context_updater);
     }
 
     // Get performance statistics
