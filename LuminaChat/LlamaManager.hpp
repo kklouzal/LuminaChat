@@ -615,6 +615,14 @@ private:
                       std::to_string(current_context->message_history.size()) + " messages)");
               // Only trigger aggressive pruning if we're not already in a summary context
             if (active_context_id != "summary_context") {
+                // Clear context state before aggressive pruning
+                if (current_context->context) {
+                    llama_kv_self_clear(current_context->context);
+                }
+                current_context->n_past = 0;
+                current_context->prev_len = 0;
+                current_context->message_cache_dirty = true;
+                
                 // Trigger aggressive pruning
                 prune_message_history(SummarizerConstants::AGGRESSIVE_PRUNING_RATIO); // Keep only 30%
                 return false; // Indicate that recovery was needed
@@ -970,9 +978,7 @@ public:
     const char* get_current_chat_template() const {
         ModelInfo* model_info = get_current_model_info();
         return model_info ? model_info->get_chat_template() : nullptr;
-    }
-
-    // Enhanced context update with better tokenization handling - FIXED recursion issue
+    }    // Enhanced context update with better tokenization handling - FIXED recursion issue
     bool update_context_with_pruning() {
         ModelInfo* model_info = get_current_model_info();
         if (!model_loaded || !model_info || !model_info->model || !current_context || !current_context->context || !model_info->vocab) {
@@ -983,30 +989,44 @@ public:
         // Skip pruning for summary contexts - they manage their own state
         bool is_summary_context = (active_context_id == "summary_context");
         
-        // Check and handle pruning first (but not for summary contexts)
-        int32_t n_ctx_used = current_context->n_past;
+        // FIXED: Calculate projected context usage before making pruning decisions
+        // This prevents the issue where we're at exactly the threshold when generation starts
+        std::string formatted_content;
+        if (!apply_template_optimized(false, formatted_content)) {
+            LLAMA_LOG("Error: Failed to apply chat template for context calculation");
+            return false;
+        }
+        
+        // Calculate how many tokens the current conversation would use
+        std::vector<llama_token> projected_tokens = process_text_to_tokens(formatted_content, true);
+        int32_t projected_usage = static_cast<int32_t>(projected_tokens.size());
         int32_t max_threshold = static_cast<int32_t>(model_info->n_ctx * 0.9f);
         
         bool context_pruned = false;
-        if (!is_summary_context && n_ctx_used > max_threshold) {            LLAMA_LOG("Context usage at " + std::to_string((float)n_ctx_used / model_info->n_ctx * 100.0f) + 
-                       "%, pruning to 60%");
+        
+        // Check if we need pruning based on projected usage, not current n_past
+        if (!is_summary_context && projected_usage > max_threshold) {
+            LLAMA_LOG("Projected context usage at " + std::to_string((float)projected_usage / model_info->n_ctx * 100.0f) + 
+                       "% (" + std::to_string(projected_usage) + "/" + std::to_string(model_info->n_ctx) + "), pruning to 60%");
             
             llama_kv_self_clear(current_context->context);
             current_context->n_past = 0;
             current_context->prev_len = 0;
             prune_message_history(SummarizerConstants::TARGET_CONTEXT_USAGE);
             context_pruned = true;
-        }
-
-        // Apply template and process
-        std::string formatted_content;
-        if (!apply_template_optimized(false, formatted_content)) {
-            LLAMA_LOG("Error: Failed to apply chat template");
-            return false;
-        }
-
-        int32_t new_len = static_cast<int32_t>(formatted_content.length());        // FIXED: If context was pruned, prev_len is 0 with messages (reset context), or prev_len > new_len, rebuild from scratch
-        // BUT for summary contexts with reset_after_generation=true, this is normal behavior
+            
+            // Mark message cache as dirty since message history was modified
+            current_context->message_cache_dirty = true;
+            
+            // Recalculate formatted content after pruning
+            if (!apply_template_optimized(false, formatted_content)) {
+                LLAMA_LOG("Error: Failed to apply chat template after pruning");
+                return false;
+            }
+        }        // Apply template and process
+        int32_t new_len = static_cast<int32_t>(formatted_content.length());        // CRITICAL: After pruning, the message structure has fundamentally changed.
+        // The context state (n_past, prev_len) no longer matches the new message history.
+        // We MUST do a full rebuild, never an incremental update, to avoid garbage output.
         if (context_pruned || current_context->prev_len > new_len || 
             (current_context->prev_len == 0 && !current_context->message_history.empty() && !is_summary_context)) {
             // Rebuild context - use add_special=true for full context
@@ -1019,9 +1039,21 @@ public:
             
             if (process_context_tokens(tokens, false)) {
                 current_context->prev_len = new_len;
+                
+                // FIXED: After rebuilding context, ensure we have valid logits for generation
+                // This is critical when pruning occurs right before generation
+                if (current_context->n_past > 0) {
+                    float* logits = llama_get_logits(current_context->context);
+                    if (!logits) {
+                        LLAMA_LOG("Warning: No logits available after context rebuild, will need manual decode");
+                        // Context was rebuilt but we need to ensure logits are available
+                        // This can happen if the rebuild ended without proper logit generation
+                    }
+                }
+                
                 LLAMA_LOG("Context rebuilt successfully with " + 
-                           std::to_string(tokens.size()) + " tokens (reset_context=" + 
-                           std::string((current_context->prev_len == 0) ? "true" : "false") + ")");
+                           std::to_string(tokens.size()) + " tokens (pruned=" + 
+                           std::string(context_pruned ? "true" : "false") + ")");
                 return true;
             }
             LLAMA_LOG("Error: Failed to rebuild context");
@@ -1218,9 +1250,7 @@ public:
         if (max_new_tokens <= 0) {
             return "Error: No space left in context for generation (context: " + 
                    std::to_string(current_context->n_past) + "/" + std::to_string(model_info->n_ctx) + ")";
-        }
-
-        // FIXED: Enhanced validation before generation loop
+        }        // FIXED: Enhanced validation before generation loop
         if (!model_info->sampler) {
             LLAMA_LOG("CRITICAL: Sampler is null before generation loop after validation!");
             return "Error: Sampler validation failed";
@@ -1229,6 +1259,57 @@ public:
         if (!current_context->context) {
             LLAMA_LOG("Error: Context is null before generation");
             return "Error: Context not properly initialized";
+        }
+        
+        // FIXED: Additional validation after potential pruning
+        // Ensure we have valid logits and the context is in a good state for generation
+        if (current_context->n_past <= 0) {
+            LLAMA_LOG("Error: Context position is invalid for generation: " + std::to_string(current_context->n_past));
+            return "Error: Context not ready for generation after update";
+        }
+          // FIXED: Comprehensive logit validation and recovery
+        float* logits = llama_get_logits(current_context->context);
+        if (!logits && current_context->n_past > 0) {
+            LLAMA_LOG("Warning: No logits available despite context having tokens, attempting recovery decode");
+              // Attempt to get logits by doing a minimal decode operation
+            // This can happen after context rebuilds where the final decode didn't generate logits
+            if (current_context->batch_initialized) {
+                // Create a minimal batch with just the last token position to generate logits
+                if (current_context->n_past > 0) {
+                    // Clear batch and set up for logit generation
+                    current_context->batch.n_tokens = 0;
+                    
+                    // Add a dummy entry to get logits at current position
+                    if (current_context->batch.token && current_context->batch.pos && 
+                        current_context->batch.logits && current_context->batch.seq_id) {
+                        
+                        // We need to process the last token again to get logits
+                        llama_token last_token = llama_vocab_eos(model_info->vocab); // Use EOS as dummy
+                        current_context->batch.token[0] = last_token;
+                        current_context->batch.pos[0] = current_context->n_past - 1;
+                        current_context->batch.logits[0] = 1; // Request logits
+                        current_context->batch.seq_id[0] = 0;
+                        current_context->batch.n_tokens = 1;
+                        
+                        int decode_result = llama_decode(current_context->context, current_context->batch);
+                        if (decode_result == 0) {
+                            logits = llama_get_logits(current_context->context);
+                            if (logits) {
+                                LLAMA_LOG("Successfully recovered logits with dummy decode");
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Final check
+            if (!logits) {
+                LLAMA_LOG("Error: Could not recover logits for generation");
+                return "Error: Context state invalid - no logits available and recovery failed";
+            }
+        } else if (!logits) {
+            LLAMA_LOG("Error: No logits available and context is empty");
+            return "Error: Context state invalid - no logits available";
         }
           // FIXED: Validate that we have logits available for sampling
         // For reset contexts, we might start with n_past=0 if the context was just created/reset
@@ -1630,7 +1711,18 @@ inline LlamaManager::SummarySlotInfo LlamaManager::get_summary_slot_info() const
 
 inline void LlamaManager::prune_message_history(float keep_ratio) {
     if (!current_context || !summarizer) return;
+    
+    // Store original message count for logging
+    size_t original_count = current_context->message_history.size();
+    
+    // Perform the pruning with summarization
     summarizer->prune_message_history(current_context->message_history, current_context->summary_slots, keep_ratio);
+    
+    // Always mark message cache as dirty after pruning since message structure changed
+    current_context->message_cache_dirty = true;
+    
+    LLAMA_LOG("Pruned message history: " + std::to_string(original_count) + " -> " + 
+              std::to_string(current_context->message_history.size()) + " messages");
 }
 
 inline bool LlamaManager::prune_conversation_with_summary(float keep_ratio) {
