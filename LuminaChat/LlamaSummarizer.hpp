@@ -108,6 +108,59 @@ public:
         return info;
     }
 
+    // Enhanced summarization for very large message collections
+    // Breaks down large summarization tasks into manageable chunks to avoid token limits
+    std::string summarize_large_message_collection(const std::vector<std::pair<std::string, std::string>>& messages_to_summarize) {
+        if (messages_to_summarize.empty() || !llama_manager) {
+            return "";
+        }
+        
+        // For smaller collections, use the standard approach
+        if (messages_to_summarize.size() <= 50) {
+            return summarize_messages(messages_to_summarize);
+        }
+        
+        SUMMARIZER_LOG("Large message collection detected (" + std::to_string(messages_to_summarize.size()) + 
+                       " messages), using chunked summarization approach");
+        
+        // Break messages into chunks of ~25 messages each
+        constexpr size_t CHUNK_SIZE = 25;
+        std::vector<std::string> chunk_summaries;
+        
+        for (size_t i = 0; i < messages_to_summarize.size(); i += CHUNK_SIZE) {
+            size_t end_idx = std::min(i + CHUNK_SIZE, messages_to_summarize.size());
+            std::vector<std::pair<std::string, std::string>> chunk(
+                messages_to_summarize.begin() + i, 
+                messages_to_summarize.begin() + end_idx
+            );
+            
+            std::string chunk_summary = summarize_messages(chunk);
+            if (!chunk_summary.empty()) {
+                chunk_summaries.push_back(chunk_summary);
+                SUMMARIZER_LOG("Successfully summarized chunk " + std::to_string(i/CHUNK_SIZE + 1) + 
+                               " (" + std::to_string(chunk.size()) + " messages)");
+            }
+        }
+        
+        // If we have multiple chunk summaries, combine them into a final summary
+        if (chunk_summaries.size() > 1) {
+            std::vector<std::pair<std::string, std::string>> final_summary_input;
+            for (size_t i = 0; i < chunk_summaries.size(); ++i) {
+                final_summary_input.emplace_back("system", 
+                    "Summary part " + std::to_string(i + 1) + ": " + chunk_summaries[i]);
+            }
+            
+            std::string final_summary = summarize_messages(final_summary_input);
+            if (!final_summary.empty()) {
+                SUMMARIZER_LOG("Successfully created final summary from " + std::to_string(chunk_summaries.size()) + " chunks");
+                return final_summary;
+            }
+        }
+        
+        // Fallback: return the first chunk summary if final combination failed
+        return chunk_summaries.empty() ? "" : chunk_summaries[0];
+    }
+
 };
 
 // Implementation of member functions
@@ -192,9 +245,8 @@ inline void LlamaSummarizer::prune_message_history(std::vector<std::pair<std::st
     for (size_t i = prune_start_idx; i < prune_end_idx; ++i) {
         messages_to_summarize.emplace_back(message_history[i]);
     }
-    
-    // Attempt to summarize using summary context
-    std::string summary = summarize_messages(messages_to_summarize);
+      // Attempt to summarize using enhanced approach for large collections
+    std::string summary = summarize_large_message_collection(messages_to_summarize);
     
     // Calculate how many messages were summarized for logging
     size_t summarized_count = prune_end_idx - prune_start_idx;
