@@ -3,7 +3,7 @@
 // RESPONSIBILITY: Core management and infrastructure
 // - Model loading, management, and lifecycle
 // - Context creation, switching, and management  
-// - Batch operations and token processing
+// - Batch operations and token processing (CORRECTED: proper single-input batching)
 // - Template application and conversation state
 // - Text-to-token conversion (input processing)
 // - Message history and summarization coordination
@@ -11,6 +11,11 @@
 // DELEGATION: Response generation is delegated to LlamaResponse class
 // 
 // Handles core classs pertaining to llama.cpp backend usage.
+//
+// BATCHING CLARIFICATION (CORRECTED):
+// Batching in llama.cpp is designed for processing multiple separate inputs/sequences 
+// simultaneously, NOT for splitting a single input into chunks. When a single input 
+// exceeds batch capacity, we process tokens sequentially rather than chunking.
 //
 // File Specific Directives:
 // Only keep a maximum of 90% maximum token usage in the context.
@@ -67,8 +72,7 @@ namespace LlamaConstants {
     constexpr int32_t DEFAULT_GPU_LAYERS = 0;
     constexpr int32_t DEFAULT_PREDICT_TOKENS = 256;
     constexpr int32_t DEFAULT_TOKEN_CACHE_SIZE = 1024;
-    
-    // Batch processing
+      // Batch processing - for multiple separate inputs, not splitting single inputs
     constexpr int32_t MAX_BATCH_SIZE = 512;
     constexpr int32_t BATCH_DIVISOR = 4;
     constexpr int32_t MAX_SEQ_IDS = 8;
@@ -197,9 +201,7 @@ private:
     mutable std::string temp_string_buffer;
 
     // Response generation handler
-    mutable LlamaResponse response_generator;
-
-    // Unified batch management
+    mutable LlamaResponse response_generator;    // Unified batch management - for single sequence processing
     void manage_batch(bool clear_only = true) {
         if (!current_context || !current_context->batch_initialized) return;
         
@@ -208,7 +210,8 @@ private:
         }
     }
 
-    // Unified batch token addition with direct position control - FIXED API usage
+    // Unified batch token addition - adds tokens from a single input to batch
+    // NOTE: This is for single-sequence processing, not multi-sequence batching
     bool add_tokens_to_batch(const std::vector<llama_token>& tokens, int32_t start_pos, 
                             const std::vector<llama_seq_id>& seq_ids, bool output_logits = false) {
         if (!current_context || !current_context->batch_initialized || tokens.empty()) return false;
@@ -346,7 +349,11 @@ private:
         return tokens;
     }
 
-    // REFACTOR: Enhanced context processing - Updated to use context's model
+    // REFACTOR: Enhanced context processing - Updated for proper single-input batching
+    // NOTE: Batching in llama.cpp is designed for processing multiple separate inputs/sequences 
+    // simultaneously, NOT for splitting a single input into chunks. Each batch operation should
+    // contain tokens from potentially multiple different inputs, each with their own sequence IDs.
+    // For single inputs that exceed batch capacity, we process sequentially rather than chunking.
     bool process_context_tokens(const std::vector<llama_token>& tokens, bool is_incremental = true) {
         if (!current_context || !current_context->batch_initialized) {
             LLAMA_LOG("Error: No active context or batch not initialized");
@@ -416,65 +423,34 @@ private:
                 return false;
             }
         }
-        
-        // Process in optimal chunks with better error handling
-        for (size_t start = 0; start < tokens.size(); start += n_batch) {
-            size_t end = std::min(start + static_cast<size_t>(n_batch), tokens.size());
-            std::vector<llama_token> chunk(tokens.begin() + start, tokens.begin() + end);
+          // FIXED: Process all tokens in a single batch - no chunking for single input
+        // Batching in llama.cpp is for multiple separate inputs, not splitting single inputs
+        if (static_cast<int32_t>(tokens.size()) > n_batch) {
+            LLAMA_LOG("Warning: Input tokens (" + std::to_string(tokens.size()) + 
+                     ") exceed batch size (" + std::to_string(n_batch) + "), processing sequentially");
             
-            bool output_logits = is_incremental && (end == tokens.size());
-            
-            if (add_tokens_to_batch(chunk, current_context->n_past, seq_ids, output_logits)) {
+            // Process tokens sequentially when they exceed batch capacity
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                std::vector<llama_token> single_token = {tokens[i]};
+                bool output_logits = is_incremental && (i == tokens.size() - 1);
+                
+                if (!add_tokens_to_batch(single_token, current_context->n_past, seq_ids, output_logits)) {
+                    LLAMA_LOG("Error: Failed to add token " + std::to_string(i) + " to batch");
+                    return false;
+                }
+                
                 // FIXED: Validate batch state before decode
                 if (current_context->batch.n_tokens <= 0) {
                     LLAMA_LOG("Warning: Empty batch after token addition");
                     continue;
                 }
                 
-                // FIXED: Additional validation before decode
-                if (!current_context->context) {
-                    LLAMA_LOG("Error: Context became null before decode");
-                    return false;
-                }
-                
-                if (!current_context->batch_initialized) {
-                    LLAMA_LOG("Error: Batch became uninitialized before decode");
-                    return false;
-                }
-                
-                // FIXED: Validate batch arrays are not null
-                if (!current_context->batch.token || !current_context->batch.pos || 
-                    !current_context->batch.logits || !current_context->batch.seq_id) {
-                    LLAMA_LOG("Error: Batch arrays are null before decode");
-                    return false;
-                }
-                
-                // FIXED: Use n_batch for validation instead of n_tokens_alloc
-                const int32_t context_n_batch = llama_n_batch(current_context->context);
-                if (current_context->batch.n_tokens > context_n_batch) {
-                    LLAMA_LOG("Error: Batch token count exceeds batch size limit");
-                    return false;
-                }
-                
-                // FIXED: Add comprehensive error checking for decode operation with try-catch
+                // Decode single token
                 try {
                     int decode_result = llama_decode(current_context->context, current_context->batch);
                     if (decode_result != 0) {
-                        LLAMA_LOG("Error: Failed to decode batch at position " + std::to_string(current_context->n_past) + 
-                                   " (error code: " + std::to_string(decode_result) + ")");
-                        
-                        // FIXED: Don't return false immediately, try to recover
-                        if (decode_result == -1) {
-                            LLAMA_LOG("Decode error -1: Attempting context reset...");
-                            if (current_context->context) {
-                                llama_kv_self_clear(current_context->context);
-                                current_context->n_past = 0;
-                            }
-                            return false; // Let caller handle retry
-                        } else {
-                            LLAMA_LOG("Severe decode error, aborting token processing");
-                            return false;
-                        }
+                        LLAMA_LOG("Error: Failed to decode token " + std::to_string(i) + " (error code: " + std::to_string(decode_result) + ")");
+                        return false;
                     }
                 } catch (const std::exception& e) {
                     LLAMA_LOG("Exception during decode: " + std::string(e.what()));
@@ -484,11 +460,77 @@ private:
                     return false;
                 }
                 
-                current_context->n_past += static_cast<int32_t>(chunk.size());
-            } else {
-                LLAMA_LOG("Error: Failed to add tokens to batch at position " + std::to_string(current_context->n_past));
+                current_context->n_past++;
+            }
+        } else {
+            // Process all tokens in a single batch (normal case)
+            bool output_logits = is_incremental;
+            
+            if (!add_tokens_to_batch(tokens, current_context->n_past, seq_ids, output_logits)) {
+                LLAMA_LOG("Error: Failed to add tokens to batch");
                 return false;
             }
+            
+            // FIXED: Validate batch state before decode
+            if (current_context->batch.n_tokens <= 0) {
+                LLAMA_LOG("Warning: Empty batch after token addition");
+                return true;
+            }
+            
+            // FIXED: Additional validation before decode
+            if (!current_context->context) {
+                LLAMA_LOG("Error: Context became null before decode");
+                return false;
+            }
+            
+            if (!current_context->batch_initialized) {
+                LLAMA_LOG("Error: Batch became uninitialized before decode");
+                return false;
+            }
+            
+            // FIXED: Validate batch arrays are not null
+            if (!current_context->batch.token || !current_context->batch.pos || 
+                !current_context->batch.logits || !current_context->batch.seq_id) {
+                LLAMA_LOG("Error: Batch arrays are null before decode");
+                return false;
+            }
+            
+            // FIXED: Use n_batch for validation instead of n_tokens_alloc
+            const int32_t context_n_batch = llama_n_batch(current_context->context);
+            if (current_context->batch.n_tokens > context_n_batch) {
+                LLAMA_LOG("Error: Batch token count exceeds batch size limit");
+                return false;
+            }
+            
+            // FIXED: Add comprehensive error checking for decode operation with try-catch
+            try {
+                int decode_result = llama_decode(current_context->context, current_context->batch);
+                if (decode_result != 0) {
+                    LLAMA_LOG("Error: Failed to decode batch at position " + std::to_string(current_context->n_past) + 
+                               " (error code: " + std::to_string(decode_result) + ")");
+                    
+                    // FIXED: Don't return false immediately, try to recover
+                    if (decode_result == -1) {
+                        LLAMA_LOG("Decode error -1: Attempting context reset...");
+                        if (current_context->context) {
+                            llama_kv_self_clear(current_context->context);
+                            current_context->n_past = 0;
+                        }
+                        return false; // Let caller handle retry
+                    } else {
+                        LLAMA_LOG("Severe decode error, aborting token processing");
+                        return false;
+                    }
+                }
+            } catch (const std::exception& e) {
+                LLAMA_LOG("Exception during decode: " + std::string(e.what()));
+                return false;
+            } catch (...) {
+                LLAMA_LOG("Unknown exception during decode");
+                return false;
+            }
+            
+            current_context->n_past += static_cast<int32_t>(tokens.size());
         }
         
         return true;
