@@ -32,7 +32,6 @@
 
 #pragma once
 
-#include <iostream>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -94,12 +93,13 @@ private:
     std::atomic<uint64_t> total_messages_processed{0};
     std::atomic<uint64_t> total_responses_sent{0};
     std::chrono::system_clock::time_point last_activity;
-    
-    // Constants
+      // Constants
     static constexpr std::chrono::milliseconds MIN_RESPONSE_INTERVAL{2000};
     static constexpr size_t MAX_MESSAGE_LENGTH = 2000;
     static constexpr int32_t MAX_CONTEXT_FILL_PERCENTAGE = 80;
     static constexpr int32_t MIN_CONTEXT_FILL_PERCENTAGE = 10;
+    static constexpr int32_t HEARTBEAT_DELAY_SEC = 5;
+    static constexpr int32_t RETRY_DELAY_MS = 500;
 
 public:
     using BackfillStatus = DiscordHistoryLoader::BackfillStatus;
@@ -469,7 +469,7 @@ public:
             // Start history backfill if enabled
             if (pull_message_history && llama_manager) {
                 std::thread([this]() {
-                    std::this_thread::sleep_for(std::chrono::seconds(5));
+                    std::this_thread::sleep_for(std::chrono::seconds(HEARTBEAT_DELAY_SEC));
                     if (is_connected && history_loader) {
                         history_loader->start_backfill();
                     }
@@ -528,7 +528,7 @@ public:
                 bot->message_create(msg);
                 
                 if (message_parts.size() > 1) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_DELAY_MS));
                 }
             }
             

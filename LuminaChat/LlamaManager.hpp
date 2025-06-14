@@ -57,7 +57,6 @@
 #include <thread>
 #include <chrono>
 #include <unordered_map>
-#include <string_view>
 #include <functional>
 #include "llama-cpp.h"
 #include "LogHandler.hpp"
@@ -84,8 +83,7 @@ namespace LlamaConstants {
     constexpr int32_t MAX_TOKEN_BUFFER_SIZE = 1024;
     constexpr int32_t MAX_SUMMARY_LENGTH = 512;
     constexpr int32_t INITIAL_TOKEN_BUFFER_SIZE = 32;
-    constexpr size_t MAX_MESSAGE_HISTORY_SIZE = 1000;
-      // Sampler defaults
+    constexpr size_t MAX_MESSAGE_HISTORY_SIZE = 1000;    // Sampler defaults
     constexpr float DEFAULT_TEMPERATURE = 0.8f;
     constexpr float DEFAULT_MIN_P = 0.05f;
     constexpr float DEFAULT_TOP_P = 0.9f;
@@ -95,6 +93,10 @@ namespace LlamaConstants {
     constexpr size_t MAX_TEXT_PREVIEW_LENGTH = 50;
     constexpr size_t STRING_RESERVE_MULTIPLIER = 4;
     constexpr int32_t MAX_RETRY_ATTEMPTS = 2;
+    
+    // Timing and sleep constants
+    constexpr int32_t RETRY_BACKOFF_MS = 50;
+    constexpr float MS_TO_MICROSECONDS = 1000.0f;
 }
 
 // Forward declaration of SummarizerConstants (fully defined in LlamaSummarizer.hpp)
@@ -1020,7 +1022,7 @@ public:
         
         // Check if we need pruning based on projected usage, not current n_past
         if (!is_summary_context && projected_usage > max_threshold) {
-            LLAMA_LOG("Starting context rebuild: PARTIAL (with pruning) - context usage " + std::to_string((float)projected_usage / model_info->n_ctx * 100.0f) + 
+            LLAMA_LOG("Starting context rebuild: PARTIAL (with pruning) - context usage " + std::to_string(static_cast<float>(projected_usage) / model_info->n_ctx * 100.0f) + 
                        "% (" + std::to_string(projected_usage) + "/" + std::to_string(model_info->n_ctx) + "), pruning to 60%");
             
             llama_kv_self_clear(current_context->context);
@@ -1209,7 +1211,7 @@ public:
                     current_context->message_cache_dirty = true;
                 }
                 
-                std::this_thread::sleep_for(std::chrono::milliseconds(LlamaConstants::MAX_RETRY_ATTEMPTS * 50)); // Simple backoff
+                std::this_thread::sleep_for(std::chrono::milliseconds(LlamaConstants::MAX_RETRY_ATTEMPTS * LlamaConstants::RETRY_BACKOFF_MS)); // Simple backoff
             } else {
                 // If we still can't update, try to continue with a minimal context
                 LLAMA_LOG("Starting context rebuild: FULL (minimal recovery) - failed to update context, attempting minimal recovery");
@@ -1310,7 +1312,7 @@ public:
         
         float avg_tps = 0.0f;
         if (current_context->last_decode_time_us > 0 && current_context->total_generation_tokens > 0) {
-            avg_tps = (float)current_context->total_generation_tokens / ((float)current_context->last_decode_time_us / 1000000.0f);
+            avg_tps = static_cast<float>(current_context->total_generation_tokens) / (static_cast<float>(current_context->last_decode_time_us) / 1000000.0f);
         }
         
         return {
@@ -1340,7 +1342,7 @@ public:
         
         Timings timings;
         timings.n_eval = static_cast<int32_t>(current_context->total_generation_tokens);
-        timings.t_eval_ms = static_cast<float>(current_context->last_decode_time_us) / 1000.0f;
+        timings.t_eval_ms = static_cast<float>(current_context->last_decode_time_us) / LlamaConstants::MS_TO_MICROSECONDS;
         return timings;
     }
 
@@ -1508,15 +1510,6 @@ public:
         // Tokenize and return count
         std::vector<llama_token> tokens = process_text_to_tokens(formatted_content, true);
         return static_cast<int32_t>(tokens.size());
-    }
-
-    // Direct access to token cache - no pass-through methods needed
-    const TokenCache& get_token_cache() const {
-        return token_cache;
-    }
-    
-    TokenCache& get_token_cache() {
-        return token_cache;
     }
 
 public:

@@ -126,6 +126,13 @@ wxDEFINE_EVENT(wxEVT_PROGRESS_UPDATE, wxCommandEvent);
 bool model_loading_progress_callback(float progress, void* user_data);
 void llama_log_callback(ggml_log_level level, const char* message, void* user_data);
 
+// UI Constants (Directive #5: Zero Magic & Strong Typing)
+namespace UIConstants {
+    constexpr int32_t CONTEXT_MONITOR_INTERVAL_MS = 2000;
+    constexpr float MS_TO_SECONDS = 1000.0f;
+    constexpr int32_t DISCORD_CONNECTION_DELAY_SEC = 5;
+}
+
 // Global frame pointer for callbacks
 LuminaChatFrame* g_main_frame = nullptr;
 
@@ -1115,9 +1122,7 @@ private:
         
         wxString message;
         message << "Summary Slot System Status:\n\n";
-        message << wxString::Format("Used slots: %zu / %zu\n\n", summary_info.used_slots, summary_info.total_slots);
-        
-        if (summary_info.used_slots == 0) {
+        message << wxString::Format("Used slots: %zu / %zu\n\n", summary_info.used_slots, summary_info.total_slots);        if (summary_info.used_slots == 0) {
             message << "No summaries generated yet.\n\n";
             message << "Summaries are created automatically when the conversation\n";
             message << "becomes too long and needs to be pruned to make room\n";
@@ -1125,11 +1130,11 @@ private:
         } else {
             message << "Summaries (chronological order, oldest to newest):\n";
             message << wxString(50, '=') << "\n\n";
-              for (size_t i = 0; i < summary_info.summaries.size(); ++i) {
-                message << wxString::Format("Slot %zu:\n", i + 1);
+              for (size_t i = 0; const auto& summary : summary_info.summaries) {
+                message << wxString::Format("Slot %zu:\n", ++i);
                 
                 // Show full summary without truncation
-                wxString summary_text = wxString::FromUTF8(summary_info.summaries[i]);
+                wxString summary_text = wxString::FromUTF8(summary);
                 
                 message << summary_text << "\n\n";
                 message << wxString(30, '-') << "\n\n";
@@ -1265,7 +1270,7 @@ private:
             
             // Start context monitoring timer (update every 2 seconds)
             if (context_monitor_timer) {
-                context_monitor_timer->Start(2000);
+                context_monitor_timer->Start(UIConstants::CONTEXT_MONITOR_INTERVAL_MS);
             }
               // Connect Discord manager to LlamaManager when model is loaded
             if (discord_manager && discord_manager->is_bot_running()) {
@@ -1369,7 +1374,7 @@ private:
                     bool backfill_reported = false;
                     
                     for (int i = 0; i < 60; ++i) { // Check for up to 5 minutes
-                        std::this_thread::sleep_for(std::chrono::seconds(5));
+                        std::this_thread::sleep_for(std::chrono::seconds(UIConstants::DISCORD_CONNECTION_DELAY_SEC));
                         
                         if (discord_manager) {
                             auto status = discord_manager->get_backfill_status();
@@ -1499,7 +1504,7 @@ private:
         // Get timings from llama manager
         auto timings = llama_manager->get_timings();
         if (timings.n_eval > 0) {
-            double tokens_per_sec = 1000.0 * timings.n_eval / timings.t_eval_ms;
+            double tokens_per_sec = UIConstants::MS_TO_SECONDS * timings.n_eval / timings.t_eval_ms;
             
             // Get additional statistics for comprehensive display
             auto perf_stats = llama_manager->get_performance_stats();

@@ -106,10 +106,15 @@ private:    // Core dependencies
     
     // State
     std::atomic<bool> backfill_in_progress{false};
-    
-    // Constants
+      // Constants
     static constexpr int32_t MESSAGES_PER_FETCH = 10;
     static constexpr float BASE_MAX_CONTEXT_FILL_RATIO = 0.01f;
+    static constexpr int32_t MAX_ITERATIONS = 1000;
+    static constexpr int32_t TIMEOUT_SECONDS = 10;
+    static constexpr int32_t RATE_LIMIT_DELAY_MS = 100;
+    static constexpr int32_t RETRY_DELAY_MS = 1000;
+    static constexpr int32_t PROGRESS_DELAY_MS = 250;
+    static constexpr int32_t INITIALIZATION_DELAY_SEC = 2;
     
     bool should_backfill_channel(uint64_t channel_id) const {
         return (isolated_channels && isolated_channels->count(channel_id)) ||
@@ -219,9 +224,8 @@ private:    // Core dependencies
                     promise->set_value(false);
                 }
             });
-        
-        // Wait for result with timeout
-        auto status = future.wait_for(std::chrono::seconds(10));
+          // Wait for result with timeout
+        auto status = future.wait_for(std::chrono::seconds(TIMEOUT_SECONDS));
         if (status == std::future_status::ready) {
             return future.get();
         } else {
@@ -435,7 +439,7 @@ private:    // Core dependencies
     
     // Updated main processing loop with proper isolated vs shared handling
     void process_all_channels() {
-        const int32_t MAX_ITERATIONS = 1000;
+        const int32_t MAX_ITERATIONS = DiscordHistoryLoader::MAX_ITERATIONS;
         int32_t iteration = 0;
         
         // Initialize context capacities once
@@ -471,7 +475,7 @@ private:    // Core dependencies
                         if (process_channel_batch(channel_id)) {
                             made_progress = true;
                             // Small delay between batches for rate limiting
-                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            std::this_thread::sleep_for(std::chrono::milliseconds(RATE_LIMIT_DELAY_MS));
                         } else {
                             break; // Channel completed or error
                         }
@@ -514,10 +518,10 @@ private:    // Core dependencies
                 
                 // If no progress but channels remain, wait and try again
                 DISCORD_HISTORY_LOG("No progress made, waiting before retry...");
-                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_DELAY_MS));
             } else {
                 // Short delay between iterations when making progress
-                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                std::this_thread::sleep_for(std::chrono::milliseconds(PROGRESS_DELAY_MS));
             }
         }
         
@@ -671,7 +675,7 @@ public:
             
             // Start processing after a short delay
             std::thread([this]() {
-                std::this_thread::sleep_for(std::chrono::seconds(2));
+                std::this_thread::sleep_for(std::chrono::seconds(INITIALIZATION_DELAY_SEC));
                 if (backfill_in_progress) {
                     // Validate we have channels to process before starting
                     {
