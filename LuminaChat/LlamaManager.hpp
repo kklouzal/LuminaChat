@@ -73,7 +73,7 @@ namespace LlamaConstants {
     constexpr int32_t DEFAULT_PREDICT_TOKENS = 256;
     constexpr int32_t DEFAULT_TOKEN_CACHE_SIZE = 1024;
       // Batch processing - for multiple separate inputs, not splitting single inputs
-    constexpr int32_t MAX_BATCH_SIZE = 512;
+    constexpr int32_t MAX_BATCH_SIZE = 8192;
     constexpr int32_t BATCH_DIVISOR = 4;
     constexpr int32_t MAX_SEQ_IDS = 8;
       // Safety margins and limits
@@ -226,12 +226,17 @@ private:
         if (start_pos < 0 || start_pos >= model_info->n_ctx) {
             LLAMA_LOG("Error: Invalid start position " + std::to_string(start_pos) + " for context size " + std::to_string(model_info->n_ctx));
             return false;
-        }
-        
+        }        
         const int32_t n_batch = llama_n_batch(current_context->context);
         if (n_batch <= 0) {
             LLAMA_LOG("Error: Invalid batch size: " + std::to_string(n_batch));
             return false;
+        }
+        
+        // Validate batch size against our maximum
+        if (n_batch > LlamaConstants::MAX_BATCH_SIZE) {
+            LLAMA_LOG("Warning: Context batch size (" + std::to_string(n_batch) + 
+                      ") exceeds MAX_BATCH_SIZE (" + std::to_string(LlamaConstants::MAX_BATCH_SIZE) + ")");
         }
         
         manage_batch(true); // Clear batch
@@ -383,10 +388,12 @@ private:
         }
         
         std::vector<llama_seq_id> seq_ids = {0};
-        
-        // Check context capacity using model's n_ctx
+          // Check context capacity using model's n_ctx
         int32_t max_threshold = static_cast<int32_t>(model_info->n_ctx * 0.9f);
-        if (!is_incremental) current_context->n_past = 0; // Reset for full context rebuild
+        if (!is_incremental) {
+            LLAMA_LOG("Starting context rebuild: FULL (non-incremental) - processing " + std::to_string(tokens.size()) + " tokens");
+            current_context->n_past = 0; // Reset for full context rebuild
+        }
         
         // FIXED: Validate n_past bounds before processing
         if (current_context->n_past < 0) {
@@ -408,11 +415,11 @@ private:
             LLAMA_LOG("Error: Token addition would cause overflow");
             return false;
         }
-        
-        if (current_context->n_past + static_cast<int32_t>(tokens.size()) > max_threshold) {
+          if (current_context->n_past + static_cast<int32_t>(tokens.size()) > max_threshold) {
             if (is_incremental) {
-                LLAMA_LOG("Context would exceed 90% (" + std::to_string(current_context->n_past + tokens.size()) + 
-                           "/" + std::to_string(model_info->n_ctx) + " tokens), triggering pruning...");                if (current_context->context) {
+                LLAMA_LOG("Starting context rebuild: PARTIAL (triggering pruning) - context would exceed 90% (" + std::to_string(current_context->n_past + tokens.size()) + 
+                           "/" + std::to_string(model_info->n_ctx) + " tokens)");
+                if (current_context->context) {
                     llama_kv_self_clear(current_context->context);
                 }
                 current_context->n_past = 0;
@@ -584,11 +591,10 @@ private:
             LLAMA_LOG("Error: Invalid model or context state");
             return false;
         }
-        
-        // Check if context position is reasonable
+          // Check if context position is reasonable
         if (current_context->n_past < 0 || current_context->n_past >= model_info->n_ctx) {
-            LLAMA_LOG("Warning: Context position out of bounds (" + std::to_string(current_context->n_past) + 
-                      "/" + std::to_string(model_info->n_ctx) + "), attempting reset");
+            LLAMA_LOG("Starting context rebuild: FULL (position validation) - context position out of bounds (" + std::to_string(current_context->n_past) + 
+                      "/" + std::to_string(model_info->n_ctx) + "), resetting");
             
             // Reset context state
             if (current_context->context) {
@@ -607,8 +613,8 @@ private:
             return true; // This is actually okay
         }        // Check for extremely long message history that might cause issues
         if (current_context->message_history.size() > LlamaConstants::MAX_MESSAGE_HISTORY_SIZE) {
-            LLAMA_LOG("Warning: Very large message history (" + 
-                      std::to_string(current_context->message_history.size()) + " messages)");
+            LLAMA_LOG("Starting context rebuild: PARTIAL (history validation) - very large message history (" + 
+                      std::to_string(current_context->message_history.size()) + " messages), triggering aggressive pruning");
               // Only trigger aggressive pruning if we're not already in a summary context
             if (active_context_id != "summary_context") {
                 // Clear context state before aggressive pruning
@@ -946,8 +952,7 @@ public:
         return tmpl ? std::string(tmpl) : "";
     }
   
-    
-    // Enhanced context update with better tokenization handling - FIXED recursion issue
+      // Enhanced context update with better tokenization handling - FIXED recursion issue
     bool update_context_with_pruning() {
         ModelInfo* model_info = get_current_model_info();
         if (!model_info || !model_info->model || !current_context || !current_context->context || !model_info->vocab) {
@@ -975,7 +980,7 @@ public:
         
         // Check if we need pruning based on projected usage, not current n_past
         if (!is_summary_context && projected_usage > max_threshold) {
-            LLAMA_LOG("Projected context usage at " + std::to_string((float)projected_usage / model_info->n_ctx * 100.0f) + 
+            LLAMA_LOG("Starting context rebuild: PARTIAL (with pruning) - context usage " + std::to_string((float)projected_usage / model_info->n_ctx * 100.0f) + 
                        "% (" + std::to_string(projected_usage) + "/" + std::to_string(model_info->n_ctx) + "), pruning to 60%");
             
             llama_kv_self_clear(current_context->context);
@@ -992,12 +997,15 @@ public:
                 LLAMA_LOG("Error: Failed to apply chat template after pruning");
                 return false;
             }
-        }        // Apply template and process
+        }// Apply template and process
         int32_t new_len = static_cast<int32_t>(formatted_content.length());        // CRITICAL: After pruning, the message structure has fundamentally changed.
         // The context state (n_past, prev_len) no longer matches the new message history.
         // We MUST do a full rebuild, never an incremental update, to avoid garbage output.
         if (context_pruned || current_context->prev_len > new_len || 
             (current_context->prev_len == 0 && !current_context->message_history.empty() && !is_summary_context)) {
+            
+            LLAMA_LOG("Starting context rebuild: FULL - rebuilding complete context from " + std::to_string(current_context->message_history.size()) + " messages");
+            
             // Rebuild context - use add_special=true for full context
             std::vector<llama_token> tokens = process_text_to_tokens(formatted_content, true);
             if (tokens.empty()) {
@@ -1027,10 +1035,10 @@ public:
             }
             LLAMA_LOG("Error: Failed to rebuild context");
             return false;
-        }
-
-        // Process new content incrementally (only if no pruning occurred)
+        }        // Process new content incrementally (only if no pruning occurred)
         if (new_len > current_context->prev_len) {
+            LLAMA_LOG("Starting context rebuild: INCREMENTAL - adding " + std::to_string(new_len - current_context->prev_len) + " new characters");
+            
             std::string new_content = formatted_content.substr(current_context->prev_len);
             if (!new_content.empty()) {
                 std::vector<llama_token> new_tokens = process_text_to_tokens(new_content, false);
@@ -1126,10 +1134,9 @@ public:
             if (update_context_with_pruning()) {
                 break; // Success
             }
-            
-            retry_count++;
+              retry_count++;
             if (retry_count < max_retries) {
-                LLAMA_LOG("Retrying context update (" + std::to_string(retry_count + 1) + "/" + std::to_string(max_retries) + ")");
+                LLAMA_LOG("Starting context rebuild: FULL (retry " + std::to_string(retry_count) + "/" + std::to_string(max_retries) + ") - retrying context update with aggressive cleanup");
                 
                 // On retry, try a more aggressive cleanup
                 if (current_context && current_context->context) {
@@ -1142,7 +1149,7 @@ public:
                 std::this_thread::sleep_for(std::chrono::milliseconds(LlamaConstants::MAX_RETRY_ATTEMPTS * 50)); // Simple backoff
             } else {
                 // If we still can't update, try to continue with a minimal context
-                LLAMA_LOG("Failed to update context, attempting minimal recovery");
+                LLAMA_LOG("Starting context rebuild: FULL (minimal recovery) - failed to update context, attempting minimal recovery");
                 
                 if (current_context && current_context->context) {
                     llama_kv_self_clear(current_context->context);
@@ -1382,11 +1389,11 @@ public:
     int32_t get_context_usage() const noexcept {
         if (!current_context) return 0;
         return current_context->n_past;
-    }
-
-    // FIXED: Enhanced batch update with proper token tracking
+    }    // FIXED: Enhanced batch update with proper token tracking
     bool update_context_from_history() {
         if (!current_context) return false;
+
+        LLAMA_LOG("Starting context rebuild: FULL (from message history) - rebuilding from " + std::to_string(current_context->message_history.size()) + " messages");
 
         // Store original state for rollback
         int32_t original_n_past = current_context->n_past;
@@ -1457,21 +1464,20 @@ public:
         return process_text_to_tokens(text, add_special);
     }
 
-private:
-    int32_t calculate_optimal_batch_size() const {
+private:    int32_t calculate_optimal_batch_size() const {
         if (!current_context || !current_context->context) {
-            return 512;
+            return LlamaConstants::MAX_BATCH_SIZE;
         }
         
         ModelInfo* model_info = get_current_model_info();
         if (!model_info) {
-            return 512;
+            return LlamaConstants::MAX_BATCH_SIZE;
         }
         
         int32_t n_batch = llama_n_batch(current_context->context);
         int32_t available_ctx = model_info->n_ctx - current_context->n_past;
         
-        return std::max(1, std::min({n_batch, available_ctx, 512}));
+        return std::max(1, std::min({n_batch, available_ctx, LlamaConstants::MAX_BATCH_SIZE}));
     }
       void clear_caches() const {
         token_cache.clear();    }
@@ -1529,6 +1535,8 @@ inline bool LlamaManager::prune_conversation_with_summary(float keep_ratio) {
 
 inline void LlamaManager::clear_conversation() {
     if (!current_context) return;
+    
+    LLAMA_LOG("Starting context rebuild: FULL (conversation cleared) - clearing all " + std::to_string(current_context->message_history.size()) + " messages");
     
     if (current_context->context) {
         llama_kv_self_clear(current_context->context);
