@@ -1,4 +1,14 @@
 // LlamaResponse.hpp - header-only implementation for AI response generation
+// 
+// RESPONSIBILITY: Pure response generation functionality
+// - Token-to-text conversion for generated output
+// - Response generation loop and token sampling
+// - Generation state validation and recovery
+// - Sampler validation and recovery
+// 
+// DEPENDENCIES: Requires ModelInfo and ContextInfo from LlamaManager
+// INTEGRATION: Called by LlamaManager through template callbacks for batch operations
+//
 // Provides response generation functionality extracted from LlamaManager for better modularity.
 //
 // Project Settings:
@@ -37,13 +47,16 @@
 #include "llama-cpp.h"
 #include "LogHandler.hpp"
 
+// Forward declaration of shared constants from LlamaManager
+// Note: These are defined in LlamaManager.hpp and should not be redefined here
+// This ensures single source of truth for configuration constants
+
 // Constants for response generation (Directive #5: Zero Magic & Strong Typing)
 namespace ResponseConstants {
-    constexpr int32_t TOKEN_SAFETY_MARGIN = 32;
-    constexpr int32_t MAX_RETRY_ATTEMPTS = 2;
-    constexpr size_t STRING_RESERVE_MULTIPLIER = 4;
     constexpr int32_t SAMPLER_VALIDATION_INTERVAL = 10;
-    constexpr int32_t RECOVERY_SLEEP_MS = 100;
+    constexpr int32_t INITIAL_BUFFER_SIZE = 32;
+    constexpr int32_t MAX_BUFFER_SIZE = 1024;
+    constexpr int32_t DUMMY_TOKEN_DECODE_POS_OFFSET = 1;
 }
 
 // Forward declarations and type definitions for LlamaManager integration
@@ -60,6 +73,11 @@ namespace SummarizerConstants {
 // Thread Safety Contract (Directive #12):
 // This class is NOT thread-safe and should only be accessed from within LlamaManager's context.
 // All methods assume valid ModelInfo and ContextInfo structures are provided.
+//
+// USAGE PATTERN:
+// 1. LlamaManager prepares context and provides callback functions for batch operations
+// 2. LlamaResponse handles the generation loop, token sampling, and text conversion
+// 3. LlamaManager receives tokens through callbacks to manage batch operations and context updates
 class LlamaResponse {
 private:
     // Working buffers for token conversion
@@ -98,9 +116,7 @@ private:
         
         LLAMA_LOG("Sampler recovered successfully with greedy sampling");
         return true;
-    }
-
-    // Convert token to text using the context's model vocabulary
+    }    // Convert token to text using the context's model vocabulary
     std::string convert_token_to_text(llama_token token, ModelInfo* model_info) const {
         if (!model_info || !model_info->vocab) {
             LLAMA_LOG("Error: Vocabulary not available from current context's model");
@@ -113,16 +129,13 @@ private:
             return "";
         }
         
-        constexpr int32_t INITIAL_BUFFER_SIZE = 32;
-        constexpr int32_t MAX_BUFFER_SIZE = 1024;
-        
-        temp_string_buffer.resize(INITIAL_BUFFER_SIZE);
+        temp_string_buffer.resize(ResponseConstants::INITIAL_BUFFER_SIZE);
         int32_t result = llama_token_to_piece(model_info->vocab, token, temp_string_buffer.data(), 
                                              temp_string_buffer.size(), 0, true);
         
         if (result < 0) {
             size_t required_size = static_cast<size_t>(-result);
-            if (required_size > MAX_BUFFER_SIZE) {
+            if (required_size > ResponseConstants::MAX_BUFFER_SIZE) {
                 LLAMA_LOG("Error: Token conversion requires excessive buffer size: " + std::to_string(required_size));
                 return "";
             }
@@ -148,11 +161,10 @@ private:
         // Add a dummy entry to get logits at current position
         if (context_info->batch.token && context_info->batch.pos && 
             context_info->batch.logits && context_info->batch.seq_id) {
-            
-            // Use EOS token as dummy for logit generation
+              // Use EOS token as dummy for logit generation
             llama_token dummy_token = llama_vocab_eos(model_info->vocab);
             context_info->batch.token[0] = dummy_token;
-            context_info->batch.pos[0] = context_info->n_past - 1;
+            context_info->batch.pos[0] = context_info->n_past - ResponseConstants::DUMMY_TOKEN_DECODE_POS_OFFSET;
             context_info->batch.logits[0] = 1; // Request logits
             context_info->batch.seq_id[0] = 0;
             context_info->batch.n_tokens = 1;
@@ -202,6 +214,22 @@ private:
 public:
     LlamaResponse() {
         temp_string_buffer.reserve(64); // Pre-allocate reasonable buffer size
+    }    // Public utility method for token-to-text conversion
+    std::string token_to_text(llama_token token, ModelInfo* model_info) const {
+        return convert_token_to_text(token, model_info);
+    }
+
+    // Public utility methods for validation (can be used by LlamaManager for state checking)
+    static bool validate_sampler(ModelInfo* model_info) {
+        return validate_and_recover_sampler(model_info);
+    }
+
+    static bool validate_context_for_generation(ContextInfo* context_info, ModelInfo* model_info) {
+        return validate_generation_state(context_info, model_info);
+    }
+
+    static bool attempt_logits_recovery(ContextInfo* context_info, ModelInfo* model_info) {
+        return recover_logits(context_info, model_info);
     }
 
     // Main response generation function
@@ -237,28 +265,22 @@ public:
             }
         } else if (!logits) {
             return "Error: Context state invalid - no logits available";
-        }
-
-        // Calculate available space for generation
+        }        // Calculate available space for generation
         const int32_t max_new_tokens = std::min(model_info->n_predict, 
-                                               model_info->n_ctx - context_info->n_past - ResponseConstants::TOKEN_SAFETY_MARGIN);
+                                               model_info->n_ctx - context_info->n_past - LlamaConstants::TOKEN_SAFETY_MARGIN);
         
         if (max_new_tokens <= 0) {
             return "Error: No space left in context for generation (context: " + 
                    std::to_string(context_info->n_past) + "/" + std::to_string(model_info->n_ctx) + ")";
         }
 
-        LLAMA_LOG("Starting generation with " + std::to_string(max_new_tokens) + " max tokens, n_past=" + std::to_string(context_info->n_past));
-
-        // Initialize generation state
+        LLAMA_LOG("Starting generation with " + std::to_string(max_new_tokens) + " max tokens, n_past=" + std::to_string(context_info->n_past));        // Initialize generation state
         std::string response;
-        response.reserve(max_new_tokens * ResponseConstants::STRING_RESERVE_MULTIPLIER);
+        response.reserve(max_new_tokens * LlamaConstants::STRING_RESERVE_MULTIPLIER);
         
         auto generation_start = std::chrono::high_resolution_clock::now();
         int32_t n_generated = 0;
-        std::vector<llama_seq_id> seq_ids = {0};
-
-        // Main generation loop
+        std::vector<llama_seq_id> seq_ids = {0};        // Main generation loop
         while (n_generated < max_new_tokens) {
             // Periodic sampler validation during long generation
             if (n_generated % ResponseConstants::SAMPLER_VALIDATION_INTERVAL == 0 && !model_info->sampler) {

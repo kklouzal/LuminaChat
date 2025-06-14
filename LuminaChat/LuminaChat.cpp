@@ -1079,9 +1079,8 @@ private:
                         "Insufficient Messages", wxOK | wxICON_INFORMATION);
             return;
         }
-        
-        // Check if summarization is available
-        if (!llama_manager->is_summarization_available()) {
+          // Check if summarization is available
+        if (!llama_manager->has_context("summary_context")) {
             wxMessageBox("Summarization is not available. Please configure a summary model in Settings.", 
                         "Summarization Unavailable", wxOK | wxICON_WARNING);
             return;

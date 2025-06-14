@@ -65,25 +65,32 @@ private:
     
     // Context ID for summary operations
     static constexpr const char* SUMMARY_CONTEXT_ID = "summary_context";
+    
+    // 5-slot summary system: maintains chronological order of conversation summaries
+    // When the 6th summary is generated, slot 0 is dropped, slots shift left, and new summary goes to slot 4
+    std::vector<std::string> summary_slots;
 
 public:
-    explicit LlamaSummarizer(LlamaManager* manager) : llama_manager(manager) {}    // Delete copy constructor and assignment operator
+    explicit LlamaSummarizer(LlamaManager* manager) : llama_manager(manager) {
+        summary_slots.reserve(SummarizerConstants::MAX_SUMMARY_SLOTS);
+    }    // Delete copy constructor and assignment operator
     LlamaSummarizer(const LlamaSummarizer&) = delete;
     LlamaSummarizer& operator=(const LlamaSummarizer&) = delete;
 
-    // Check if summarization is available (summary context exists)
-    bool is_summarization_available() const;
-
     // Add summary to the 5-slot chronological summary system
-    void add_summary_to_slots(std::vector<std::string>& summary_slots, const std::string& new_summary);
+    void add_summary_to_slots(const std::string& new_summary);
 
     // Enhanced prune message history using summary model to condense pruned messages
     void prune_message_history(std::vector<std::pair<std::string, std::string>>& message_history, 
-                              std::vector<std::string>& summary_slots, 
                               float keep_ratio);
 
     // Summarize a collection of messages using the summary context
     std::string summarize_messages(const std::vector<std::pair<std::string, std::string>>& messages_to_summarize);
+
+    // Clear all summary slots (useful when conversation is cleared)
+    void clear_summary_slots() {
+        summary_slots.clear();
+    }
 
     // Summary slot information structure
     struct SummarySlotInfo {
@@ -93,25 +100,20 @@ public:
     };
     
     // Get information about summary slots
-    SummarySlotInfo get_summary_slot_info(const std::vector<std::string>& summary_slots) const {
+    SummarySlotInfo get_summary_slot_info() const {
         SummarySlotInfo info;
         info.total_slots = SummarizerConstants::MAX_SUMMARY_SLOTS;
         info.used_slots = summary_slots.size();
         info.summaries = summary_slots;
-        return info;    }
+        return info;
+    }
 
-private:
-    // No private helper methods needed - using LogHandler macros directly
 };
 
 // Implementation of member functions
 
-inline bool LlamaSummarizer::is_summarization_available() const {
-    if (!llama_manager) return false;
-    return llama_manager->has_context(SUMMARY_CONTEXT_ID);
-}
 
-inline void LlamaSummarizer::add_summary_to_slots(std::vector<std::string>& summary_slots, const std::string& new_summary) {
+inline void LlamaSummarizer::add_summary_to_slots(const std::string& new_summary) {
     if (new_summary.empty()) return;
     
     // If we're at capacity (5 slots), implement rollover summarization
@@ -149,7 +151,6 @@ inline void LlamaSummarizer::add_summary_to_slots(std::vector<std::string>& summ
 }
 
 inline void LlamaSummarizer::prune_message_history(std::vector<std::pair<std::string, std::string>>& message_history, 
-                                                  std::vector<std::string>& summary_slots, 
                                                   float keep_ratio) {
     if (message_history.empty()) {
         SUMMARIZER_LOG("No messages to prune - message history is empty");
@@ -208,9 +209,8 @@ inline void LlamaSummarizer::prune_message_history(std::vector<std::pair<std::st
     }
     
     // Handle 5-slot summary system
-    if (!summary.empty()) {
-        // Add new summary to the slot system
-        add_summary_to_slots(summary_slots, summary);
+    if (!summary.empty()) {        // Add new summary to the slot system
+        add_summary_to_slots(summary);
         SUMMARIZER_LOG("Successfully created summary for " + std::to_string(summarized_count) + " pruned messages");
         SUMMARIZER_LOG("Summary slots now contain " + std::to_string(summary_slots.size()) + " summaries");
     } else {
