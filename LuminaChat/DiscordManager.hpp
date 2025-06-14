@@ -69,7 +69,7 @@ private:
     // Configuration
     DiscordBotConfig config;
     std::string main_context_id;
-    std::string model_id = "main_model"; // FIXED: Set default model_id
+    std::string model_id = "main_model";
     
     // State
     std::atomic<bool> is_running{false};
@@ -250,7 +250,7 @@ private:    void setup_event_handlers() {
         last_response_time[user_id] = now;
         return false;
     }
-      // FIXED: Get system prompt from main context for new Discord contexts
+      // Get system prompt from main context for new Discord contexts
     std::string get_system_prompt_for_new_context() const {
         if (!llama_manager || main_context_id.empty()) return "";
         
@@ -293,11 +293,10 @@ private:    void setup_event_handlers() {
             std::string context_id = "discord_dm_" + std::to_string(user_id);
             
             // Check if context already exists before trying to create
-            if (llama_manager && llama_manager->has_context(context_id)) {
-                user_contexts[user_id] = context_id;
+            if (llama_manager && llama_manager->has_context(context_id)) {                user_contexts[user_id] = context_id;
                 return context_id;
             }
-              // FIXED: Use new API with model_id parameter and proper system prompt
+              // Use new API with model_id parameter and proper system prompt
             std::string system_prompt = get_system_prompt_for_new_context();
             if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, system_prompt)) {
                 user_contexts[user_id] = context_id;
@@ -312,11 +311,10 @@ private:    void setup_event_handlers() {
             std::string context_id = "discord_channel_" + std::to_string(channel_id);
             
             // Check if context already exists before trying to create
-            if (llama_manager && llama_manager->has_context(context_id)) {
-                channel_contexts[channel_id] = context_id;
+            if (llama_manager && llama_manager->has_context(context_id)) {                channel_contexts[channel_id] = context_id;
                 return context_id;
             }
-              // FIXED: Use new API with model_id parameter and proper system prompt
+              // Use new API with model_id parameter and proper system prompt
             std::string system_prompt = get_system_prompt_for_new_context();
             if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, system_prompt)) {
                 channel_contexts[channel_id] = context_id;
@@ -403,10 +401,9 @@ public:
     void set_main_context_id(const std::string& context_id) {
         main_context_id = context_id;
     }
-    
-    // NEW: Set model ID for context creation
+      // Set model ID for context creation
     void set_model_id(const std::string& model_identifier) {
-        model_id = model_identifier.empty() ? "main_model" : model_identifier; // FIXED: Ensure non-empty
+        model_id = model_identifier.empty() ? "main_model" : model_identifier;
     }
     
     void set_history_settings(bool pull_history, int32_t fill_percentage) {
@@ -420,9 +417,8 @@ public:
     }
     
     void set_llama_manager(LlamaManager* manager) {
-        llama_manager = manager;
-        if (manager) {
-            // FIXED: Ensure model_id is set before configuring history loader
+        llama_manager = manager;        if (manager) {
+            // Ensure model_id is set before configuring history loader
             if (model_id.empty()) {
                 model_id = "main_model";
             }
@@ -444,9 +440,8 @@ public:
             uint32_t intents = dpp::i_default_intents | dpp::i_message_content;
             bot = std::make_unique<dpp::cluster>(config.bot_token, intents);
             setup_event_handlers();
-            
-            if (history_loader && llama_manager) {
-                // FIXED: Ensure model_id is set before configuring history loader
+              if (history_loader && llama_manager) {
+                // Ensure model_id is set before configuring history loader
                 if (model_id.empty()) {
                     model_id = "main_model";
                 }

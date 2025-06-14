@@ -283,8 +283,7 @@ inline void LlamaSummarizer::prune_message_history(std::vector<std::pair<std::st
         new_history.emplace_back("system", "[Note: " + std::to_string(summarized_count - fallback_keep) + 
                                 " older messages removed due to context limits]");
     }
-    
-    // FIXED: Do NOT add summary slots to message history during regular pruning
+      // Do NOT add summary slots to message history during regular pruning
     // Summary slots are maintained separately and only used for rollover summarization
     // The actual summaries are not part of the conversation context
     

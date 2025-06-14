@@ -1364,7 +1364,7 @@ private:
                 ui.discord_btn->SetLabel("Disconnect Discord");
                 AddSystemMessage("Discord bot connecting...");
                 
-                // UPDATED: Simplified backfill monitoring for new structure
+                // Simplified backfill monitoring for new structure
                 std::thread([this]() {
                     bool backfill_reported = false;
                     

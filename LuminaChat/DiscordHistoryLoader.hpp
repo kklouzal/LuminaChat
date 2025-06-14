@@ -75,7 +75,7 @@ private:    // Core dependencies
     dpp::cluster* bot = nullptr;
     LlamaManager* llama_manager = nullptr;
     std::string main_context_id;
-    std::string model_id; // NEW: Store model ID for context creation
+    std::string model_id; // Store model ID for context creation
     
     // Bot identification for recognizing own messages
     uint64_t bot_user_id = 0;
@@ -120,7 +120,7 @@ private:    // Core dependencies
         return isolated_channels && isolated_channels->count(channel_id);
     }
     
-    // NEW: Initialize context capacities once at start
+    // Initialize context capacities once at start
     void initialize_context_capacities() {
         std::lock_guard<std::mutex> lock(capacity_mutex);
         context_capacity_limits.clear();
@@ -160,7 +160,7 @@ private:    // Core dependencies
         DISCORD_HISTORY_LOG("Initialized capacity tracking for " + std::to_string(unique_contexts.size()) + " contexts");
     }
     
-    // SIMPLIFIED: Check capacity without context switching
+    // Check capacity without context switching
     bool can_add_more_messages_estimated_no_switch(const std::string& context_id, int32_t additional_tokens) {
         std::lock_guard<std::mutex> lock(capacity_mutex);
         
@@ -174,13 +174,13 @@ private:    // Core dependencies
         return (current_it->second + additional_tokens) < capacity_it->second;
     }
     
-    // NEW: Update estimated token usage without context switching
+    // Update estimated token usage without context switching
     void update_estimated_token_usage(const std::string& context_id, int32_t additional_tokens) {
         std::lock_guard<std::mutex> lock(capacity_mutex);
         context_current_tokens[context_id] += additional_tokens;
     }
     
-    // SIMPLIFIED: Direct message fetching and processing
+    // Direct message fetching and processing
     bool process_channel_batch(uint64_t channel_id) {
         auto& state = channel_states[channel_id];
         if (state.fetch_complete) {
@@ -231,7 +231,7 @@ private:    // Core dependencies
         }
     }
     
-    // MODIFIED: Collect messages with exact tokenization using LlamaManager
+    // Collect messages with exact tokenization using LlamaManager
     bool collect_messages_for_later(const dpp::message_map& messages, uint64_t channel_id) {
         if (messages.empty()) return false;
         
@@ -275,7 +275,7 @@ private:    // Core dependencies
                 pending.message_id = static_cast<uint64_t>(msg.id);
                 pending.target_context_id = state.context_id;
                 
-                // FIXED: Use LlamaManager's new public tokenization method
+                // Use LlamaManager's new public tokenization method
                 std::string formatted_message;
                 if (is_our_bot) {
                     // For bot messages, don't include username prefix since it's "assistant"
@@ -325,7 +325,7 @@ private:    // Core dependencies
             {
                 std::lock_guard<std::mutex> lock(state_mutex);
                 state.messages_fetched += static_cast<int32_t>(batch_messages.size());
-                // FIXED: Set last_message_id to oldest message for next API call to fetch older messages
+                // Set last_message_id to oldest message for next API call to fetch older messages
                 if (oldest_id != UINT64_MAX) {
                     state.last_message_id = oldest_id;
                 }
@@ -353,7 +353,7 @@ private:    // Core dependencies
             
             DISCORD_HISTORY_LOG("Channel " + std::to_string(channel_id) + " completed - context capacity reached (" + capacity_info + ")");
         } else {
-            // FIXED: Even if no messages were added, update the last_message_id to continue pagination
+            // Even if no messages were added, update the last_message_id to continue pagination
             std::lock_guard<std::mutex> lock(state_mutex);
             if (oldest_id != UINT64_MAX) {
                 state.last_message_id = oldest_id;
@@ -365,7 +365,7 @@ private:    // Core dependencies
         return false;
     }
     
-    // MODIFIED: Apply collected messages using pre-tokenized content
+    // Apply collected messages using pre-tokenized content
     void apply_collected_messages() {
         std::lock_guard<std::mutex> lock(pending_messages_mutex);
         if (pending_messages.empty()) return;
@@ -424,7 +424,7 @@ private:    // Core dependencies
         DISCORD_HISTORY_LOG("Tokenized message application phase completed");
     }
     
-    // SIMPLIFIED: Round-robin for shared channels
+    // Round-robin for shared channels
     uint64_t get_next_shared_channel() {
         if (shared_channels_list.empty()) return 0;
         
@@ -433,7 +433,7 @@ private:    // Core dependencies
         return channel_id;
     }
     
-    // MODIFIED: Updated main processing loop with proper isolated vs shared handling
+    // Updated main processing loop with proper isolated vs shared handling
     void process_all_channels() {
         const int32_t MAX_ITERATIONS = 1000;
         int32_t iteration = 0;
@@ -543,10 +543,10 @@ public:
         bot = discord_bot;
         llama_manager = llama_mgr;
         main_context_id = main_ctx_id;
-        model_id = model_identifier; // NEW: Store model ID
+        model_id = model_identifier;
     }
     
-    // NEW: Set bot identification information for recognizing own messages
+    // Set bot identification information for recognizing own messages
     void set_bot_identity(uint64_t user_id, const std::string& username) {
         bot_user_id = user_id;
         bot_username = username;
@@ -590,7 +590,7 @@ public:
         shared_channels_list.clear();
         shared_channel_index = 0;
         
-        // FIXED: Validate prerequisites before proceeding
+        // Validate prerequisites before proceeding
         if (model_id.empty()) {
             DISCORD_HISTORY_LOG("Error: No model_id configured for context creation");
             backfill_in_progress = false;
@@ -617,7 +617,7 @@ public:
                                   if (state.is_isolated) {
                                     state.context_id = "discord_channel_" + std::to_string(channel_id);
                                     
-                                    // FIXED: Validate model_id and create context with proper system prompt
+                                    // Validate model_id and create context with proper system prompt
                                     if (!model_id.empty()) {
                                         if (!llama_manager->has_context(state.context_id)) {
                                             // Get system prompt from main context
@@ -650,7 +650,7 @@ public:
                                     state.context_id = main_context_id;
                                     shared_channels_list.push_back(channel_id);
                                     
-                                    // FIXED: Validate main context exists
+                                    // Validate main context exists
                                     if (!llama_manager->has_context(main_context_id)) {
                                         DISCORD_HISTORY_LOG("Error: Main context '" + main_context_id + "' does not exist");
                                         continue; // Skip this channel
@@ -673,7 +673,7 @@ public:
             std::thread([this]() {
                 std::this_thread::sleep_for(std::chrono::seconds(2));
                 if (backfill_in_progress) {
-                    // FIXED: Validate we have channels to process before starting
+                    // Validate we have channels to process before starting
                     {
                         std::lock_guard<std::mutex> lock(state_mutex);
                         if (channel_states.empty()) {

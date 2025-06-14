@@ -297,12 +297,7 @@ public:
                         } else if (key == "HistoryFillPercentage") {
                             discord_history_fill_percentage = ValidateInt32(value, DEFAULT_HISTORY_FILL_PERCENTAGE, MIN_HISTORY_PERCENTAGE, MAX_HISTORY_PERCENTAGE);
                             loaded_count++;
-                            SETTINGS_LOG("Loaded HistoryFillPercentage: " + std::to_string(discord_history_fill_percentage) + "%");
-                        }
-                        // Legacy support: ignore old ChannelIds setting if present
-                        else if (key == "ChannelIds") {
-                            SETTINGS_LOG("Ignored legacy ChannelIds setting (no longer used)");
-                        }
+                            SETTINGS_LOG("Loaded HistoryFillPercentage: " + std::to_string(discord_history_fill_percentage) + "%");                        }
                     } else if (current_section == "Summarizer") {
                         if (key == "ModelPath") {
                             summarizer_model_path = UnescapeString(value);

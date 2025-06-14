@@ -222,17 +222,7 @@ public:
     // Public utility methods for validation (can be used by LlamaManager for state checking)
     static bool validate_sampler(ModelInfo* model_info) {
         return validate_and_recover_sampler(model_info);
-    }
-
-    static bool validate_context_for_generation(ContextInfo* context_info, ModelInfo* model_info) {
-        return validate_generation_state(context_info, model_info);
-    }
-
-    static bool attempt_logits_recovery(ContextInfo* context_info, ModelInfo* model_info) {
-        return recover_logits(context_info, model_info);
-    }
-
-    // Main response generation function
+    }    // Main response generation function
     // Dependencies: Requires valid ModelInfo, ContextInfo, and proper LlamaManager integration
     template<typename BatchTokenAdder, typename ContextUpdater>
     std::string generate_response(const std::string& input, const std::string& username,
