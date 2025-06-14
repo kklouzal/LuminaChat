@@ -32,16 +32,16 @@
 // Enable Run-Time Type Information (RTTI) YES (/GR)
 //
 // CRITICAL CODING DIRECTIVES:
-// 1.  Minimalism & Performance: Deliver lean, efficient solutions; do not create or preserve unused helpers or wrappers.
-// 2.  Redundancy Elimination: Remove unused, obsolete, and legacy code—including unneeded interfaces and includes.
+// 1.  Minimalism & Performance: Deliver lean, efficient solutions; do not create or preserve unused helpers, wrappers, trivial accessors (setters/getters), or scaffolding.
+// 2.  Redundancy Elimination: Remove unused, obsolete, and legacy code—including unneeded interfaces, includes, helper or accessor methods.
 // 3.  Consistent Style: Adopt a uniform coding style and structure for clarity and maintainability.
 // 4.  Documentation: Write concise comments that explain complex logic and key design decisions.
-// 5.  Zero Magic & Strong Typing: Replace magic literals with named constants, enums, or constexpr; prefer scoped enums.
-// 6.  Function Boundaries: Define clear responsibilities; reduce overlap and avoid unnecessary layers.
-// 7.  Core Preservation: Streamline code while safeguarding essential features; favor direct access over extra abstractions.
+// 5.  Zero Magic & Strong Typing: Replace magic literals with named constants, enums, or constexpr; prefer scoped enums over raw ints.
+// 6.  Function Boundaries: Define clear responsibilities; reduce overlap and avoid unnecessary layers of indirection.
+// 7.  Core Preservation: Streamline code while safeguarding essential features; favor direct variable or object access/passing over extra abstractions (e.g., setters/getters).
 // 8.  Const-Correctness & Immutability: Mark variables, parameters, and methods as const wherever possible.
 // 9.  RAII & Resource Safety: Encapsulate resource acquisition/release in constructors/destructors or smart pointers.
-// 10. Standard Library Preference: Favor STL algorithms and containers over custom loops and buffers.
+// 10. Standard Library Preference: Favor STL algorithms and containers over custom loops and buffers for clarity and safety.
 // 11. Cross-Platform Portability: Use fixed-width types and proper initialization to guarantee identical behavior everywhere.
 // 12. Thread Safety: Define and document thread-safety contracts; protect shared state with mutexes, atomics, or thread-safe containers.
 // 13. Smart Caching: Cache frequently used values to minimize allocations and improve performance.
@@ -937,26 +937,16 @@ public:
             return 0;
         }
         return it->second->n_past;
-    }
-      // Get the system message from the current context
+    }    // Get the system message from the current context (internal use only)
     const std::string& get_current_system_message() const noexcept {
         static const std::string empty_string;
         if (!current_context) return empty_string;
-        return current_context->system_message;    }
-    
-    // Set the reset before generation flag for a specific context
-    bool set_context_reset_flag(const std::string& context_id, bool reset_after_generation) {
-        auto it = contexts.find(context_id);
-        if (it == contexts.end()) {
-            LLAMA_LOG("Error: Context '" + context_id + "' not found");
-            return false;
-        }
-        
-        it->second->reset_after_generation = reset_after_generation;
-        LLAMA_LOG("Set reset_before_generation flag to " + std::string(reset_after_generation ? "true" : "false") + 
-                  " for context '" + context_id + "'");
-        return true;
-    }    // Clear conversation history
+        return current_context->system_message;
+    }
+
+private:
+
+public:// Clear conversation history
     void clear_conversation();// Prune message history with summarization and context update
     bool prune_conversation_with_summary(float keep_ratio = 0.6f);
 
@@ -1445,17 +1435,10 @@ public:
         current_context->message_history.emplace_back(role, content);
         current_context->message_cache_dirty = true;
     }
-    
-    // Get context size for capacity calculations - uses model-specific value
+      // Get context size for capacity calculations - uses model-specific value
     int32_t get_context_size() const noexcept {
         ModelInfo* model_info = get_current_model_info();
         return model_info ? model_info->n_ctx : LlamaConstants::DEFAULT_CONTEXT_SIZE; // Default fallback
-    }
-
-    // Get current context token usage
-    int32_t get_context_usage() const noexcept {
-        if (!current_context) return 0;
-        return current_context->n_past;
     }
     
     // Enhanced batch update with proper token tracking
@@ -1524,7 +1507,8 @@ public:
         return process_text_to_tokens(text, add_special);
     }
 
-private:    int32_t calculate_optimal_batch_size() const {
+private:
+    int32_t calculate_optimal_batch_size() const {
         if (!current_context || !current_context->context) {
             return LlamaConstants::MAX_BATCH_SIZE;
         }
@@ -1603,7 +1587,7 @@ inline void LlamaManager::clear_conversation() {
     }
     current_context->message_history.clear();
     if (current_context->summarizer) {
-        current_context->summarizer->clear_summary_slots(); // Clear summary slots when conversation is cleared
+        current_context->summarizer->summary_slots.clear(); // Clear summary slots when conversation is cleared (Directive #7: direct access)
     }
     current_context->message_cache_dirty = true;
     current_context->n_past = 0;

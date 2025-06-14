@@ -14,16 +14,16 @@
 // Enable Run-Time Type Information (RTTI) YES (/GR)
 //
 // CRITICAL CODING DIRECTIVES:
-// 1.  Minimalism & Performance: Deliver lean, efficient solutions; do not create or preserve unused helpers or wrappers.
-// 2.  Redundancy Elimination: Remove unused, obsolete, and legacy code—including unneeded interfaces and includes.
+// 1.  Minimalism & Performance: Deliver lean, efficient solutions; do not create or preserve unused helpers, wrappers, trivial accessors (setters/getters), or scaffolding.
+// 2.  Redundancy Elimination: Remove unused, obsolete, and legacy code—including unneeded interfaces, includes, helper or accessor methods.
 // 3.  Consistent Style: Adopt a uniform coding style and structure for clarity and maintainability.
 // 4.  Documentation: Write concise comments that explain complex logic and key design decisions.
-// 5.  Zero Magic & Strong Typing: Replace magic literals with named constants, enums, or constexpr; prefer scoped enums.
-// 6.  Function Boundaries: Define clear responsibilities; reduce overlap and avoid unnecessary layers.
-// 7.  Core Preservation: Streamline code while safeguarding essential features; favor direct access over extra abstractions.
+// 5.  Zero Magic & Strong Typing: Replace magic literals with named constants, enums, or constexpr; prefer scoped enums over raw ints.
+// 6.  Function Boundaries: Define clear responsibilities; reduce overlap and avoid unnecessary layers of indirection.
+// 7.  Core Preservation: Streamline code while safeguarding essential features; favor direct variable or object access/passing over extra abstractions (e.g., setters/getters).
 // 8.  Const-Correctness & Immutability: Mark variables, parameters, and methods as const wherever possible.
 // 9.  RAII & Resource Safety: Encapsulate resource acquisition/release in constructors/destructors or smart pointers.
-// 10. Standard Library Preference: Favor STL algorithms and containers over custom loops and buffers.
+// 10. Standard Library Preference: Favor STL algorithms and containers over custom loops and buffers for clarity and safety.
 // 11. Cross-Platform Portability: Use fixed-width types and proper initialization to guarantee identical behavior everywhere.
 // 12. Thread Safety: Define and document thread-safety contracts; protect shared state with mutexes, atomics, or thread-safe containers.
 // 13. Smart Caching: Cache frequently used values to minimize allocations and improve performance.
@@ -64,14 +64,11 @@ private:
     std::unique_ptr<dpp::cluster> bot;
     std::unique_ptr<DiscordHistoryLoader> history_loader;
     LlamaManager* llama_manager;
-    
-    // Configuration
+
+      // Configuration
     DiscordBotConfig config;
-    std::string main_context_id;
-    std::string model_id = "main_model";
-    
+
     // State
-    std::atomic<bool> is_running{false};
     std::atomic<bool> is_connected{false};
     std::atomic<bool> should_stop{false};
     
@@ -102,13 +99,22 @@ private:
     static constexpr int32_t RETRY_DELAY_MS = 500;
 
 public:
+    // State
+    std::atomic<bool> is_running{ false };
+
+    // Configuration
+    std::string main_context_id;
+
+    std::string model_id = "main_model";
+
     using BackfillStatus = DiscordHistoryLoader::BackfillStatus;
     
     BackfillStatus get_backfill_status() const {
         return history_loader ? history_loader->get_status() : BackfillStatus{};
     }
 
-private:    void setup_event_handlers() {
+private:
+    void setup_event_handlers() {
         if (!bot) return;
         
         bot->on_ready([this](const dpp::ready_t& event) {
@@ -397,15 +403,7 @@ public:
         std::lock_guard<std::mutex> lock(channel_config_mutex);
         allow_dms = allow;
     }
-    
-    void set_main_context_id(const std::string& context_id) {
-        main_context_id = context_id;
-    }
-      // Set model ID for context creation
-    void set_model_id(const std::string& model_identifier) {
-        model_id = model_identifier.empty() ? "main_model" : model_identifier;
-    }
-    
+
     void set_history_settings(bool pull_history, int32_t fill_percentage) {
         std::lock_guard<std::mutex> lock(channel_config_mutex);
         pull_message_history = pull_history;
@@ -540,10 +538,9 @@ public:
             return false;
         }
     }
-    
-    // Status and statistics
-    bool is_bot_running() const { return is_running; }
-    bool is_bot_connected() const { return is_connected; }
+      // Status and statistics  
+    // Direct access to is_running (Directive #7: favor direct access over thin accessors)
+    // Removed unused is_bot_connected() method (Directive #2: Redundancy Elimination)
     
     struct BotStatistics {
         uint64_t messages_processed;

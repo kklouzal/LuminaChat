@@ -9,21 +9,21 @@
 // Enable Run-Time Type Information (RTTI) YES (/GR)
 //
 // CRITICAL CODING DIRECTIVES:
-// 1.  Minimalism & Performance: Deliver lean, efficient solutions; do not create or preserve unused helpers or wrappers.
-// 2.  Consistent Style: Adopt a uniform coding style and structure for clarity and maintainability.
-// 3.  Documentation: Write concise comments that explain complex logic and key design decisions.
-// 4.  Redundancy Elimination: Remove unused, obsolete, and legacy code—including unneeded interfaces and includes.
-// 5.  Function Boundaries: Define clear responsibilities; reduce overlap and avoid unnecessary layers.
-// 6.  Core Preservation: Streamline code while safeguarding essential features; favor direct access over extra abstractions.
-// 7.  Cross-Platform Portability: Use fixed-width types and proper initialization to guarantee identical behavior everywhere.
-// 8.  Smart Caching: Cache frequently used values to minimize allocations and improve performance.
-// 9.  Logical Consistency: Verify code flow to ensure coherent, error-free execution paths.
-// 10. Continuous Refinement: Regularly refactor and confirm that updates preserve stable functionality.
-// 11. Const-Correctness & Immutability: Mark variables, parameters, and methods as const wherever possible.
-// 12. RAII & Resource Safety: Encapsulate resource acquisition/release in constructors/destructors or smart pointers.
-// 13. Zero Magic & Strong Typing: Replace magic literals with named constants, enums, or constexpr; prefer scoped enums.
-// 14. Standard Library Preference: Favor STL algorithms and containers over custom loops and buffers.
-// 15. Thread Safety: Define and document thread-safety contracts; protect shared state with mutexes, atomics, or thread-safe containers.
+// 1.  Minimalism & Performance: Deliver lean, efficient solutions; do not create or preserve unused helpers, wrappers, trivial accessors (setters/getters), or scaffolding.
+// 2.  Redundancy Elimination: Remove unused, obsolete, and legacy code—including unneeded interfaces, includes, helper or accessor methods.
+// 3.  Consistent Style: Adopt a uniform coding style and structure for clarity and maintainability.
+// 4.  Documentation: Write concise comments that explain complex logic and key design decisions.
+// 5.  Zero Magic & Strong Typing: Replace magic literals with named constants, enums, or constexpr; prefer scoped enums over raw ints.
+// 6.  Function Boundaries: Define clear responsibilities; reduce overlap and avoid unnecessary layers of indirection.
+// 7.  Core Preservation: Streamline code while safeguarding essential features; favor direct variable or object access/passing over extra abstractions (e.g., setters/getters).
+// 8.  Const-Correctness & Immutability: Mark variables, parameters, and methods as const wherever possible.
+// 9.  RAII & Resource Safety: Encapsulate resource acquisition/release in constructors/destructors or smart pointers.
+// 10. Standard Library Preference: Favor STL algorithms and containers over custom loops and buffers for clarity and safety.
+// 11. Cross-Platform Portability: Use fixed-width types and proper initialization to guarantee identical behavior everywhere.
+// 12. Thread Safety: Define and document thread-safety contracts; protect shared state with mutexes, atomics, or thread-safe containers.
+// 13. Smart Caching: Cache frequently used values to minimize allocations and improve performance.
+// 14. Logical Consistency: Verify code flow to ensure coherent, error-free execution paths.
+// 15. Continuous Refinement: Regularly refactor and confirm that updates preserve stable functionality.
 
 #include <wx/wx.h>
 #include <wx/filedlg.h>
@@ -1002,7 +1002,7 @@ private:
     void UpdateDiscordButtonState() noexcept {
         if (!ui.discord_btn || !discord_manager) return;
         
-        ui.discord_btn->SetLabel(discord_manager->is_bot_running() ? 
+        ui.discord_btn->SetLabel(discord_manager->is_running.load() ? 
                                "Disconnect Discord" : "Connect Discord");
     }
     
@@ -1273,10 +1273,10 @@ private:
                 context_monitor_timer->Start(UIConstants::CONTEXT_MONITOR_INTERVAL_MS);
             }
               // Connect Discord manager to LlamaManager when model is loaded
-            if (discord_manager && discord_manager->is_bot_running()) {
+            if (discord_manager && discord_manager->is_running.load()) {
                 discord_manager->set_llama_manager(llama_manager.get());
-                discord_manager->set_main_context_id("main_chat");
-                discord_manager->set_model_id("main_model");
+                discord_manager->main_context_id = "main_chat";
+                discord_manager->model_id = "main_model";
                 DISCORD_LOG("Discord bot connected to loaded model");
             }
             
@@ -1315,7 +1315,7 @@ private:
         ui.context_progress_bar->SetForegroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_HIGHLIGHT));
         
         // Disconnect Discord manager from LlamaManager when model is stopped
-        if (discord_manager && discord_manager->is_bot_running()) {
+        if (discord_manager && discord_manager->is_running.load()) {
             discord_manager->set_llama_manager(nullptr);
             DISCORD_LOG("Discord bot disconnected from model");
         }
@@ -1335,7 +1335,7 @@ private:
             return;
         }
         
-        if (discord_manager->is_bot_running()) {
+        if (discord_manager->is_running.load()) {
             // Stop Discord bot
             discord_manager->shutdown();
             ui.discord_btn->SetLabel("Connect Discord");
@@ -1357,8 +1357,8 @@ private:
             }
               // Set up integration with LlamaManager
             discord_manager->set_llama_manager(llama_manager.get());
-            discord_manager->set_main_context_id("main_chat");
-            discord_manager->set_model_id("main_model");
+            discord_manager->main_context_id = "main_chat";
+            discord_manager->model_id = "main_model";
             discord_manager->set_isolated_channels(config.discord_isolated_channels);
             discord_manager->set_shared_history_channels(config.discord_shared_channels);
             discord_manager->set_allow_dms(config.discord_allow_dms);
