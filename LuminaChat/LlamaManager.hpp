@@ -176,11 +176,9 @@ private:
     
     std::unordered_map<std::string, std::unique_ptr<ModelInfo>> models;
     std::unordered_map<std::string, std::unique_ptr<ContextInfo>> contexts;
-    std::string active_context_id;
-    ContextInfo* current_context;
-      // Legacy compatibility - only keep model_loaded flag
-    bool model_loaded;
-      // Template and cache management
+    std::string active_context_id;    ContextInfo* current_context;
+    
+    // Template and cache management
     mutable std::string template_buffer;
     mutable TokenCache token_cache;
       // Working buffers
@@ -585,7 +583,7 @@ private:
     }
 
 public:
-    LlamaManager() : current_context(nullptr), model_loaded(false), token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE) {
+    LlamaManager() : current_context(nullptr), token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE) {
         summarizer = std::make_unique<LlamaSummarizer>(this);
     }
 
@@ -655,11 +653,7 @@ public:
         }
         
         llama_sampler_chain_add(model_info->sampler, llama_sampler_init_greedy());
-        
-        models[actual_model_id] = std::move(model_info);
-        
-        // Update legacy flags for compatibility
-        model_loaded = true;
+          models[actual_model_id] = std::move(model_info);
         
         // Clear caches when new model is loaded
         clear_caches();
@@ -923,7 +917,7 @@ public:
     }    // Enhanced context update with better tokenization handling - FIXED recursion issue
     bool update_context_with_pruning() {
         ModelInfo* model_info = get_current_model_info();
-        if (!model_loaded || !model_info || !model_info->model || !current_context || !current_context->context || !model_info->vocab) {
+        if (!model_info || !model_info->model || !current_context || !current_context->context || !model_info->vocab) {
             LLAMA_LOG("Error: Model components not initialized");
             return false;
         }
@@ -1071,7 +1065,7 @@ public:
     }    // Enhanced generation with response delegation to LlamaResponse
     std::string generate_response(const std::string& input, const std::string& username = "Schwi") {
         ModelInfo* model_info = get_current_model_info();
-        if (!model_loaded || !model_info || !model_info->model || !current_context || !current_context->context || !model_info->vocab || !current_context->batch_initialized) {
+        if (!model_info || !model_info->model_loaded || !model_info->model || !current_context || !current_context->context || !model_info->vocab || !current_context->batch_initialized) {
             return "Error: Model components not properly initialized or no active context";
         }
 
@@ -1330,11 +1324,8 @@ public:
         contexts.clear();
         active_context_id.clear();
         current_context = nullptr;
-        
-        // Clean up all models - ModelInfo destructor handles model cleanup
+          // Clean up all models - ModelInfo destructor handles model cleanup
         models.clear();
-        
-        model_loaded = false;
         
         // Efficient memory cleanup
         std::string().swap(template_buffer);
