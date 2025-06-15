@@ -282,7 +282,7 @@ private:    // Core dependencies
                 } else {
                     formatted_message = msg.author.username + ": " + actual_content;
                 }
-                pending.tokenized_content = llama_manager->tokenize_text(formatted_message, false);
+                pending.tokenized_content = llama_manager->process_text_to_tokens(formatted_message, false);
                 
                 // Check for reasonable token count limits
                 if (pending.tokenized_content.size() > 2048) {

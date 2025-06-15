@@ -160,9 +160,12 @@ struct ContextInfo {
     // Performance tracking
     int64_t total_generation_tokens = 0;
     int64_t last_decode_time_us = 0;
-      // Cache state
+
+    // Cache state
     mutable bool message_cache_dirty = true;
-    mutable std::vector<llama_chat_message> message_cache;    // Token count tracking for efficiency - maintains accurate count of tokens in message history
+    mutable std::vector<llama_chat_message> message_cache;
+    
+    // Token count tracking for efficiency - maintains accurate count of tokens in message history
     // Always >= 0, updated during context rebuilds and incremental updates
     // NOTE: This field was previously sometimes set to -1 to indicate invalidation,
     // but that pattern is no longer used. The count is now always maintained accurately.
@@ -170,12 +173,15 @@ struct ContextInfo {
     
     // Reference to associated model
     ModelInfo* model_info;
-      // Special flag for contexts that should reset before each generation
+
+    // Special flag for contexts that should reset before each generation
     // Primarily used for summary models that need a clean slate for each task
     bool reset_after_generation = false;
-      // Summarizer for handling conversation summarization per context
+
+    // Summarizer for handling conversation summarization per context
     std::unique_ptr<LlamaSummarizer> summarizer;
-      ContextInfo() : context(nullptr), batch{}, batch_initialized(false), 
+
+    ContextInfo() : context(nullptr), batch{}, batch_initialized(false), 
                    n_past(0), prev_len(0), message_history_token_count(0), model_info(nullptr) {
     }
     
@@ -211,7 +217,9 @@ private:
     mutable std::string temp_string_buffer;
 
     // Response generation handler
-    mutable LlamaResponse response_generator;    // Unified batch management - for single sequence processing
+    mutable LlamaResponse response_generator;
+    
+    // Unified batch management - for single sequence processing
     void clear_batch() {
         if (!current_context || !current_context->batch_initialized) return;
         current_context->batch.n_tokens = 0;
@@ -294,70 +302,6 @@ private:
     bool add_single_token_to_batch(llama_token token, int32_t pos, 
                                   const std::vector<llama_seq_id>& seq_ids, bool output_logits = true) {
         return add_tokens_to_batch({token}, pos, seq_ids, output_logits);
-    }
-
-    // Unified tokenization with caching - Updated to use context's model
-    std::vector<llama_token> process_text_to_tokens(const std::string& text, bool add_special = true) const {
-        if (text.empty()) return {};
-        
-        // Get vocab from current context's model
-        if (!current_context || !current_context->model_info || !current_context->model_info->vocab) {
-            LLAMA_LOG("Error: No vocabulary available from current context's model");
-            return {};
-        }
-        
-        std::string cache_key = text + (add_special ? ":s" : ":n");
-        
-        // Check cache first
-        std::vector<llama_token> cached_tokens = token_cache.get(cache_key);
-        if (!cached_tokens.empty()) {
-            return cached_tokens;
-        }
-        
-        // Get required buffer size for tokenization
-        const int32_t n_tokens_required = -llama_tokenize(current_context->model_info->vocab, text.c_str(), text.size(), nullptr, 0, add_special, true);
-        if (n_tokens_required <= 0) {
-            // Don't treat empty tokenization as warning for whitespace-only text
-            if (std::all_of(text.begin(), text.end(), [](char c) { return std::isspace(c); })) {
-                // Cache empty result for whitespace-only strings
-                token_cache.put(cache_key, {});
-                return {};
-            }            LLAMA_LOG("Warning: Text tokenization failed or resulted in 0 tokens: '" + 
-                       text.substr(0, LlamaConstants::MAX_TEXT_PREVIEW_LENGTH) + (text.size() > LlamaConstants::MAX_TEXT_PREVIEW_LENGTH ? "..." : "") + "'");
-            return {};
-        }
-        
-        // Add bounds checking for extremely large token counts
-        if (n_tokens_required > current_context->model_info->n_ctx) {
-            LLAMA_LOG("Error: Text would produce " + std::to_string(n_tokens_required) + 
-                       " tokens, exceeding context limit of " + std::to_string(current_context->model_info->n_ctx));
-            return {};
-        }
-        
-        // Allocate buffer and tokenize
-        std::vector<llama_token> tokens(n_tokens_required);
-        const int32_t n_tokens_actual = llama_tokenize(current_context->model_info->vocab, text.c_str(), text.size(), 
-                                                       tokens.data(), tokens.size(), add_special, true);
-        
-        if (n_tokens_actual < 0) {
-            LLAMA_LOG("Error: Tokenization failed with error code: " + std::to_string(n_tokens_actual));
-            return {};
-        }
-        
-        // Handle case where actual tokens is 0 but expected was > 0
-        if (n_tokens_actual == 0 && n_tokens_required > 0) {
-            LLAMA_LOG("Warning: Expected " + std::to_string(n_tokens_required) + " tokens but got 0");
-            tokens.clear();
-        } else if (n_tokens_actual != n_tokens_required) {
-            LLAMA_LOG("Warning: Token count mismatch - expected " + std::to_string(n_tokens_required) + 
-                       ", got " + std::to_string(n_tokens_actual));
-            tokens.resize(std::max(0, n_tokens_actual)); // Ensure non-negative size
-        }
-        
-        // Cache the result
-        token_cache.put(cache_key, tokens);
-        
-        return tokens;
     }
 
     // REFACTOR: Enhanced context processing - Updated for proper single-input batching
@@ -451,7 +395,7 @@ private:
                 LLAMA_LOG("Note: Large incremental update, using incremental batch processing");
                 return process_large_context_incrementally(tokens, n_batch);
             }
-        }else {
+        } else {
             // Process all tokens in a single batch (normal case)
             bool output_logits = is_incremental;
             
@@ -655,11 +599,14 @@ private:
         if (current_context->message_history.empty()) {
             LLAMA_LOG("Warning: Empty message history");
             return true; // This is actually okay
-        }        // Check for extremely long message history that might cause issues
+        }
+        
+        // Check for extremely long message history that might cause issues
         if (current_context->message_history.size() > LlamaConstants::MAX_MESSAGE_HISTORY_SIZE) {
             LLAMA_LOG("Starting context rebuild: PARTIAL (history validation) - very large message history (" + 
                       std::to_string(current_context->message_history.size()) + " messages), triggering aggressive pruning");
-              // Only trigger aggressive pruning if we're not already in a summary context
+            
+            // Only trigger aggressive pruning if we're not already in a summary context
             if (active_context_id != "summary_context") {
                 // Clear context state before aggressive pruning
                 if (current_context->context) {
@@ -752,8 +699,8 @@ public:
             return false;
         }
         
-        llama_sampler_chain_add(model_info->sampler, llama_sampler_init_greedy());
-          models[actual_model_id] = std::move(model_info);*/
+        llama_sampler_chain_add(model_info->sampler, llama_sampler_init_greedy());*/
+          models[actual_model_id] = std::move(model_info);
         
         // Clear caches when new model is loaded
         clear_caches();
@@ -948,7 +895,70 @@ public:
         return it->second.get();
     }
 
-public:
+    // Unified tokenization with caching - Updated to use context's model
+    std::vector<llama_token> process_text_to_tokens(const std::string& text, bool add_special = true) const {
+        if (text.empty()) return {};
+        
+        // Get vocab from current context's model
+        if (!current_context || !current_context->model_info || !current_context->model_info->vocab) {
+            LLAMA_LOG("Error: No vocabulary available from current context's model");
+            return {};
+        }
+        
+        std::string cache_key = text + (add_special ? ":s" : ":n");
+        
+        // Check cache first
+        std::vector<llama_token> cached_tokens = token_cache.get(cache_key);
+        if (!cached_tokens.empty()) {
+            return cached_tokens;
+        }
+        
+        // Get required buffer size for tokenization
+        const int32_t n_tokens_required = -llama_tokenize(current_context->model_info->vocab, text.c_str(), text.size(), nullptr, 0, add_special, true);
+        if (n_tokens_required <= 0) {
+            // Don't treat empty tokenization as warning for whitespace-only text
+            if (std::all_of(text.begin(), text.end(), [](char c) { return std::isspace(c); })) {
+                // Cache empty result for whitespace-only strings
+                token_cache.put(cache_key, {});
+                return {};
+            }            LLAMA_LOG("Warning: Text tokenization failed or resulted in 0 tokens: '" + 
+                       text.substr(0, LlamaConstants::MAX_TEXT_PREVIEW_LENGTH) + (text.size() > LlamaConstants::MAX_TEXT_PREVIEW_LENGTH ? "..." : "") + "'");
+            return {};
+        }
+        
+        // Add bounds checking for extremely large token counts
+        if (n_tokens_required > current_context->model_info->n_ctx) {
+            LLAMA_LOG("Error: Text would produce " + std::to_string(n_tokens_required) + 
+                       " tokens, exceeding context limit of " + std::to_string(current_context->model_info->n_ctx));
+            return {};
+        }
+        
+        // Allocate buffer and tokenize
+        std::vector<llama_token> tokens(n_tokens_required);
+        const int32_t n_tokens_actual = llama_tokenize(current_context->model_info->vocab, text.c_str(), text.size(), 
+                                                       tokens.data(), tokens.size(), add_special, true);
+        
+        if (n_tokens_actual < 0) {
+            LLAMA_LOG("Error: Tokenization failed with error code: " + std::to_string(n_tokens_actual));
+            return {};
+        }
+        
+        // Handle case where actual tokens is 0 but expected was > 0
+        if (n_tokens_actual == 0 && n_tokens_required > 0) {
+            LLAMA_LOG("Warning: Expected " + std::to_string(n_tokens_required) + " tokens but got 0");
+            tokens.clear();
+        } else if (n_tokens_actual != n_tokens_required) {
+            LLAMA_LOG("Warning: Token count mismatch - expected " + std::to_string(n_tokens_required) + 
+                       ", got " + std::to_string(n_tokens_actual));
+            tokens.resize(std::max(0, n_tokens_actual)); // Ensure non-negative size
+        }
+        
+        // Cache the result
+        token_cache.put(cache_key, tokens);
+        
+        return tokens;
+    }
+    
     // Clear conversation history
     void clear_conversation();// Prune message history with summarization and context update
     bool prune_conversation_with_summary(float keep_ratio = 0.6f);
@@ -1338,7 +1348,8 @@ public:
         contexts.clear();
         active_context_id.clear();
         current_context = nullptr;
-          // Clean up all models - ModelInfo destructor handles model cleanup
+        
+        // Clean up all models - ModelInfo destructor handles model cleanup
         models.clear();
         
         // Efficient memory cleanup
@@ -1404,12 +1415,6 @@ public:
         return true;
     }
 
-public:
-    // Public tokenization method for external use
-    std::vector<llama_token> tokenize_text(const std::string& text, bool add_special = false) const {
-        return process_text_to_tokens(text, add_special);
-    }
-
 private:
     int32_t calculate_optimal_batch_size() const {
         if (!current_context || !current_context->context) {
@@ -1425,8 +1430,10 @@ private:
         
         return std::max(1, std::min({n_batch, available_ctx, LlamaConstants::MAX_BATCH_SIZE}));
     }
-      void clear_caches() const {
-        token_cache.clear();    }
+
+    void clear_caches() const {
+        token_cache.clear();
+    }
 };
 
 // Include LlamaSummarizer implementation after class declaration to avoid circular dependency
@@ -1475,7 +1482,8 @@ inline bool LlamaManager::prune_conversation_with_summary(float keep_ratio) {
     } else {
         LLAMA_LOG("Warning: Context update failed after manual pruning");
     }
-      return success;
+
+    return success;
 }
 
 inline void LlamaManager::clear_conversation() {
