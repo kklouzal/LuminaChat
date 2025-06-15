@@ -1103,9 +1103,7 @@ private:
             wxMessageBox("Failed to switch to main chat context.", "Context Error", 
                         wxOK | wxICON_ERROR);
             return;
-        }
-
-        try {
+        }        try {
             // Show progress
             AddSystemMessage("Starting prune and summarize (keeping 90% of context)...");
             
@@ -1113,8 +1111,14 @@ private:
             bool success = llama_manager->prune_conversation_with_summary(0.9f);
             
             if (success) {
-                AddSystemMessage("Context pruned and summarized successfully.");
-                UpdateContextProgress();
+                // Update context after pruning
+                success = llama_manager->update_context_from_history();
+                if (success) {
+                    AddSystemMessage("Context pruned and summarized successfully.");
+                    UpdateContextProgress();
+                } else {
+                    AddSystemMessage("Pruning succeeded but failed to update context.");
+                }
             } else {
                 AddSystemMessage("Failed to prune and summarize context.");
             }
