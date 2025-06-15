@@ -260,20 +260,10 @@ private:
     std::string get_system_prompt_for_new_context() const {
         if (!llama_manager || main_context_id.empty()) return "";
         
-        // Store the original context to restore it later
-        std::string original_context = llama_manager->get_active_context();
-        std::string system_prompt;
-        
-        // Switch to main context temporarily to get its system message
-        if (llama_manager->switch_to_context(main_context_id)) {
-            // Get the system message from the main context
-            system_prompt = llama_manager->get_current_system_message();
-            
-            // Restore original context if needed
-            if (!original_context.empty() && original_context != main_context_id) {
-                llama_manager->switch_to_context(original_context);
-            }
-        }
+        // Get the main context info to retrieve system prompt
+        auto context_info = llama_manager->get_context_info(main_context_id);
+        // get the system message from the main context
+        std::string system_prompt = context_info->system_message;
         
         return system_prompt;
     }
@@ -506,8 +496,11 @@ public:
                 std::string footer_text = "🤖 LuminaChat AI";
                 
                 if (llama_manager && !context_id.empty()) {
-                    int32_t context_usage = llama_manager->get_context_usage_for(context_id);
-                    int32_t context_size = llama_manager->get_context_size_for(context_id);
+                    // Get ContextInfo for the context ID
+                    auto context_info = llama_manager->get_context_info(context_id);
+                    
+                    int32_t context_usage = context_info->n_past;
+                    int32_t context_size = context_info->get_context_size();
                     
                     if (context_size > 0) {
                         footer_text += " • Context: " + std::to_string(context_usage) + "/" + std::to_string(context_size);

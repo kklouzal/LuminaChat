@@ -360,6 +360,7 @@ private:
         
         return tokens;
     }
+
     // REFACTOR: Enhanced context processing - Updated for proper single-input batching
     // NOTE: Batching in llama.cpp is designed for processing multiple separate inputs/sequences 
     // simultaneously, NOT for splitting a single input into chunks. Each batch operation should
@@ -681,7 +682,9 @@ private:
         }
         
         return true; // State is valid
-    }    // Helper to get current model info
+    }
+    
+    // Helper to get current model info
     ModelInfo* get_current_model_info() const noexcept {
         return current_context ? current_context->model_info : nullptr;
     }
@@ -692,7 +695,9 @@ public:
 
     ~LlamaManager() noexcept {
         cleanup();
-    }    // Initialize llama.cpp backend
+    }
+    
+    // Initialize llama.cpp backend
     bool initialize() {
         ggml_backend_load_all();
         return true;    }
@@ -848,7 +853,8 @@ public:
         
         return true;
     }
-      bool switch_to_context(const std::string& context_id) {
+
+    bool switch_to_context(const std::string& context_id) {
         auto it = contexts.find(context_id);
         if (it == contexts.end()) {
             LLAMA_LOG("Error: Context '" + context_id + "' not found");
@@ -920,37 +926,25 @@ public:
         LLAMA_LOG("Removed context '" + context_id + "'");
         return true;
     }
-      std::vector<std::string> list_contexts() const {
+
+    std::vector<std::string> list_contexts() const {
         std::vector<std::string> context_list;
         context_list.reserve(contexts.size()); // Directive #8: Smart Caching
         std::transform(contexts.begin(), contexts.end(), std::back_inserter(context_list),
                       [](const auto& pair) { return pair.first; }); // Directive #14: STL algorithms preferred
         return context_list;
     }
-      std::string get_active_context() const noexcept {
+
+    std::string get_active_context() const noexcept {
         return active_context_id;
     }
-      bool has_context(const std::string& context_id) const noexcept {
+
+    bool has_context(const std::string& context_id) const noexcept {
         return contexts.find(context_id) != contexts.end();
-    }
-      // Get context size for a specific context without switching
-    int32_t get_context_size_for(const std::string& context_id) const {
-        auto it = contexts.find(context_id);
-        if (it == contexts.end() || !it->second) {
-            return 0;
-        }
-        return it->second->get_context_size();
-    }
-      // Get context usage for a specific context without switching
-    int32_t get_context_usage_for(const std::string& context_id) const {
-        auto it = contexts.find(context_id);
-        if (it == contexts.end() || !it->second) {
-            return 0;
-        }
-        return it->second->n_past;
     }
     
     // Retrieve a ContextInfo object by its ID
+    // Critical Needed for context access in various operations
     ContextInfo* get_context_info(const std::string& context_id) const {
         auto it = contexts.find(context_id);
         if (it == contexts.end()) {
@@ -958,24 +952,21 @@ public:
         }
         return it->second.get();
     }
-    
-    // Get the system message from the current context (internal use only)
-    const std::string& get_current_system_message() const noexcept {
-        static const std::string empty_string;
-        if (!current_context) return empty_string;
-        return current_context->system_message;
+
+    // Retrieve a ModelInfo object by its ID
+    // Critical Needed for model access in various operations
+    ModelInfo* get_model_info(const std::string& model_id) const {
+        auto it = models.find(model_id);
+        if (it == models.end()) {
+            return nullptr;
+        }
+        return it->second.get();
     }
 
-private:
-
-public:// Clear conversation history
+public:
+    // Clear conversation history
     void clear_conversation();// Prune message history with summarization and context update
     bool prune_conversation_with_summary(float keep_ratio = 0.6f);
-
-    // Get current message count (useful for determining when pruning might be needed)
-    size_t get_message_count() const {
-        return current_context ? current_context->message_history.size() : 0;
-    }
     
     // Convert message history to llama_chat_message format
     std::vector<llama_chat_message> convert_to_llama_messages() const {
@@ -994,19 +985,8 @@ public:// Clear conversation history
     };
     
     SummarySlotInfo get_summary_slot_info() const;
-
-    // Get the model's default chat template
-    std::string get_model_chat_template() const {
-        ModelInfo* model_info = get_current_model_info();
-        if (!model_info || !model_info->model) {
-            return "";
-        }
-        
-        const char* tmpl = llama_model_chat_template(model_info->model, nullptr);
-        return tmpl ? std::string(tmpl) : "";
-    }
   
-      // Enhanced context update with better tokenization handling
+    // Enhanced context update with better tokenization handling
     bool update_context_with_pruning() {
         ModelInfo* model_info = get_current_model_info();
         if (!model_info || !model_info->model || !current_context || !current_context->context || !model_info->vocab) {
@@ -1051,8 +1031,12 @@ public:// Clear conversation history
                 LLAMA_LOG("Error: Failed to apply chat template after pruning");
                 return false;
             }
-        }// Apply template and process
-        int32_t new_len = static_cast<int32_t>(formatted_content.length());        // CRITICAL: After pruning, the message structure has fundamentally changed.
+        }
+        
+        // Apply template and process
+        int32_t new_len = static_cast<int32_t>(formatted_content.length());
+        
+        // CRITICAL: After pruning, the message structure has fundamentally changed.
         // The context state (n_past, prev_len) no longer matches the new message history.
         // We MUST do a full rebuild, never an incremental update, to avoid garbage output.
         if (context_pruned || current_context->prev_len > new_len || 
@@ -1082,7 +1066,9 @@ public:// Clear conversation history
             }
             LLAMA_LOG("Error: Failed to rebuild context");
             return false;
-        }        // Process new content incrementally (only if no pruning occurred)
+        }
+        
+        // Process new content incrementally (only if no pruning occurred)
         if (new_len > current_context->prev_len) {
             LLAMA_LOG("Starting context rebuild: INCREMENTAL - adding " + std::to_string(new_len - current_context->prev_len) + " new characters");
             
@@ -1102,88 +1088,6 @@ public:// Clear conversation history
 
         current_context->prev_len = new_len;
         return true;
-    }
-
-    // Enhanced message history processing for large contexts
-    // Uses incremental batching when message history produces very large token counts
-    bool process_large_message_history_incrementally(const std::string& formatted_content) {
-        if (!current_context || formatted_content.empty()) return false;
-        
-        // Calculate total tokens needed
-        std::vector<llama_token> all_tokens = process_text_to_tokens(formatted_content, true);
-        if (all_tokens.empty()) {
-            LLAMA_LOG("Warning: Formatted content produced no tokens");
-            return true;
-        }
-        
-        const int32_t n_batch = llama_n_batch(current_context->context);
-        if (n_batch <= 0) {
-            LLAMA_LOG("Error: Invalid batch size for large message history processing");
-            return false;
-        }
-        
-        // If tokens fit in a single batch, use normal processing
-        if (static_cast<int32_t>(all_tokens.size()) <= n_batch) {
-            return process_context_tokens(all_tokens, false);
-        }
-        
-        // Process large message history using incremental batch approach
-        LLAMA_LOG("Large message history (" + std::to_string(all_tokens.size()) + 
-                  " tokens) detected, using incremental batch processing");
-        
-        return process_large_context_incrementally(all_tokens, n_batch);
-    }
-
-    // Enhanced sampler configuration with runtime validation
-    void configure_sampler(float temperature = LlamaConstants::DEFAULT_TEMPERATURE, float min_p = LlamaConstants::DEFAULT_MIN_P, float top_p = LlamaConstants::DEFAULT_TOP_P, int32_t top_k = LlamaConstants::DEFAULT_TOP_K) {
-        ModelInfo* model_info = get_current_model_info();
-        if (!model_info) {
-            LLAMA_LOG("Error: No model info available for sampler configuration");
-            return;
-        }
-        
-        LLAMA_LOG("Configuring sampler for model '" + model_info->model_path + "'");
-        
-        if (model_info->sampler) {
-            llama_sampler_free(model_info->sampler);
-            model_info->sampler = nullptr;
-        }
-        
-        auto sparams = llama_sampler_chain_default_params();
-        sparams.no_perf = false;
-        model_info->sampler = llama_sampler_chain_init(sparams);
-        
-        if (!model_info->sampler) {
-            LLAMA_LOG("Error: Failed to create sampler chain");
-            return;
-        }
-        
-        // Add sampling strategies
-        if (top_k > 0) {
-            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_top_k(top_k));
-        }
-        
-        if (top_p < 1.0f) {
-            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_top_p(top_p, 1));
-        }
-        
-        if (min_p > 0.0f) {
-            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_min_p(min_p, 1));
-        }
-        
-        if (temperature > 0.0f) {
-            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_temp(temperature));
-            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
-        } else {
-            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_greedy());
-        }
-        
-        // Validate final sampler state
-        if (!model_info->sampler) {
-            LLAMA_LOG("Error: Sampler became null during configuration");
-        } else {
-            LLAMA_LOG("Sampler reconfigured successfully for model");
-        }
     }
     
     // Enhanced generation with response delegation to LlamaResponse

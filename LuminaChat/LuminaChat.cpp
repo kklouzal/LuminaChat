@@ -749,6 +749,16 @@ public:
             AppendToLogsThreadSafe(wxString::FromUTF8(msg));
         });
         
+        // Set up summarizer-specific logging to route to summaries tab
+        LogHandler::set_summarizer_callback([this](const std::string& msg) {
+            AppendToSummariesThreadSafe(wxString::FromUTF8(msg));
+        });
+        
+        // Set up summarizer-specific logging to summaries tab
+        LogHandler::set_summarizer_callback([this](const std::string& msg) {
+            AppendToSummariesThreadSafe(wxString::FromUTF8(msg));
+        });
+        
         LoadConfiguration();
         CreateUI();
         SetupConsoleRedirection();
@@ -829,12 +839,12 @@ private:
         ui.discord_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::CONNECT_DISCORD), "Connect Discord");
         ui.prune_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::PRUNE_SUMMARIZE), "Prune && Summarize");
         ui.summary_slots_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::VIEW_SUMMARY_SLOTS), "View Summaries");
-    }void CreateStatusArea() {
+    }    void CreateStatusArea() {
         ui.progress_label = new wxStaticText(ui.main_panel, wxID_ANY, "Ready");
         ui.progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, wxSize(-1, 20));
         ui.progress_bar->Hide();
         
-        ui.context_label = new wxStaticText(ui.main_panel, wxID_ANY, "Context: N/A", wxDefaultPosition, wxSize(120, -1));
+        ui.context_label = new wxStaticText(ui.main_panel, wxID_ANY, "Context: N/A", wxDefaultPosition, wxSize(220, -1));
         ui.context_progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, wxSize(200, 15));
         
         ui.timings_label = new wxStaticText(ui.main_panel, wxID_ANY, "");
@@ -905,10 +915,9 @@ private:
         toolbar_sizer->Add(ui.prune_btn, 0, wxRIGHT, 5);
         toolbar_sizer->Add(ui.summary_slots_btn, 0);
         toolbar_sizer->AddStretchSpacer();
-        
-        // Context monitoring area - fixed sizing and spacing
+          // Context monitoring area - fixed sizing and spacing
         auto* context_sizer = new wxBoxSizer(wxHORIZONTAL);
-        context_sizer->Add(ui.context_label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
+        context_sizer->Add(ui.context_label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
         context_sizer->Add(ui.context_progress_bar, 0, wxALIGN_CENTER_VERTICAL);
         context_sizer->AddStretchSpacer();
         
@@ -1073,26 +1082,29 @@ private:
             return;
         }
         
-        // Ensure we're using the main chat context
-        if (!llama_manager->switch_to_context("main_chat")) {
-            wxMessageBox("Failed to switch to main chat context.", "Context Error", 
-                        wxOK | wxICON_ERROR);
-            return;
-        }
-        
         // Check if there's a conversation to prune
-        if (llama_manager->get_message_count() < 3) {
-            wxMessageBox("Need at least 3 messages in the conversation to prune.", 
+        // Note: This is triggered from the UI and only effects the main chat context
+        auto context_info = llama_manager->get_context_info("main_chat");
+        if (context_info->message_history.size() < 10) {
+            wxMessageBox("Need at least 10 messages in the conversation to prune.", 
                         "Insufficient Messages", wxOK | wxICON_INFORMATION);
             return;
         }
-          // Check if summarization is available
+
+        // Check if summarization is available
         if (!llama_manager->has_context("summary_context")) {
             wxMessageBox("Summarization is not available. Please configure a summary model in Settings.", 
                         "Summarization Unavailable", wxOK | wxICON_WARNING);
             return;
         }
         
+        // Ensure we're using the main chat context only after other checks have passed
+        if (!llama_manager->switch_to_context("main_chat")) {
+            wxMessageBox("Failed to switch to main chat context.", "Context Error", 
+                        wxOK | wxICON_ERROR);
+            return;
+        }
+
         try {
             // Show progress
             AddSystemMessage("Starting prune and summarize (keeping 90% of context)...");
@@ -1107,7 +1119,8 @@ private:
                 AddSystemMessage("Failed to prune and summarize context.");
             }
             
-        } catch (const std::exception& e) {            AddSystemMessage(wxString::Format("Error during pruning: %s", e.what()));
+        } catch (const std::exception& e) {
+            AddSystemMessage(wxString::Format("Error during pruning: %s", e.what()));
         }
     }
     
@@ -1225,7 +1238,8 @@ private:
         if (success) {
             // Handle chat template first - only save model template if no custom template was provided
             if (config.chat_template.empty()) {
-                std::string model_template = llama_manager->get_model_chat_template();
+                auto model_info = llama_manager->get_model_info("main_model");
+                std::string model_template = model_info->get_chat_template();
                 if (!model_template.empty()) {
                     config.chat_template = model_template;
                     SettingsManager::SaveSettings(config.model_path, config.context_size, config.gpu_layers, config.predict_tokens, 
@@ -1526,10 +1540,10 @@ private:
             ui.context_progress_bar->SetValue(0);
             return;
         }
-        
-        // Get context usage information directly without switching contexts
-        int32_t context_size = llama_manager->get_context_size_for("main_chat");
-        int32_t context_usage = llama_manager->get_context_usage_for("main_chat");
+          // Get context usage information directly without switching contexts
+        auto context_info = llama_manager->get_context_info("main_chat");
+        int32_t context_usage = context_info->n_past;
+        int32_t context_size = context_info->get_context_size();
         
         if (context_size > 0) {
             float usage_percentage = static_cast<float>(context_usage) / static_cast<float>(context_size) * 100.0f;

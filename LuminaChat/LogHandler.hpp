@@ -59,6 +59,7 @@ class LogHandler {
 private:
     // Thread-safe callback mechanism
     std::function<void(const std::string&)> output_callback;
+    std::function<void(const std::string&)> summarizer_callback;
     mutable std::mutex callback_mutex;
     
     // Logging configuration
@@ -132,12 +133,18 @@ public:
     // Delete copy constructor and assignment operator
     LogHandler(const LogHandler&) = delete;
     LogHandler& operator=(const LogHandler&) = delete;
-    
-    // Set output callback (thread-safe)
+      // Set output callback (thread-safe)
     static void set_output_callback(std::function<void(const std::string&)> callback) {
         auto& handler = instance();
         std::lock_guard<std::mutex> lock(handler.callback_mutex);
         handler.output_callback = callback;
+    }
+    
+    // Set summarizer-specific callback (thread-safe)
+    static void set_summarizer_callback(std::function<void(const std::string&)> callback) {
+        auto& handler = instance();
+        std::lock_guard<std::mutex> lock(handler.callback_mutex);
+        handler.summarizer_callback = callback;
     }
       // Configuration methods (removed unused setters per Directive #2: Redundancy Elimination)
     
@@ -152,11 +159,14 @@ public:
         
         // Format the message
         std::string formatted = handler.format_message(level, component, message);
-        
-        // Send to callback if available
+          // Send to callback if available
         {
             std::lock_guard<std::mutex> lock(handler.callback_mutex);
-            if (handler.output_callback) {
+            
+            // Route summarizer logs to the summarizer callback if available
+            if (component == LogComponent::SUMMARIZER_MANAGER && handler.summarizer_callback) {
+                handler.summarizer_callback(formatted + "\n");
+            } else if (handler.output_callback) {
                 handler.output_callback(formatted + "\n");
             }
         }

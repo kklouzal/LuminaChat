@@ -328,16 +328,15 @@ inline std::string LlamaSummarizer::summarize_messages(const std::vector<std::pa
     // Create a more explicit summarization request with better prompt
     std::string summarization_request = "Please provide a concise but informative summary of the following conversation. Focus on the main topics discussed and key information exchanged:\n\n" + 
                                       content_to_summarize + 
-                                      "\nProvide a clear summary:";
-      SUMMARIZER_LOG("Preparing to summarize " + std::to_string(messages_to_summarize.size()) + " messages");
-    SUMMARIZER_LOG("Summary request length: " + std::to_string(summarization_request.length()) + " characters");
+                                      "\nProvide a clear summary:";    SUMMARIZER_LOG("Starting summarization of " + std::to_string(messages_to_summarize.size()) + " messages");
     
-    // Log detailed summary input for debugging
-    std::string summary_input_details = "Summarizing " + std::to_string(messages_to_summarize.size()) + " messages";
+    // Log the input being summarized in a user-friendly format
+    std::string input_summary = "=== INPUT TO SUMMARIZE ===\n";
     for (const auto& [role, content] : messages_to_summarize) {
-        summary_input_details += "\n" + role + ": " + (content.length() > 100 ? content.substr(0, 100) + "..." : content);
+        input_summary += role + ": " + content + "\n\n";
     }
-    SUMMARIZER_LOG(summary_input_details);
+    input_summary += "========================\n";
+    SUMMARIZER_LOG(input_summary);
       // Generate summary using the summary context
     std::string summary;
     try {
@@ -354,18 +353,19 @@ inline std::string LlamaSummarizer::summarize_messages(const std::vector<std::pa
         if (!summary.empty() && summary.size() >= 6 && summary.substr(0, 6) == "Error:") {
             SUMMARIZER_LOG_ERROR("Summary generation returned error: " + summary);
             summary = ""; // Treat as failed summarization
-        } else if (!summary.empty()) {
-            // Clean up the summary (remove any extra whitespace, newlines)
+        } else if (!summary.empty()) {            // Clean up the summary (remove any extra whitespace, newlines)
             size_t start = summary.find_first_not_of(" \t\n\r");
             size_t end = summary.find_last_not_of(" \t\n\r");
             if (start != std::string::npos && end != std::string::npos) {
                 summary = summary.substr(start, end - start + 1);
             }
             
-            SUMMARIZER_LOG("Successfully generated summary: " + summary);
+            // Log the successful output in a user-friendly format
+            std::string output_message = "=== GENERATED SUMMARY ===\n" + summary + "\n==========================\n";
+            SUMMARIZER_LOG(output_message);
         } else {
-            SUMMARIZER_LOG("Generated summary is empty");
-        }    } catch (const std::exception& e) {
+            SUMMARIZER_LOG("Warning: Generated summary is empty");
+        }} catch (const std::exception& e) {
         SUMMARIZER_LOG_ERROR("Exception during message summarization: " + std::string(e.what()));
         summary = "";
     } catch (...) {

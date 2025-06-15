@@ -83,6 +83,57 @@ private:
     // Working buffers for token conversion
     mutable std::vector<char> temp_string_buffer;
 
+    // Enhanced sampler configuration with runtime validation
+    static void configure_sampler(ModelInfo* model_info, float temperature = LlamaConstants::DEFAULT_TEMPERATURE, float min_p = LlamaConstants::DEFAULT_MIN_P, float top_p = LlamaConstants::DEFAULT_TOP_P, int32_t top_k = LlamaConstants::DEFAULT_TOP_K) {
+        if (!model_info) {
+            LLAMA_LOG("Error: No model info available for sampler configuration");
+            return;
+        }
+        
+        LLAMA_LOG("Configuring sampler for model '" + model_info->model_path + "'");
+        
+        if (model_info->sampler) {
+            llama_sampler_free(model_info->sampler);
+            model_info->sampler = nullptr;
+        }
+        
+        auto sparams = llama_sampler_chain_default_params();
+        sparams.no_perf = false;
+        model_info->sampler = llama_sampler_chain_init(sparams);
+        
+        if (!model_info->sampler) {
+            LLAMA_LOG("Error: Failed to create sampler chain");
+            return;
+        }
+        
+        // Add sampling strategies
+        if (top_k > 0) {
+            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_top_k(top_k));
+        }
+        
+        if (top_p < 1.0f) {
+            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_top_p(top_p, 1));
+        }
+        
+        if (min_p > 0.0f) {
+            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_min_p(min_p, 1));
+        }
+        
+        if (temperature > 0.0f) {
+            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_temp(temperature));
+            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+        } else {
+            llama_sampler_chain_add(model_info->sampler, llama_sampler_init_greedy());
+        }
+        
+        // Validate final sampler state
+        if (!model_info->sampler) {
+            LLAMA_LOG("Error: Sampler became null during configuration");
+        } else {
+            LLAMA_LOG("Sampler configured successfully for model");
+        }
+    }
+
     // Validate and recover sampler if needed
     static bool validate_and_recover_sampler(ModelInfo* model_info) {
         if (!model_info) {
@@ -96,27 +147,23 @@ private:
         
         LLAMA_LOG("WARNING: Sampler is NULL, attempting recovery...");
         
-        // Attempt to recreate a basic greedy sampler
-        auto sparams = llama_sampler_chain_default_params();
-        sparams.no_perf = false;
-        model_info->sampler = llama_sampler_chain_init(sparams);
+        // Attempt to recreate the sampler
+        configure_sampler(model_info, 
+                          LlamaConstants::DEFAULT_TEMPERATURE, 
+                          LlamaConstants::DEFAULT_MIN_P, 
+                          LlamaConstants::DEFAULT_TOP_P, 
+                          LlamaConstants::DEFAULT_TOP_K);
         
         if (!model_info->sampler) {
             LLAMA_LOG("CRITICAL: Failed to recover sampler!");
             return false;
         }
         
-        // Add basic greedy sampling
-        llama_sampler_chain_add(model_info->sampler, llama_sampler_init_greedy());
-        
-        if (!model_info->sampler) {
-            LLAMA_LOG("CRITICAL: Sampler became NULL after adding greedy sampler during recovery!");
-            return false;
-        }
-        
-        LLAMA_LOG("Sampler recovered successfully with greedy sampling");
+        LLAMA_LOG("Sampler recovered successfully");
         return true;
-    }    // Convert token to text using the context's model vocabulary
+    }
+    
+    // Convert token to text using the context's model vocabulary
     std::string convert_token_to_text(llama_token token, ModelInfo* model_info) const {
         if (!model_info || !model_info->vocab) {
             LLAMA_LOG("Error: Vocabulary not available from current context's model");

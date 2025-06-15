@@ -619,16 +619,11 @@ public:
                                     // Validate model_id and create context with proper system prompt
                                     if (!model_id.empty()) {
                                         if (!llama_manager->has_context(state.context_id)) {
+                                            // Get the main shared context info to retrieve system prompt
+                                            auto context_info = llama_manager->get_context_info(main_context_id);
+
                                             // Get system prompt from main context
-                                            std::string system_prompt;
-                                            std::string original_context = llama_manager->get_active_context();
-                                            if (llama_manager->switch_to_context(main_context_id)) {
-                                                system_prompt = llama_manager->get_current_system_message();
-                                                // Restore original context
-                                                if (!original_context.empty() && original_context != main_context_id) {
-                                                    llama_manager->switch_to_context(original_context);
-                                                }
-                                            }
+                                            std::string system_prompt = context_info->system_message;
                                             
                                             if (llama_manager->create_context(state.context_id, model_id, system_prompt)) {
                                                 DISCORD_HISTORY_LOG("Created isolated context '" + state.context_id + 
