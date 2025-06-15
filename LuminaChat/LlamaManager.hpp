@@ -157,9 +157,12 @@ struct ContextInfo {
     std::vector<std::pair<std::string, std::string>> message_history;
     std::string system_message;
     
+    // Template buffer - context-specific to avoid conflicts
+    mutable std::string template_buffer;
+    
     // Performance tracking
     int64_t total_generation_tokens = 0;
-    int64_t last_decode_time_us = 0;    // Cache state - enhanced with conversation state tracking
+    int64_t last_decode_time_us = 0;// Cache state - enhanced with conversation state tracking
     mutable bool message_cache_dirty = true;
     mutable std::vector<llama_chat_message> message_cache;
       // Conversation state for improved logic flow - single source of truth
@@ -205,10 +208,154 @@ struct ContextInfo {
     ContextInfo() : context(nullptr), batch{}, batch_initialized(false), 
                    n_past(0), prev_len(0), message_history_token_count(0), model_info(nullptr) {
     }
-    
-    // Get context size directly from associated model
+      // Get context size directly from associated model
     int32_t get_context_size() const noexcept {
         return model_info ? model_info->n_ctx : LlamaConstants::DEFAULT_CONTEXT_SIZE;
+    }
+    
+    // Template application specific to this context
+    bool apply_template(bool add_generation_prompt, std::string& result) const {
+        if (!model_info) return false;
+        
+        const char* tmpl = model_info->get_chat_template();
+        if (!tmpl) return false;
+        
+        // Update message cache if needed
+        if (message_cache_dirty) {
+            message_cache = convert_to_llama_messages();
+            message_cache_dirty = false;
+        }
+        
+        // Apply template with auto-resize
+        template_buffer.resize(model_info->n_ctx * LlamaConstants::STRING_RESERVE_MULTIPLIER);
+        int32_t result_len = llama_chat_apply_template(
+            tmpl, message_cache.data(), message_cache.size(),
+            add_generation_prompt, template_buffer.data(), template_buffer.size()
+        );
+        
+        if (result_len < 0) {
+            template_buffer.resize(-result_len);
+            result_len = llama_chat_apply_template(
+                tmpl, message_cache.data(), message_cache.size(),
+                add_generation_prompt, template_buffer.data(), template_buffer.size()
+            );
+        }
+        
+        if (result_len > 0) {
+            result = std::string(template_buffer.data(), result_len);
+            return true;
+        }
+        return false;
+    }
+    
+    // Validate context state
+    bool validate_state() const {
+        if (!model_info || !model_info->model || !context) {
+            return false;
+        }
+        
+        // Check if context position is reasonable
+        if (n_past < 0 || n_past >= model_info->n_ctx) {
+            return false;
+        }
+        
+        // Check for extremely long message history that might cause issues
+        if (message_history.size() > LlamaConstants::MAX_MESSAGE_HISTORY_SIZE) {
+            return false;
+        }
+        
+        return true;
+    }
+    
+    // Reset context state
+    void reset_context_state() {
+        if (context) {
+            llama_memory_clear(llama_get_memory(context), true);
+        }
+        n_past = 0;
+        prev_len = 0;
+        conversation_state.invalidate();
+        message_cache_dirty = true;
+    }
+    
+    // Check if context needs pruning based on token count
+    bool needs_pruning(int32_t token_count) const {
+        if (!model_info) return false;
+          int32_t max_threshold = static_cast<int32_t>(model_info->n_ctx * 0.9f);
+        return token_count > max_threshold;
+    }
+    
+    // Batch management methods - context-specific
+    void clear_batch() {
+        if (!batch_initialized) return;
+        batch.n_tokens = 0;
+    }
+
+    // Add tokens from a single input to batch
+    // NOTE: This is for single-sequence processing, not multi-sequence batching
+    bool add_tokens_to_batch(const std::vector<llama_token>& tokens, int32_t start_pos, 
+                            const std::vector<llama_seq_id>& seq_ids, bool output_logits = false) {
+        if (!batch_initialized || tokens.empty() || !model_info) return false;
+        
+        // Validate start_pos is reasonable
+        if (start_pos < 0 || start_pos >= model_info->n_ctx) {
+            return false;
+        }        
+        
+        const int32_t n_batch = llama_n_batch(context);
+        if (n_batch <= 0) {
+            return false;
+        }
+        
+        clear_batch(); // Clear batch
+        
+        // Validate sequence IDs
+        if (seq_ids.empty()) {
+            return false;
+        }
+        
+        // Use n_batch as the capacity limit
+        for (size_t i = 0; i < tokens.size() && batch.n_tokens < n_batch; ++i) {
+            // Check position bounds carefully
+            int32_t pos = start_pos + static_cast<int32_t>(i);
+            if (pos >= model_info->n_ctx || pos < 0) {
+                break;
+            }
+            
+            // Validate token value
+            if (tokens[i] < 0) {
+                return false;
+            }
+            
+            // Ensure we don't exceed batch array bounds
+            if (batch.n_tokens >= n_batch) {
+                break;
+            }
+            
+            batch.token[batch.n_tokens] = tokens[i];
+            batch.pos[batch.n_tokens] = pos;
+            batch.n_seq_id[batch.n_tokens] = static_cast<int32_t>(std::min(seq_ids.size(), size_t(LlamaConstants::MAX_SEQ_IDS)));
+            
+            // Safe sequence ID copying with bounds check
+            for (size_t j = 0; j < std::min(seq_ids.size(), size_t(LlamaConstants::MAX_SEQ_IDS)); ++j) {
+                batch.seq_id[batch.n_tokens][j] = seq_ids[j];
+            }
+            
+            batch.logits[batch.n_tokens] = (i == tokens.size() - 1) ? output_logits : false;
+            batch.n_tokens++;
+        }
+        
+        return batch.n_tokens > 0;
+    }
+    
+private:
+    // Convert message history to llama_chat_message format
+    std::vector<llama_chat_message> convert_to_llama_messages() const {
+        std::vector<llama_chat_message> messages;
+        for (const auto& msg : message_history) {
+            messages.push_back({ msg.first.c_str(), msg.second.c_str() });
+        }
+        return messages;
     }
 };
 
@@ -232,97 +379,17 @@ private:
     std::unordered_map<std::string, std::unique_ptr<ContextInfo>> contexts;
     std::string active_context_id;    ContextInfo* current_context;
     
-    // Template and cache management
-    mutable std::string template_buffer;
-    mutable TokenCache token_cache;    // Working buffers
-    mutable std::string temp_string_buffer;
+    // Working buffers
+    mutable TokenCache token_cache;
+    mutable std::string temp_string_buffer;// Working buffers
 
     // Response generation handler
     mutable LlamaResponse response_generator;
-    
-    // Unified batch management - for single sequence processing
-    void clear_batch() {
-        if (!current_context || !current_context->batch_initialized) return;
-        current_context->batch.n_tokens = 0;
-    }
-
-    // Unified batch token addition - adds tokens from a single input to batch
-    // NOTE: This is for single-sequence processing, not multi-sequence batching
-    bool add_tokens_to_batch(const std::vector<llama_token>& tokens, int32_t start_pos, 
-                            const std::vector<llama_seq_id>& seq_ids, bool output_logits = false) {
-        if (!current_context || !current_context->batch_initialized || tokens.empty()) return false;
-        
-        if (!current_context->model_info) {
-            LLAMA_LOG("Error: No model info available for batch operations");
-            return false;
-        }
-        
-        // Validate start_pos is reasonable
-        if (start_pos < 0 || start_pos >= current_context->model_info->n_ctx) {
-            LLAMA_LOG("Error: Invalid start position " + std::to_string(start_pos) + " for context size " + std::to_string(current_context->model_info->n_ctx));
-            return false;
-        }        
-        const int32_t n_batch = llama_n_batch(current_context->context);
-        if (n_batch <= 0) {
-            LLAMA_LOG("Error: Invalid batch size: " + std::to_string(n_batch));
-            return false;
-        }
-        
-        // Validate batch size against our maximum
-        if (n_batch > LlamaConstants::MAX_BATCH_SIZE) {
-            LLAMA_LOG("Warning: Context batch size (" + std::to_string(n_batch) + 
-                      ") exceeds MAX_BATCH_SIZE (" + std::to_string(LlamaConstants::MAX_BATCH_SIZE) + ")");
-        }
-        
-        clear_batch(); // Clear batch
-        
-        // Validate sequence IDs
-        if (seq_ids.empty()) {
-            LLAMA_LOG("Error: Empty sequence ID vector");
-            return false;
-        }
-        
-        // Use n_batch as the capacity limit
-        for (size_t i = 0; i < tokens.size() && current_context->batch.n_tokens < n_batch; ++i) {
-            // Check position bounds carefully
-            int32_t pos = start_pos + static_cast<int32_t>(i);
-            if (pos >= current_context->model_info->n_ctx || pos < 0) {
-                LLAMA_LOG("Warning: Token position " + std::to_string(pos) + " exceeds context bounds [0, " + std::to_string(current_context->model_info->n_ctx) + ")");
-                break;
-            }
-            
-            // Validate token value
-            if (tokens[i] < 0) {
-                LLAMA_LOG("Error: Invalid token value " + std::to_string(tokens[i]) + " at position " + std::to_string(i));
-                return false;
-            }
-            
-            // Ensure we don't exceed batch array bounds
-            if (current_context->batch.n_tokens >= n_batch) {
-                LLAMA_LOG("Warning: Batch capacity exceeded, stopping token addition");
-                break;
-            }
-            
-            current_context->batch.token[current_context->batch.n_tokens] = tokens[i];
-            current_context->batch.pos[current_context->batch.n_tokens] = pos;
-            current_context->batch.n_seq_id[current_context->batch.n_tokens] = static_cast<int32_t>(std::min(seq_ids.size(), size_t(LlamaConstants::MAX_SEQ_IDS)));
-            
-            // Safe sequence ID copying with bounds check
-            for (size_t j = 0; j < std::min(seq_ids.size(), size_t(LlamaConstants::MAX_SEQ_IDS)); ++j) {
-                current_context->batch.seq_id[current_context->batch.n_tokens][j] = seq_ids[j];
-            }
-            
-            current_context->batch.logits[current_context->batch.n_tokens] = (i == tokens.size() - 1) ? output_logits : false;
-            current_context->batch.n_tokens++;
-        }
-        
-        return current_context->batch.n_tokens > 0;
-    }
-
-    // Single token addition for generation loop
+      // Single token addition for generation loop
     bool add_single_token_to_batch(llama_token token, int32_t pos, 
                                   const std::vector<llama_seq_id>& seq_ids, bool output_logits = true) {
-        return add_tokens_to_batch({token}, pos, seq_ids, output_logits);
+        if (!current_context) return false;
+        return current_context->add_tokens_to_batch({token}, pos, seq_ids, output_logits);
     }
 
     // REFACTOR: Enhanced context processing - Updated for proper single-input batching
@@ -421,7 +488,7 @@ private:
             // Process all tokens in a single batch (normal case)
             bool output_logits = is_incremental;
             
-            if (!add_tokens_to_batch(tokens, current_context->n_past, seq_ids, output_logits)) {
+            if (!current_context->add_tokens_to_batch(tokens, current_context->n_past, seq_ids, output_logits)) {
                 LLAMA_LOG("Error: Failed to add tokens to batch");
                 return false;
             }
@@ -496,13 +563,9 @@ private:
     bool process_large_context_incrementally(const std::vector<llama_token>& tokens, int32_t n_batch) {
         if (!current_context || tokens.empty()) return false;
         
-        LLAMA_LOG("Processing " + std::to_string(tokens.size()) + " tokens using incremental batch method (batch size: " + std::to_string(n_batch) + ")");
-        
-        // Clear context for full rebuild
-        if (current_context->context) {
-            llama_memory_clear(llama_get_memory(current_context->context), true); // Ensure kv memory/cache is cleared
-        }
-        current_context->n_past = 0;
+        LLAMA_LOG("Processing " + std::to_string(tokens.size()) + " tokens using incremental batch method (batch size: " + std::to_string(n_batch) + ")");        
+        // Clear context for full rebuild using context's reset method
+        current_context->reset_context_state();
         
         // Process tokens in batch-sized chunks
         size_t total_tokens = tokens.size();
@@ -519,7 +582,7 @@ private:
             LLAMA_LOG("Processing incremental batch " + std::to_string(processed / n_batch + 1) + 
                      " (" + std::to_string(chunk_size) + " tokens, pos: " + std::to_string(current_context->n_past) + ")");
             
-            if (!add_tokens_to_batch(chunk, current_context->n_past, seq_ids, output_logits)) {
+            if (!current_context->add_tokens_to_batch(chunk, current_context->n_past, seq_ids, output_logits)) {
                 LLAMA_LOG("Error: Failed to add batch chunk starting at token " + std::to_string(processed));
                 return false;
             }
@@ -553,94 +616,6 @@ private:
         LLAMA_LOG("Successfully processed " + std::to_string(total_tokens) + " tokens using " + 
                  std::to_string((total_tokens + n_batch - 1) / n_batch) + " incremental batches");        
         return true;
-    }
-
-    // Unified template application - Updated to use context's model
-    bool apply_template_optimized(bool add_generation_prompt, std::string& result) const {
-        if (!current_context) return false;
-        
-        if (!current_context->model_info) return false;
-        
-        const char* tmpl = current_context->model_info->get_chat_template();
-        if (!tmpl) return false;
-        
-        // Update message cache if needed
-        if (current_context->message_cache_dirty) {
-            current_context->message_cache = convert_to_llama_messages();
-            current_context->message_cache_dirty = false;
-        }
-          // Apply template with auto-resize
-        template_buffer.resize(current_context->model_info->n_ctx * LlamaConstants::STRING_RESERVE_MULTIPLIER);
-        int32_t result_len = llama_chat_apply_template(
-            tmpl, current_context->message_cache.data(), current_context->message_cache.size(),
-            add_generation_prompt, template_buffer.data(), template_buffer.size()
-        );
-        
-        if (result_len < 0) {
-            template_buffer.resize(-result_len);
-            result_len = llama_chat_apply_template(
-                tmpl, current_context->message_cache.data(), current_context->message_cache.size(),
-                add_generation_prompt, template_buffer.data(), template_buffer.size()
-            );
-        }
-        
-        if (result_len > 0) {
-            result = std::string(template_buffer.data(), result_len);            return true;
-        }
-        return false;
-    }
-
-    // Validate conversation state and attempt recovery if needed
-    bool validate_conversation_state() {
-        if (!current_context) {
-            LLAMA_LOG("Error: No active context");
-            return false;
-        }
-        
-        if (!current_context->model_info || !current_context->model_info->model || !current_context->context) {
-            LLAMA_LOG("Error: Invalid model or context state");
-            return false;
-        }
-          // Check if context position is reasonable
-        if (current_context->n_past < 0 || current_context->n_past >= current_context->model_info->n_ctx) {
-            LLAMA_LOG("Starting context rebuild: FULL (position validation) - context position out of bounds (" + std::to_string(current_context->n_past) + 
-                      "/" + std::to_string(current_context->model_info->n_ctx) + "), resetting");
-            
-            // Reset context state
-            if (current_context->context) {
-                llama_memory_clear(llama_get_memory(current_context->context), true); // Ensure kv memory/cache is cleared
-            }
-            current_context->n_past = 0;
-            current_context->prev_len = 0;
-            current_context->message_cache_dirty = true;
-            
-            return false; // Indicate that recovery was needed
-        }
-        
-        // Check if message history is reasonable
-        if (current_context->message_history.empty()) {
-            LLAMA_LOG("Warning: Empty message history");
-            return true; // This is actually okay
-        }
-        
-        // Check for extremely long message history that might cause issues
-        if (current_context->message_history.size() > LlamaConstants::MAX_MESSAGE_HISTORY_SIZE) {
-            LLAMA_LOG("Starting context rebuild: PARTIAL (history validation) - very large message history (" + 
-                      std::to_string(current_context->message_history.size()) + " messages), triggering aggressive pruning");
-              // Only trigger aggressive pruning if we're not already in a summary context
-              // 
-              if (active_context_id != "summary_context") {
-                // Trigger aggressive pruning and update context
-                if (prune_conversation_with_summary(SummarizerConstants::AGGRESSIVE_PRUNING_RATIO)) { // Keep only 30%
-                    update_context_from_history();
-                }
-                return false; // Indicate that recovery was needed
-            } else {
-                LLAMA_LOG("Skipping pruning for summary context");
-            }
-        }
-        
-        return true; // State is valid
     }
     
 public:
@@ -946,17 +921,7 @@ public:
     // Clear conversation history
     void clear_conversation();// Prune message history with summarization and context update
     bool prune_conversation_with_summary(float keep_ratio = 0.6f);
-    
-    // Convert message history to llama_chat_message format
-    std::vector<llama_chat_message> convert_to_llama_messages() const {
-        if (!current_context) return {};
-        
-        std::vector<llama_chat_message> messages;
-        for (const auto& msg : current_context->message_history) {
-            messages.push_back({ msg.first.c_str(), msg.second.c_str() });
-        }
-        return messages;    }
-      // Forward declaration for summary slot info - implementation after LlamaSummarizer include
+        // Forward declaration for summary slot info - implementation after LlamaSummarizer include
     struct SummarySlotInfo {
         size_t total_slots;
         size_t used_slots;
@@ -964,48 +929,7 @@ public:
     };
     
     SummarySlotInfo get_summary_slot_info() const;
-    
-    // Enhanced context update with pruning decision logic
-    bool update_context_with_pruning() {
-        if (!current_context || !current_context->context || !current_context->model_info || !current_context->model_info->model || !current_context->model_info->vocab) {
-            LLAMA_LOG("Error: Model components not initialized");
-            return false;
-        }
-
-        // Skip pruning for summary contexts - they manage their own state
-        bool is_summary_context = (active_context_id == "summary_context");
         
-        // Calculate projected context usage before making pruning decisions
-        std::string formatted_content;
-        if (!apply_template_optimized(false, formatted_content)) {
-            LLAMA_LOG("Error: Failed to apply chat template for context calculation");
-            return false;
-        }
-        
-        // Calculate how many tokens the current conversation would use
-        std::vector<llama_token> projected_tokens = process_text_to_tokens(formatted_content, true);
-        int32_t projected_usage = static_cast<int32_t>(projected_tokens.size());
-        int32_t max_threshold = static_cast<int32_t>(current_context->model_info->n_ctx * 0.9f);
-        
-        // Check if we need pruning based on projected usage
-        if (!is_summary_context && projected_usage > max_threshold) {
-            LLAMA_LOG("Starting context rebuild: PARTIAL (with pruning) - context usage " + 
-                      std::to_string(static_cast<float>(projected_usage) / current_context->model_info->n_ctx * 100.0f) + 
-                      "% (" + std::to_string(projected_usage) + "/" + std::to_string(current_context->model_info->n_ctx) + "), pruning to 60%");
-            
-            // Perform pruning with summarization (this also clears context state)
-            if (!prune_conversation_with_summary(SummarizerConstants::TARGET_CONTEXT_USAGE)) {
-                LLAMA_LOG("Error: Failed to prune conversation");
-                return false;
-            }
-            
-            // Update context from the pruned message history
-            return update_context_from_history();
-        }
-          // No pruning needed, proceed with regular context update
-        return rebuild_context_from_formatted_content(formatted_content);
-    }
-    
 private:
     // Improved logic flow helper methods
       // Add message and mark conversation state as needing rebuild
@@ -1035,18 +959,33 @@ private:
             LLAMA_LOG("Context preparation skipped - conversation state up to date");
             return true;
         }
-        
-        LLAMA_LOG("Preparing context for generation - rebuild required");
+          LLAMA_LOG("Preparing context for generation - rebuild required");
         
         // Validate conversation state before proceeding
-        if (!validate_conversation_state()) {
+        if (!current_context->validate_state()) {
+            LLAMA_LOG("Starting context rebuild: FULL (position validation) - context state invalid, resetting");
+            current_context->reset_context_state();
             LLAMA_LOG("Conversation state validation failed, attempting recovery");
         }
         
-        // PHASE 1: Apply template and get formatted content
+        // Check for extremely long message history that might cause issues
+        if (current_context->message_history.size() > LlamaConstants::MAX_MESSAGE_HISTORY_SIZE) {
+            LLAMA_LOG("Starting context rebuild: PARTIAL (history validation) - very large message history (" + 
+                      std::to_string(current_context->message_history.size()) + " messages), triggering aggressive pruning");
+            // Only trigger aggressive pruning if we're not already in a summary context
+            if (active_context_id != "summary_context") {
+                // Trigger aggressive pruning and update context
+                if (prune_conversation_with_summary(SummarizerConstants::AGGRESSIVE_PRUNING_RATIO)) { // Keep only 30%
+                    update_context_from_history();
+                }
+            } else {
+                LLAMA_LOG("Skipping pruning for summary context");
+            }
+        }
+          // PHASE 1: Apply template and get formatted content
         LLAMA_LOG("Phase 1: Applying chat template");
         std::string formatted_content;
-        if (!apply_template_optimized(false, formatted_content)) {
+        if (!current_context->apply_template(false, formatted_content)) {
             LLAMA_LOG("Error: Failed to apply chat template during context preparation");
             return false;
         }
@@ -1057,9 +996,23 @@ private:
         int32_t total_token_count = static_cast<int32_t>(tokens.size());
         
         LLAMA_LOG("Template applied and tokenized: " + std::to_string(total_token_count) + " tokens");
+          // PHASE 3: Check if pruning is needed and handle accordingly
+        bool pruning_needed = current_context->needs_pruning(total_token_count);
         
-        // PHASE 3: Check if pruning is needed and handle accordingly
-        if (needs_pruning(total_token_count)) {
+        // Skip pruning for summary contexts - they manage their own state
+        if (active_context_id == "summary_context") {
+            LLAMA_LOG("Pruning skipped - summary context manages its own state");
+            pruning_needed = false;
+        }
+        
+        if (pruning_needed) {
+            float usage_percentage = current_context->model_info ? 
+                static_cast<float>(total_token_count) / current_context->model_info->n_ctx * 100.0f : 0.0f;
+            
+            LLAMA_LOG("Context usage: " + std::to_string(usage_percentage) + "% (" + 
+                      std::to_string(total_token_count) + "/" + std::to_string(current_context->get_context_size()) + 
+                      "). Pruning REQUIRED");
+            
             LLAMA_LOG("Phase 3: Pruning required - token count exceeds 90% threshold");
             if (!prune_and_rebuild(formatted_content, tokens, total_token_count)) {
                 LLAMA_LOG("Error: Failed to prune and rebuild context");
@@ -1087,29 +1040,6 @@ private:
         LLAMA_LOG("Context preparation completed successfully");
         return true;
     }
-    
-    // Check if context needs pruning based on token count    // Clear decision point for pruning logic
-    bool needs_pruning(int32_t token_count) const {
-        if (!current_context || !current_context->model_info) return false;
-        
-        // Skip pruning for summary contexts - they manage their own state
-        bool is_summary_context = (active_context_id == "summary_context");
-        if (is_summary_context) {
-            LLAMA_LOG("Pruning skipped - summary context manages its own state");
-            return false;
-        }
-        
-        int32_t max_threshold = static_cast<int32_t>(current_context->model_info->n_ctx * 0.9f);
-        float usage_percentage = static_cast<float>(token_count) / current_context->model_info->n_ctx * 100.0f;
-        
-        bool pruning_needed = token_count > max_threshold;
-        
-        LLAMA_LOG("Context usage: " + std::to_string(usage_percentage) + "% (" + 
-                  std::to_string(token_count) + "/" + std::to_string(current_context->model_info->n_ctx) + 
-                  "). Pruning " + (pruning_needed ? "REQUIRED" : "not needed"));
-        
-        return pruning_needed;
-    }
       // Pruning and rebuilding logic with clear phases
     bool prune_and_rebuild(std::string& formatted_content, std::vector<llama_token>& tokens, int32_t& total_token_count) {
         if (!current_context) return false;
@@ -1124,10 +1054,9 @@ private:
             LLAMA_LOG("Error: Failed to prune conversation with summary");
             return false;
         }
-        
-        // PRUNING PHASE 2: Re-apply template with pruned messages
+          // PRUNING PHASE 2: Re-apply template with pruned messages
         LLAMA_LOG("Pruning Phase 2: Re-applying template with pruned content");
-        if (!apply_template_optimized(false, formatted_content)) {
+        if (!current_context->apply_template(false, formatted_content)) {
             LLAMA_LOG("Error: Failed to re-apply template after pruning");
             return false;
         }
@@ -1157,10 +1086,9 @@ private:
     // Prepare generation prompt for response generation
     bool prepare_generation_prompt() {
         if (!current_context) return false;
-        
-        // Apply template for generation and handle generation prompt
+          // Apply template for generation and handle generation prompt
         std::string generation_content;
-        if (!apply_template_optimized(true, generation_content)) {
+        if (!current_context->apply_template(true, generation_content)) {
             LLAMA_LOG("Error: Failed to apply generation template");
             return false;
         }
@@ -1220,10 +1148,9 @@ private:
         auto token_adder = [this](llama_token token, int32_t pos, const std::vector<llama_seq_id>& seq_ids, bool output_logits) -> bool {
             return add_single_token_to_batch(token, pos, seq_ids, output_logits);
         };
-          auto context_updater = [this]() -> void {
-            // Update context length tracking after generation
+          auto context_updater = [this]() -> void {            // Update context length tracking after generation
             std::string updated_content;
-            if (apply_template_optimized(false, updated_content)) {
+            if (current_context->apply_template(false, updated_content)) {
                 current_context->prev_len = static_cast<int32_t>(updated_content.length());
             }
         };
@@ -1242,7 +1169,9 @@ private:
         return response.empty() ? "Error: Failed to generate response - empty result" : response;
     }
 
-public:    /* 
+public:
+
+/* 
      * IMPROVED LINEAR LOGIC FLOW FOR RESPONSE GENERATION
      * ================================================
      * 
@@ -1266,7 +1195,9 @@ public:    /*
      * - Separated concerns (preparation vs. generation)
      * - Linear, predictable flow (no jumping between methods)
      * - Comprehensive logging for debugging
-     */    std::string generate_response(const std::string& input, const std::string& username = "Schwi") {
+     */
+    
+     std::string generate_response(const std::string& input, const std::string& username = "Schwi") {
         // Pre-flight validation
         if (!current_context || !current_context->context || !current_context->model_info || 
             !current_context->model_info->model_loaded || !current_context->model_info->model || 
@@ -1366,68 +1297,6 @@ public:    /*
         timings.t_eval_ms = static_cast<float>(current_context->last_decode_time_us) / LlamaConstants::MS_TO_MICROSECONDS;
         return timings;
     }
-
-    // Simplified batch processing using unified functions only
-    bool process_full_context(const std::string& full_content) {
-        if (!current_context || full_content.empty()) return true;
-
-        if (!current_context->model_info) {
-            LLAMA_LOG("Error: No model info available for full context processing");
-            return false;
-        }
-
-        // Use unified tokenization
-        std::vector<llama_token> tokens = process_text_to_tokens(full_content, true);
-        if (tokens.empty()) return false;
-
-        // Check context capacity with safety margin
-        const int32_t safety_margin = LlamaConstants::BATCH_SAFETY_MARGIN;
-        if (static_cast<int32_t>(tokens.size()) > current_context->model_info->n_ctx - safety_margin) {
-            LLAMA_LOG("Warning: Context too large (" + std::to_string(tokens.size()) + 
-                       " tokens > " + std::to_string(current_context->model_info->n_ctx - safety_margin) + " limit)");
-            return false;
-        }
-
-        // Use unified context processing
-        current_context->n_past = 0;
-        if (!process_context_tokens(tokens, false)) {
-            return false;
-        }
-        
-        current_context->prev_len = static_cast<int32_t>(full_content.length());
-        
-        LLAMA_LOG("Successfully processed " + std::to_string(tokens.size()) + 
-                   " tokens in full context rebuild");
-        return true;
-    }
-
-    // Optimized batch initialization with calculated size
-    bool initialize_batch() {
-        if (!current_context || current_context->batch_initialized) {
-            return true;
-        }
-
-        int32_t batch_size = calculate_optimal_batch_size();
-        if (batch_size <= 0) {
-            LLAMA_LOG("Error: Invalid batch size for initialization: " + std::to_string(batch_size));
-            return false;
-        }
-        
-        // Use safer batch initialization
-        current_context->batch = llama_batch_init(batch_size, 0, 1);
-        if (current_context->batch.token == nullptr || 
-            current_context->batch.pos == nullptr || 
-            current_context->batch.n_seq_id == nullptr ||
-            current_context->batch.seq_id == nullptr ||
-            current_context->batch.logits == nullptr) {
-            LLAMA_LOG("Error: Failed to initialize batch arrays with size " + std::to_string(batch_size));
-            return false;
-        }
-
-        current_context->batch_initialized = true;
-        LLAMA_LOG("Initialized batch with optimal size: " + std::to_string(batch_size));
-        return true;
-    }
     
     // Enhanced cleanup with memory optimization
     void cleanup() {
@@ -1452,11 +1321,7 @@ public:    /*
         active_context_id.clear();
         current_context = nullptr;
         
-        // Clean up all models - ModelInfo destructor handles model cleanup
-        models.clear();
-        
-        // Efficient memory cleanup
-        std::string().swap(template_buffer);
+        // Clean up all models - ModelInfo destructor handles model cleanup        models.clear();
         
         LLAMA_LOG("Cleanup completed");
     }
@@ -1485,7 +1350,7 @@ public:    /*
 
         // Generate formatted content from current message history
         std::string formatted_content;
-        if (!apply_template_optimized(false, formatted_content)) {
+        if (!current_context->apply_template(false, formatted_content)) {
             LLAMA_LOG("Error: Failed to apply chat template");
             return false;
         }
@@ -1684,25 +1549,6 @@ inline void LlamaManager::clear_conversation() {
 // Progress callback function declaration (needs to be outside class for C compatibility)
 extern bool model_loading_progress_callback(float progress, void *user_data);
 
-//
-//  IMPROVED LOGIC FLOW IMPLEMENTATION SUMMARY:
-//  ==========================================
-//
-//  The LlamaManager now implements a clean, linear logic flow that is much easier to follow:
-//
-//  PRIMARY FLOW:
-//    User Input → add_message_and_invalidate() → prepare_context_for_generation() → generate_response_tokens() → add_response
-//
-//  KEY IMPROVEMENTS:
-//  - Single source of truth: ConversationState holds all conversation data and validity flags
-//  - Clear decision points: needs_pruning() provides explicit pruning logic
-//  - Lazy evaluation: Context only rebuilt when conversation_state.needs_rebuild = true
-//  - Separated concerns: Context preparation vs. response generation are cleanly separated
-//  - Linear flow: No more jumping between scattered methods during generation
-//  - Comprehensive logging: Each phase is clearly logged for debugging
-//  - Predictable state management: State invalidation and updates follow consistent patterns
-//
-//  This eliminates the previous convoluted flow and makes the codebase much more maintainable.
 //
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!
 //
