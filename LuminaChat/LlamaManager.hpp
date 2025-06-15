@@ -661,6 +661,7 @@ public:
         // Set up model parameters with provided values
         llama_model_params model_params = llama_model_default_params();
         model_params.n_gpu_layers = gpu_layers;
+        model_params.use_mmap = true; // Enable memory-mapped file support
         
         // Set progress callback if user data is provided
         if (progress_callback_user_data) {
@@ -688,19 +689,7 @@ public:
             LLAMA_LOG("Custom chat template stored for model '" + actual_model_id + "'");
         }
         
-        // Initialize default sampler for the model
-        // TODO: I don't think we need to initialize a sampler here since the response class will handle it
-        /*auto sparams = llama_sampler_chain_default_params();
-        sparams.no_perf = false;
-        model_info->sampler = llama_sampler_chain_init(sparams);
-        
-        if (!model_info->sampler) {
-            LLAMA_LOG("Error: Failed to create sampler for model '" + actual_model_id + "'");
-            return false;
-        }
-        
-        llama_sampler_chain_add(model_info->sampler, llama_sampler_init_greedy());*/
-          models[actual_model_id] = std::move(model_info);
+        models[actual_model_id] = std::move(model_info);
         
         // Clear caches when new model is loaded
         clear_caches();
@@ -740,6 +729,9 @@ public:
         ctx_params.n_batch = std::min(LlamaConstants::MAX_BATCH_SIZE, model_info->n_ctx / LlamaConstants::BATCH_DIVISOR);
         ctx_params.n_threads = std::thread::hardware_concurrency();
         ctx_params.no_perf = false;
+        ctx_params.flash_attn = true;
+        ctx_params.op_offload = true;
+        ctx_params.offload_kqv = true;
         
         // Create context
         context_info->context = llama_init_from_model(model_info->model, ctx_params);
@@ -802,30 +794,6 @@ public:
             LLAMA_LOG("Error: Context '" + context_id + "' has invalid state");
             return false;
         }
-        
-        // Validate the sampler for this context's model
-        // TODO: I really don't think this is necessary here since the response class will validate the sampler and create one if needed
-        /*if (!it->second->model_info->sampler) {
-            LLAMA_LOG("Warning: Context '" + context_id + "' has no sampler, attempting to create one");
-            // Try to create a sampler for this model
-            it->second->model_info->sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
-            if (it->second->model_info->sampler) {
-                llama_sampler_chain_add(it->second->model_info->sampler, 
-                                       llama_sampler_init_temp(LlamaConstants::DEFAULT_TEMPERATURE));
-                llama_sampler_chain_add(it->second->model_info->sampler, 
-                                       llama_sampler_init_min_p(LlamaConstants::DEFAULT_MIN_P, 1));
-                llama_sampler_chain_add(it->second->model_info->sampler, 
-                                       llama_sampler_init_top_k(LlamaConstants::DEFAULT_TOP_K));
-                llama_sampler_chain_add(it->second->model_info->sampler, 
-                                       llama_sampler_init_top_p(LlamaConstants::DEFAULT_TOP_P, 1));
-                llama_sampler_chain_add(it->second->model_info->sampler, 
-                                       llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
-                LLAMA_LOG("Created new sampler for context '" + context_id + "'");
-            } else {
-                LLAMA_LOG("Error: Failed to create sampler for context '" + context_id + "'");
-                return false;
-            }
-        }*/
         
         active_context_id = context_id;
         current_context = it->second.get();
