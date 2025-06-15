@@ -307,16 +307,6 @@ inline std::string LlamaSummarizer::summarize_messages(const std::vector<std::pa
         return "";
     }
     
-    // Store current context to restore later
-    std::string original_context_id = llama_manager->get_active_context();
-    SUMMARIZER_LOG("Attempting to switch from context '" + original_context_id + "' to '" + SUMMARY_CONTEXT_ID + "'");
-      // Switch to summary context temporarily
-    if (!llama_manager->switch_to_context(SUMMARY_CONTEXT_ID)) {
-        SUMMARIZER_LOG_ERROR("Failed to switch to summary context");
-        return "";
-    }
-    
-    SUMMARIZER_LOG("Successfully switched to summary context");    
     // Build the content to summarize with better formatting
     std::string content_to_summarize;
     content_to_summarize.reserve(SummarizerConstants::SUMMARY_CONTENT_RESERVE_SIZE);
@@ -328,7 +318,8 @@ inline std::string LlamaSummarizer::summarize_messages(const std::vector<std::pa
     // Create a more explicit summarization request with better prompt
     std::string summarization_request = "Please provide a concise but informative summary of the following conversation. Focus on the main topics discussed and key information exchanged:\n\n" + 
                                       content_to_summarize + 
-                                      "\nProvide a clear summary:";    SUMMARIZER_LOG("Starting summarization of " + std::to_string(messages_to_summarize.size()) + " messages");
+                                      "\nProvide a clear summary:";
+    SUMMARIZER_LOG("Starting summarization of " + std::to_string(messages_to_summarize.size()) + " messages");
     
     // Log the input being summarized in a user-friendly format
     std::string input_summary = "=== INPUT TO SUMMARIZE ===\n";
@@ -339,6 +330,16 @@ inline std::string LlamaSummarizer::summarize_messages(const std::vector<std::pa
     SUMMARIZER_LOG(input_summary);
       // Generate summary using the summary context
     std::string summary;
+    
+    // Store current context to restore later
+    std::string original_context_id = llama_manager->get_active_context();
+    SUMMARIZER_LOG("Attempting to switch from context '" + original_context_id + "' to '" + SUMMARY_CONTEXT_ID + "'");
+      // Switch to summary context temporarily
+    if (!llama_manager->switch_to_context(SUMMARY_CONTEXT_ID)) {
+        SUMMARIZER_LOG_ERROR("Failed to switch to summary context");
+        return "";
+    }
+
     try {
         SUMMARIZER_LOG("Calling generate_response for summarization...");
           // Validate that we're actually in the summary context before generation
@@ -353,7 +354,8 @@ inline std::string LlamaSummarizer::summarize_messages(const std::vector<std::pa
         if (!summary.empty() && summary.size() >= 6 && summary.substr(0, 6) == "Error:") {
             SUMMARIZER_LOG_ERROR("Summary generation returned error: " + summary);
             summary = ""; // Treat as failed summarization
-        } else if (!summary.empty()) {            // Clean up the summary (remove any extra whitespace, newlines)
+        } else if (!summary.empty()) {
+            // Clean up the summary (remove any extra whitespace, newlines)
             size_t start = summary.find_first_not_of(" \t\n\r");
             size_t end = summary.find_last_not_of(" \t\n\r");
             if (start != std::string::npos && end != std::string::npos) {
@@ -371,7 +373,9 @@ inline std::string LlamaSummarizer::summarize_messages(const std::vector<std::pa
     } catch (...) {
         SUMMARIZER_LOG_ERROR("Unknown exception during message summarization");
         summary = "";
-    }    // Restore original context with error checking
+    }
+    
+    // Restore original context with error checking
     SUMMARIZER_LOG("Attempting to restore original context: '" + original_context_id + "'");
     if (!original_context_id.empty()) {
         if (!llama_manager->switch_to_context(original_context_id)) {

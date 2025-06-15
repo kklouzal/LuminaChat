@@ -273,42 +273,42 @@ public:
     // Dependencies: Requires valid ModelInfo, ContextInfo, and proper LlamaManager integration
     template<typename BatchTokenAdder, typename ContextUpdater>
     std::string generate_response(const std::string& input, const std::string& username,
-                                ModelInfo* model_info, ContextInfo* context_info,
+                                ContextInfo* context_info,
                                 BatchTokenAdder add_token_to_batch, ContextUpdater update_context) const {
         
-        if (!model_info || !context_info || input.empty()) {
+        if (!context_info || !context_info->model_info || input.empty()) {
             return "Error: Invalid generation parameters";
         }
 
-        if (!model_info->model || !context_info->context || !model_info->vocab || !context_info->batch_initialized) {
+        if (!context_info->model_info->model || !context_info->context || !context_info->model_info->vocab || !context_info->batch_initialized) {
             return "Error: Model components not properly initialized or no active context";
         }
 
         // Validate and recover sampler if needed
-        if (!validate_and_recover_sampler(model_info)) {
+        if (!validate_and_recover_sampler(context_info->model_info)) {
             return "Error: Sampler validation/recovery failed";
         }
 
         // Validate generation state
-        if (!validate_generation_state(context_info, model_info)) {
+        if (!validate_generation_state(context_info, context_info->model_info)) {
             return "Error: Context state invalid for generation";
         }
 
         // Validate or attempt to recover logits
         float* logits = llama_get_logits(context_info->context);
         if (!logits && context_info->n_past > 0) {
-            if (!recover_logits(context_info, model_info)) {
+            if (!recover_logits(context_info, context_info->model_info)) {
                 return "Error: Context state invalid - no logits available and recovery failed";
             }
         } else if (!logits) {
             return "Error: Context state invalid - no logits available";
         }        // Calculate available space for generation
-        const int32_t max_new_tokens = std::min(model_info->n_predict, 
-                                               model_info->n_ctx - context_info->n_past - LlamaConstants::TOKEN_SAFETY_MARGIN);
+        const int32_t max_new_tokens = std::min(context_info->model_info->n_predict, 
+                                               context_info->model_info->n_ctx - context_info->n_past - LlamaConstants::TOKEN_SAFETY_MARGIN);
         
         if (max_new_tokens <= 0) {
             return "Error: No space left in context for generation (context: " + 
-                   std::to_string(context_info->n_past) + "/" + std::to_string(model_info->n_ctx) + ")";
+                   std::to_string(context_info->n_past) + "/" + std::to_string(context_info->model_info->n_ctx) + ")";
         }
 
         LLAMA_LOG("Starting generation with " + std::to_string(max_new_tokens) + " max tokens, n_past=" + std::to_string(context_info->n_past));        // Initialize generation state
@@ -320,7 +320,7 @@ public:
         std::vector<llama_seq_id> seq_ids = {0};        // Main generation loop
         while (n_generated < max_new_tokens) {
             // Periodic sampler validation during long generation
-            if (n_generated % ResponseConstants::SAMPLER_VALIDATION_INTERVAL == 0 && !model_info->sampler) {
+            if (n_generated % ResponseConstants::SAMPLER_VALIDATION_INTERVAL == 0 && !context_info->model_info->sampler) {
                 LLAMA_LOG("CRITICAL: Sampler became null during generation at token " + std::to_string(n_generated));
                 return "Error: Sampler failed during generation";
             }
@@ -328,7 +328,7 @@ public:
             // Sample next token
             llama_token new_token;
             try {
-                new_token = llama_sampler_sample(model_info->sampler, context_info->context, -1);
+                new_token = llama_sampler_sample(context_info->model_info->sampler, context_info->context, -1);
             } catch (const std::exception& e) {
                 LLAMA_LOG("Exception during token sampling: " + std::string(e.what()));
                 return "Error: Exception during token generation";
@@ -344,13 +344,13 @@ public:
             }
             
             // Check for end-of-generation token
-            if (llama_vocab_is_eog(model_info->vocab, new_token)) {
+            if (llama_vocab_is_eog(context_info->model_info->vocab, new_token)) {
                 LLAMA_LOG("End of generation token encountered");
                 break;
             }
 
             // Convert token to text
-            std::string token_text = convert_token_to_text(new_token, model_info);
+            std::string token_text = convert_token_to_text(new_token, context_info->model_info);
             if (token_text.empty()) {
                 LLAMA_LOG("Warning: Empty token text for token " + std::to_string(new_token));
                 continue;
@@ -421,7 +421,7 @@ public:
         }
 
         // Final sampler validation
-        if (!model_info->sampler) {
+        if (!context_info->model_info->sampler) {
             LLAMA_LOG("WARNING: Sampler is NULL at end of generation!");
         }
 
