@@ -54,6 +54,14 @@
 #include "SettingsManager.hpp"
 #include "LogHandler.hpp"
 
+// Define SummarizerConstants to avoid multiple definition errors
+namespace SummarizerConstants {
+    const size_t MAX_SUMMARY_SLOTS = 5;
+    const float MAX_CONTEXT_USAGE = 0.90f;
+    const float TARGET_CONTEXT_USAGE = 0.60f;
+    const float AGGRESSIVE_PRUNING_RATIO = 0.3f;
+}
+
 // Forward declarations
 class LuminaChatFrame;
 class ModelWorkerThread;
@@ -1273,9 +1281,10 @@ private:
                     std::string summary_prompt = config.summarizer_system_prompt.empty() ? 
                         "You are a helpful assistant that summarizes conversations concisely and accurately." : 
                         config.summarizer_system_prompt;
-                    
-                    if (llama_manager->create_context("summary_context", "summary_model", summary_prompt, true)) {
+                      if (llama_manager->create_context("summary_context", "summary_model", summary_prompt, true)) {
                         LLAMA_LOG("Summary context created successfully with summarizer model");
+                        // Initialize summarizer resources for all existing contexts
+                        llama_manager->initialize_summarizer_resources();
                         // Note: Summarizer chat template was already set during model loading
                     } else {
                         LLAMA_LOG("Warning: Failed to create summary context, summarization features may be limited");

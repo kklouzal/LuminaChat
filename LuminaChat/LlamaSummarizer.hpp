@@ -32,20 +32,22 @@
 #include <vector>
 #include <cstdint>
 #include <algorithm>
+#include <functional>
 #include "LogHandler.hpp"
 
-// Forward declaration to avoid circular dependency
-class LlamaManager;
+// Forward declarations to avoid circular dependency
+struct ContextInfo;
+struct ModelInfo;
 
 // Constants for summarization configuration
 namespace SummarizerConstants {
     // Summary slot management
-    constexpr size_t MAX_SUMMARY_SLOTS = 5;
+    extern const size_t MAX_SUMMARY_SLOTS;
     
     // Context management ratios
-    constexpr float MAX_CONTEXT_USAGE = 0.90f;
-    constexpr float TARGET_CONTEXT_USAGE = 0.60f;
-    constexpr float AGGRESSIVE_PRUNING_RATIO = 0.3f;
+    extern const float MAX_CONTEXT_USAGE;
+    extern const float TARGET_CONTEXT_USAGE;
+    extern const float AGGRESSIVE_PRUNING_RATIO;
     
     // Performance constants
     constexpr size_t SUMMARY_CONTENT_RESERVE_SIZE = 4096;
@@ -60,10 +62,19 @@ namespace SummarizerConstants {
 // External synchronization is required for concurrent access.
 class LlamaSummarizer {
 private:
-    // Reference to the LlamaManager for context switching and generation
-    LlamaManager* llama_manager;
+    // Reference to the parent context that owns this summarizer
+    ContextInfo* parent_context;
     
-    // Context ID for summary operations
+    // Reference to the summary model for validation/checks
+    ModelInfo* summary_model;
+    
+    // Reference to the summary context for direct operations
+    ContextInfo* summary_context;
+    
+    // Callback for generating responses (decouples from LlamaManager implementation)
+    std::function<std::string(const std::string&, const std::string&, ContextInfo*)> generate_response_callback;
+    
+    // Context ID for summary operations (for logging/validation)
     static constexpr const char* SUMMARY_CONTEXT_ID = "summary_context";
 
 public:    // 5-slot summary system: maintains chronological order of conversation summaries
@@ -73,10 +84,20 @@ public:    // 5-slot summary system: maintains chronological order of conversati
 
 private:
     
-public:
-    explicit LlamaSummarizer(LlamaManager* manager) : llama_manager(manager) {
+public:    explicit LlamaSummarizer(ContextInfo* parent_ctx, ModelInfo* summary_mdl = nullptr, ContextInfo* summary_ctx = nullptr,
+                           std::function<std::string(const std::string&, const std::string&, ContextInfo*)> response_callback = nullptr) 
+        : parent_context(parent_ctx), summary_model(summary_mdl), summary_context(summary_ctx), 
+          generate_response_callback(std::move(response_callback)) {
         summary_slots.reserve(SummarizerConstants::MAX_SUMMARY_SLOTS);
-    }    // Delete copy constructor and assignment operator
+    }
+    
+    // Method to set summary context and callback after creation (for late initialization)
+    void set_summary_resources(ModelInfo* summary_mdl, ContextInfo* summary_ctx,
+                              std::function<std::string(const std::string&, const std::string&, ContextInfo*)> response_callback) {
+        summary_model = summary_mdl;
+        summary_context = summary_ctx;
+        generate_response_callback = std::move(response_callback);
+    }// Delete copy constructor and assignment operator
     LlamaSummarizer(const LlamaSummarizer&) = delete;
     LlamaSummarizer& operator=(const LlamaSummarizer&) = delete;
 
@@ -107,7 +128,7 @@ public:
     // Enhanced summarization for very large message collections
     // Breaks down large summarization tasks into manageable chunks to avoid token limits
     std::string summarize_large_message_collection(const std::vector<std::pair<std::string, std::string>>& messages_to_summarize) {
-        if (messages_to_summarize.empty() || !llama_manager) {
+        if (messages_to_summarize.empty()) {
             return "";
         }
         
@@ -157,6 +178,9 @@ public:
         return chunk_summaries.empty() ? "" : chunk_summaries[0];
     }
 
+    // Direct summary generation using stored context pointers (eliminates LlamaManager dependency)
+    std::string generate_summary_directly(const std::string& summarization_request);
+
 };
 
 // Implementation of member functions
@@ -203,6 +227,43 @@ inline void LlamaSummarizer::prune_message_history(std::vector<std::pair<std::st
                                                   float keep_ratio) {
     if (message_history.empty()) {
         SUMMARIZER_LOG("No messages to prune - message history is empty");
+        return;
+    }
+    
+    // Check if summary resources are available
+    if (!summary_context || !summary_model || !generate_response_callback) {
+        SUMMARIZER_LOG("Warning: Summary resources not available - performing simple pruning without summarization");
+        
+        // Fallback: simple pruning without summarization
+        bool has_system = !message_history.empty() && message_history[0].first == "system";
+        size_t system_offset = has_system ? 1 : 0;
+        size_t total_messages = message_history.size() - system_offset;
+        size_t messages_to_keep = std::max(size_t(2), static_cast<size_t>(total_messages * keep_ratio));
+        
+        if (messages_to_keep >= total_messages) {
+            return; // No pruning needed
+        }
+        
+        // Keep system message + recent messages
+        std::vector<std::pair<std::string, std::string>> new_history;
+        if (has_system) {
+            new_history.emplace_back(std::move(message_history[0]));
+        }
+        
+        // Add a note about removed messages
+        size_t removed_count = total_messages - messages_to_keep;
+        new_history.emplace_back("system", "[Note: " + std::to_string(removed_count) + 
+                                " older messages removed due to context limits]");
+        
+        // Keep recent messages
+        size_t start_idx = message_history.size() - messages_to_keep;
+        for (size_t i = start_idx; i < message_history.size(); ++i) {
+            new_history.emplace_back(std::move(message_history[i]));
+        }
+        
+        message_history = std::move(new_history);
+        SUMMARIZER_LOG("Simple pruning completed - kept " + std::to_string(messages_to_keep) + 
+                       " of " + std::to_string(total_messages) + " messages");
         return;
     }
     
@@ -297,13 +358,20 @@ inline void LlamaSummarizer::prune_message_history(std::vector<std::pair<std::st
 }
 
 inline std::string LlamaSummarizer::summarize_messages(const std::vector<std::pair<std::string, std::string>>& messages_to_summarize) {
-    if (messages_to_summarize.empty() || !llama_manager) {
-        SUMMARIZER_LOG("Error: Empty messages or null llama_manager");
+    if (messages_to_summarize.empty()) {
+        SUMMARIZER_LOG("Error: Empty messages to summarize");
         return "";
     }
-      // Check if we have a summary context available
-    if (!llama_manager->has_context(SUMMARY_CONTEXT_ID)) {
-        SUMMARIZER_LOG_ERROR("No summary context available for message summarization");
+    
+    // Check if summary resources are available
+    if (!summary_context || !summary_model || !generate_response_callback) {
+        SUMMARIZER_LOG_ERROR("Summary resources not available - context, model, or callback missing");
+        return "";
+    }
+    
+    // Validate that the summary context is properly initialized
+    if (!summary_context->context || !summary_context->model_info || !summary_context->batch_initialized) {
+        SUMMARIZER_LOG_ERROR("Summary context is not properly initialized for message summarization");
         return "";
     }
     
@@ -319,6 +387,7 @@ inline std::string LlamaSummarizer::summarize_messages(const std::vector<std::pa
     std::string summarization_request = "Please provide a concise but informative summary of the following conversation. Focus on the main topics discussed and key information exchanged:\n\n" + 
                                       content_to_summarize + 
                                       "\nProvide a clear summary:";
+    
     SUMMARIZER_LOG("Starting summarization of " + std::to_string(messages_to_summarize.size()) + " messages");
     
     // Log the input being summarized in a user-friendly format
@@ -328,61 +397,18 @@ inline std::string LlamaSummarizer::summarize_messages(const std::vector<std::pa
     }
     input_summary += "========================\n";
     SUMMARIZER_LOG(input_summary);
-      // Generate summary using the summary context
-    std::string summary;
     
-    // Store current context to restore later
-    std::string original_context_id = llama_manager->get_active_context();
-    SUMMARIZER_LOG("Attempting to switch from context '" + original_context_id + "' to '" + SUMMARY_CONTEXT_ID + "'");
-      // Switch to summary context temporarily
-    if (!llama_manager->switch_to_context(SUMMARY_CONTEXT_ID)) {
-        SUMMARIZER_LOG_ERROR("Failed to switch to summary context");
-        return "";
-    }
-
-    try {
-        SUMMARIZER_LOG("Calling generate_response for summarization...");
-          // Validate that we're actually in the summary context before generation
-        if (llama_manager->get_active_context() != SUMMARY_CONTEXT_ID) {
-            SUMMARIZER_LOG_ERROR("Not in summary context before generation");
-            return "";
-        }
-        
-        summary = llama_manager->generate_response(summarization_request, "user");
-        SUMMARIZER_LOG("Generate_response returned: '" + summary + "'");
-          // Check if the summary is actually an error message
-        if (!summary.empty() && summary.size() >= 6 && summary.substr(0, 6) == "Error:") {
-            SUMMARIZER_LOG_ERROR("Summary generation returned error: " + summary);
-            summary = ""; // Treat as failed summarization
-        } else if (!summary.empty()) {
-            // Clean up the summary (remove any extra whitespace, newlines)
-            size_t start = summary.find_first_not_of(" \t\n\r");
-            size_t end = summary.find_last_not_of(" \t\n\r");
-            if (start != std::string::npos && end != std::string::npos) {
-                summary = summary.substr(start, end - start + 1);
-            }
-            
-            // Log the successful output in a user-friendly format
-            std::string output_message = "=== GENERATED SUMMARY ===\n" + summary + "\n==========================\n";
-            SUMMARIZER_LOG(output_message);
-        } else {
-            SUMMARIZER_LOG("Warning: Generated summary is empty");
-        }} catch (const std::exception& e) {
-        SUMMARIZER_LOG_ERROR("Exception during message summarization: " + std::string(e.what()));
-        summary = "";
-    } catch (...) {
-        SUMMARIZER_LOG_ERROR("Unknown exception during message summarization");
-        summary = "";
-    }
+    // Generate summary using the direct approach (no context switching needed)
+    std::string summary = generate_summary_directly(summarization_request);
     
-    // Restore original context with error checking
-    SUMMARIZER_LOG("Attempting to restore original context: '" + original_context_id + "'");
-    if (!original_context_id.empty()) {
-        if (!llama_manager->switch_to_context(original_context_id)) {
-            SUMMARIZER_LOG_ERROR("Failed to restore original context '" + original_context_id + "'");
-        } else {
-            SUMMARIZER_LOG("Successfully restored original context");
-        }
+    // Check if the summary is actually an error message
+    if (!summary.empty() && summary.size() >= 6 && summary.substr(0, 6) == "Error:") {
+        SUMMARIZER_LOG_ERROR("Summary generation returned error: " + summary);
+        summary = ""; // Treat as failed summarization
+    } else if (!summary.empty()) {
+        // Log the successful output in a user-friendly format
+        std::string output_message = "=== GENERATED SUMMARY ===\n" + summary + "\n==========================\n";
+        SUMMARIZER_LOG(output_message);
     }
     
     if (summary.empty()) {
@@ -390,6 +416,54 @@ inline std::string LlamaSummarizer::summarize_messages(const std::vector<std::pa
     } else {
         SUMMARIZER_LOG("Successfully summarized " + std::to_string(messages_to_summarize.size()) + 
                        " messages into " + std::to_string(summary.length()) + " character summary");
+    }
+    
+    return summary;
+}
+
+inline std::string LlamaSummarizer::generate_summary_directly(const std::string& summarization_request) {
+    if (summarization_request.empty() || !summary_context || !summary_model || !generate_response_callback) {
+        SUMMARIZER_LOG("Error: Empty request, null context/model, or missing callback");
+        return "";
+    }
+    
+    // Validate that the summary context is properly initialized
+    if (!summary_context->context || !summary_context->model_info || !summary_context->batch_initialized) {
+        SUMMARIZER_LOG_ERROR("Summary context is not properly initialized");
+        return "";
+    }
+    
+    // Validate that the summary context is associated with the correct model
+    if (summary_context->model_info != summary_model) {
+        SUMMARIZER_LOG_ERROR("Summary context is not associated with the expected summary model");
+        return "";
+    }
+    
+    SUMMARIZER_LOG("Starting direct summary generation using callback");
+    
+    std::string summary;
+    try {
+        // Use the callback to generate the response directly on the summary context
+        summary = generate_response_callback(summarization_request, "user", summary_context);
+        
+        // Clean up the summary (remove any extra whitespace, newlines)
+        if (!summary.empty()) {
+            size_t start = summary.find_first_not_of(" \t\n\r");
+            size_t end = summary.find_last_not_of(" \t\n\r");
+            if (start != std::string::npos && end != std::string::npos) {
+                summary = summary.substr(start, end - start + 1);
+            }
+            
+            SUMMARIZER_LOG("Successfully generated summary using direct callback");
+        } else {
+            SUMMARIZER_LOG("Warning: Generated summary is empty");
+        }
+    } catch (const std::exception& e) {
+        SUMMARIZER_LOG_ERROR("Exception during direct summary generation: " + std::string(e.what()));
+        summary = "";
+    } catch (...) {
+        SUMMARIZER_LOG_ERROR("Unknown exception during direct summary generation");
+        summary = "";
     }
     
     return summary;

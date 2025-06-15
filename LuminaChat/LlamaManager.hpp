@@ -61,6 +61,7 @@
 #include "llama-cpp.h"
 #include "LogHandler.hpp"
 #include "TokenCache.hpp"
+#include "LlamaContext.hpp"
 
 // Forward declarations
 class LlamaSummarizer;
@@ -68,296 +69,29 @@ bool model_loading_progress_callback(float progress, void *user_data);
 
 // Constants for configuration and performance (Directive #13: Zero Magic & Strong Typing)
 namespace LlamaConstants {
-    // Model defaults
-    constexpr int32_t DEFAULT_CONTEXT_SIZE = 2048;
-    constexpr int32_t DEFAULT_GPU_LAYERS = 0;
-    constexpr int32_t DEFAULT_PREDICT_TOKENS = 256;
+    // Additional constants specific to LlamaManager (core constants are in LlamaContext.hpp)
     constexpr int32_t DEFAULT_TOKEN_CACHE_SIZE = 1024;
-      // Batch processing - for multiple separate inputs, not splitting single inputs
+    // Batch processing - for multiple separate inputs, not splitting single inputs
     constexpr int32_t MAX_BATCH_SIZE = 8192;
     constexpr int32_t BATCH_DIVISOR = 4;
-    constexpr int32_t MAX_SEQ_IDS = 8;
-      // Safety margins and limits
+    // Safety margins and limits
     constexpr int32_t TOKEN_SAFETY_MARGIN = 32;
     constexpr int32_t BATCH_SAFETY_MARGIN = 128;
     constexpr int32_t MAX_TOKEN_BUFFER_SIZE = 1024;
     constexpr int32_t MAX_SUMMARY_LENGTH = 512;
     constexpr int32_t INITIAL_TOKEN_BUFFER_SIZE = 32;
-    constexpr size_t MAX_MESSAGE_HISTORY_SIZE = 1000;    // Sampler defaults
+    // Sampler defaults
     constexpr float DEFAULT_TEMPERATURE = 0.8f;
     constexpr float DEFAULT_MIN_P = 0.05f;
     constexpr float DEFAULT_TOP_P = 0.9f;
     constexpr int32_t DEFAULT_TOP_K = 40;
-    
     // String processing constants
     constexpr size_t MAX_TEXT_PREVIEW_LENGTH = 50;
-    constexpr size_t STRING_RESERVE_MULTIPLIER = 4;
     constexpr int32_t MAX_RETRY_ATTEMPTS = 2;
-    
     // Timing and sleep constants
     constexpr int32_t RETRY_BACKOFF_MS = 50;
     constexpr float MS_TO_MICROSECONDS = 1000.0f;
 }
-
-// Forward declaration of SummarizerConstants (fully defined in LlamaSummarizer.hpp)
-namespace SummarizerConstants {
-    extern const size_t MAX_SUMMARY_SLOTS;
-    extern const float TARGET_CONTEXT_USAGE;
-    extern const float AGGRESSIVE_PRUNING_RATIO;
-}
-
-// Model information container
-struct ModelInfo {
-    llama_model* model;
-    const llama_vocab* vocab;
-    llama_sampler* sampler;
-    int32_t n_ctx;
-    int32_t n_gpu_layers;
-    int32_t n_predict;
-    std::string model_path;
-    std::string custom_chat_template;
-    bool model_loaded;
-    
-    ModelInfo() : model(nullptr), vocab(nullptr), sampler(nullptr), 
-                 n_ctx(LlamaConstants::DEFAULT_CONTEXT_SIZE), n_gpu_layers(LlamaConstants::DEFAULT_GPU_LAYERS), 
-                 n_predict(LlamaConstants::DEFAULT_PREDICT_TOKENS), model_loaded(false) {}
-    
-    ~ModelInfo() {
-        if (sampler) {
-            llama_sampler_free(sampler);
-            sampler = nullptr;
-        }
-        if (model) {
-            llama_model_free(model);
-            model = nullptr;
-        }
-        vocab = nullptr;
-        model_loaded = false;
-    }
-    
-    // Get chat template (custom or model default)
-    const char* get_chat_template() const {
-        if (!custom_chat_template.empty()) {
-            return custom_chat_template.c_str();
-        }
-        if (model) {
-            return llama_model_chat_template(model, nullptr);
-        }
-        return nullptr;
-    }
-};
-
-// Multi-context support
-struct ContextInfo {
-    llama_context* context;
-    llama_batch batch;
-    bool batch_initialized;
-    int32_t n_past;
-    int32_t prev_len;
-    std::vector<std::pair<std::string, std::string>> message_history;
-    std::string system_message;
-    
-    // Template buffer - context-specific to avoid conflicts
-    mutable std::string template_buffer;
-    
-    // Performance tracking
-    int64_t total_generation_tokens = 0;
-    int64_t last_decode_time_us = 0;// Cache state - enhanced with conversation state tracking
-    mutable bool message_cache_dirty = true;
-    mutable std::vector<llama_chat_message> message_cache;
-      // Conversation state for improved logic flow - single source of truth
-    struct ConversationState {
-        std::string formatted_content;     // Template-applied content ready for tokenization
-        std::vector<llama_token> tokens;   // Tokenized representation of formatted_content
-        int32_t total_token_count = 0;     // Exact count of tokens (for efficiency)
-        bool needs_rebuild = true;         // Flag indicating if context rebuild is required
-        
-        // Mark state as invalid, requiring full rebuild
-        void invalidate() {
-            needs_rebuild = true;
-            formatted_content.clear();
-            tokens.clear();
-            total_token_count = 0;
-        }
-        
-        // Update state with new processed content (marks as valid)
-        void update(const std::string& content, const std::vector<llama_token>& new_tokens) {
-            formatted_content = content;
-            tokens = new_tokens;
-            total_token_count = static_cast<int32_t>(new_tokens.size());
-            needs_rebuild = false;  // State is now up-to-date
-        }
-    } conversation_state;
-    
-    // Token count tracking for efficiency - maintains accurate count of tokens in message history
-    // Always >= 0, updated during context rebuilds and incremental updates
-    // NOTE: This field was previously sometimes set to -1 to indicate invalidation,
-    // but that pattern is no longer used. The count is now always maintained accurately.
-    int32_t message_history_token_count = 0;
-    
-    // Reference to associated model
-    ModelInfo* model_info;
-
-    // Special flag for contexts that should reset before each generation
-    // Primarily used for summary models that need a clean slate for each task
-    bool reset_after_generation = false;
-
-    // Summarizer for handling conversation summarization per context
-    std::unique_ptr<LlamaSummarizer> summarizer;
-
-    ContextInfo() : context(nullptr), batch{}, batch_initialized(false), 
-                   n_past(0), prev_len(0), message_history_token_count(0), model_info(nullptr) {
-    }
-      // Get context size directly from associated model
-    int32_t get_context_size() const noexcept {
-        return model_info ? model_info->n_ctx : LlamaConstants::DEFAULT_CONTEXT_SIZE;
-    }
-    
-    // Template application specific to this context
-    bool apply_template(bool add_generation_prompt, std::string& result) const {
-        if (!model_info) return false;
-        
-        const char* tmpl = model_info->get_chat_template();
-        if (!tmpl) return false;
-        
-        // Update message cache if needed
-        if (message_cache_dirty) {
-            message_cache = convert_to_llama_messages();
-            message_cache_dirty = false;
-        }
-        
-        // Apply template with auto-resize
-        template_buffer.resize(model_info->n_ctx * LlamaConstants::STRING_RESERVE_MULTIPLIER);
-        int32_t result_len = llama_chat_apply_template(
-            tmpl, message_cache.data(), message_cache.size(),
-            add_generation_prompt, template_buffer.data(), template_buffer.size()
-        );
-        
-        if (result_len < 0) {
-            template_buffer.resize(-result_len);
-            result_len = llama_chat_apply_template(
-                tmpl, message_cache.data(), message_cache.size(),
-                add_generation_prompt, template_buffer.data(), template_buffer.size()
-            );
-        }
-        
-        if (result_len > 0) {
-            result = std::string(template_buffer.data(), result_len);
-            return true;
-        }
-        return false;
-    }
-    
-    // Validate context state
-    bool validate_state() const {
-        if (!model_info || !model_info->model || !context) {
-            return false;
-        }
-        
-        // Check if context position is reasonable
-        if (n_past < 0 || n_past >= model_info->n_ctx) {
-            return false;
-        }
-        
-        // Check for extremely long message history that might cause issues
-        if (message_history.size() > LlamaConstants::MAX_MESSAGE_HISTORY_SIZE) {
-            return false;
-        }
-        
-        return true;
-    }
-    
-    // Reset context state
-    void reset_context_state() {
-        if (context) {
-            llama_memory_clear(llama_get_memory(context), true);
-        }
-        n_past = 0;
-        prev_len = 0;
-        conversation_state.invalidate();
-        message_cache_dirty = true;
-    }
-    
-    // Check if context needs pruning based on token count
-    bool needs_pruning(int32_t token_count) const {
-        if (!model_info) return false;
-          int32_t max_threshold = static_cast<int32_t>(model_info->n_ctx * 0.9f);
-        return token_count > max_threshold;
-    }
-    
-    // Batch management methods - context-specific
-    void clear_batch() {
-        if (!batch_initialized) return;
-        batch.n_tokens = 0;
-    }
-
-    // Add tokens from a single input to batch
-    // NOTE: This is for single-sequence processing, not multi-sequence batching
-    bool add_tokens_to_batch(const std::vector<llama_token>& tokens, int32_t start_pos, 
-                            const std::vector<llama_seq_id>& seq_ids, bool output_logits = false) {
-        if (!batch_initialized || tokens.empty() || !model_info) return false;
-        
-        // Validate start_pos is reasonable
-        if (start_pos < 0 || start_pos >= model_info->n_ctx) {
-            return false;
-        }        
-        
-        const int32_t n_batch = llama_n_batch(context);
-        if (n_batch <= 0) {
-            return false;
-        }
-        
-        clear_batch(); // Clear batch
-        
-        // Validate sequence IDs
-        if (seq_ids.empty()) {
-            return false;
-        }
-        
-        // Use n_batch as the capacity limit
-        for (size_t i = 0; i < tokens.size() && batch.n_tokens < n_batch; ++i) {
-            // Check position bounds carefully
-            int32_t pos = start_pos + static_cast<int32_t>(i);
-            if (pos >= model_info->n_ctx || pos < 0) {
-                break;
-            }
-            
-            // Validate token value
-            if (tokens[i] < 0) {
-                return false;
-            }
-            
-            // Ensure we don't exceed batch array bounds
-            if (batch.n_tokens >= n_batch) {
-                break;
-            }
-            
-            batch.token[batch.n_tokens] = tokens[i];
-            batch.pos[batch.n_tokens] = pos;
-            batch.n_seq_id[batch.n_tokens] = static_cast<int32_t>(std::min(seq_ids.size(), size_t(LlamaConstants::MAX_SEQ_IDS)));
-            
-            // Safe sequence ID copying with bounds check
-            for (size_t j = 0; j < std::min(seq_ids.size(), size_t(LlamaConstants::MAX_SEQ_IDS)); ++j) {
-                batch.seq_id[batch.n_tokens][j] = seq_ids[j];
-            }
-            
-            batch.logits[batch.n_tokens] = (i == tokens.size() - 1) ? output_logits : false;
-            batch.n_tokens++;
-        }
-        
-        return batch.n_tokens > 0;
-    }
-    
-private:
-    // Convert message history to llama_chat_message format
-    std::vector<llama_chat_message> convert_to_llama_messages() const {
-        std::vector<llama_chat_message> messages;
-        for (const auto& msg : message_history) {
-            messages.push_back({ msg.first.c_str(), msg.second.c_str() });
-        }
-        return messages;
-    }
-};
 
 #include "LlamaResponse.hpp"
 
@@ -756,12 +490,11 @@ public:
         // Ensure token count is properly initialized (safety check)
         if (context_info->message_history_token_count < 0) {
             context_info->message_history_token_count = 0;
-        }
-          // Set the reset after generation flag
+        }        // Set the reset after generation flag
         context_info->reset_after_generation = reset_after_generation;
         
-        // Initialize summarizer for this context
-        context_info->summarizer = std::make_unique<LlamaSummarizer>(this);
+        // Initialize summarizer for this context with parent context only (summary resources will be set later)
+        context_info->summarizer = std::make_unique<LlamaSummarizer>(context_info.get());
         
         contexts[context_id] = std::move(context_info);
         LLAMA_LOG("Created context '" + context_id + "' with model '" + model_id + "' successfully");
@@ -916,11 +649,40 @@ public:
         token_cache.put(cache_key, tokens);
         
         return tokens;
+    }    // Clear conversation history - delegates to current context
+    void clear_conversation() {
+        if (!current_context) return;
+        
+        LLAMA_LOG("Delegating conversation clearing to context");
+        current_context->clear_conversation();
     }
-    
-    // Clear conversation history
-    void clear_conversation();// Prune message history with summarization and context update
-    bool prune_conversation_with_summary(float keep_ratio = 0.6f);
+
+    // Prune message history with summarization and context update - delegates to current context
+    bool prune_conversation_with_summary(float keep_ratio = 0.6f) {
+        if (!current_context) {
+            LLAMA_LOG("Warning: No active context for pruning");
+            return false;
+        }
+        
+        // Don't prune summary contexts
+        if (active_context_id == "summary_context") {
+            LLAMA_LOG("Skipping pruning for summary context");
+            return true;
+        }
+        
+        LLAMA_LOG("Delegating pruning to context with " + std::to_string(current_context->message_history.size()) + 
+                  " messages, keep_ratio=" + std::to_string(keep_ratio));
+        
+        return current_context->prune_with_summarization(keep_ratio);
+    }
+
+    // Helper method to add messages to history without immediate context update - delegates to current context
+    void add_message_to_history(const std::string& role, const std::string& content) {
+        if (!current_context) return;
+        
+        LLAMA_LOG("Delegating message addition to context: " + role);
+        current_context->add_message(role, content);
+    }
         // Forward declaration for summary slot info - implementation after LlamaSummarizer include
     struct SummarySlotInfo {
         size_t total_slots;
@@ -929,10 +691,36 @@ public:
     };
     
     SummarySlotInfo get_summary_slot_info() const;
+    
+    // Initialize summarizer resources for all contexts when summary context becomes available
+    void initialize_summarizer_resources() {
+        // Find the summary context and model
+        ContextInfo* summary_ctx = get_context_info("summary_context");
+        ModelInfo* summary_mdl = get_model_info("summary_model");
+        
+        if (!summary_ctx || !summary_mdl) {
+            LLAMA_LOG("Warning: Summary context or model not available for summarizer initialization");
+            return;
+        }
+        
+        // Create callback function for response generation
+        auto response_callback = [this](const std::string& input, const std::string& username, ContextInfo* target_context) -> std::string {
+            return generate_response_on_context(input, username, target_context);
+        };
+        
+        // Update all existing context summarizers
+        for (auto& [context_id, context_info] : contexts) {
+            if (context_info->summarizer && context_id != "summary_context") {
+                context_info->summarizer->set_summary_resources(summary_mdl, summary_ctx, response_callback);
+                LLAMA_LOG("Initialized summarizer resources for context '" + context_id + "'");
+            }
+        }
+        
+        LLAMA_LOG("Successfully initialized summarizer resources for all contexts");
+    }
         
 private:
-    // Improved logic flow helper methods
-      // Add message and mark conversation state as needing rebuild
+    // Improved logic flow helper methods    // Add message and mark conversation state as needing rebuild
     void add_message_and_invalidate(const std::string& role, const std::string& content) {
         if (!current_context) return;
         
@@ -940,12 +728,10 @@ private:
         
         // Setup conversation - ensure system message is in history if context is empty
         if (current_context->message_history.empty() && !current_context->system_message.empty()) {
-            current_context->message_history.emplace_back("system", current_context->system_message);
+            current_context->add_message("system", current_context->system_message);
         }
         
-        current_context->message_history.emplace_back(role, content);
-        current_context->message_cache_dirty = true;
-        current_context->conversation_state.invalidate();
+        current_context->add_message(role, content);
         
         LLAMA_LOG("Message added. Total messages: " + std::to_string(current_context->message_history.size()) + 
                   ". State invalidated - rebuild required.");
@@ -1321,19 +1107,8 @@ public:
         active_context_id.clear();
         current_context = nullptr;
         
-        // Clean up all models - ModelInfo destructor handles model cleanup        models.clear();
-        
+        // Clean up all models - ModelInfo destructor handles model cleanup        models.clear();        
         LLAMA_LOG("Cleanup completed");
-    }
-    
-    // Helper method to add messages to history without immediate context update
-    void add_message_to_history(const std::string& role, const std::string& content) {
-        if (!current_context) return;
-
-        current_context->message_history.emplace_back(role, content);
-        current_context->message_cache_dirty = true;
-        
-        // Token count will be updated during the next context update for accuracy
     }
     
     // Get context size for capacity calculations - uses current context's model
@@ -1470,12 +1245,42 @@ private:
         
         return true;
     }
+    
+    // Helper method for summarizer callback - generates response on a specific context
+    std::string generate_response_on_context(const std::string& input, const std::string& username, ContextInfo* target_context) {
+        if (!target_context) {
+            return "Error: No target context provided";
+        }
+        
+        // Store current context to restore later
+        ContextInfo* original_context = current_context;
+        std::string original_context_id = active_context_id;
+        
+        // Temporarily switch to target context
+        current_context = target_context;
+        active_context_id = "temporary_summary_context"; // For logging purposes
+        
+        try {
+            // Generate response using existing logic
+            std::string result = generate_response(input, username);
+            
+            // Restore original context
+            current_context = original_context;
+            active_context_id = original_context_id;
+              return result;
+        } catch (...) {
+            // Ensure we restore context even on exception
+            current_context = original_context;
+            active_context_id = original_context_id;
+            throw;
+        }
+    }
 };
 
 // Include LlamaSummarizer implementation after class declaration to avoid circular dependency
 #include "LlamaSummarizer.hpp"
 
-// Implementation of methods that depend on LlamaSummarizer
+// Implementation of LlamaManager methods that depend on LlamaSummarizer
 inline LlamaManager::SummarySlotInfo LlamaManager::get_summary_slot_info() const {
     if (!current_context || !current_context->summarizer) {
         return {SummarizerConstants::MAX_SUMMARY_SLOTS, 0, {}};
@@ -1483,71 +1288,6 @@ inline LlamaManager::SummarySlotInfo LlamaManager::get_summary_slot_info() const
     auto summarizer_info = current_context->summarizer->get_summary_slot_info();
     return {summarizer_info.total_slots, summarizer_info.used_slots, summarizer_info.summaries};
 }
-
-// Message history pruning with summarization - focused solely on message pruning
-inline bool LlamaManager::prune_conversation_with_summary(float keep_ratio) {
-    if (!current_context || current_context->message_history.empty()) {
-        LLAMA_LOG("Warning: No active context or empty message history for pruning");
-        return false;
-    }
-    
-    if (!current_context->summarizer) {
-        LLAMA_LOG("Warning: No summarizer available for pruning");
-        return false;
-    }
-    
-    // Don't prune summary contexts
-    if (active_context_id == "summary_context") {
-        LLAMA_LOG("Skipping pruning for summary context");
-        return true;
-    }
-    
-    size_t original_message_count = current_context->message_history.size();
-    LLAMA_LOG("Starting message pruning with " + std::to_string(original_message_count) + 
-              " messages, keep_ratio=" + std::to_string(keep_ratio));
-    
-    // Clear context state before pruning since message structure will change
-    if (current_context->context) {
-        llama_memory_clear(llama_get_memory(current_context->context), true);
-    }
-    current_context->n_past = 0;
-    current_context->prev_len = 0;
-    
-    // Perform the pruning with summarization
-    current_context->summarizer->prune_message_history(current_context->message_history, keep_ratio);
-    
-    // Always mark message cache as dirty after pruning since message structure changed
-    current_context->message_cache_dirty = true;
-    
-    LLAMA_LOG("Message pruning completed. Messages: " + std::to_string(original_message_count) + 
-              " -> " + std::to_string(current_context->message_history.size()));
-    
-    return true;
-}
-
-inline void LlamaManager::clear_conversation() {
-    if (!current_context) return;
-    
-    LLAMA_LOG("Starting context rebuild: FULL (conversation cleared) - clearing all " + std::to_string(current_context->message_history.size()) + " messages");
-    
-    if (current_context->context) {
-        llama_memory_clear(llama_get_memory(current_context->context), true); // Ensure kv memory/cache is cleared
-    }
-    current_context->message_history.clear();
-    if (current_context->summarizer) {
-        current_context->summarizer->summary_slots.clear(); // Clear summary slots when conversation is cleared (Directive #7: direct access)
-    }
-    current_context->message_cache_dirty = true;
-    current_context->n_past = 0;
-    current_context->prev_len = 0;
-    
-    // Reset token count since conversation is cleared
-    current_context->message_history_token_count = 0;
-      LLAMA_LOG("Cleared conversation history and summary slots");
-}
-
-// Progress callback function declaration (needs to be outside class for C compatibility)
-extern bool model_loading_progress_callback(float progress, void *user_data);
 
 //
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!

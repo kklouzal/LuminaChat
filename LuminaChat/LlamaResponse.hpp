@@ -427,21 +427,17 @@ public:
             
             // Preserve system message but clear everything else
             std::string saved_system_message = context_info->system_message;
-            
-            // Clear context state
+              // Clear context state
             if (context_info->context) {
                 llama_memory_clear(llama_get_memory(context_info->context), true); // Ensure kv memory/cache is cleared
             }
             context_info->n_past = 0;
             context_info->prev_len = 0;
-            context_info->message_history.clear();
-            context_info->message_cache_dirty = true;
-            context_info->message_history_token_count = 0; // Reset token count since we cleared history
+            context_info->clear_conversation();
               // Restore system message for next task
             if (!saved_system_message.empty()) {
                 context_info->system_message = saved_system_message;
-                context_info->message_history.emplace_back("system", saved_system_message);
-                context_info->message_cache_dirty = true;
+                context_info->add_message("system", saved_system_message);
                 // Token count will be updated during next context processing
                 LLAMA_LOG("Restored system message for next task");
             }
