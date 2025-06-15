@@ -38,5 +38,8 @@
     <ClInclude Include="TokenCache.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="common_utils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

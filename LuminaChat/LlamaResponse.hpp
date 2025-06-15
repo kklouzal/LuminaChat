@@ -337,12 +337,11 @@ public:
             LLAMA_LOG("Generated " + std::to_string(n_generated) + " tokens in " + 
                      std::to_string(context_info->last_decode_time_us / 1000.0f) + "ms (" + 
                      std::to_string(tokens_per_second) + " t/s)");
-        }
-
-        // Update conversation history and context
+        }        // Update conversation history and context
         if (!response.empty()) {
             context_info->message_history.emplace_back("assistant", response);
             context_info->message_cache_dirty = true;
+            // Token count will be updated during context processing
             
             // Update context length using provided updater
             update_context();
@@ -357,18 +356,19 @@ public:
             
             // Clear context state
             if (context_info->context) {
-                llama_kv_self_clear(context_info->context);
+                llama_memory_clear(llama_get_memory(context_info->context), true); // Ensure kv memory/cache is cleared
             }
             context_info->n_past = 0;
             context_info->prev_len = 0;
             context_info->message_history.clear();
             context_info->message_cache_dirty = true;
-            
-            // Restore system message for next task
+            context_info->message_history_token_count = 0; // Reset token count since we cleared history
+              // Restore system message for next task
             if (!saved_system_message.empty()) {
                 context_info->system_message = saved_system_message;
                 context_info->message_history.emplace_back("system", saved_system_message);
                 context_info->message_cache_dirty = true;
+                // Token count will be updated during next context processing
                 LLAMA_LOG("Restored system message for next task");
             }
         }

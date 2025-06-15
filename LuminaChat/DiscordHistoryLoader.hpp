@@ -47,6 +47,7 @@
 
 #include <dpp/dpp.h>
 #include "LogHandler.hpp"
+#include "common_utils.hpp"
 
 class LlamaManager;
 
@@ -133,8 +134,6 @@ private:    // Core dependencies
         
         if (!llama_manager) return;
         
-        std::string original_context = llama_manager->get_active_context();
-        
         // Get unique context IDs
         std::unordered_set<std::string> unique_contexts;
         for (const auto& [channel_id, state] : channel_states) {
@@ -143,23 +142,19 @@ private:    // Core dependencies
         
         // Initialize capacity data for each context
         for (const std::string& context_id : unique_contexts) {
-            if (llama_manager->switch_to_context(context_id)) {
-                int32_t current_tokens = llama_manager->get_message_history_token_count();
-                int32_t context_size = llama_manager->get_context_size();
-                float fill_ratio = BASE_MAX_CONTEXT_FILL_RATIO * context_fill_percentage;
-                int32_t capacity_limit = static_cast<int32_t>(context_size * fill_ratio);
-                
-                context_current_tokens[context_id] = current_tokens;
-                context_capacity_limits[context_id] = capacity_limit;
-                
-                DISCORD_HISTORY_LOG("Context '" + context_id + "' capacity: " + std::to_string(current_tokens) + 
-                           "/" + std::to_string(capacity_limit) + " tokens");
-            }
-        }
-        
-        // Restore original context
-        if (!original_context.empty()) {
-            llama_manager->switch_to_context(original_context);
+            // Get the context info from LlamaManager
+            auto context = llama_manager->get_context_info(context_id);
+
+            int32_t current_tokens = context->message_history_token_count;
+            int32_t context_size = context->get_context_size();
+            float fill_ratio = BASE_MAX_CONTEXT_FILL_RATIO * context_fill_percentage;
+            int32_t capacity_limit = static_cast<int32_t>(context_size * fill_ratio);
+            
+            context_current_tokens[context_id] = current_tokens;
+            context_capacity_limits[context_id] = capacity_limit;
+            
+            DISCORD_HISTORY_LOG("Context '" + context_id + "' capacity: " + std::to_string(current_tokens) + 
+                        "/" + std::to_string(capacity_limit) + " tokens");
         }
         
         DISCORD_HISTORY_LOG("Initialized capacity tracking for " + std::to_string(unique_contexts.size()) + " contexts");
@@ -274,7 +269,7 @@ private:    // Core dependencies
                     }
                 }
                 
-                pending.content = actual_content;
+                pending.content = safe_trim(actual_content);
                 pending.timestamp = std::chrono::system_clock::time_point(std::chrono::seconds(msg.sent));
                 pending.message_id = static_cast<uint64_t>(msg.id);
                 pending.target_context_id = state.context_id;
