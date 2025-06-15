@@ -48,6 +48,7 @@
 #include <memory>
 #include <utility>
 #include <limits>
+#include <functional>
 #include "llama-cpp.h"
 #include "LogHandler.hpp"
 
@@ -581,6 +582,274 @@ struct ContextInfo {
         return true;
     }
     
+    // Prepare context for generation - centralized context preparation logic
+    template<typename TokenProcessor, typename PruningCallback>
+    bool prepare_context_for_generation(TokenProcessor&& process_text_to_tokens, 
+                                       PruningCallback&& prune_conversation_with_summary,
+                                       const std::string& active_context_id,
+                                       std::function<bool()> update_context_from_history) {
+        // Early return if no rebuild needed (optimization)
+        if (!conversation_state.needs_rebuild && !message_cache_dirty) {
+            LLAMA_LOG("Context preparation skipped - conversation state up to date");
+            return true;
+        }
+
+        LLAMA_LOG("Preparing context for generation - rebuild required");
+        
+        // Validate conversation state before proceeding
+        if (!validate_state()) {
+            LLAMA_LOG("Starting context rebuild: FULL (position validation) - context state invalid, resetting");
+            reset_context_state();
+            LLAMA_LOG("Conversation state validation failed, attempting recovery");
+        }
+        
+        // Check for extremely long message history that might cause issues
+        if (message_history.size() > LlamaConstants::MAX_MESSAGE_HISTORY_SIZE) {
+            LLAMA_LOG("Starting context rebuild: PARTIAL (history validation) - very large message history (" + 
+                      std::to_string(message_history.size()) + " messages), triggering aggressive pruning");
+            // Only trigger aggressive pruning if we're not already in a summary context
+            if (active_context_id != "summary_context") {
+                // Trigger aggressive pruning and update context
+                if (prune_conversation_with_summary(SummarizerConstants::AGGRESSIVE_PRUNING_RATIO)) { // Keep only 30%
+                    update_context_from_history();
+                }
+            } else {
+                LLAMA_LOG("Skipping pruning for summary context");
+            }
+        }
+
+        // PHASE 1: Apply template and get formatted content
+        LLAMA_LOG("Phase 1: Applying chat template");
+        std::string formatted_content;
+        if (!apply_template(false, formatted_content)) {
+            LLAMA_LOG("Error: Failed to apply chat template during context preparation");
+            return false;
+        }
+        
+        // PHASE 2: Tokenize and get exact count
+        LLAMA_LOG("Phase 2: Tokenizing formatted content");
+        std::vector<llama_token> tokens = process_text_to_tokens(formatted_content, true);
+        int32_t total_token_count = static_cast<int32_t>(tokens.size());
+        
+        LLAMA_LOG("Template applied and tokenized: " + std::to_string(total_token_count) + " tokens");
+
+        // PHASE 3: Check if pruning is needed and handle accordingly
+        bool pruning_needed = needs_pruning(total_token_count);
+        
+        // Skip pruning for summary contexts - they manage their own state
+        if (active_context_id == "summary_context") {
+            LLAMA_LOG("Pruning skipped - summary context manages its own state");
+            pruning_needed = false;
+        }
+        
+        if (pruning_needed) {
+            float usage_percentage = model_info ? 
+                static_cast<float>(total_token_count) / model_info->n_ctx * 100.0f : 0.0f;
+            
+            LLAMA_LOG("Context usage: " + std::to_string(usage_percentage) + "% (" + 
+                      std::to_string(total_token_count) + "/" + std::to_string(get_context_size()) + 
+                      "). Pruning REQUIRED");
+            
+            LLAMA_LOG("Phase 3: Pruning required - token count exceeds 90% threshold");
+            if (!prune_and_rebuild(formatted_content, tokens, total_token_count, process_text_to_tokens, prune_conversation_with_summary)) {
+                LLAMA_LOG("Error: Failed to prune and rebuild context");
+                return false;
+            }
+        } else {
+            LLAMA_LOG("Phase 3: No pruning needed - rebuilding context with current tokens");
+            // PHASE 4: Rebuild context with current tokens
+            if (!rebuild_context_from_formatted_content(formatted_content, process_text_to_tokens, prune_conversation_with_summary)) {
+                LLAMA_LOG("Error: Failed to rebuild context from formatted content");
+                return false;
+            }
+            
+            // Update conversation state to reflect current state
+            conversation_state.update(formatted_content, tokens);
+        }
+        
+        // PHASE 5: Prepare generation prompt if needed
+        LLAMA_LOG("Phase 5: Preparing generation prompt");
+        if (!prepare_generation_prompt(process_text_to_tokens, prune_conversation_with_summary)) {
+            LLAMA_LOG("Error: Failed to prepare generation prompt");
+            return false;
+        }
+        
+        LLAMA_LOG("Context preparation completed successfully");
+        return true;
+    }
+
+    // Prepare generation prompt for response generation
+    template<typename TokenProcessor, typename PruningCallback>
+    bool prepare_generation_prompt(TokenProcessor&& process_text_to_tokens, 
+                                  PruningCallback&& prune_conversation_with_summary) {
+        // Apply template for generation and handle generation prompt
+        std::string generation_content;
+        if (!apply_template(true, generation_content)) {
+            LLAMA_LOG("Error: Failed to apply generation template");
+            return false;
+        }
+        
+        // Handle generation prompt correctly for reset contexts
+        std::string generation_prompt;
+        if (prev_len < static_cast<int32_t>(generation_content.length())) {
+            generation_prompt = generation_content.substr(prev_len);
+        }
+
+        if (!generation_prompt.empty()) {
+            // For generation prompts, typically don't add special tokens
+            std::vector<llama_token> prompt_tokens = process_text_to_tokens(generation_prompt, false);
+            if (!prompt_tokens.empty()) {
+                auto pruning_callback = [&prune_conversation_with_summary]() { 
+                    return prune_conversation_with_summary(SummarizerConstants::TARGET_CONTEXT_USAGE); 
+                };
+                if (!process_context_tokens(prompt_tokens, true, pruning_callback)) {
+                    LLAMA_LOG("Error: Failed to process generation prompt tokens");
+                    return false;
+                }
+            } else {
+                LLAMA_LOG("Warning: Generation prompt produced no tokens");
+            }
+        } else {
+            LLAMA_LOG("No new generation prompt content to process (prev_len=" + 
+                      std::to_string(prev_len) + ", total_len=" + 
+                      std::to_string(generation_content.length()) + ")");
+        }
+        
+        return true;
+    }
+
+    // Dedicated context rebuilding from formatted content with rollback support
+    template<typename TokenProcessor, typename PruningCallback>
+    bool rebuild_context_from_formatted_content(const std::string& formatted_content,
+                                               TokenProcessor&& process_text_to_tokens,
+                                               PruningCallback&& prune_conversation_with_summary) {
+        int32_t new_len = static_cast<int32_t>(formatted_content.length());
+        
+        // Store original state for potential rollback
+        int32_t original_n_past = n_past;
+        int32_t original_prev_len = prev_len;
+        
+        // Check if we need a full rebuild or can do incremental update
+        bool needs_full_rebuild = (prev_len > new_len || 
+                                  (prev_len == 0 && !message_history.empty()));
+        
+        if (needs_full_rebuild) {
+            LLAMA_LOG("Starting context rebuild: FULL - rebuilding complete context from " + 
+                      std::to_string(message_history.size()) + " messages");
+            
+            // Clear context state for full rebuild
+            if (context) {
+                llama_memory_clear(llama_get_memory(context), true);
+            }
+            n_past = 0;
+            prev_len = 0;
+
+            // Process full content
+            std::vector<llama_token> rebuild_tokens = process_text_to_tokens(formatted_content, true);
+            auto pruning_callback = [&prune_conversation_with_summary]() { 
+                return prune_conversation_with_summary(SummarizerConstants::TARGET_CONTEXT_USAGE); 
+            };
+            if (!rebuild_tokens.empty() && process_context_tokens(rebuild_tokens, false, pruning_callback)) {
+                prev_len = new_len;
+                message_history_token_count = n_past;
+                
+                // Ensure we have valid logits for generation
+                if (n_past > 0) {
+                    float* logits = llama_get_logits(context);
+                    if (!logits) {
+                        LLAMA_LOG("Warning: No logits available after context rebuild, will need manual decode");
+                    }
+                }
+                
+                LLAMA_LOG("Context rebuilt successfully with " + 
+                          std::to_string(rebuild_tokens.size()) + " tokens");
+                return true;
+            }
+            
+            // Rollback on failure
+            n_past = original_n_past;
+            prev_len = original_prev_len;
+            LLAMA_LOG("Error: Failed to rebuild context, rolled back to previous state");
+            return false;
+        }
+        
+        // Incremental update
+        if (new_len > prev_len) {
+            LLAMA_LOG("Starting context rebuild: INCREMENTAL - adding " + 
+                      std::to_string(new_len - prev_len) + " new characters");
+            
+            std::string new_content = formatted_content.substr(prev_len);
+            if (!new_content.empty()) {
+                std::vector<llama_token> new_tokens = process_text_to_tokens(new_content, false);
+                auto pruning_callback = [&prune_conversation_with_summary]() { 
+                    return prune_conversation_with_summary(SummarizerConstants::TARGET_CONTEXT_USAGE); 
+                };
+                if (!new_tokens.empty() && !process_context_tokens(new_tokens, true, pruning_callback)) {
+                    LLAMA_LOG("Error: Failed to process incremental tokens");
+                    return false;
+                }
+                
+                // Update token count incrementally
+                message_history_token_count += static_cast<int32_t>(new_tokens.size());
+                LLAMA_LOG("Updated token count incrementally: +" + std::to_string(new_tokens.size()) + 
+                          " = " + std::to_string(message_history_token_count));
+            }
+        }
+
+        prev_len = new_len;
+        
+        // Validate the rebuild was successful for non-empty histories
+        if (n_past <= 0 && !message_history.empty()) {
+            LLAMA_LOG("Warning: Context rebuild resulted in zero tokens despite having message history");
+        }
+        
+        return true;
+    }
+
+    // Pruning and rebuilding logic with clear phases
+    template<typename TokenProcessor, typename PruningCallback>
+    bool prune_and_rebuild(std::string& formatted_content, std::vector<llama_token>& tokens, int32_t& total_token_count,
+                          TokenProcessor&& process_text_to_tokens, PruningCallback&& prune_conversation_with_summary) {
+        LLAMA_LOG("Starting pruning and rebuild process");
+        LLAMA_LOG("Current usage: " + std::to_string(static_cast<float>(total_token_count) / model_info->n_ctx * 100.0f) + 
+                  "% (" + std::to_string(total_token_count) + "/" + std::to_string(model_info->n_ctx) + ")");
+        
+        // PRUNING PHASE 1: Perform message history pruning with summarization
+        LLAMA_LOG("Pruning Phase 1: Summarizing and pruning message history");
+        if (!prune_conversation_with_summary(SummarizerConstants::TARGET_CONTEXT_USAGE)) {
+            LLAMA_LOG("Error: Failed to prune conversation with summarization");
+            return false;
+        }
+
+        // PRUNING PHASE 2: Re-apply template with pruned messages
+        LLAMA_LOG("Pruning Phase 2: Re-applying template with pruned content");
+        if (!apply_template(false, formatted_content)) {
+            LLAMA_LOG("Error: Failed to re-apply template after pruning");
+            return false;
+        }
+        
+        // PRUNING PHASE 3: Re-tokenize with pruned content
+        LLAMA_LOG("Pruning Phase 3: Re-tokenizing pruned content");
+        tokens = process_text_to_tokens(formatted_content, true);
+        total_token_count = static_cast<int32_t>(tokens.size());
+        
+        LLAMA_LOG("After pruning: " + std::to_string(static_cast<float>(total_token_count) / model_info->n_ctx * 100.0f) + 
+                  "% (" + std::to_string(total_token_count) + "/" + std::to_string(model_info->n_ctx) + ")");
+        
+        // PRUNING PHASE 4: Rebuild context with pruned content
+        LLAMA_LOG("Pruning Phase 4: Rebuilding context with pruned content");
+        if (!rebuild_context_from_formatted_content(formatted_content, process_text_to_tokens, prune_conversation_with_summary)) {
+            LLAMA_LOG("Error: Failed to rebuild context after pruning");
+            return false;
+        }
+        
+        // Update conversation state to reflect pruned state
+        conversation_state.update(formatted_content, tokens);
+        
+        LLAMA_LOG("Pruning and rebuild completed successfully");
+        return true;
+    }
+
 private:
     // Convert message history to llama_chat_message format
     std::vector<llama_chat_message> convert_to_llama_messages() const {
