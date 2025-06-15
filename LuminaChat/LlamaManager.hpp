@@ -159,11 +159,32 @@ struct ContextInfo {
     
     // Performance tracking
     int64_t total_generation_tokens = 0;
-    int64_t last_decode_time_us = 0;
-
-    // Cache state
+    int64_t last_decode_time_us = 0;    // Cache state - enhanced with conversation state tracking
     mutable bool message_cache_dirty = true;
     mutable std::vector<llama_chat_message> message_cache;
+      // Conversation state for improved logic flow - single source of truth
+    struct ConversationState {
+        std::string formatted_content;     // Template-applied content ready for tokenization
+        std::vector<llama_token> tokens;   // Tokenized representation of formatted_content
+        int32_t total_token_count = 0;     // Exact count of tokens (for efficiency)
+        bool needs_rebuild = true;         // Flag indicating if context rebuild is required
+        
+        // Mark state as invalid, requiring full rebuild
+        void invalidate() {
+            needs_rebuild = true;
+            formatted_content.clear();
+            tokens.clear();
+            total_token_count = 0;
+        }
+        
+        // Update state with new processed content (marks as valid)
+        void update(const std::string& content, const std::vector<llama_token>& new_tokens) {
+            formatted_content = content;
+            tokens = new_tokens;
+            total_token_count = static_cast<int32_t>(new_tokens.size());
+            needs_rebuild = false;  // State is now up-to-date
+        }
+    } conversation_state;
     
     // Token count tracking for efficiency - maintains accurate count of tokens in message history
     // Always >= 0, updated during context rebuilds and incremental updates
@@ -942,7 +963,9 @@ public:
         std::vector<std::string> summaries;
     };
     
-    SummarySlotInfo get_summary_slot_info() const;    // Enhanced context update with pruning decision logic
+    SummarySlotInfo get_summary_slot_info() const;
+    
+    // Enhanced context update with pruning decision logic
     bool update_context_with_pruning() {
         if (!current_context || !current_context->context || !current_context->model_info || !current_context->model_info->model || !current_context->model_info->vocab) {
             LLAMA_LOG("Error: Model components not initialized");
@@ -979,109 +1002,169 @@ public:
             // Update context from the pruned message history
             return update_context_from_history();
         }
-        
-        // No pruning needed, proceed with regular context update
+          // No pruning needed, proceed with regular context update
         return rebuild_context_from_formatted_content(formatted_content);
     }
     
-    // Enhanced generation with response delegation to LlamaResponse
-    std::string generate_response(const std::string& input, const std::string& username = "Schwi") {
-        if (!current_context || !current_context->context || !current_context->model_info || !current_context->model_info->model_loaded || !current_context->model_info->model || !current_context->model_info->vocab || !current_context->batch_initialized) {
-            return "Error: Model components not properly initialized or no active context";
-        }
-
-        if (input.empty()) return "Error: Empty input";
-
-        // Validate conversation state before proceeding
-        if (!validate_conversation_state()) {
-            LLAMA_LOG("Conversation state required recovery, retrying...");
-        }
+private:
+    // Improved logic flow helper methods
+      // Add message and mark conversation state as needing rebuild
+    void add_message_and_invalidate(const std::string& role, const std::string& content) {
+        if (!current_context) return;
+        
+        LLAMA_LOG("Adding " + role + " message and invalidating conversation state");
         
         // Setup conversation - ensure system message is in history if context is empty
         if (current_context->message_history.empty() && !current_context->system_message.empty()) {
             current_context->message_history.emplace_back("system", current_context->system_message);
-            current_context->message_cache_dirty = true;
-            // Token count will be updated after context processing
         }
-
-        // User input is added to the message using the provided username as the ROLE
-        // Chat template processing will handel tagging as "user"
-        // This is done to allow for better handling of multi-user conversations
-        current_context->message_history.emplace_back(username, input);
-        current_context->message_cache_dirty = true;
-        // Token count will be updated after context processing
-
-        // Update context using unified function - with retry logic
-        int32_t retry_count = 0;
-        const int32_t max_retries = LlamaConstants::MAX_RETRY_ATTEMPTS;
         
-        while (retry_count < max_retries) {
-            if (update_context_with_pruning()) {
-                break; // Success
-            }
-            retry_count++;
-            if (retry_count < max_retries) {
-                LLAMA_LOG("Starting context rebuild: FULL (retry " + std::to_string(retry_count) + "/" + std::to_string(max_retries) + ") - retrying context update with aggressive cleanup");
-                
-                // On retry, try a more aggressive cleanup
-                if (current_context && current_context->context) {
-                    llama_memory_clear(llama_get_memory(current_context->context), true); // Ensure kv memory/cache is cleared
-                    current_context->n_past = 0;
-                    current_context->prev_len = 0;
-                    current_context->message_cache_dirty = true;
-                }
-                
-                std::this_thread::sleep_for(std::chrono::milliseconds(LlamaConstants::MAX_RETRY_ATTEMPTS * LlamaConstants::RETRY_BACKOFF_MS)); // Simple backoff
-            } else {
-                // If we still can't update, try to continue with a minimal context
-                LLAMA_LOG("Starting context rebuild: FULL (minimal recovery) - failed to update context, attempting minimal recovery");
-                
-                if (current_context && current_context->context) {
-                    llama_memory_clear(llama_get_memory(current_context->context), true); // Ensure kv memory/cache is cleared
-                    current_context->n_past = 0;
-                    current_context->prev_len = 0;
-                    current_context->message_cache_dirty = true;
-                    
-                    // Keep only the last few messages for minimal context
-                    if (current_context->message_history.size() > 3) {
-                        auto minimal_history = std::vector<std::pair<std::string, std::string>>();
-                        
-                        // Keep system message if present
-                        if (!current_context->message_history.empty() && 
-                            current_context->message_history[0].first == "system") {
-                            minimal_history.emplace_back(current_context->message_history[0]);
-                        }
-                        
-                        // Keep last 2 messages
-                        size_t start_idx = std::max(size_t(1), current_context->message_history.size() - 2);
-                        for (size_t i = start_idx; i < current_context->message_history.size(); ++i) {
-                            if (current_context->message_history[i].first != "system") {
-                                minimal_history.emplace_back(current_context->message_history[i]);
-                            }
-                        }
-                        
-                        current_context->message_history = std::move(minimal_history);
-                        current_context->message_cache_dirty = true;
-                        // Token count will be updated during context processing
-                        
-                        // Try one more time with minimal context
-                        if (update_context_with_pruning()) {
-                            LLAMA_LOG("Recovered with minimal context");
-                            break;
-                        }
-                    }
-                }
-                
-                return "Error: Context recovery failed. The conversation history may have become too complex. Try starting a new conversation.";
-            }
+        current_context->message_history.emplace_back(role, content);
+        current_context->message_cache_dirty = true;
+        current_context->conversation_state.invalidate();
+        
+        LLAMA_LOG("Message added. Total messages: " + std::to_string(current_context->message_history.size()) + 
+                  ". State invalidated - rebuild required.");
+    }
+      // Prepare context for generation - centralized context preparation logic
+    bool prepare_context_for_generation() {
+        if (!current_context) return false;
+        
+        // Early return if no rebuild needed (optimization)
+        if (!current_context->conversation_state.needs_rebuild && !current_context->message_cache_dirty) {
+            LLAMA_LOG("Context preparation skipped - conversation state up to date");
+            return true;
         }
-
-        // Prepare for generation using unified template function
+        
+        LLAMA_LOG("Preparing context for generation - rebuild required");
+        
+        // Validate conversation state before proceeding
+        if (!validate_conversation_state()) {
+            LLAMA_LOG("Conversation state validation failed, attempting recovery");
+        }
+        
+        // PHASE 1: Apply template and get formatted content
+        LLAMA_LOG("Phase 1: Applying chat template");
+        std::string formatted_content;
+        if (!apply_template_optimized(false, formatted_content)) {
+            LLAMA_LOG("Error: Failed to apply chat template during context preparation");
+            return false;
+        }
+        
+        // PHASE 2: Tokenize and get exact count
+        LLAMA_LOG("Phase 2: Tokenizing formatted content");
+        std::vector<llama_token> tokens = process_text_to_tokens(formatted_content, true);
+        int32_t total_token_count = static_cast<int32_t>(tokens.size());
+        
+        LLAMA_LOG("Template applied and tokenized: " + std::to_string(total_token_count) + " tokens");
+        
+        // PHASE 3: Check if pruning is needed and handle accordingly
+        if (needs_pruning(total_token_count)) {
+            LLAMA_LOG("Phase 3: Pruning required - token count exceeds 90% threshold");
+            if (!prune_and_rebuild(formatted_content, tokens, total_token_count)) {
+                LLAMA_LOG("Error: Failed to prune and rebuild context");
+                return false;
+            }
+        } else {
+            LLAMA_LOG("Phase 3: No pruning needed - rebuilding context with current tokens");
+            // PHASE 4: Rebuild context with current tokens
+            if (!rebuild_context_from_formatted_content(formatted_content)) {
+                LLAMA_LOG("Error: Failed to rebuild context from formatted content");
+                return false;
+            }
+            
+            // Update conversation state to reflect current state
+            current_context->conversation_state.update(formatted_content, tokens);
+        }
+        
+        // PHASE 5: Prepare generation prompt if needed
+        LLAMA_LOG("Phase 5: Preparing generation prompt");
+        if (!prepare_generation_prompt()) {
+            LLAMA_LOG("Error: Failed to prepare generation prompt");
+            return false;
+        }
+        
+        LLAMA_LOG("Context preparation completed successfully");
+        return true;
+    }
+    
+    // Check if context needs pruning based on token count    // Clear decision point for pruning logic
+    bool needs_pruning(int32_t token_count) const {
+        if (!current_context || !current_context->model_info) return false;
+        
+        // Skip pruning for summary contexts - they manage their own state
+        bool is_summary_context = (active_context_id == "summary_context");
+        if (is_summary_context) {
+            LLAMA_LOG("Pruning skipped - summary context manages its own state");
+            return false;
+        }
+        
+        int32_t max_threshold = static_cast<int32_t>(current_context->model_info->n_ctx * 0.9f);
+        float usage_percentage = static_cast<float>(token_count) / current_context->model_info->n_ctx * 100.0f;
+        
+        bool pruning_needed = token_count > max_threshold;
+        
+        LLAMA_LOG("Context usage: " + std::to_string(usage_percentage) + "% (" + 
+                  std::to_string(token_count) + "/" + std::to_string(current_context->model_info->n_ctx) + 
+                  "). Pruning " + (pruning_needed ? "REQUIRED" : "not needed"));
+        
+        return pruning_needed;
+    }
+      // Pruning and rebuilding logic with clear phases
+    bool prune_and_rebuild(std::string& formatted_content, std::vector<llama_token>& tokens, int32_t& total_token_count) {
+        if (!current_context) return false;
+        
+        LLAMA_LOG("Starting pruning and rebuild process");
+        LLAMA_LOG("Current usage: " + std::to_string(static_cast<float>(total_token_count) / current_context->model_info->n_ctx * 100.0f) + 
+                  "% (" + std::to_string(total_token_count) + "/" + std::to_string(current_context->model_info->n_ctx) + ")");
+        
+        // PRUNING PHASE 1: Perform message history pruning with summarization
+        LLAMA_LOG("Pruning Phase 1: Summarizing and pruning message history");
+        if (!prune_conversation_with_summary(SummarizerConstants::TARGET_CONTEXT_USAGE)) {
+            LLAMA_LOG("Error: Failed to prune conversation with summary");
+            return false;
+        }
+        
+        // PRUNING PHASE 2: Re-apply template with pruned messages
+        LLAMA_LOG("Pruning Phase 2: Re-applying template with pruned content");
+        if (!apply_template_optimized(false, formatted_content)) {
+            LLAMA_LOG("Error: Failed to re-apply template after pruning");
+            return false;
+        }
+        
+        // PRUNING PHASE 3: Re-tokenize with pruned content
+        LLAMA_LOG("Pruning Phase 3: Re-tokenizing pruned content");
+        tokens = process_text_to_tokens(formatted_content, true);
+        total_token_count = static_cast<int32_t>(tokens.size());
+        
+        LLAMA_LOG("After pruning: " + std::to_string(static_cast<float>(total_token_count) / current_context->model_info->n_ctx * 100.0f) + 
+                  "% (" + std::to_string(total_token_count) + "/" + std::to_string(current_context->model_info->n_ctx) + ")");
+        
+        // PRUNING PHASE 4: Rebuild context with pruned content
+        LLAMA_LOG("Pruning Phase 4: Rebuilding context with pruned content");
+        if (!rebuild_context_from_formatted_content(formatted_content)) {
+            LLAMA_LOG("Error: Failed to rebuild context after pruning");
+            return false;
+        }
+        
+        // Update conversation state to reflect pruned state
+        current_context->conversation_state.update(formatted_content, tokens);
+        
+        LLAMA_LOG("Pruning and rebuild completed successfully");
+        return true;
+    }
+    
+    // Prepare generation prompt for response generation
+    bool prepare_generation_prompt() {
+        if (!current_context) return false;
+        
+        // Apply template for generation and handle generation prompt
         std::string generation_content;
         if (!apply_template_optimized(true, generation_content)) {
-            return "Error: Failed to apply generation template";
+            LLAMA_LOG("Error: Failed to apply generation template");
+            return false;
         }
-
+        
         // Handle generation prompt correctly for reset contexts
         std::string generation_prompt;
         if (current_context->prev_len < static_cast<int32_t>(generation_content.length())) {
@@ -1093,7 +1176,8 @@ public:
             std::vector<llama_token> prompt_tokens = process_text_to_tokens(generation_prompt, false);
             if (!prompt_tokens.empty()) {
                 if (!process_context_tokens(prompt_tokens, true)) {
-                    return "Error: Failed to process generation prompt";
+                    LLAMA_LOG("Error: Failed to process generation prompt tokens");
+                    return false;
                 }
             } else {
                 LLAMA_LOG("Warning: Generation prompt produced no tokens");
@@ -1103,20 +1187,136 @@ public:
                       std::to_string(current_context->prev_len) + ", total_len=" + 
                       std::to_string(generation_content.length()) + ")");
         }
-
-        // Delegate response generation to LlamaResponse class
+        
+        return true;
+    }    // Generate response tokens using LlamaResponse
+    std::string generate_response_tokens() {
+        if (!current_context) return "Error: No active context";
+        
+        // Validate that context is properly prepared for generation
+        if (!current_context->context || !current_context->model_info || !current_context->model_info->vocab) {
+            return "Error: Context not properly initialized for generation";
+        }
+          // Check that we have valid context position
+        if (current_context->n_past < 0) {
+            return "Error: Context position is negative (n_past=" + std::to_string(current_context->n_past) + ")";
+        }
+        
+        // For very first generation, n_past could be 0, which is acceptable
+        // But we need to ensure the context has been properly prepared
+        if (current_context->n_past == 0 && current_context->message_history.empty()) {
+            return "Error: Context is completely empty - no messages and n_past=0";
+        }
+          // Ensure we have logits available for generation (if context has been built)
+        if (current_context->n_past > 0) {
+            float* logits = llama_get_logits(current_context->context);
+            if (!logits) {
+                LLAMA_LOG("Warning: No logits available after context rebuild, but proceeding with generation");
+                // Don't fail here - let LlamaResponse handle this case
+            }
+        }
+        
+        LLAMA_LOG("Pre-generation validation passed - context ready for generation");        // Setup callback functions for LlamaResponse
         auto token_adder = [this](llama_token token, int32_t pos, const std::vector<llama_seq_id>& seq_ids, bool output_logits) -> bool {
             return add_single_token_to_batch(token, pos, seq_ids, output_logits);
         };
-        
-        auto context_updater = [this]() -> void {
+          auto context_updater = [this]() -> void {
+            // Update context length tracking after generation
             std::string updated_content;
             if (apply_template_optimized(false, updated_content)) {
                 current_context->prev_len = static_cast<int32_t>(updated_content.length());
             }
         };
+          // Single attempt at generation
+        // Context should already be properly prepared by prepare_context_for_generation()
+        LLAMA_LOG("Delegating to LlamaResponse for token generation");
+        std::string response = response_generator.generate_response("generate", "assistant", current_context, token_adder, context_updater);
+        
+        if (!response.empty() && !response.starts_with("Error:")) {
+            LLAMA_LOG("Response generation completed successfully: " + std::to_string(response.length()) + " characters");
+            return response;
+        }
+        
+        // If generation failed, log the error but don't attempt aggressive recovery
+        LLAMA_LOG("Response generation failed: " + response);
+        return response.empty() ? "Error: Failed to generate response - empty result" : response;
+    }
 
-        return response_generator.generate_response(input, username, current_context, token_adder, context_updater);
+public:    /* 
+     * IMPROVED LINEAR LOGIC FLOW FOR RESPONSE GENERATION
+     * ================================================
+     * 
+     * This method implements a clean, predictable, and easy-to-follow logic flow:
+     *
+     * 1. PRE-FLIGHT VALIDATION: Ensure all required components are ready
+     * 2. ADD MESSAGE & INVALIDATE: Add user input to conversation, mark state as needing rebuild
+     * 3. PREPARE CONTEXT: Centralized preparation handling:
+     *    - Template application (converts message history to model format)
+     *    - Tokenization (gets exact token counts)
+     *    - Pruning decision (checks if context exceeds 90% threshold)
+     *    - Context rebuild (full rebuild with or without pruning)
+     *    - Generation prompt preparation
+     * 4. GENERATE RESPONSE: Pure token generation using LlamaResponse
+     * 5. UPDATE CONVERSATION: Add response to conversation state
+     *
+     * KEY IMPROVEMENTS:
+     * - Single source of truth for conversation state (ConversationState)
+     * - Clear decision points (needs_pruning())
+     * - Lazy evaluation (only rebuild when needed)
+     * - Separated concerns (preparation vs. generation)
+     * - Linear, predictable flow (no jumping between methods)
+     * - Comprehensive logging for debugging
+     */    std::string generate_response(const std::string& input, const std::string& username = "Schwi") {
+        // Pre-flight validation
+        if (!current_context || !current_context->context || !current_context->model_info || 
+            !current_context->model_info->model_loaded || !current_context->model_info->model || 
+            !current_context->model_info->vocab || !current_context->batch_initialized) {
+            return "Error: Model components not properly initialized or no active context";
+        }
+
+        if (input.empty()) {
+            return "Error: Empty input";
+        }
+
+        LLAMA_LOG("Starting improved linear generation flow for input: " + 
+                  (input.length() > 50 ? input.substr(0, 50) + "..." : input));
+
+        // STEP 1: Update conversation with new input
+        add_message_and_invalidate(username, input);
+        
+        // STEP 2: Prepare context for generation (handles template, tokenization, pruning, rebuild)
+        if (!prepare_context_for_generation()) {
+            LLAMA_LOG("Context preparation failed, attempting one recovery");
+            
+            // Single recovery attempt - clear context state and try again
+            if (current_context && current_context->context) {
+                llama_memory_clear(llama_get_memory(current_context->context), true);
+                current_context->n_past = 0;
+                current_context->prev_len = 0;
+                current_context->message_cache_dirty = true;
+                current_context->conversation_state.invalidate();
+                
+                if (!prepare_context_for_generation()) {
+                    return "Error: Failed to prepare context for generation after recovery attempt";
+                }
+                LLAMA_LOG("Context preparation recovered successfully");
+            } else {
+                return "Error: Failed to prepare context for generation";
+            }
+        }
+        
+        // STEP 3: Generate response tokens
+        std::string response = generate_response_tokens();
+        
+        // STEP 4: Update conversation with response (if successful)
+        if (!response.empty() && !response.starts_with("Error:")) {
+            add_message_and_invalidate("assistant", response);
+            LLAMA_LOG("Linear generation flow completed successfully");
+        } else {
+            LLAMA_LOG("Linear generation flow failed: " + response);
+        }
+        
+        return response;
     }
 
     // Get performance statistics
@@ -1274,7 +1474,9 @@ public:
     // Get context size for capacity calculations - uses current context's model
     int32_t get_context_size() const noexcept {
         return current_context ? current_context->get_context_size() : LlamaConstants::DEFAULT_CONTEXT_SIZE;
-    }    // Context rebuild orchestrator - handles full rebuild from message history
+    }
+    
+    // Context rebuild orchestrator - handles full rebuild from message history
     bool update_context_from_history() {
         if (!current_context) return false;
 
@@ -1323,7 +1525,9 @@ private:
 
     void clear_caches() const {
         token_cache.clear();
-    }    // Dedicated context rebuilding from formatted content with rollback support
+    }
+    
+    // Dedicated context rebuilding from formatted content with rollback support
     bool rebuild_context_from_formatted_content(const std::string& formatted_content) {
         int32_t new_len = static_cast<int32_t>(formatted_content.length());
         
@@ -1474,13 +1678,31 @@ inline void LlamaManager::clear_conversation() {
     
     // Reset token count since conversation is cleared
     current_context->message_history_token_count = 0;
-    
-    LLAMA_LOG("Cleared conversation history and summary slots");
+      LLAMA_LOG("Cleared conversation history and summary slots");
 }
 
 // Progress callback function declaration (needs to be outside class for C compatibility)
 extern bool model_loading_progress_callback(float progress, void *user_data);
 
+//
+//  IMPROVED LOGIC FLOW IMPLEMENTATION SUMMARY:
+//  ==========================================
+//
+//  The LlamaManager now implements a clean, linear logic flow that is much easier to follow:
+//
+//  PRIMARY FLOW:
+//    User Input → add_message_and_invalidate() → prepare_context_for_generation() → generate_response_tokens() → add_response
+//
+//  KEY IMPROVEMENTS:
+//  - Single source of truth: ConversationState holds all conversation data and validity flags
+//  - Clear decision points: needs_pruning() provides explicit pruning logic
+//  - Lazy evaluation: Context only rebuilt when conversation_state.needs_rebuild = true
+//  - Separated concerns: Context preparation vs. response generation are cleanly separated
+//  - Linear flow: No more jumping between scattered methods during generation
+//  - Comprehensive logging: Each phase is clearly logged for debugging
+//  - Predictable state management: State invalidation and updates follow consistent patterns
+//
+//  This eliminates the previous convoluted flow and makes the codebase much more maintainable.
 //
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!
 //

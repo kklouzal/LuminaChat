@@ -236,10 +236,11 @@ private:
             LLAMA_LOG("Error: Invalid context or model state");
             return false;
         }
-        
-        // Check context position bounds
-        if (context_info->n_past <= 0 || context_info->n_past >= model_info->n_ctx) {
-            LLAMA_LOG("Error: Invalid context position during generation: " + std::to_string(context_info->n_past));
+          // Check context position bounds  
+        // Note: n_past can be 0 for initial generation, but should not be negative
+        if (context_info->n_past < 0 || context_info->n_past >= model_info->n_ctx) {
+            LLAMA_LOG("Error: Invalid context position during generation: " + std::to_string(context_info->n_past) + 
+                      " (valid range: 0 to " + std::to_string(model_info->n_ctx - 1) + ")");
             return false;
         }
         
@@ -276,11 +277,38 @@ public:
                                 ContextInfo* context_info,
                                 BatchTokenAdder add_token_to_batch, ContextUpdater update_context) const {
         
-        if (!context_info || !context_info->model_info || input.empty()) {
+        if (!context_info) {
+            LLAMA_LOG("Error: context_info is NULL");
+            return "Error: Invalid generation parameters";
+        }
+        
+        if (!context_info->model_info) {
+            LLAMA_LOG("Error: context_info->model_info is NULL");
+            return "Error: Invalid generation parameters";
+        }
+        
+        if (input.empty()) {
+            LLAMA_LOG("Error: input is empty");
             return "Error: Invalid generation parameters";
         }
 
-        if (!context_info->model_info->model || !context_info->context || !context_info->model_info->vocab || !context_info->batch_initialized) {
+        if (!context_info->model_info->model) {
+            LLAMA_LOG("Error: model is NULL");
+            return "Error: Model components not properly initialized or no active context";
+        }
+        
+        if (!context_info->context) {
+            LLAMA_LOG("Error: context is NULL");
+            return "Error: Model components not properly initialized or no active context";
+        }
+        
+        if (!context_info->model_info->vocab) {
+            LLAMA_LOG("Error: vocab is NULL");
+            return "Error: Model components not properly initialized or no active context";
+        }
+        
+        if (!context_info->batch_initialized) {
+            LLAMA_LOG("Error: batch not initialized");
             return "Error: Model components not properly initialized or no active context";
         }
 
@@ -292,17 +320,20 @@ public:
         // Validate generation state
         if (!validate_generation_state(context_info, context_info->model_info)) {
             return "Error: Context state invalid for generation";
-        }
-
-        // Validate or attempt to recover logits
+        }        // Validate or attempt to recover logits
         float* logits = llama_get_logits(context_info->context);
-        if (!logits && context_info->n_past > 0) {
-            if (!recover_logits(context_info, context_info->model_info)) {
-                return "Error: Context state invalid - no logits available and recovery failed";
+        if (!logits) {
+            if (context_info->n_past > 0) {
+                // Context has been processed but no logits - attempt recovery
+                if (!recover_logits(context_info, context_info->model_info)) {
+                    return "Error: Context state invalid - no logits available and recovery failed";
+                }
+            } else {
+                // n_past == 0, this might be normal for initial generation
+                // We'll try to proceed and let the generation loop handle the decode
+                LLAMA_LOG("Warning: No logits available at n_past=0, will attempt initial decode during generation");
             }
-        } else if (!logits) {
-            return "Error: Context state invalid - no logits available";
-        }        // Calculate available space for generation
+        }// Calculate available space for generation
         const int32_t max_new_tokens = std::min(context_info->model_info->n_predict, 
                                                context_info->model_info->n_ctx - context_info->n_past - LlamaConstants::TOKEN_SAFETY_MARGIN);
         
@@ -383,13 +414,9 @@ public:
             float tokens_per_second = static_cast<float>(n_generated) / (static_cast<float>(context_info->last_decode_time_us) / 1000000.0f);
             LLAMA_LOG("Generated " + std::to_string(n_generated) + " tokens in " + 
                      std::to_string(context_info->last_decode_time_us / 1000.0f) + "ms (" + 
-                     std::to_string(tokens_per_second) + " t/s)");
-        }        // Update conversation history and context
+                     std::to_string(tokens_per_second) + " t/s)");        }        // Do NOT automatically update conversation history - let LlamaManager handle this
+        // The linear flow in LlamaManager will add the response to conversation history
         if (!response.empty()) {
-            context_info->message_history.emplace_back("assistant", response);
-            context_info->message_cache_dirty = true;
-            // Token count will be updated during context processing
-            
             // Update context length using provided updater
             update_context();
         }
