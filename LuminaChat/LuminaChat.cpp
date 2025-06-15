@@ -9,21 +9,21 @@
 // Enable Run-Time Type Information (RTTI) YES (/GR)
 //
 // CRITICAL CODING DIRECTIVES:
-// 1.  Minimalism & Performance: Deliver lean, efficient solutions; do not create or preserve unused helpers or wrappers.
-// 2.  Consistent Style: Adopt a uniform coding style and structure for clarity and maintainability.
-// 3.  Documentation: Write concise comments that explain complex logic and key design decisions.
-// 4.  Redundancy Elimination: Remove unused, obsolete, and legacy code—including unneeded interfaces and includes.
-// 5.  Function Boundaries: Define clear responsibilities; reduce overlap and avoid unnecessary layers.
-// 6.  Core Preservation: Streamline code while safeguarding essential features; favor direct access over extra abstractions.
-// 7.  Cross-Platform Portability: Use fixed-width types and proper initialization to guarantee identical behavior everywhere.
-// 8.  Smart Caching: Cache frequently used values to minimize allocations and improve performance.
-// 9.  Logical Consistency: Verify code flow to ensure coherent, error-free execution paths.
-// 10. Continuous Refinement: Regularly refactor and confirm that updates preserve stable functionality.
-// 11. Const-Correctness & Immutability: Mark variables, parameters, and methods as const wherever possible.
-// 12. RAII & Resource Safety: Encapsulate resource acquisition/release in constructors/destructors or smart pointers.
-// 13. Zero Magic & Strong Typing: Replace magic literals with named constants, enums, or constexpr; prefer scoped enums.
-// 14. Standard Library Preference: Favor STL algorithms and containers over custom loops and buffers.
-// 15. Thread Safety: Define and document thread-safety contracts; protect shared state with mutexes, atomics, or thread-safe containers.
+// 1.  Minimalism & Performance: Deliver lean, efficient solutions; do not create or preserve unused helpers, wrappers, trivial accessors (setters/getters), or scaffolding.
+// 2.  Redundancy Elimination: Remove unused, obsolete, and legacy code—including unneeded interfaces, includes, helper or accessor methods.
+// 3.  Consistent Style: Adopt a uniform coding style and structure for clarity and maintainability.
+// 4.  Documentation: Write concise comments that explain complex logic and key design decisions.
+// 5.  Zero Magic & Strong Typing: Replace magic literals with named constants, enums, or constexpr; prefer scoped enums over raw ints.
+// 6.  Function Boundaries: Define clear responsibilities; reduce overlap and avoid unnecessary layers of indirection.
+// 7.  Core Preservation: Streamline code while safeguarding essential features; favor direct variable or object access/passing over extra abstractions (e.g., setters/getters).
+// 8.  Const-Correctness & Immutability: Mark variables, parameters, and methods as const wherever possible.
+// 9.  RAII & Resource Safety: Encapsulate resource acquisition/release in constructors/destructors or smart pointers.
+// 10. Standard Library Preference: Favor STL algorithms and containers over custom loops and buffers for clarity and safety.
+// 11. Cross-Platform Portability: Use fixed-width types and proper initialization to guarantee identical behavior everywhere.
+// 12. Thread Safety: Define and document thread-safety contracts; protect shared state with mutexes, atomics, or thread-safe containers.
+// 13. Smart Caching: Cache frequently used values to minimize allocations and improve performance.
+// 14. Logical Consistency: Verify code flow to ensure coherent, error-free execution paths.
+// 15. Continuous Refinement: Regularly refactor and confirm that updates preserve stable functionality.
 
 #include <wx/wx.h>
 #include <wx/filedlg.h>
@@ -106,6 +106,7 @@ enum class EventId : int32_t {
     BROWSE_MODEL,
     CONNECT_DISCORD,
     PRUNE_SUMMARIZE,
+    VIEW_SUMMARY_SLOTS,
     MODEL_LOADED,
     RESPONSE_READY,
     PROGRESS_UPDATE,
@@ -124,6 +125,13 @@ wxDEFINE_EVENT(wxEVT_PROGRESS_UPDATE, wxCommandEvent);
 // Forward declarations for callback functions
 bool model_loading_progress_callback(float progress, void* user_data);
 void llama_log_callback(ggml_log_level level, const char* message, void* user_data);
+
+// UI Constants (Directive #5: Zero Magic & Strong Typing)
+namespace UIConstants {
+    constexpr int32_t CONTEXT_MONITOR_INTERVAL_MS = 2000;
+    constexpr float MS_TO_SECONDS = 1000.0f;
+    constexpr int32_t DISCORD_CONNECTION_DELAY_SEC = 5;
+}
 
 // Global frame pointer for callbacks
 LuminaChatFrame* g_main_frame = nullptr;
@@ -716,7 +724,7 @@ private:
     // Context monitoring timer
     wxTimer* context_monitor_timer;    // UI controls with better organization
     struct UIControls {
-        wxButton *start_btn, *stop_btn, *settings_btn, *discord_btn, *prune_btn;
+        wxButton *start_btn, *stop_btn, *settings_btn, *discord_btn, *prune_btn, *summary_slots_btn;
         wxGauge* progress_bar;
         wxGauge* context_progress_bar;
         wxStaticText *progress_label, *timings_label, *context_label;
@@ -736,19 +744,19 @@ public:
         discord_manager = std::make_unique<DiscordManager>();
         
         // Initialize context monitoring timer
-        context_monitor_timer = new wxTimer(this, static_cast<int>(EventId::CONTEXT_MONITOR_TIMER));
-          // Set up unified logging
+        context_monitor_timer = new wxTimer(this, static_cast<int>(EventId::CONTEXT_MONITOR_TIMER));        // Set up unified logging
         LogHandler::set_output_callback([this](const std::string& msg) {
             AppendToLogsThreadSafe(wxString::FromUTF8(msg));
         });
         
-        // Set up summary logging callbacks
-        llama_manager->set_summary_input_callback([this](const std::string& input) {
-            AppendSummaryInput(wxString::FromUTF8(input));
+        // Set up summarizer-specific logging to route to summaries tab
+        LogHandler::set_summarizer_callback([this](const std::string& msg) {
+            AppendToSummariesThreadSafe(wxString::FromUTF8(msg));
         });
         
-        llama_manager->set_summary_output_callback([this](const std::string& output) {
-            AppendSummaryOutput(wxString::FromUTF8(output));
+        // Set up summarizer-specific logging to summaries tab
+        LogHandler::set_summarizer_callback([this](const std::string& msg) {
+            AppendToSummariesThreadSafe(wxString::FromUTF8(msg));
         });
         
         LoadConfiguration();
@@ -824,19 +832,19 @@ private:
         
         SetMinSize(wxSize(600, 400));
         AddWelcomeMessage();
-    }
-      void CreateToolbar() {
+    }      void CreateToolbar() {
         ui.start_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::START), "Start");
         ui.stop_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::STOP), "Stop");
         ui.settings_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::SETTINGS), "Settings");
         ui.discord_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::CONNECT_DISCORD), "Connect Discord");
         ui.prune_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::PRUNE_SUMMARIZE), "Prune && Summarize");
-    }void CreateStatusArea() {
+        ui.summary_slots_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::VIEW_SUMMARY_SLOTS), "View Summaries");
+    }    void CreateStatusArea() {
         ui.progress_label = new wxStaticText(ui.main_panel, wxID_ANY, "Ready");
         ui.progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, wxSize(-1, 20));
         ui.progress_bar->Hide();
         
-        ui.context_label = new wxStaticText(ui.main_panel, wxID_ANY, "Context: N/A", wxDefaultPosition, wxSize(120, -1));
+        ui.context_label = new wxStaticText(ui.main_panel, wxID_ANY, "Context: N/A", wxDefaultPosition, wxSize(220, -1));
         ui.context_progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, wxSize(200, 15));
         
         ui.timings_label = new wxStaticText(ui.main_panel, wxID_ANY, "");
@@ -901,16 +909,15 @@ private:
         ui.notebook->AddPage(panel, "Logs");
     }    void LayoutComponents() {
         auto* toolbar_sizer = new wxBoxSizer(wxHORIZONTAL);
-        toolbar_sizer->Add(ui.start_btn, 0, wxRIGHT, 5);
-        toolbar_sizer->Add(ui.stop_btn, 0, wxRIGHT, 5);  
+        toolbar_sizer->Add(ui.start_btn, 0, wxRIGHT, 5);        toolbar_sizer->Add(ui.stop_btn, 0, wxRIGHT, 5);  
         toolbar_sizer->Add(ui.settings_btn, 0, wxRIGHT, 5);
         toolbar_sizer->Add(ui.discord_btn, 0, wxRIGHT, 5);
-        toolbar_sizer->Add(ui.prune_btn, 0);
+        toolbar_sizer->Add(ui.prune_btn, 0, wxRIGHT, 5);
+        toolbar_sizer->Add(ui.summary_slots_btn, 0);
         toolbar_sizer->AddStretchSpacer();
-        
-        // Context monitoring area - fixed sizing and spacing
+          // Context monitoring area - fixed sizing and spacing
         auto* context_sizer = new wxBoxSizer(wxHORIZONTAL);
-        context_sizer->Add(ui.context_label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
+        context_sizer->Add(ui.context_label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
         context_sizer->Add(ui.context_progress_bar, 0, wxALIGN_CENTER_VERTICAL);
         context_sizer->AddStretchSpacer();
         
@@ -931,8 +938,8 @@ private:
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnStart, this, static_cast<int>(EventId::START));
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnStop, this, static_cast<int>(EventId::STOP));
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnSettings, this, static_cast<int>(EventId::SETTINGS));
-        Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnConnectDiscord, this, static_cast<int>(EventId::CONNECT_DISCORD));
-        Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnPruneSummarize, this, static_cast<int>(EventId::PRUNE_SUMMARIZE));
+        Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnConnectDiscord, this, static_cast<int>(EventId::CONNECT_DISCORD));        Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnPruneSummarize, this, static_cast<int>(EventId::PRUNE_SUMMARIZE));
+        Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnViewSummarySlots, this, static_cast<int>(EventId::VIEW_SUMMARY_SLOTS));
         Bind(wxEVT_COMMAND_TEXT_ENTER, &LuminaChatFrame::OnInputEnter, this, static_cast<int>(EventId::INPUT_TEXT));
         
         Bind(wxEVT_MODEL_LOADED, &LuminaChatFrame::OnModelLoaded, this);
@@ -991,12 +998,12 @@ private:
       void UpdateButtonStates() noexcept {
         const bool started = is_started.load();
         const bool processing = is_processing.load();
-        
-        if (ui.start_btn) ui.start_btn->Enable(!started && !processing);
+          if (ui.start_btn) ui.start_btn->Enable(!started && !processing);
         if (ui.stop_btn) ui.stop_btn->Enable(started);
         if (ui.input_text) ui.input_text->Enable(started && !processing);
         if (ui.settings_btn) ui.settings_btn->Enable(!processing);
         if (ui.prune_btn) ui.prune_btn->Enable(started && !processing);
+        if (ui.summary_slots_btn) ui.summary_slots_btn->Enable(started && !processing);
         
         UpdateDiscordButtonState();
     }
@@ -1004,7 +1011,7 @@ private:
     void UpdateDiscordButtonState() noexcept {
         if (!ui.discord_btn || !discord_manager) return;
         
-        ui.discord_btn->SetLabel(discord_manager->is_bot_running() ? 
+        ui.discord_btn->SetLabel(discord_manager->is_running.load() ? 
                                "Disconnect Discord" : "Connect Discord");
     }
     
@@ -1067,8 +1074,7 @@ private:
         
         return combined;
     }
-    
-    // Optimized event handler methods
+      // Optimized event handler methods
     void OnPruneSummarize(wxCommandEvent& event) {
         if (!is_started || is_processing || !llama_manager) {
             wxMessageBox("Please start the model first.", "Model Not Started", 
@@ -1077,19 +1083,28 @@ private:
         }
         
         // Check if there's a conversation to prune
-        if (llama_manager->get_message_count() < 3) {
-            wxMessageBox("Need at least 3 messages in the conversation to prune.", 
+        // Note: This is triggered from the UI and only effects the main chat context
+        auto context_info = llama_manager->get_context_info("main_chat");
+        if (context_info->message_history.size() < 10) {
+            wxMessageBox("Need at least 10 messages in the conversation to prune.", 
                         "Insufficient Messages", wxOK | wxICON_INFORMATION);
             return;
         }
-        
+
         // Check if summarization is available
-        if (!llama_manager->is_summarization_available()) {
+        if (!llama_manager->has_context("summary_context")) {
             wxMessageBox("Summarization is not available. Please configure a summary model in Settings.", 
                         "Summarization Unavailable", wxOK | wxICON_WARNING);
             return;
         }
         
+        // Ensure we're using the main chat context only after other checks have passed
+        if (!llama_manager->switch_to_context("main_chat")) {
+            wxMessageBox("Failed to switch to main chat context.", "Context Error", 
+                        wxOK | wxICON_ERROR);
+            return;
+        }
+
         try {
             // Show progress
             AddSystemMessage("Starting prune and summarize (keeping 90% of context)...");
@@ -1107,6 +1122,42 @@ private:
         } catch (const std::exception& e) {
             AddSystemMessage(wxString::Format("Error during pruning: %s", e.what()));
         }
+    }
+    
+    void OnViewSummarySlots(wxCommandEvent& event) {
+        if (!is_started || !llama_manager) {
+            wxMessageBox("Please start the model first.", "Model Not Started", 
+                        wxOK | wxICON_WARNING);
+            return;
+        }
+        
+        auto summary_info = llama_manager->get_summary_slot_info();
+        
+        wxString message;
+        message << "Summary Slot System Status:\n\n";
+        message << wxString::Format("Used slots: %zu / %zu\n\n", summary_info.used_slots, summary_info.total_slots);        if (summary_info.used_slots == 0) {
+            message << "No summaries generated yet.\n\n";
+            message << "Summaries are created automatically when the conversation\n";
+            message << "becomes too long and needs to be pruned to make room\n";
+            message << "for new messages.";
+        } else {
+            message << "Summaries (chronological order, oldest to newest):\n";
+            message << wxString(50, '=') << "\n\n";
+              for (size_t i = 0; const auto& summary : summary_info.summaries) {
+                message << wxString::Format("Slot %zu:\n", ++i);
+                
+                // Show full summary without truncation
+                wxString summary_text = wxString::FromUTF8(summary);
+                
+                message << summary_text << "\n\n";
+                message << wxString(30, '-') << "\n\n";
+            }
+            
+            message << "When slot " << summary_info.total_slots + 1 << " is needed, slot 1 will be\n";
+            message << "automatically removed and all slots will shift left.";
+        }
+        
+        wxMessageBox(message, "Summary Slots", wxOK | wxICON_INFORMATION);
     }
     
     void OnStart(wxCommandEvent& event) {
@@ -1187,7 +1238,8 @@ private:
         if (success) {
             // Handle chat template first - only save model template if no custom template was provided
             if (config.chat_template.empty()) {
-                std::string model_template = llama_manager->get_model_chat_template();
+                auto model_info = llama_manager->get_model_info("main_model");
+                std::string model_template = model_info->get_chat_template();
                 if (!model_template.empty()) {
                     config.chat_template = model_template;
                     SettingsManager::SaveSettings(config.model_path, config.context_size, config.gpu_layers, config.predict_tokens, 
@@ -1232,13 +1284,13 @@ private:
             
             // Start context monitoring timer (update every 2 seconds)
             if (context_monitor_timer) {
-                context_monitor_timer->Start(2000);
+                context_monitor_timer->Start(UIConstants::CONTEXT_MONITOR_INTERVAL_MS);
             }
-            
-            // Connect Discord manager to LlamaManager when model is loaded
-            if (discord_manager && discord_manager->is_bot_running()) {
+              // Connect Discord manager to LlamaManager when model is loaded
+            if (discord_manager && discord_manager->is_running.load()) {
                 discord_manager->set_llama_manager(llama_manager.get());
-                discord_manager->set_main_context_id("main_chat");
+                discord_manager->main_context_id = "main_chat";
+                discord_manager->model_id = "main_model";
                 DISCORD_LOG("Discord bot connected to loaded model");
             }
             
@@ -1277,7 +1329,7 @@ private:
         ui.context_progress_bar->SetForegroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_HIGHLIGHT));
         
         // Disconnect Discord manager from LlamaManager when model is stopped
-        if (discord_manager && discord_manager->is_bot_running()) {
+        if (discord_manager && discord_manager->is_running.load()) {
             discord_manager->set_llama_manager(nullptr);
             DISCORD_LOG("Discord bot disconnected from model");
         }
@@ -1297,7 +1349,7 @@ private:
             return;
         }
         
-        if (discord_manager->is_bot_running()) {
+        if (discord_manager->is_running.load()) {
             // Stop Discord bot
             discord_manager->shutdown();
             ui.discord_btn->SetLabel("Connect Discord");
@@ -1317,10 +1369,10 @@ private:
                 AddSystemMessage("Failed to configure Discord bot");
                 return;
             }
-            
-            // Set up integration with LlamaManager
+              // Set up integration with LlamaManager
             discord_manager->set_llama_manager(llama_manager.get());
-            discord_manager->set_main_context_id("main_chat");
+            discord_manager->main_context_id = "main_chat";
+            discord_manager->model_id = "main_model";
             discord_manager->set_isolated_channels(config.discord_isolated_channels);
             discord_manager->set_shared_history_channels(config.discord_shared_channels);
             discord_manager->set_allow_dms(config.discord_allow_dms);
@@ -1331,12 +1383,12 @@ private:
                 ui.discord_btn->SetLabel("Disconnect Discord");
                 AddSystemMessage("Discord bot connecting...");
                 
-                // UPDATED: Simplified backfill monitoring for new structure
+                // Simplified backfill monitoring for new structure
                 std::thread([this]() {
                     bool backfill_reported = false;
                     
                     for (int i = 0; i < 60; ++i) { // Check for up to 5 minutes
-                        std::this_thread::sleep_for(std::chrono::seconds(5));
+                        std::this_thread::sleep_for(std::chrono::seconds(UIConstants::DISCORD_CONNECTION_DELAY_SEC));
                         
                         if (discord_manager) {
                             auto status = discord_manager->get_backfill_status();
@@ -1396,14 +1448,18 @@ private:
                            "Settings Updated", wxOK | wxICON_INFORMATION);
             }
         }
-    }
-
-    void OnInputEnter(wxCommandEvent& event) {
+    }    void OnInputEnter(wxCommandEvent& event) {
         if (!is_started || is_processing) return;
         
         // Check if context is created
         if (!context_created) {
             AddSystemMessage("Error: Chat context not available. Please restart the model.");
+            return;
+        }
+        
+        // Ensure we're using the main chat context before processing the message
+        if (!llama_manager->switch_to_context("main_chat")) {
+            AddSystemMessage("Error: Failed to switch to main chat context.");
             return;
         }
         
@@ -1462,7 +1518,7 @@ private:
         // Get timings from llama manager
         auto timings = llama_manager->get_timings();
         if (timings.n_eval > 0) {
-            double tokens_per_sec = 1000.0 * timings.n_eval / timings.t_eval_ms;
+            double tokens_per_sec = UIConstants::MS_TO_SECONDS * timings.n_eval / timings.t_eval_ms;
             
             // Get additional statistics for comprehensive display
             auto perf_stats = llama_manager->get_performance_stats();
@@ -1484,19 +1540,25 @@ private:
             ui.context_progress_bar->SetValue(0);
             return;
         }
-        
-        // Get context usage information directly without switching contexts
-        int32_t context_size = llama_manager->get_context_size_for("main_chat");
-        int32_t context_usage = llama_manager->get_context_usage_for("main_chat");
+          // Get context usage information directly without switching contexts
+        auto context_info = llama_manager->get_context_info("main_chat");
+        int32_t context_usage = context_info->n_past;
+        int32_t context_size = context_info->get_context_size();
         
         if (context_size > 0) {
             float usage_percentage = static_cast<float>(context_usage) / static_cast<float>(context_size) * 100.0f;
             int32_t progress_value = static_cast<int32_t>(usage_percentage);
+              ui.context_progress_bar->SetValue(std::min(progress_value, 100));
             
-            ui.context_progress_bar->SetValue(std::min(progress_value, 100));
+            // Get summary slot information
+            auto summary_info = llama_manager->get_summary_slot_info();
             
-            // More descriptive label showing context buffer usage vs conversation tokens
-            ui.context_label->SetLabel(wxString::Format("Buffer: %d/%d", context_usage, context_size));
+            // More descriptive label showing context buffer usage and summary slots
+            wxString label = wxString::Format("Buffer: %d/%d", context_usage, context_size);
+            if (summary_info.used_slots > 0) {
+                label += wxString::Format(" | Summaries: %zu/%zu", summary_info.used_slots, summary_info.total_slots);
+            }
+            ui.context_label->SetLabel(label);
             
             // Change color based on usage (visual feedback)
             if (usage_percentage > 90.0f) {

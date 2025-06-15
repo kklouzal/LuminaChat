@@ -14,16 +14,16 @@
 // Enable Run-Time Type Information (RTTI) YES (/GR)
 //
 // CRITICAL CODING DIRECTIVES:
-// 1.  Minimalism & Performance: Deliver lean, efficient solutions; do not create or preserve unused helpers or wrappers.
-// 2.  Redundancy Elimination: Remove unused, obsolete, and legacy code—including unneeded interfaces and includes.
+// 1.  Minimalism & Performance: Deliver lean, efficient solutions; do not create or preserve unused helpers, wrappers, trivial accessors (setters/getters), or scaffolding.
+// 2.  Redundancy Elimination: Remove unused, obsolete, and legacy code—including unneeded interfaces, includes, helper or accessor methods.
 // 3.  Consistent Style: Adopt a uniform coding style and structure for clarity and maintainability.
 // 4.  Documentation: Write concise comments that explain complex logic and key design decisions.
-// 5.  Zero Magic & Strong Typing: Replace magic literals with named constants, enums, or constexpr; prefer scoped enums.
-// 6.  Function Boundaries: Define clear responsibilities; reduce overlap and avoid unnecessary layers.
-// 7.  Core Preservation: Streamline code while safeguarding essential features; favor direct access over extra abstractions.
+// 5.  Zero Magic & Strong Typing: Replace magic literals with named constants, enums, or constexpr; prefer scoped enums over raw ints.
+// 6.  Function Boundaries: Define clear responsibilities; reduce overlap and avoid unnecessary layers of indirection.
+// 7.  Core Preservation: Streamline code while safeguarding essential features; favor direct variable or object access/passing over extra abstractions (e.g., setters/getters).
 // 8.  Const-Correctness & Immutability: Mark variables, parameters, and methods as const wherever possible.
 // 9.  RAII & Resource Safety: Encapsulate resource acquisition/release in constructors/destructors or smart pointers.
-// 10. Standard Library Preference: Favor STL algorithms and containers over custom loops and buffers.
+// 10. Standard Library Preference: Favor STL algorithms and containers over custom loops and buffers for clarity and safety.
 // 11. Cross-Platform Portability: Use fixed-width types and proper initialization to guarantee identical behavior everywhere.
 // 12. Thread Safety: Define and document thread-safety contracts; protect shared state with mutexes, atomics, or thread-safe containers.
 // 13. Smart Caching: Cache frequently used values to minimize allocations and improve performance.
@@ -47,6 +47,7 @@
 
 #include <dpp/dpp.h>
 #include "LogHandler.hpp"
+#include "common_utils.hpp"
 
 class LlamaManager;
 
@@ -71,12 +72,15 @@ struct PendingMessage {
 };
 
 class DiscordHistoryLoader {
-private:
-    // Core dependencies
+private:    // Core dependencies
     dpp::cluster* bot = nullptr;
     LlamaManager* llama_manager = nullptr;
     std::string main_context_id;
-    std::string model_id; // NEW: Store model ID for context creation
+    std::string model_id; // Store model ID for context creation
+    
+    // Bot identification for recognizing own messages
+    uint64_t bot_user_id = 0;
+    std::string bot_username;
     
     // Channel configuration
     const std::unordered_set<uint64_t>* isolated_channels = nullptr;
@@ -103,10 +107,15 @@ private:
     
     // State
     std::atomic<bool> backfill_in_progress{false};
-    
-    // Constants
+      // Constants
     static constexpr int32_t MESSAGES_PER_FETCH = 10;
     static constexpr float BASE_MAX_CONTEXT_FILL_RATIO = 0.01f;
+    static constexpr int32_t MAX_ITERATIONS = 1000;
+    static constexpr int32_t TIMEOUT_SECONDS = 10;
+    static constexpr int32_t RATE_LIMIT_DELAY_MS = 100;
+    static constexpr int32_t RETRY_DELAY_MS = 1000;
+    static constexpr int32_t PROGRESS_DELAY_MS = 250;
+    static constexpr int32_t INITIALIZATION_DELAY_SEC = 2;
     
     bool should_backfill_channel(uint64_t channel_id) const {
         return (isolated_channels && isolated_channels->count(channel_id)) ||
@@ -117,15 +126,13 @@ private:
         return isolated_channels && isolated_channels->count(channel_id);
     }
     
-    // NEW: Initialize context capacities once at start
+    // Initialize context capacities once at start
     void initialize_context_capacities() {
         std::lock_guard<std::mutex> lock(capacity_mutex);
         context_capacity_limits.clear();
         context_current_tokens.clear();
         
         if (!llama_manager) return;
-        
-        std::string original_context = llama_manager->get_active_context();
         
         // Get unique context IDs
         std::unordered_set<std::string> unique_contexts;
@@ -135,29 +142,25 @@ private:
         
         // Initialize capacity data for each context
         for (const std::string& context_id : unique_contexts) {
-            if (llama_manager->switch_to_context(context_id)) {
-                int32_t current_tokens = llama_manager->get_message_history_token_count();
-                int32_t context_size = llama_manager->get_context_size();
-                float fill_ratio = BASE_MAX_CONTEXT_FILL_RATIO * context_fill_percentage;
-                int32_t capacity_limit = static_cast<int32_t>(context_size * fill_ratio);
-                
-                context_current_tokens[context_id] = current_tokens;
-                context_capacity_limits[context_id] = capacity_limit;
-                
-                DISCORD_HISTORY_LOG("Context '" + context_id + "' capacity: " + std::to_string(current_tokens) + 
-                           "/" + std::to_string(capacity_limit) + " tokens");
-            }
-        }
-        
-        // Restore original context
-        if (!original_context.empty()) {
-            llama_manager->switch_to_context(original_context);
+            // Get the context info from LlamaManager
+            auto context = llama_manager->get_context_info(context_id);
+
+            int32_t current_tokens = context->message_history_token_count;
+            int32_t context_size = context->get_context_size();
+            float fill_ratio = BASE_MAX_CONTEXT_FILL_RATIO * context_fill_percentage;
+            int32_t capacity_limit = static_cast<int32_t>(context_size * fill_ratio);
+            
+            context_current_tokens[context_id] = current_tokens;
+            context_capacity_limits[context_id] = capacity_limit;
+            
+            DISCORD_HISTORY_LOG("Context '" + context_id + "' capacity: " + std::to_string(current_tokens) + 
+                        "/" + std::to_string(capacity_limit) + " tokens");
         }
         
         DISCORD_HISTORY_LOG("Initialized capacity tracking for " + std::to_string(unique_contexts.size()) + " contexts");
     }
     
-    // SIMPLIFIED: Check capacity without context switching
+    // Check capacity without context switching
     bool can_add_more_messages_estimated_no_switch(const std::string& context_id, int32_t additional_tokens) {
         std::lock_guard<std::mutex> lock(capacity_mutex);
         
@@ -171,13 +174,13 @@ private:
         return (current_it->second + additional_tokens) < capacity_it->second;
     }
     
-    // NEW: Update estimated token usage without context switching
+    // Update estimated token usage without context switching
     void update_estimated_token_usage(const std::string& context_id, int32_t additional_tokens) {
         std::lock_guard<std::mutex> lock(capacity_mutex);
         context_current_tokens[context_id] += additional_tokens;
     }
     
-    // SIMPLIFIED: Direct message fetching and processing
+    // Direct message fetching and processing
     bool process_channel_batch(uint64_t channel_id) {
         auto& state = channel_states[channel_id];
         if (state.fetch_complete) {
@@ -216,9 +219,8 @@ private:
                     promise->set_value(false);
                 }
             });
-        
-        // Wait for result with timeout
-        auto status = future.wait_for(std::chrono::seconds(10));
+          // Wait for result with timeout
+        auto status = future.wait_for(std::chrono::seconds(TIMEOUT_SECONDS));
         if (status == std::future_status::ready) {
             return future.get();
         } else {
@@ -228,7 +230,7 @@ private:
         }
     }
     
-    // MODIFIED: Collect messages with exact tokenization using LlamaManager
+    // Collect messages with exact tokenization using LlamaManager
     bool collect_messages_for_later(const dpp::message_map& messages, uint64_t channel_id) {
         if (messages.empty()) return false;
         
@@ -237,25 +239,54 @@ private:
         // Process messages with exact tokenization
         std::vector<PendingMessage> batch_messages;
         uint64_t oldest_id = UINT64_MAX; // Track oldest message ID for next iteration
-        int32_t total_exact_tokens = 0;
-        
-        for (const auto& [id, msg] : messages) {
-            if (!msg.author.is_bot() && !msg.content.empty()) {
+        int32_t total_exact_tokens = 0;          for (const auto& [id, msg] : messages) {
+            // Check if this is a user message OR our bot's own message
+            bool is_our_bot = msg.author.is_bot() && (static_cast<uint64_t>(msg.author.id) == bot_user_id);
+            
+            // For bot messages, allow empty content if there are embeds; for user messages, content must be non-empty
+            bool has_content = !msg.content.empty();
+            bool has_embed_content = is_our_bot && !msg.embeds.empty() && !msg.embeds[0].description.empty();
+            bool should_process = (!msg.author.is_bot() || is_our_bot) && (has_content || has_embed_content);
+            
+            if (should_process) {
                 PendingMessage pending;
                 pending.channel_id = channel_id;
-                pending.username = msg.author.username;
-                pending.content = msg.content;
+                
+                // Use "assistant" role for our bot's messages, username for user messages
+                if (is_our_bot) {
+                    pending.username = "assistant";
+                } else {
+                    pending.username = msg.author.username;
+                }
+                
+                // For bot messages, extract content from embeds if they exist, otherwise use regular content
+                std::string actual_content = msg.content;
+                if (is_our_bot && !msg.embeds.empty()) {
+                    // Extract content from the first embed's description
+                    const auto& embed = msg.embeds[0];
+                    if (!embed.description.empty()) {
+                        actual_content = embed.description;
+                    }
+                }
+                
+                pending.content = safe_trim(actual_content);
                 pending.timestamp = std::chrono::system_clock::time_point(std::chrono::seconds(msg.sent));
                 pending.message_id = static_cast<uint64_t>(msg.id);
                 pending.target_context_id = state.context_id;
                 
-                // FIXED: Use LlamaManager's new public tokenization method
-                std::string formatted_message = msg.author.username + ": " + msg.content;
-                pending.tokenized_content = llama_manager->tokenize_text(formatted_message, false);
+                // Use LlamaManager's new public tokenization method
+                std::string formatted_message;
+                if (is_our_bot) {
+                    // For bot messages, don't include username prefix since it's "assistant"
+                    formatted_message = actual_content;
+                } else {
+                    formatted_message = msg.author.username + ": " + actual_content;
+                }
+                pending.tokenized_content = llama_manager->process_text_to_tokens(formatted_message, false);
                 
                 // Check for reasonable token count limits
                 if (pending.tokenized_content.size() > 2048) {
-                    DISCORD_HISTORY_LOG("Warning: Message from " + msg.author.username + " would produce " + 
+                    DISCORD_HISTORY_LOG("Warning: Message from " + (is_our_bot ? "bot" : msg.author.username) + " would produce " + 
                                std::to_string(pending.tokenized_content.size()) + " tokens, skipping");
                     continue;
                 }
@@ -269,10 +300,10 @@ private:
                     oldest_id = std::min(oldest_id, pending.message_id);
                 } else {
                     DISCORD_HISTORY_LOG("Warning: Tokenization produced 0 tokens for message from " + 
-                               msg.author.username + ", skipping");
+                               (is_our_bot ? "bot" : msg.author.username) + ", skipping");
                 }
             } else {
-                // Still need to track message IDs even for bot messages to ensure proper pagination
+                // Still need to track message IDs even for other bot messages to ensure proper pagination
                 uint64_t msg_id = static_cast<uint64_t>(msg.id);
                 oldest_id = std::min(oldest_id, msg_id);
             }
@@ -293,7 +324,7 @@ private:
             {
                 std::lock_guard<std::mutex> lock(state_mutex);
                 state.messages_fetched += static_cast<int32_t>(batch_messages.size());
-                // FIXED: Set last_message_id to oldest message for next API call to fetch older messages
+                // Set last_message_id to oldest message for next API call to fetch older messages
                 if (oldest_id != UINT64_MAX) {
                     state.last_message_id = oldest_id;
                 }
@@ -321,7 +352,7 @@ private:
             
             DISCORD_HISTORY_LOG("Channel " + std::to_string(channel_id) + " completed - context capacity reached (" + capacity_info + ")");
         } else {
-            // FIXED: Even if no messages were added, update the last_message_id to continue pagination
+            // Even if no messages were added, update the last_message_id to continue pagination
             std::lock_guard<std::mutex> lock(state_mutex);
             if (oldest_id != UINT64_MAX) {
                 state.last_message_id = oldest_id;
@@ -333,7 +364,7 @@ private:
         return false;
     }
     
-    // MODIFIED: Apply collected messages using pre-tokenized content
+    // Apply collected messages using pre-tokenized content
     void apply_collected_messages() {
         std::lock_guard<std::mutex> lock(pending_messages_mutex);
         if (pending_messages.empty()) return;
@@ -392,7 +423,7 @@ private:
         DISCORD_HISTORY_LOG("Tokenized message application phase completed");
     }
     
-    // SIMPLIFIED: Round-robin for shared channels
+    // Round-robin for shared channels
     uint64_t get_next_shared_channel() {
         if (shared_channels_list.empty()) return 0;
         
@@ -401,9 +432,9 @@ private:
         return channel_id;
     }
     
-    // MODIFIED: Updated main processing loop with proper isolated vs shared handling
+    // Updated main processing loop with proper isolated vs shared handling
     void process_all_channels() {
-        const int32_t MAX_ITERATIONS = 1000;
+        const int32_t MAX_ITERATIONS = DiscordHistoryLoader::MAX_ITERATIONS;
         int32_t iteration = 0;
         
         // Initialize context capacities once
@@ -415,17 +446,17 @@ private:
         
         while (backfill_in_progress && iteration < MAX_ITERATIONS) {
             bool made_progress = false;
-            
-            // Process isolated channels sequentially to completion
+              // Process isolated channels sequentially to completion using STL algorithms (Directive #14)
             // Since each has its own context, we can fill them completely without affecting others
             std::vector<uint64_t> isolated_channels_to_process;
             {
                 std::lock_guard<std::mutex> lock(state_mutex);
-                for (const auto& [channel_id, state] : channel_states) {
+                std::for_each(channel_states.begin(), channel_states.end(), [&](const auto& pair) {
+                    const auto& [channel_id, state] = pair;
                     if (state.is_isolated && !state.fetch_complete) {
                         isolated_channels_to_process.push_back(channel_id);
                     }
-                }
+                });
             }
             
             // Process all isolated channels until complete or no progress
@@ -439,7 +470,7 @@ private:
                         if (process_channel_batch(channel_id)) {
                             made_progress = true;
                             // Small delay between batches for rate limiting
-                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            std::this_thread::sleep_for(std::chrono::milliseconds(RATE_LIMIT_DELAY_MS));
                         } else {
                             break; // Channel completed or error
                         }
@@ -467,17 +498,12 @@ private:
             
             iteration++;
             
-            if (!made_progress) {
-                // Check if all channels are complete
+            if (!made_progress) {                // Check if all channels are complete using STL algorithms (Directive #14)
                 bool all_complete = true;
                 {
                     std::lock_guard<std::mutex> lock(state_mutex);
-                    for (const auto& [channel_id, state] : channel_states) {
-                        if (!state.fetch_complete) {
-                            all_complete = false;
-                            break;
-                        }
-                    }
+                    all_complete = std::all_of(channel_states.begin(), channel_states.end(),
+                        [](const auto& pair) { return pair.second.fetch_complete; });
                 }
                 
                 if (all_complete) {
@@ -487,10 +513,10 @@ private:
                 
                 // If no progress but channels remain, wait and try again
                 DISCORD_HISTORY_LOG("No progress made, waiting before retry...");
-                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_DELAY_MS));
             } else {
                 // Short delay between iterations when making progress
-                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                std::this_thread::sleep_for(std::chrono::milliseconds(PROGRESS_DELAY_MS));
             }
         }
         
@@ -512,12 +538,18 @@ public:
 
     DiscordHistoryLoader() = default;
     ~DiscordHistoryLoader() = default;
-    
-    void configure(dpp::cluster* discord_bot, LlamaManager* llama_mgr, const std::string& main_ctx_id, const std::string& model_identifier = "") {
+      void configure(dpp::cluster* discord_bot, LlamaManager* llama_mgr, const std::string& main_ctx_id, const std::string& model_identifier = "") {
         bot = discord_bot;
         llama_manager = llama_mgr;
         main_context_id = main_ctx_id;
-        model_id = model_identifier; // NEW: Store model ID
+        model_id = model_identifier;
+    }
+    
+    // Set bot identification information for recognizing own messages
+    void set_bot_identity(uint64_t user_id, const std::string& username) {
+        bot_user_id = user_id;
+        bot_username = username;
+        DISCORD_HISTORY_LOG("Bot identity set: ID=" + std::to_string(user_id) + ", Username=" + username);
     }
     
     void set_channel_configuration(const std::unordered_set<uint64_t>* allowed,
@@ -557,7 +589,7 @@ public:
         shared_channels_list.clear();
         shared_channel_index = 0;
         
-        // FIXED: Validate prerequisites before proceeding
+        // Validate prerequisites before proceeding
         if (model_id.empty()) {
             DISCORD_HISTORY_LOG("Error: No model_id configured for context creation");
             backfill_in_progress = false;
@@ -581,16 +613,21 @@ public:
                             if (channel.is_text_channel() && should_backfill_channel(channel_id)) {
                                 ChannelState state;
                                 state.is_isolated = is_isolated_channel(channel_id);
-                                
-                                if (state.is_isolated) {
+                                  if (state.is_isolated) {
                                     state.context_id = "discord_channel_" + std::to_string(channel_id);
                                     
-                                    // FIXED: Validate model_id and create context with proper error handling
+                                    // Validate model_id and create context with proper system prompt
                                     if (!model_id.empty()) {
                                         if (!llama_manager->has_context(state.context_id)) {
-                                            if (llama_manager->create_context(state.context_id, model_id, "")) {
+                                            // Get the main shared context info to retrieve system prompt
+                                            auto context_info = llama_manager->get_context_info(main_context_id);
+
+                                            // Get system prompt from main context
+                                            std::string system_prompt = context_info->system_message;
+                                            
+                                            if (llama_manager->create_context(state.context_id, model_id, system_prompt)) {
                                                 DISCORD_HISTORY_LOG("Created isolated context '" + state.context_id + 
-                                                           "' with model '" + model_id + "'");
+                                                           "' with model '" + model_id + "' and system prompt");
                                             } else {
                                                 DISCORD_HISTORY_LOG("Error: Failed to create isolated context '" + 
                                                            state.context_id + "' with model '" + model_id + "'");
@@ -607,7 +644,7 @@ public:
                                     state.context_id = main_context_id;
                                     shared_channels_list.push_back(channel_id);
                                     
-                                    // FIXED: Validate main context exists
+                                    // Validate main context exists
                                     if (!llama_manager->has_context(main_context_id)) {
                                         DISCORD_HISTORY_LOG("Error: Main context '" + main_context_id + "' does not exist");
                                         continue; // Skip this channel
@@ -628,9 +665,9 @@ public:
             
             // Start processing after a short delay
             std::thread([this]() {
-                std::this_thread::sleep_for(std::chrono::seconds(2));
+                std::this_thread::sleep_for(std::chrono::seconds(INITIALIZATION_DELAY_SEC));
                 if (backfill_in_progress) {
-                    // FIXED: Validate we have channels to process before starting
+                    // Validate we have channels to process before starting
                     {
                         std::lock_guard<std::mutex> lock(state_mutex);
                         if (channel_states.empty()) {
@@ -666,8 +703,7 @@ public:
         
         return status;
     }
-    
-    bool is_in_progress() const { return backfill_in_progress; }
+      bool is_in_progress() const { return backfill_in_progress; }
 };
 
 //

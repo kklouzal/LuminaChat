@@ -14,16 +14,16 @@
 // Enable Run-Time Type Information (RTTI) YES (/GR)
 //
 // CRITICAL CODING DIRECTIVES:
-// 1.  Minimalism & Performance: Deliver lean, efficient solutions; do not create or preserve unused helpers or wrappers.
-// 2.  Redundancy Elimination: Remove unused, obsolete, and legacy code—including unneeded interfaces and includes.
+// 1.  Minimalism & Performance: Deliver lean, efficient solutions; do not create or preserve unused helpers, wrappers, trivial accessors (setters/getters), or scaffolding.
+// 2.  Redundancy Elimination: Remove unused, obsolete, and legacy code—including unneeded interfaces, includes, helper or accessor methods.
 // 3.  Consistent Style: Adopt a uniform coding style and structure for clarity and maintainability.
 // 4.  Documentation: Write concise comments that explain complex logic and key design decisions.
-// 5.  Zero Magic & Strong Typing: Replace magic literals with named constants, enums, or constexpr; prefer scoped enums.
-// 6.  Function Boundaries: Define clear responsibilities; reduce overlap and avoid unnecessary layers.
-// 7.  Core Preservation: Streamline code while safeguarding essential features; favor direct access over extra abstractions.
+// 5.  Zero Magic & Strong Typing: Replace magic literals with named constants, enums, or constexpr; prefer scoped enums over raw ints.
+// 6.  Function Boundaries: Define clear responsibilities; reduce overlap and avoid unnecessary layers of indirection.
+// 7.  Core Preservation: Streamline code while safeguarding essential features; favor direct variable or object access/passing over extra abstractions (e.g., setters/getters).
 // 8.  Const-Correctness & Immutability: Mark variables, parameters, and methods as const wherever possible.
 // 9.  RAII & Resource Safety: Encapsulate resource acquisition/release in constructors/destructors or smart pointers.
-// 10. Standard Library Preference: Favor STL algorithms and containers over custom loops and buffers.
+// 10. Standard Library Preference: Favor STL algorithms and containers over custom loops and buffers for clarity and safety.
 // 11. Cross-Platform Portability: Use fixed-width types and proper initialization to guarantee identical behavior everywhere.
 // 12. Thread Safety: Define and document thread-safety contracts; protect shared state with mutexes, atomics, or thread-safe containers.
 // 13. Smart Caching: Cache frequently used values to minimize allocations and improve performance.
@@ -32,7 +32,6 @@
 
 #pragma once
 
-#include <iostream>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -65,14 +64,11 @@ private:
     std::unique_ptr<dpp::cluster> bot;
     std::unique_ptr<DiscordHistoryLoader> history_loader;
     LlamaManager* llama_manager;
-    
-    // Configuration
+
+      // Configuration
     DiscordBotConfig config;
-    std::string main_context_id;
-    std::string model_id = "main_model"; // FIXED: Set default model_id
-    
+
     // State
-    std::atomic<bool> is_running{false};
     std::atomic<bool> is_connected{false};
     std::atomic<bool> should_stop{false};
     
@@ -94,14 +90,23 @@ private:
     std::atomic<uint64_t> total_messages_processed{0};
     std::atomic<uint64_t> total_responses_sent{0};
     std::chrono::system_clock::time_point last_activity;
-    
-    // Constants
+      // Constants
     static constexpr std::chrono::milliseconds MIN_RESPONSE_INTERVAL{2000};
     static constexpr size_t MAX_MESSAGE_LENGTH = 2000;
     static constexpr int32_t MAX_CONTEXT_FILL_PERCENTAGE = 80;
     static constexpr int32_t MIN_CONTEXT_FILL_PERCENTAGE = 10;
+    static constexpr int32_t HEARTBEAT_DELAY_SEC = 5;
+    static constexpr int32_t RETRY_DELAY_MS = 500;
 
 public:
+    // State
+    std::atomic<bool> is_running{ false };
+
+    // Configuration
+    std::string main_context_id;
+
+    std::string model_id = "main_model";
+
     using BackfillStatus = DiscordHistoryLoader::BackfillStatus;
     
     BackfillStatus get_backfill_status() const {
@@ -115,6 +120,11 @@ private:
         bot->on_ready([this](const dpp::ready_t& event) {
             is_connected = true;
             DISCORD_LOG("Discord bot ready! Logged in as: " + bot->me.username);
+            
+            // Pass bot identity to history loader for recognizing own messages
+            if (history_loader) {
+                history_loader->set_bot_identity(static_cast<uint64_t>(bot->me.id), bot->me.username);
+            }
         });
         
         bot->on_message_create([this](const dpp::message_create_t& event) {
@@ -234,8 +244,7 @@ private:
         std::lock_guard<std::mutex> lock(channel_config_mutex);
         return isolated_channels.count(channel_id) > 0;
     }
-    
-    bool is_rate_limited(uint64_t user_id) {
+      bool is_rate_limited(uint64_t user_id) {
         std::lock_guard<std::mutex> lock(data_mutex);
         auto now = std::chrono::system_clock::now();
         auto it = last_response_time.find(user_id);
@@ -246,6 +255,17 @@ private:
         
         last_response_time[user_id] = now;
         return false;
+    }
+      // Get system prompt from main context for new Discord contexts
+    std::string get_system_prompt_for_new_context() const {
+        if (!llama_manager || main_context_id.empty()) return "";
+        
+        // Get the main context info to retrieve system prompt
+        auto context_info = llama_manager->get_context_info(main_context_id);
+        // get the system message from the main context
+        std::string system_prompt = context_info->system_message;
+        
+        return system_prompt;
     }
     
     std::string get_or_create_user_context(uint64_t user_id, const std::string& username, 
@@ -269,13 +289,12 @@ private:
             std::string context_id = "discord_dm_" + std::to_string(user_id);
             
             // Check if context already exists before trying to create
-            if (llama_manager && llama_manager->has_context(context_id)) {
-                user_contexts[user_id] = context_id;
+            if (llama_manager && llama_manager->has_context(context_id)) {                user_contexts[user_id] = context_id;
                 return context_id;
             }
-            
-            // FIXED: Use new API with model_id parameter
-            if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, "")) {
+              // Use new API with model_id parameter and proper system prompt
+            std::string system_prompt = get_system_prompt_for_new_context();
+            if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, system_prompt)) {
                 user_contexts[user_id] = context_id;
                 return context_id;
             }
@@ -288,19 +307,44 @@ private:
             std::string context_id = "discord_channel_" + std::to_string(channel_id);
             
             // Check if context already exists before trying to create
-            if (llama_manager && llama_manager->has_context(context_id)) {
-                channel_contexts[channel_id] = context_id;
+            if (llama_manager && llama_manager->has_context(context_id)) {                channel_contexts[channel_id] = context_id;
                 return context_id;
             }
-            
-            // FIXED: Use new API with model_id parameter
-            if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, "")) {
+              // Use new API with model_id parameter and proper system prompt
+            std::string system_prompt = get_system_prompt_for_new_context();
+            if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, system_prompt)) {
                 channel_contexts[channel_id] = context_id;
                 return context_id;
             }
         }
+          return "";
+    }
+    
+    // Helper function to get context ID for a specific channel/user
+    std::string get_context_for_channel(uint64_t channel_id, uint64_t user_id = 0, uint64_t guild_id = 0) const {
+        const bool is_dm = (guild_id == 0);
+        const bool is_isolated_chan = is_isolated_channel(channel_id);
         
-        return "";
+        // Use shared main context for regular channels
+        if (!is_isolated_chan && !is_dm) {
+            return main_context_id;
+        }
+        
+        std::lock_guard<std::mutex> lock(data_mutex);
+        
+        if (is_dm && user_id != 0) {
+            auto it = user_contexts.find(user_id);
+            if (it != user_contexts.end()) {
+                return it->second;
+            }
+        } else if (is_isolated_chan) {
+            auto it = channel_contexts.find(channel_id);
+            if (it != channel_contexts.end()) {
+                return it->second;
+            }
+        }
+        
+        return main_context_id; // Fallback to main context
     }
     
     void cleanup_contexts() {
@@ -349,16 +393,7 @@ public:
         std::lock_guard<std::mutex> lock(channel_config_mutex);
         allow_dms = allow;
     }
-    
-    void set_main_context_id(const std::string& context_id) {
-        main_context_id = context_id;
-    }
-    
-    // NEW: Set model ID for context creation
-    void set_model_id(const std::string& model_identifier) {
-        model_id = model_identifier.empty() ? "main_model" : model_identifier; // FIXED: Ensure non-empty
-    }
-    
+
     void set_history_settings(bool pull_history, int32_t fill_percentage) {
         std::lock_guard<std::mutex> lock(channel_config_mutex);
         pull_message_history = pull_history;
@@ -370,9 +405,8 @@ public:
     }
     
     void set_llama_manager(LlamaManager* manager) {
-        llama_manager = manager;
-        if (manager) {
-            // FIXED: Ensure model_id is set before configuring history loader
+        llama_manager = manager;        if (manager) {
+            // Ensure model_id is set before configuring history loader
             if (model_id.empty()) {
                 model_id = "main_model";
             }
@@ -394,9 +428,8 @@ public:
             uint32_t intents = dpp::i_default_intents | dpp::i_message_content;
             bot = std::make_unique<dpp::cluster>(config.bot_token, intents);
             setup_event_handlers();
-            
-            if (history_loader && llama_manager) {
-                // FIXED: Ensure model_id is set before configuring history loader
+              if (history_loader && llama_manager) {
+                // Ensure model_id is set before configuring history loader
                 if (model_id.empty()) {
                     model_id = "main_model";
                 }
@@ -424,7 +457,7 @@ public:
             // Start history backfill if enabled
             if (pull_message_history && llama_manager) {
                 std::thread([this]() {
-                    std::this_thread::sleep_for(std::chrono::seconds(5));
+                    std::this_thread::sleep_for(std::chrono::seconds(HEARTBEAT_DELAY_SEC));
                     if (is_connected && history_loader) {
                         history_loader->start_backfill();
                     }
@@ -452,16 +485,41 @@ public:
         is_connected = false;
         cleanup_contexts();
     }
-    
-    bool send_message(uint64_t channel_id, const std::string& message) {
+      bool send_message(uint64_t channel_id, const std::string& message) {
         if (!is_running || !is_connected || !bot || message.empty()) return false;
         
         try {
             auto message_parts = split_message(message);
             for (const auto& part : message_parts) {
-                bot->message_create(dpp::message(channel_id, part));
+                // Get context information for this channel
+                std::string context_id = get_context_for_channel(channel_id, 0, 0);
+                std::string footer_text = "🤖 LuminaChat AI";
+                
+                if (llama_manager && !context_id.empty()) {
+                    // Get ContextInfo for the context ID
+                    auto context_info = llama_manager->get_context_info(context_id);
+                    
+                    int32_t context_usage = context_info->n_past;
+                    int32_t context_size = context_info->get_context_size();
+                    
+                    if (context_size > 0) {
+                        footer_text += " • Context: " + std::to_string(context_usage) + "/" + std::to_string(context_size);
+                    }
+                }
+                
+                // Create a nice looking embed for bot responses
+                dpp::embed embed = dpp::embed()
+                    .set_color(0x00ff9f)  // Nice green color
+                    .set_description(part)
+                    .set_footer(dpp::embed_footer().set_text(footer_text))
+                    .set_timestamp(time(nullptr));
+                
+                dpp::message msg(channel_id, "");
+                msg.add_embed(embed);
+                bot->message_create(msg);
+                
                 if (message_parts.size() > 1) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_DELAY_MS));
                 }
             }
             
@@ -473,10 +531,9 @@ public:
             return false;
         }
     }
-    
-    // Status and statistics
-    bool is_bot_running() const { return is_running; }
-    bool is_bot_connected() const { return is_connected; }
+      // Status and statistics  
+    // Direct access to is_running (Directive #7: favor direct access over thin accessors)
+    // Removed unused is_bot_connected() method (Directive #2: Redundancy Elimination)
     
     struct BotStatistics {
         uint64_t messages_processed;
