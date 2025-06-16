@@ -108,26 +108,77 @@ private:
     
     std::unordered_map<std::string, std::unique_ptr<ModelInfo>> models;
     std::unordered_map<std::string, std::unique_ptr<ContextInfo>> contexts;
-    //std::string active_context_id;    ContextInfo* current_context;
-      // Working buffers
+    //std::string active_context_id;    ContextInfo* current_context;    // Working buffers
     mutable TokenCache token_cache;
-    mutable std::string temp_string_buffer;// Working buffers
+    mutable std::string temp_string_buffer;
 
-    // Response generation handler
+    // Response generation handler with lookahead support
     mutable LlamaResponse response_generator;
+    
+    // Lookahead configuration
+    LookaheadConfig lookahead_config;
     
 public:
     LlamaManager() : token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE) {
+        // Initialize lookahead with default configuration (disabled)
+        lookahead_config.enabled = true;
+        lookahead_config.window_size = ResponseConstants::DEFAULT_LOOKAHEAD_WINDOW;
+        lookahead_config.ngram_size = ResponseConstants::DEFAULT_NGRAM_SIZE;
+        lookahead_config.max_verification = ResponseConstants::DEFAULT_MAX_VERIFICATION;
+        response_generator.configure_lookahead(lookahead_config);
     }
 
     ~LlamaManager() noexcept {
         cleanup();
     }
-    
-    // Initialize llama.cpp backend
+      // Initialize llama.cpp backend
     bool initialize() {
         ggml_backend_load_all();
-        return true;    }
+        return true;
+    }
+    
+    // Configure lookahead decoding parameters
+    void configure_lookahead(const LookaheadConfig& config) {
+        if (config.validate()) {
+            lookahead_config = config;
+            response_generator.configure_lookahead(lookahead_config);
+            LLAMA_LOG("Lookahead configured: enabled=" + std::string(config.enabled ? "true" : "false") + 
+                     ", W=" + std::to_string(config.window_size) + 
+                     ", N=" + std::to_string(config.ngram_size) + 
+                     ", G=" + std::to_string(config.max_verification));
+        } else {
+            LLAMA_LOG("Error: Invalid lookahead configuration provided");
+        }
+    }
+    
+    // Enable lookahead with default or custom parameters
+    void enable_lookahead(int32_t window_size = ResponseConstants::DEFAULT_LOOKAHEAD_WINDOW,
+                         int32_t ngram_size = ResponseConstants::DEFAULT_NGRAM_SIZE,
+                         int32_t max_verification = ResponseConstants::DEFAULT_MAX_VERIFICATION) {
+        LookaheadConfig config;
+        config.enabled = true;
+        config.window_size = window_size;
+        config.ngram_size = ngram_size;
+        config.max_verification = max_verification;
+        configure_lookahead(config);
+    }
+    
+    // Disable lookahead decoding
+    void disable_lookahead() {
+        lookahead_config.enabled = false;
+        response_generator.configure_lookahead(lookahead_config);
+        LLAMA_LOG("Lookahead decoding disabled");
+    }
+    
+    // Get current lookahead configuration
+    const LookaheadConfig& get_lookahead_config() const noexcept {
+        return lookahead_config;
+    }
+    
+    // Check if lookahead is currently enabled
+    bool is_lookahead_enabled() const noexcept {
+        return lookahead_config.enabled && lookahead_config.validate();
+    }
 
     // Load .gguf model file and create ModelInfo with specific parameters
     bool load_model(const std::string& model_path, const std::string& model_id = "", 
@@ -514,14 +565,21 @@ public:
             std::string updated_content;
             if (target_context->apply_template(false, updated_content)) {
                 target_context->prev_len = static_cast<int32_t>(updated_content.length());
-            }
-        };
+            }        };
         
-        LLAMA_LOG("Delegating to LlamaResponse for token generation");
+        // Log lookahead status before generation
+        if (is_lookahead_enabled()) {
+            LLAMA_LOG("Delegating to LlamaResponse for token generation with LOOKAHEAD enabled (W=" + 
+                     std::to_string(lookahead_config.window_size) + ", N=" + 
+                     std::to_string(lookahead_config.ngram_size) + ", G=" + 
+                     std::to_string(lookahead_config.max_verification) + ")");
+        } else {
+            LLAMA_LOG("Delegating to LlamaResponse for token generation with standard decoding");
+        }
+        
         std::string response = response_generator.generate_response("generate", "assistant", target_context, token_adder, context_updater);
-        
-        // STEP 4: Update conversation with response (if successful)
-        if (!response.empty() && !response.starts_with("Error:")) {
+          // STEP 4: Update conversation with response (if successful)
+        if (!response.empty() && response.substr(0, 6) != "Error:") {
             target_context->add_message("assistant", response);
             LLAMA_LOG("Linear generation flow completed successfully");
         } else {
