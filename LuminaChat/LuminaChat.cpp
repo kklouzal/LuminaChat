@@ -245,12 +245,17 @@ private:
         }
         
         return true;
-    }
-
-    bool GenerateResponse() {
+    }    bool GenerateResponse() {
         if (should_stop || config.input_text.empty() || !llama_manager) return false;
         
-        config.result = llama_manager->generate_response(config.input_text, config.input_username);
+        // Use direct context access for main chat to avoid potential context switching issues
+        auto main_context = llama_manager->get_context_info("main_chat");
+        if (!main_context) {
+            config.result = "Error: Failed to access main chat context";
+            return false;
+        }
+        
+        config.result = llama_manager->generate_response(config.input_text, main_context, config.input_username);
         return !config.result.empty() && !config.result.starts_with("Error:");
     }
     
@@ -1097,30 +1102,28 @@ private:
             wxMessageBox("Need at least 10 messages in the conversation to prune.", 
                         "Insufficient Messages", wxOK | wxICON_INFORMATION);
             return;
-        }
-
-        // Check if summarization is available
+        }        // Check if summarization is available
         if (!llama_manager->has_context("summary_context")) {
             wxMessageBox("Summarization is not available. Please configure a summary model in Settings.", 
                         "Summarization Unavailable", wxOK | wxICON_WARNING);
             return;
         }
         
-        // Ensure we're using the main chat context only after other checks have passed
-        if (!llama_manager->switch_to_context("main_chat")) {
-            wxMessageBox("Failed to switch to main chat context.", "Context Error", 
+        // Get the main chat context directly instead of switching
+        auto main_context = llama_manager->get_context_info("main_chat");
+        if (!main_context) {
+            wxMessageBox("Failed to access main chat context.", "Context Error", 
                         wxOK | wxICON_ERROR);
             return;
         }        try {
             // Show progress
             AddSystemMessage("Starting prune and summarize (keeping 90% of context)...");
             
-            // Perform pruning with 90% keep ratio (10% prune)
-            bool success = llama_manager->prune_conversation_with_summary(0.9f);
-            
-            if (success) {
-                // Update context after pruning
-                success = llama_manager->update_context_from_history();
+            // Perform pruning with 90% keep ratio (10% prune) using direct context access
+            bool success = llama_manager->prune_conversation_with_summary(main_context, 0.9f);
+              if (success) {
+                // Update context after pruning using direct context access
+                success = llama_manager->update_context_from_history(main_context);
                 if (success) {
                     AddSystemMessage("Context pruned and summarized successfully.");
                     UpdateContextProgress();
@@ -1135,15 +1138,22 @@ private:
             AddSystemMessage(wxString::Format("Error during pruning: %s", e.what()));
         }
     }
-    
-    void OnViewSummarySlots(wxCommandEvent& event) {
+      void OnViewSummarySlots(wxCommandEvent& event) {
         if (!is_started || !llama_manager) {
             wxMessageBox("Please start the model first.", "Model Not Started", 
                         wxOK | wxICON_WARNING);
             return;
         }
         
-        auto summary_info = llama_manager->get_summary_slot_info();
+        // Get summary info for the main chat context
+        auto main_context = llama_manager->get_context_info("main_chat");
+        if (!main_context) {
+            wxMessageBox("Failed to access main chat context.", "Context Error", 
+                        wxOK | wxICON_ERROR);
+            return;
+        }
+        
+        auto summary_info = llama_manager->get_summary_slot_info(main_context);
         
         wxString message;
         message << "Summary Slot System Status:\n\n";
@@ -1470,9 +1480,9 @@ private:
             return;
         }
         
-        // Ensure we're using the main chat context before processing the message
-        if (!llama_manager->switch_to_context("main_chat")) {
-            AddSystemMessage("Error: Failed to switch to main chat context.");
+        // Verify main chat context exists instead of switching to it
+        if (!llama_manager->has_context("main_chat")) {
+            AddSystemMessage("Error: Main chat context not available.");
             return;
         }
         
