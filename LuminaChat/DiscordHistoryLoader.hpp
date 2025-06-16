@@ -399,7 +399,8 @@ private:    // Core dependencies
                 
                 for (const auto& msg : messages) {
                     // Use the context-specific overload to avoid context switching
-                    llama_manager->add_message_to_history(target_context, msg.username, msg.content);
+                    DISCORD_HISTORY_LOG("Adding message from " + msg.username + " to specified context");
+                    target_context->add_message(msg.username, msg.content);
                     added_count++;
                     total_tokens_added += msg.actual_token_count;
                 }

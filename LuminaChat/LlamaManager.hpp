@@ -389,33 +389,6 @@ public:
         
         return tokens;
     }
-        
-    // Clear conversation history
-    void clear_conversation(ContextInfo* target_context) {        
-        LLAMA_LOG("Clearing conversation for specified context");
-        target_context->clear_conversation();
-    }
-
-    // Prune message history with summarization
-    // Context-specific conversation pruning with summarization
-    bool prune_conversation_with_summary(ContextInfo* target_context, float keep_ratio = 0.6f) {
-        // Don't prune summary contexts
-        if (target_context == get_context_info("summary_context")) {
-            LLAMA_LOG("Skipping pruning for summary context");
-            return true;
-        }
-        
-        LLAMA_LOG("Pruning context with " + std::to_string(target_context->message_history.size()) + 
-                  " messages, keep_ratio=" + std::to_string(keep_ratio));
-        
-        return target_context->prune_with_summarization(keep_ratio);
-    }
-    
-    // Context-specific message addition to history
-    void add_message_to_history(ContextInfo* target_context, const std::string& role, const std::string& content) {
-        LLAMA_LOG("Adding message from " + role + " to specified context");
-        target_context->add_message(role, content);
-    }
     
     // Forward declaration for summary slot info - implementation after LlamaSummarizer include
     // TODO: Move this into LlamaSummarizer and access it through the parent ContextInfo
@@ -428,7 +401,8 @@ public:
     // Context-specific summary slot information
     // TODO: Move this into LlamaSummarizer and access it through the parent ContextInfo
     SummarySlotInfo get_summary_slot_info(ContextInfo* target_context) const;
-      // Initialize summarizer resources for all contexts when summary context becomes available
+    
+    // Initialize summarizer resources for all contexts when summary context becomes available
     void initialize_summarizer_resources() {
         // Find the summary context and model
         ContextInfo* summary_ctx = get_context_info("summary_context");
@@ -456,25 +430,7 @@ public:
         
         LLAMA_LOG("Successfully initialized summarizer resources for " + std::to_string(initialized_count) + " contexts");
     }
-        
-private:
-    // Improved logic flow helper methods
-    // Add message and mark conversation state as needing rebuild
-    void add_message_and_invalidate(ContextInfo* target_context, const std::string& role, const std::string& content) {
-        LLAMA_LOG("Adding " + role + " message and invalidating conversation state for specified context");
-        
-        // Setup conversation - ensure system message is in history if context is empty
-        if (target_context->message_history.empty() && !target_context->system_message.empty()) {
-            target_context->add_message("system", target_context->system_message);
-        }
-        
-        target_context->add_message(role, content);
-        
-        LLAMA_LOG("Message added. Total messages: " + std::to_string(target_context->message_history.size()) + 
-                  ". State invalidated - rebuild required.");
-    }
   
-
 public:
 
 /* 
@@ -520,14 +476,14 @@ public:
                   (input.length() > 50 ? input.substr(0, 50) + "..." : input));
 
         // STEP 1: Update conversation with new input
-        add_message_and_invalidate(target_context, username, input);
+        target_context->add_message(username, input);
         
         // STEP 2: Prepare context for generation (handles template, tokenization, pruning, rebuild)
         auto token_processor = [this, target_context](const std::string& text, bool add_special) {
             return process_text_to_tokens(text, target_context, add_special);
         };
         auto pruning_callback = [this, target_context](float keep_ratio) {
-            return prune_conversation_with_summary(target_context, keep_ratio);
+            return target_context->prune_with_summarization(keep_ratio);
         };
         
         if (!target_context->prepare_context_for_generation(token_processor, pruning_callback)) {
@@ -566,7 +522,7 @@ public:
         
         // STEP 4: Update conversation with response (if successful)
         if (!response.empty() && !response.starts_with("Error:")) {
-            add_message_and_invalidate(target_context, "assistant", response);
+            target_context->add_message("assistant", response);
             LLAMA_LOG("Linear generation flow completed successfully");
         } else {
             LLAMA_LOG("Linear generation flow failed: " + response);
@@ -653,7 +609,7 @@ public:
             return process_text_to_tokens(text, target_context, add_special);
         };
         auto pruning_callback = [this, target_context](float keep_ratio) {
-            return prune_conversation_with_summary(target_context, keep_ratio);
+            return target_context->prune_with_summarization(keep_ratio);
         };
         
         return target_context->update_context_from_history(token_processor, pruning_callback);

@@ -323,11 +323,18 @@ struct ContextInfo {
     
     // Add message to this context's history
     void add_message(const std::string& role, const std::string& content) {
+        // Setup conversation - ensure system message is in history if context is empty
+        if (message_history.empty() && !system_message.empty()) {
+            LLAMA_LOG("Adding system message to empty context history prior to adding first message");
+            message_history.emplace_back("system", system_message);
+        }
         message_history.emplace_back(role, content);
         message_cache_dirty = true;
         conversation_state.needs_rebuild = true;
         
         // Token count will be updated during the next context update for accuracy
+        LLAMA_LOG("Message added for " + role + " - Total messages: " + std::to_string(message_history.size()) + 
+                  ". State invalidated - rebuild required.");
     }
     
     // Clear conversation for this context (implementation after LlamaSummarizer include)
@@ -909,12 +916,17 @@ inline void ContextInfo::clear_conversation() {
 }
 
 inline bool ContextInfo::prune_with_summarization(float keep_ratio) {
+    LLAMA_LOG("Pruning context with " + std::to_string(message_history.size()) + 
+                " messages, keep_ratio=" + std::to_string(keep_ratio));
+
     if (!summarizer) {
+        LLAMA_LOG("Skipping pruning; no summarizer");
         return false; // Cannot prune without summarizer
     }
     
     size_t original_message_count = message_history.size();
-    if (original_message_count < 3) {
+    if (original_message_count < 10) {
+        LLAMA_LOG("Skipping pruning; need at least 10 messages in history");
         return false; // Need at least a few messages to prune
     }
     

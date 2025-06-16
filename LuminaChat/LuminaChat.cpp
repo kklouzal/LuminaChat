@@ -1120,7 +1120,7 @@ private:
             AddSystemMessage("Starting prune and summarize (keeping 90% of context)...");
             
             // Perform pruning with 90% keep ratio (10% prune) using direct context access
-            bool success = llama_manager->prune_conversation_with_summary(main_context, 0.9f);
+            bool success = main_context->prune_with_summarization(0.9f);
               if (success) {
                 // Update context after pruning using direct context access
                 success = llama_manager->update_context_from_history(main_context);
