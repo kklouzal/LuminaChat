@@ -176,19 +176,20 @@ private:
     
     std::string process_user_message(const std::string& message, const std::string& username, 
                                    uint64_t user_id, uint64_t channel_id, uint64_t guild_id) {
-        if (!llama_manager) return "Error: AI backend not available";
-        
+        if (!llama_manager) return "Error: AI backend not available";        
         total_messages_processed++;
         last_activity = std::chrono::system_clock::now();
         
         std::string context_id = get_or_create_user_context(user_id, username, channel_id, guild_id);
         if (context_id.empty()) return "Error: Failed to access chat context";
         
-        if (!llama_manager->switch_to_context(context_id)) {
+        // Use direct context access instead of switching
+        ContextInfo* target_context = llama_manager->get_context_info(context_id);
+        if (!target_context) {
             return "Error: Failed to access your chat context";
         }
         
-        std::string response = llama_manager->generate_response(message, username);
+        std::string response = llama_manager->generate_response(message, target_context, username);
         return response.empty() ? "I'm not sure how to respond to that. Could you try rephrasing?" : response;
     }
     

@@ -273,8 +273,7 @@ private:    // Core dependencies
                 pending.timestamp = std::chrono::system_clock::time_point(std::chrono::seconds(msg.sent));
                 pending.message_id = static_cast<uint64_t>(msg.id);
                 pending.target_context_id = state.context_id;
-                
-                // Use LlamaManager's new public tokenization method
+                  // Use LlamaManager's context-specific tokenization method
                 std::string formatted_message;
                 if (is_our_bot) {
                     // For bot messages, don't include username prefix since it's "assistant"
@@ -282,7 +281,14 @@ private:    // Core dependencies
                 } else {
                     formatted_message = msg.author.username + ": " + actual_content;
                 }
-                pending.tokenized_content = llama_manager->process_text_to_tokens(formatted_message, false);
+                  // Get the specific context for tokenization to ensure consistency
+                ContextInfo* target_context = llama_manager->get_context_info(state.context_id);
+                if (target_context) {
+                    pending.tokenized_content = llama_manager->process_text_to_tokens(formatted_message, target_context, false);
+                } else {
+                    DISCORD_HISTORY_LOG("Warning: Could not find context " + state.context_id + " for tokenization, skipping message");
+                    continue; // Skip this message if we can't find the appropriate context
+                }
                 
                 // Check for reasonable token count limits
                 if (pending.tokenized_content.size() > 2048) {
@@ -376,47 +382,40 @@ private:    // Core dependencies
             [](const PendingMessage& a, const PendingMessage& b) {
                 return a.timestamp < b.timestamp;
             });
-        
-        // Group messages by target context
+          // Group messages by target context
         std::unordered_map<std::string, std::vector<PendingMessage>> context_groups;
         for (const auto& msg : pending_messages) {
             context_groups[msg.target_context_id].push_back(msg);
         }
         
-        // Apply messages to each context using pre-tokenized content
-        std::string original_context = llama_manager->get_active_context();
-        
+        // Apply messages to each context using direct context access instead of switching
         for (const auto& [context_id, messages] : context_groups) {
-            DISCORD_HISTORY_LOG("Switching to context '" + context_id + "' to add " + std::to_string(messages.size()) + " tokenized messages");
+            DISCORD_HISTORY_LOG("Adding " + std::to_string(messages.size()) + " tokenized messages to context '" + context_id + "' directly");
             
-            if (llama_manager->switch_to_context(context_id)) {
+            ContextInfo* target_context = llama_manager->get_context_info(context_id);
+            if (target_context) {
                 int32_t added_count = 0;
                 int32_t total_tokens_added = 0;
                 
                 for (const auto& msg : messages) {
-                    // Use the regular add_message_to_history for now
-                    // In the future, we could add a method to LlamaManager that accepts pre-tokenized content
-                    llama_manager->add_message_to_history(msg.username, msg.content);
+                    // Use the context-specific overload to avoid context switching
+                    llama_manager->add_message_to_history(target_context, msg.username, msg.content);
                     added_count++;
                     total_tokens_added += msg.actual_token_count;
                 }
                 
-                if (llama_manager->update_context_from_history()) {
+                if (llama_manager->update_context_from_history(target_context)) {
                     DISCORD_HISTORY_LOG("Successfully added " + std::to_string(added_count) + " messages (" + 
                                std::to_string(total_tokens_added) + " tokens) to context " + context_id);
                 } else {
                     DISCORD_HISTORY_LOG("Failed to update context " + context_id + " from history");
                 }
             } else {
-                DISCORD_HISTORY_LOG("Failed to switch to context " + context_id);
+                DISCORD_HISTORY_LOG("Failed to get context info for " + context_id);
             }
         }
         
-        // Restore original context
-        if (!original_context.empty()) {
-            llama_manager->switch_to_context(original_context);
-            DISCORD_HISTORY_LOG("Restored original context: " + original_context);
-        }
+        // No need to restore context since we didn't switch
         
         // Clear processed messages
         pending_messages.clear();

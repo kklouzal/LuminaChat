@@ -54,6 +54,14 @@
 #include "SettingsManager.hpp"
 #include "LogHandler.hpp"
 
+// Define SummarizerConstants to avoid multiple definition errors
+namespace SummarizerConstants {
+    const size_t MAX_SUMMARY_SLOTS = 5;
+    const float MAX_CONTEXT_USAGE = 0.90f;
+    const float TARGET_CONTEXT_USAGE = 0.60f;
+    const float AGGRESSIVE_PRUNING_RATIO = 0.3f;
+}
+
 // Forward declarations
 class LuminaChatFrame;
 class ModelWorkerThread;
@@ -237,12 +245,17 @@ private:
         }
         
         return true;
-    }
-
-    bool GenerateResponse() {
+    }    bool GenerateResponse() {
         if (should_stop || config.input_text.empty() || !llama_manager) return false;
         
-        config.result = llama_manager->generate_response(config.input_text, config.input_username);
+        // Use direct context access for main chat to avoid potential context switching issues
+        auto main_context = llama_manager->get_context_info("main_chat");
+        if (!main_context) {
+            config.result = "Error: Failed to access main chat context";
+            return false;
+        }
+        
+        config.result = llama_manager->generate_response(config.input_text, main_context, config.input_username);
         return !config.result.empty() && !config.result.starts_with("Error:");
     }
     
@@ -1089,32 +1102,34 @@ private:
             wxMessageBox("Need at least 10 messages in the conversation to prune.", 
                         "Insufficient Messages", wxOK | wxICON_INFORMATION);
             return;
-        }
-
-        // Check if summarization is available
+        }        // Check if summarization is available
         if (!llama_manager->has_context("summary_context")) {
             wxMessageBox("Summarization is not available. Please configure a summary model in Settings.", 
                         "Summarization Unavailable", wxOK | wxICON_WARNING);
             return;
         }
         
-        // Ensure we're using the main chat context only after other checks have passed
-        if (!llama_manager->switch_to_context("main_chat")) {
-            wxMessageBox("Failed to switch to main chat context.", "Context Error", 
+        // Get the main chat context directly instead of switching
+        auto main_context = llama_manager->get_context_info("main_chat");
+        if (!main_context) {
+            wxMessageBox("Failed to access main chat context.", "Context Error", 
                         wxOK | wxICON_ERROR);
             return;
-        }
-
-        try {
+        }        try {
             // Show progress
             AddSystemMessage("Starting prune and summarize (keeping 90% of context)...");
             
-            // Perform pruning with 90% keep ratio (10% prune)
-            bool success = llama_manager->prune_conversation_with_summary(0.9f);
-            
-            if (success) {
-                AddSystemMessage("Context pruned and summarized successfully.");
-                UpdateContextProgress();
+            // Perform pruning with 90% keep ratio (10% prune) using direct context access
+            bool success = llama_manager->prune_conversation_with_summary(main_context, 0.9f);
+              if (success) {
+                // Update context after pruning using direct context access
+                success = llama_manager->update_context_from_history(main_context);
+                if (success) {
+                    AddSystemMessage("Context pruned and summarized successfully.");
+                    UpdateContextProgress();
+                } else {
+                    AddSystemMessage("Pruning succeeded but failed to update context.");
+                }
             } else {
                 AddSystemMessage("Failed to prune and summarize context.");
             }
@@ -1123,15 +1138,22 @@ private:
             AddSystemMessage(wxString::Format("Error during pruning: %s", e.what()));
         }
     }
-    
-    void OnViewSummarySlots(wxCommandEvent& event) {
+      void OnViewSummarySlots(wxCommandEvent& event) {
         if (!is_started || !llama_manager) {
             wxMessageBox("Please start the model first.", "Model Not Started", 
                         wxOK | wxICON_WARNING);
             return;
         }
         
-        auto summary_info = llama_manager->get_summary_slot_info();
+        // Get summary info for the main chat context
+        auto main_context = llama_manager->get_context_info("main_chat");
+        if (!main_context) {
+            wxMessageBox("Failed to access main chat context.", "Context Error", 
+                        wxOK | wxICON_ERROR);
+            return;
+        }
+        
+        auto summary_info = llama_manager->get_summary_slot_info(main_context);
         
         wxString message;
         message << "Summary Slot System Status:\n\n";
@@ -1269,9 +1291,10 @@ private:
                     std::string summary_prompt = config.summarizer_system_prompt.empty() ? 
                         "You are a helpful assistant that summarizes conversations concisely and accurately." : 
                         config.summarizer_system_prompt;
-                    
-                    if (llama_manager->create_context("summary_context", "summary_model", summary_prompt, true)) {
+                      if (llama_manager->create_context("summary_context", "summary_model", summary_prompt, true)) {
                         LLAMA_LOG("Summary context created successfully with summarizer model");
+                        // Initialize summarizer resources for all existing contexts
+                        llama_manager->initialize_summarizer_resources();
                         // Note: Summarizer chat template was already set during model loading
                     } else {
                         LLAMA_LOG("Warning: Failed to create summary context, summarization features may be limited");
@@ -1279,7 +1302,7 @@ private:
                 }
             }
         }
-          if (success) {
+        if (success) {
             is_started = true;
             
             // Start context monitoring timer (update every 2 seconds)
@@ -1298,7 +1321,7 @@ private:
             AddSystemMessage("LuminaChat ready! Type your message below.");
             ui.input_text->SetFocus();
             
-            llama_manager->reset_timings();
+            llama_manager->reset_timings(llama_manager->get_context_info("main_chat"));
             ui.timings_label->SetLabel("");
         } else {
             LLAMA_LOG_ERROR("Failed to load model or create context");
@@ -1457,9 +1480,9 @@ private:
             return;
         }
         
-        // Ensure we're using the main chat context before processing the message
-        if (!llama_manager->switch_to_context("main_chat")) {
-            AddSystemMessage("Error: Failed to switch to main chat context.");
+        // Verify main chat context exists instead of switching to it
+        if (!llama_manager->has_context("main_chat")) {
+            AddSystemMessage("Error: Main chat context not available.");
             return;
         }
         
@@ -1510,18 +1533,21 @@ private:
         // Auto-scroll to bottom
         ui.chat_history->SetInsertionPointEnd();
         ui.chat_history->ShowPosition(ui.chat_history->GetLastPosition());
-    }    void UpdateTimingsDisplay() {
+    }
+    
+    void UpdateTimingsDisplay() {
         if (!is_started || !llama_manager) {
             return;
         }
         
         // Get timings from llama manager
-        auto timings = llama_manager->get_timings();
+        auto context_info = llama_manager->get_context_info("main_chat");
+        auto timings = llama_manager->get_timings(context_info);
         if (timings.n_eval > 0) {
             double tokens_per_sec = UIConstants::MS_TO_SECONDS * timings.n_eval / timings.t_eval_ms;
             
             // Get additional statistics for comprehensive display
-            auto perf_stats = llama_manager->get_performance_stats();
+            auto perf_stats = llama_manager->get_performance_stats(context_info);
             
             ui.timings_label->SetLabel(wxString::Format("Generated: %d tokens, %.2f tok/s (%.2fms)", 
                                                        timings.n_eval, 
@@ -1534,7 +1560,9 @@ private:
     
     void OnContextMonitorTimer(wxTimerEvent& event) {
         UpdateContextProgress();
-    }    void UpdateContextProgress() {
+    }
+    
+    void UpdateContextProgress() {
         if (!is_started || !llama_manager || !context_created || !llama_manager->has_context("main_chat")) {
             ui.context_label->SetLabel("Buffer: N/A");
             ui.context_progress_bar->SetValue(0);
@@ -1551,7 +1579,7 @@ private:
               ui.context_progress_bar->SetValue(std::min(progress_value, 100));
             
             // Get summary slot information
-            auto summary_info = llama_manager->get_summary_slot_info();
+            auto summary_info = llama_manager->get_summary_slot_info(context_info);
             
             // More descriptive label showing context buffer usage and summary slots
             wxString label = wxString::Format("Buffer: %d/%d", context_usage, context_size);
