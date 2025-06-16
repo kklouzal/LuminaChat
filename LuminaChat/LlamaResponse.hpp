@@ -44,12 +44,17 @@
 #include <chrono>
 #include <thread>
 #include <algorithm>
+#include <functional>
 #include "llama-cpp.h"
 #include "LogHandler.hpp"
 
-// Forward declaration of shared constants from LlamaManager
-// Note: These are defined in LlamaManager.hpp and should not be redefined here
-// This ensures single source of truth for configuration constants
+// Forward declarations to avoid circular dependencies
+struct ModelInfo;
+struct ContextInfo;
+
+// Type aliases for callback functions used in batch processing integration
+using BatchTokenAdder = std::function<bool(llama_token, int32_t, const std::vector<llama_seq_id>&, bool)>;
+using ContextUpdater = std::function<void()>;
 
 // Constants for response generation (Directive #5: Zero Magic & Strong Typing)
 namespace ResponseConstants {
@@ -59,32 +64,47 @@ namespace ResponseConstants {
     constexpr int32_t DUMMY_TOKEN_DECODE_POS_OFFSET = 1;
 }
 
-// Forward declarations and type definitions for LlamaManager integration
-// These structures are defined in LlamaManager.hpp to maintain proper ownership
-// while enabling tight integration with LlamaResponse functionality
-struct ModelInfo;
-struct ContextInfo;
-
-// Forward declaration for summary constants
-namespace SummarizerConstants {
-    extern const size_t MAX_SUMMARY_SLOTS;
+// Local constants to avoid dependency issues (values must match LlamaManager/LlamaContext)
+namespace LlamaResponseConstants {
+    // These values must be kept in sync with LlamaManager.hpp and LlamaContext.hpp
+    constexpr float DEFAULT_TEMPERATURE = 0.8f;
+    constexpr float DEFAULT_MIN_P = 0.05f;
+    constexpr float DEFAULT_TOP_P = 0.9f;
+    constexpr int32_t DEFAULT_TOP_K = 40;
+    constexpr int32_t TOKEN_SAFETY_MARGIN = 32;
+    constexpr size_t STRING_RESERVE_MULTIPLIER = 4;
+    constexpr float TARGET_CONTEXT_USAGE = 0.60f;
 }
 
 // Thread Safety Contract (Directive #12):
 // This class is NOT thread-safe and should only be accessed from within LlamaManager's context.
 // All methods assume valid ModelInfo and ContextInfo structures are provided.
 //
-// USAGE PATTERN:
+// RESPONSIBILITY SEPARATION:
+// LlamaResponse is solely responsible for:
+// 1. Pure response generation - token sampling, text conversion, generation loop
+// 2. Sampler lifecycle management - configuration, validation, recovery
+// 3. Generation state validation - ensuring context is ready for generation
+// 4. Performance tracking - generation timing and token count statistics
+//
+// LlamaResponse does NOT handle:
+// - Model loading/management (LlamaManager responsibility)
+// - Context creation/switching (LlamaManager responsibility)  
+// - Text-to-token conversion for inputs (LlamaManager responsibility)
+// - Template application (LlamaManager responsibility)
+// - Conversation history management (LlamaManager responsibility)
+// - Batch operations setup (LlamaManager provides callbacks)
+//
+// INTEGRATION PATTERN:
 // 1. LlamaManager prepares context and provides callback functions for batch operations
 // 2. LlamaResponse handles the generation loop, token sampling, and text conversion
 // 3. LlamaManager receives tokens through callbacks to manage batch operations and context updates
+// 4. This separation allows LlamaManager to focus on infrastructure while LlamaResponse focuses on generation
 class LlamaResponse {
 private:
     // Working buffers for token conversion
-    mutable std::vector<char> temp_string_buffer;
-
-    // Enhanced sampler configuration with runtime validation
-    static void configure_sampler(ModelInfo* model_info, float temperature = LlamaConstants::DEFAULT_TEMPERATURE, float min_p = LlamaConstants::DEFAULT_MIN_P, float top_p = LlamaConstants::DEFAULT_TOP_P, int32_t top_k = LlamaConstants::DEFAULT_TOP_K) {
+    mutable std::vector<char> temp_string_buffer;    // Enhanced sampler configuration with runtime validation
+    static void configure_sampler(ModelInfo* model_info, float temperature, float min_p, float top_p, int32_t top_k) {
         LLAMA_LOG("Configuring sampler for model '" + model_info->model_path + "'");
         
         if (model_info->sampler) {
@@ -135,14 +155,12 @@ private:
             return true; // Sampler is valid
         }
         
-        LLAMA_LOG("WARNING: Sampler is NULL, attempting recovery...");
-        
-        // Attempt to recreate the sampler
+        LLAMA_LOG("WARNING: Sampler is NULL, attempting recovery...");        // Attempt to recreate the sampler with default parameters
         configure_sampler(model_info, 
-                          LlamaConstants::DEFAULT_TEMPERATURE, 
-                          LlamaConstants::DEFAULT_MIN_P, 
-                          LlamaConstants::DEFAULT_TOP_P, 
-                          LlamaConstants::DEFAULT_TOP_K);
+                          LlamaResponseConstants::DEFAULT_TEMPERATURE, 
+                          LlamaResponseConstants::DEFAULT_MIN_P, 
+                          LlamaResponseConstants::DEFAULT_TOP_P, 
+                          LlamaResponseConstants::DEFAULT_TOP_K);
         
         if (!model_info->sampler) {
             LLAMA_LOG("CRITICAL: Failed to recover sampler!");
@@ -218,17 +236,35 @@ private:
         
         LLAMA_LOG("Error: Could not recover logits for generation");
         return false;
-    }
+    }    // Comprehensive validation and recovery for generation components
+    static bool validate_generation_components(ContextInfo* context_info, ModelInfo* model_info) {
+        // Basic component validation
+        if (!model_info) {
+            LLAMA_LOG("Error: model_info is NULL");
+            return false;
+        }
 
-    // Validate context state before generation
-    static bool validate_generation_state(ContextInfo* context_info, ModelInfo* model_info) {
-        if (!context_info->context) {
-            LLAMA_LOG("Error: Invalid context or model state");
+        if (!model_info->model) {
+            LLAMA_LOG("Error: model is NULL");
             return false;
         }
         
-        // Check context position bounds  
-        // Note: n_past can be 0 for initial generation, but should not be negative
+        if (!context_info->context) {
+            LLAMA_LOG("Error: context is NULL");
+            return false;
+        }
+        
+        if (!model_info->vocab) {
+            LLAMA_LOG("Error: vocab is NULL");
+            return false;
+        }
+        
+        if (!context_info->batch_initialized) {
+            LLAMA_LOG("Error: batch not initialized");
+            return false;
+        }
+        
+        // Context position validation
         if (context_info->n_past < 0 || context_info->n_past >= model_info->n_ctx) {
             LLAMA_LOG("Error: Invalid context position during generation: " + std::to_string(context_info->n_past) + 
                       " (valid range: 0 to " + std::to_string(model_info->n_ctx - 1) + ")");
@@ -241,12 +277,6 @@ private:
             return false;
         }
         
-        // Validate batch initialization
-        if (!context_info->batch_initialized) {
-            LLAMA_LOG("Error: Batch not initialized for generation");
-            return false;
-        }
-        
         return true;
     }
 
@@ -255,64 +285,23 @@ public:
         temp_string_buffer.reserve(64); // Pre-allocate reasonable buffer size
     }
     
-    // Public utility method for token-to-text conversion
-    // TODO: This function can probably be removed in favor of direct access to convert_token_to_text
-    std::string token_to_text(llama_token token, ModelInfo* model_info) const {
-        return convert_token_to_text(token, model_info);
-    }
-
-    // Public utility methods for validation (can be used by LlamaManager for state checking)
-    // TODO: This function can probably be removed in favor of direct access to validate_and_recover_sampler
-    static bool validate_sampler(ModelInfo* model_info) {
-        return validate_and_recover_sampler(model_info);
-    }
-    
     // Main response generation function
     // Dependencies: Requires valid ModelInfo, ContextInfo, and proper LlamaManager integration
     template<typename BatchTokenAdder, typename ContextUpdater>
     std::string generate_response(const std::string& input, const std::string& username,
                                 ContextInfo* context_info,
                                 BatchTokenAdder add_token_to_batch, ContextUpdater update_context) const {
-        
-        if (input.empty()) {
+          if (input.empty()) {
             LLAMA_LOG("Error: input is empty");
             return "Error: Invalid generation parameters";
         }
 
-        // TODO: The following 5 checks can probably be combined into a single validation function
-        if (!context_info->model_info) {
-            LLAMA_LOG("Error: context_info->model_info is NULL");
-            return "Error: Invalid generation parameters";
-        }
-
-        if (!context_info->model_info->model) {
-            LLAMA_LOG("Error: model is NULL");
-            return "Error: Model components not properly initialized or no active context";
-        }
-        
-        if (!context_info->context) {
-            LLAMA_LOG("Error: context is NULL");
-            return "Error: Model components not properly initialized or no active context";
-        }
-        
-        if (!context_info->model_info->vocab) {
-            LLAMA_LOG("Error: vocab is NULL");
-            return "Error: Model components not properly initialized or no active context";
-        }
-        
-        if (!context_info->batch_initialized) {
-            LLAMA_LOG("Error: batch not initialized");
-            return "Error: Model components not properly initialized or no active context";
-        }
-
-        // Validate and recover sampler if needed
+        // Comprehensive validation of all generation components
+        if (!validate_generation_components(context_info, context_info->model_info)) {
+            return "Error: Model components not properly initialized or invalid context state";
+        }        // Validate and recover sampler if needed
         if (!validate_and_recover_sampler(context_info->model_info)) {
             return "Error: Sampler validation/recovery failed";
-        }
-
-        // Validate generation state
-        if (!validate_generation_state(context_info, context_info->model_info)) {
-            return "Error: Context state invalid for generation";
         }
         
         // Validate or attempt to recover logits
@@ -329,10 +318,9 @@ public:
                 LLAMA_LOG("Warning: No logits available at n_past=0, will attempt initial decode during generation");
             }
         }
-        
-        // Calculate available space for generation
+          // Calculate available space for generation
         const int32_t max_new_tokens = std::min(context_info->model_info->n_predict, 
-                                               context_info->model_info->n_ctx - context_info->n_past - LlamaConstants::TOKEN_SAFETY_MARGIN);
+                                               context_info->model_info->n_ctx - context_info->n_past - LlamaResponseConstants::TOKEN_SAFETY_MARGIN);
         
         if (max_new_tokens <= 0) {
             return "Error: No space left in context for generation (context: " + 
@@ -341,7 +329,7 @@ public:
 
         LLAMA_LOG("Starting generation with " + std::to_string(max_new_tokens) + " max tokens, n_past=" + std::to_string(context_info->n_past));        // Initialize generation state
         std::string response;
-        response.reserve(max_new_tokens * LlamaConstants::STRING_RESERVE_MULTIPLIER);
+        response.reserve(max_new_tokens * LlamaResponseConstants::STRING_RESERVE_MULTIPLIER);
         
         auto generation_start = std::chrono::high_resolution_clock::now();
         int32_t n_generated = 0;
