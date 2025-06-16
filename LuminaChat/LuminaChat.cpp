@@ -1302,7 +1302,7 @@ private:
                 }
             }
         }
-          if (success) {
+        if (success) {
             is_started = true;
             
             // Start context monitoring timer (update every 2 seconds)
@@ -1321,7 +1321,7 @@ private:
             AddSystemMessage("LuminaChat ready! Type your message below.");
             ui.input_text->SetFocus();
             
-            llama_manager->reset_timings();
+            llama_manager->reset_timings(llama_manager->get_context_info("main_chat"));
             ui.timings_label->SetLabel("");
         } else {
             LLAMA_LOG_ERROR("Failed to load model or create context");
@@ -1533,18 +1533,21 @@ private:
         // Auto-scroll to bottom
         ui.chat_history->SetInsertionPointEnd();
         ui.chat_history->ShowPosition(ui.chat_history->GetLastPosition());
-    }    void UpdateTimingsDisplay() {
+    }
+    
+    void UpdateTimingsDisplay() {
         if (!is_started || !llama_manager) {
             return;
         }
         
         // Get timings from llama manager
-        auto timings = llama_manager->get_timings();
+        auto context_info = llama_manager->get_context_info("main_chat");
+        auto timings = llama_manager->get_timings(context_info);
         if (timings.n_eval > 0) {
             double tokens_per_sec = UIConstants::MS_TO_SECONDS * timings.n_eval / timings.t_eval_ms;
             
             // Get additional statistics for comprehensive display
-            auto perf_stats = llama_manager->get_performance_stats();
+            auto perf_stats = llama_manager->get_performance_stats(context_info);
             
             ui.timings_label->SetLabel(wxString::Format("Generated: %d tokens, %.2f tok/s (%.2fms)", 
                                                        timings.n_eval, 
@@ -1557,7 +1560,9 @@ private:
     
     void OnContextMonitorTimer(wxTimerEvent& event) {
         UpdateContextProgress();
-    }    void UpdateContextProgress() {
+    }
+    
+    void UpdateContextProgress() {
         if (!is_started || !llama_manager || !context_created || !llama_manager->has_context("main_chat")) {
             ui.context_label->SetLabel("Buffer: N/A");
             ui.context_progress_bar->SetValue(0);
@@ -1574,7 +1579,7 @@ private:
               ui.context_progress_bar->SetValue(std::min(progress_value, 100));
             
             // Get summary slot information
-            auto summary_info = llama_manager->get_summary_slot_info();
+            auto summary_info = llama_manager->get_summary_slot_info(context_info);
             
             // More descriptive label showing context buffer usage and summary slots
             wxString label = wxString::Format("Buffer: %d/%d", context_usage, context_size);

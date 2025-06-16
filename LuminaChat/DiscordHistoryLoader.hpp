@@ -281,14 +281,13 @@ private:    // Core dependencies
                 } else {
                     formatted_message = msg.author.username + ": " + actual_content;
                 }
-                
-                // Get the specific context for tokenization to ensure consistency
+                  // Get the specific context for tokenization to ensure consistency
                 ContextInfo* target_context = llama_manager->get_context_info(state.context_id);
                 if (target_context) {
                     pending.tokenized_content = llama_manager->process_text_to_tokens(formatted_message, target_context, false);
                 } else {
-                    DISCORD_HISTORY_LOG("Warning: Could not find context " + state.context_id + " for tokenization, using default");
-                    pending.tokenized_content = llama_manager->process_text_to_tokens(formatted_message, false);
+                    DISCORD_HISTORY_LOG("Warning: Could not find context " + state.context_id + " for tokenization, skipping message");
+                    continue; // Skip this message if we can't find the appropriate context
                 }
                 
                 // Check for reasonable token count limits

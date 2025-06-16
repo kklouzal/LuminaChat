@@ -108,7 +108,7 @@ private:
     
     std::unordered_map<std::string, std::unique_ptr<ModelInfo>> models;
     std::unordered_map<std::string, std::unique_ptr<ContextInfo>> contexts;
-    std::string active_context_id;    ContextInfo* current_context;
+    //std::string active_context_id;    ContextInfo* current_context;
       // Working buffers
     mutable TokenCache token_cache;
     mutable std::string temp_string_buffer;// Working buffers
@@ -117,7 +117,7 @@ private:
     mutable LlamaResponse response_generator;
     
 public:
-    LlamaManager() : current_context(nullptr), token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE) {
+    LlamaManager() : token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE) {
     }
 
     ~LlamaManager() noexcept {
@@ -136,13 +136,11 @@ public:
         if (!std::filesystem::exists(model_path)) {
             LLAMA_LOG("Error: Model file does not exist: " + model_path);
             return false;
-        }
-
-        std::string actual_model_id = model_id.empty() ? std::filesystem::path(model_path).stem().string() : model_id;
+        }        std::string actual_model_id = model_id.empty() ? std::filesystem::path(model_path).stem().string() : model_id;
         
         if (models.find(actual_model_id) != models.end()) {
-            LLAMA_LOG("Error: Model '" + actual_model_id + "' already loaded");
-            return false;
+            LLAMA_LOG("Model '" + actual_model_id + "' already loaded, using existing model");
+            return true;
         }
 
         auto model_info = std::make_unique<ModelInfo>();
@@ -241,8 +239,9 @@ public:
         
         // Always use provided system prompt, or copy from main context if empty
         std::string prompt_to_use = system_prompt;
-        if (prompt_to_use.empty() && current_context && !current_context->system_message.empty()) {
-            prompt_to_use = current_context->system_message;
+		auto main_context = get_context_info("main_context");
+        if (prompt_to_use.empty() && main_context && !main_context->system_message.empty()) {
+            prompt_to_use = main_context->system_message;
         }        // Set system message if we have one
         if (!prompt_to_use.empty()) {
             context_info->system_message = prompt_to_use;
@@ -263,29 +262,6 @@ public:
         contexts[context_id] = std::move(context_info);
         LLAMA_LOG("Created context '" + context_id + "' with model '" + model_id + "' successfully");
         
-        // If this is the first context, make it active
-        if (active_context_id.empty()) {
-            switch_to_context(context_id);
-        }
-        
-        return true;
-    }
-
-    bool switch_to_context(const std::string& context_id) {
-        auto it = contexts.find(context_id);
-        if (it == contexts.end()) {
-            LLAMA_LOG("Error: Context '" + context_id + "' not found");
-            return false;
-        }
-          // Validate the context before switching
-        if (!it->second || !it->second->context || !it->second->model_info || !it->second->model_info->model) {
-            LLAMA_LOG("Error: Context '" + context_id + "' has invalid state");
-            return false;
-        }
-        
-        active_context_id = context_id;
-        current_context = it->second.get();
-        LLAMA_LOG("Switched to context '" + context_id + "' (model: " + current_context->model_info->model_path + ")");
         return true;
     }
     
@@ -304,25 +280,9 @@ public:
             llama_free(it->second->context);
         }
         
-        // If this was the active context, clear it
-        if (active_context_id == context_id) {
-            active_context_id.clear();
-            current_context = nullptr;
-            
-            // Switch to another context if available
-            if (!contexts.empty()) {
-                auto first_context = contexts.begin();
-                switch_to_context(first_context->first);
-            }
-        }
-        
         contexts.erase(it);
         LLAMA_LOG("Removed context '" + context_id + "'");
         return true;
-    }
-
-    std::string get_active_context() const noexcept {
-        return active_context_id;
     }
 
     // Check if a context exists by ID
@@ -349,11 +309,7 @@ public:
             return nullptr;
         }
         return it->second.get();
-    }    // Unified tokenization with caching - Overloaded to accept specific context
-    std::vector<llama_token> process_text_to_tokens(const std::string& text, bool add_special = true) const {
-        return process_text_to_tokens(text, current_context, add_special);
-    }
-    
+    }    // Context-specific tokenization with caching
     std::vector<llama_token> process_text_to_tokens(const std::string& text, ContextInfo* target_context, bool add_special = true) const {
         if (text.empty()) return {};
         
@@ -414,11 +370,8 @@ public:
         token_cache.put(cache_key, tokens);
         
         return tokens;
-    }    // Clear conversation history - overloaded for specific context
-    void clear_conversation() {
-        clear_conversation(current_context);
     }
-    
+        // Clear conversation history
     void clear_conversation(ContextInfo* target_context) {
         if (!target_context) return;
         
@@ -426,11 +379,8 @@ public:
         target_context->clear_conversation();
     }
 
-    // Prune message history with summarization - overloaded for specific context
-    bool prune_conversation_with_summary(float keep_ratio = 0.6f) {
-        return prune_conversation_with_summary(current_context, keep_ratio);
-    }
-    
+    // Prune message history with summarization
+    // Context-specific conversation pruning with summarization
     bool prune_conversation_with_summary(ContextInfo* target_context, float keep_ratio = 0.6f) {
         if (!target_context) {
             LLAMA_LOG("Warning: No context provided for pruning");
@@ -447,13 +397,7 @@ public:
                   " messages, keep_ratio=" + std::to_string(keep_ratio));
         
         return target_context->prune_with_summarization(keep_ratio);
-    }
-
-    // Helper method to add messages to history - overloaded for specific context
-    void add_message_to_history(const std::string& role, const std::string& content) {
-        add_message_to_history(current_context, role, content);
-    }
-    
+    }    // Context-specific message addition to history
     void add_message_to_history(ContextInfo* target_context, const std::string& role, const std::string& content) {
         if (!target_context) return;
         
@@ -465,8 +409,7 @@ public:
         size_t used_slots;
         std::vector<std::string> summaries;
     };
-    
-    SummarySlotInfo get_summary_slot_info() const;
+      // Context-specific summary slot information
     SummarySlotInfo get_summary_slot_info(ContextInfo* target_context) const;
     
     // Initialize summarizer resources for all contexts when summary context becomes available
@@ -497,11 +440,8 @@ public:
     }
         
 private:
-    // Improved logic flow helper methods    // Add message and mark conversation state as needing rebuild - overloaded for specific context
-    void add_message_and_invalidate(const std::string& role, const std::string& content) {
-        add_message_and_invalidate(current_context, role, content);
-    }
-    
+    // Improved logic flow helper methods
+    // Add message and mark conversation state as needing rebuild
     void add_message_and_invalidate(ContextInfo* target_context, const std::string& role, const std::string& content) {
         if (!target_context) return;
         
@@ -516,11 +456,9 @@ private:
         
         LLAMA_LOG("Message added. Total messages: " + std::to_string(target_context->message_history.size()) + 
                   ". State invalidated - rebuild required.");
-    }    // Generate response tokens using LlamaResponse - overloaded for specific context
-    std::string generate_response_tokens() {
-        return generate_response_tokens(current_context);
     }
     
+    // Generate response tokens using LlamaResponse
     std::string generate_response_tokens(ContextInfo* target_context) {
         if (!target_context) return "Error: No context provided";
         
@@ -598,11 +536,7 @@ public:
      * - Separated concerns (preparation vs. generation)
      * - Linear, predictable flow (no jumping between methods)
      * - Comprehensive logging for debugging
-     */
-      std::string generate_response(const std::string& input, const std::string& username = "Schwi") {
-        return generate_response(input, current_context, username);
-    }
-    
+     */    // Context-specific response generation
      std::string generate_response(const std::string& input, ContextInfo* target_context, const std::string& username = "Schwi") {
         // Pre-flight validation
         if (!target_context || !target_context->context || !target_context->model_info || 
@@ -665,10 +599,6 @@ public:
         float average_tokens_per_second;
     };
     
-    PerformanceStats get_performance_stats() const {
-        return get_performance_stats(current_context);
-    }
-    
     PerformanceStats get_performance_stats(ContextInfo* target_context) const {
         if (!target_context) {
             return {0, 0, 0.0f};
@@ -690,19 +620,11 @@ public:
         float t_eval_ms = 0.0f;
     };
     
-    void reset_timings() {
-        reset_timings(current_context);
-    }
-    
     void reset_timings(ContextInfo* target_context) {
         if (!target_context) return;
         
         target_context->total_generation_tokens = 0;
         target_context->last_decode_time_us = 0;
-    }
-    
-    Timings get_timings() const {
-        return get_timings(current_context);
     }
     
     Timings get_timings(ContextInfo* target_context) const {
@@ -736,22 +658,15 @@ public:
         });
         
         contexts.clear();
-        active_context_id.clear();
-        current_context = nullptr;
         
-        // Clean up all models - ModelInfo destructor handles model cleanup        models.clear();        
+        // Clean up all models - ModelInfo destructor handles model cleanup
+        models.clear();        
         LLAMA_LOG("Cleanup completed");
-    }      // Get context size for capacity calculations - overloaded for specific context
-    int32_t get_context_size() const noexcept {
-        return get_context_size(current_context);
     }
     
+    // Get context size for capacity calculations
     int32_t get_context_size(ContextInfo* target_context) const noexcept {
         return target_context ? target_context->get_context_size() : LlamaConstants::DEFAULT_CONTEXT_SIZE;
-    }
-      // Context rebuild orchestrator - overloaded for specific context
-    bool update_context_from_history() {
-        return update_context_from_history(current_context);
     }
     
     bool update_context_from_history(ContextInfo* target_context) {
@@ -796,10 +711,6 @@ private:
 #include "LlamaSummarizer.hpp"
 
 // Implementation of LlamaManager methods that depend on LlamaSummarizer
-inline LlamaManager::SummarySlotInfo LlamaManager::get_summary_slot_info() const {
-    return get_summary_slot_info(current_context);
-}
-
 inline LlamaManager::SummarySlotInfo LlamaManager::get_summary_slot_info(ContextInfo* target_context) const {
     if (!target_context || !target_context->summarizer) {
         return {SummarizerConstants::MAX_SUMMARY_SLOTS, 0, {}};
