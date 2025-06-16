@@ -259,9 +259,19 @@ public:
         
         // Set the reset after generation flag
         context_info->reset_after_generation = reset_after_generation;
-        
-        // Initialize summarizer for this context with parent context only (summary resources will be set later)
+          // Initialize summarizer for this context with parent context only (summary resources will be set later)
         context_info->summarizer = std::make_unique<LlamaSummarizer>(context_info.get());
+        
+        // If summary resources are already available, set them up immediately
+        ContextInfo* summary_ctx = get_context_info("summary_context");
+        ModelInfo* summary_mdl = get_model_info("summary_model");
+        if (summary_ctx && summary_mdl) {
+            auto response_callback = [this](const std::string& input, const std::string& username, ContextInfo* target_context) -> std::string {
+                return generate_response_on_context(input, username, target_context);
+            };
+            context_info->summarizer->set_summary_resources(summary_mdl, summary_ctx, response_callback);
+            LLAMA_LOG("Set summarizer resources for new context '" + context_id + "'");
+        }
         
         contexts[context_id] = std::move(context_info);
         LLAMA_LOG("Created context '" + context_id + "' with model '" + model_id + "' successfully");
@@ -418,8 +428,7 @@ public:
     // Context-specific summary slot information
     // TODO: Move this into LlamaSummarizer and access it through the parent ContextInfo
     SummarySlotInfo get_summary_slot_info(ContextInfo* target_context) const;
-    
-    // Initialize summarizer resources for all contexts when summary context becomes available
+      // Initialize summarizer resources for all contexts when summary context becomes available
     void initialize_summarizer_resources() {
         // Find the summary context and model
         ContextInfo* summary_ctx = get_context_info("summary_context");
@@ -435,9 +444,17 @@ public:
             return generate_response_on_context(input, username, target_context);
         };
         
-        // Update summarizer ContextInfo (will only ever be one summarizer context)
-        summary_ctx->summarizer->set_summary_resources(summary_mdl, summary_ctx, response_callback);
-        LLAMA_LOG("Successfully initialized summarizer resources");
+        // Initialize summarizer resources for ALL contexts that have summarizers
+        int32_t initialized_count = 0;
+        for (auto& [context_id, context_info] : contexts) {
+            if (context_info->summarizer) {
+                context_info->summarizer->set_summary_resources(summary_mdl, summary_ctx, response_callback);
+                initialized_count++;
+                LLAMA_LOG("Initialized summarizer resources for context: " + context_id);
+            }
+        }
+        
+        LLAMA_LOG("Successfully initialized summarizer resources for " + std::to_string(initialized_count) + " contexts");
     }
         
 private:
@@ -456,62 +473,7 @@ private:
         LLAMA_LOG("Message added. Total messages: " + std::to_string(target_context->message_history.size()) + 
                   ". State invalidated - rebuild required.");
     }
-    
-    // Generate response tokens using LlamaResponse
-    std::string generate_response_tokens(ContextInfo* target_context) {
-        // Validate that context is properly prepared for generation
-        if (!target_context->context || !target_context->model_info || !target_context->model_info->vocab) {
-            return "Error: Context not properly initialized for generation";
-        }
-          
-        // Check that we have valid context position
-        if (target_context->n_past < 0) {
-            return "Error: Context position is negative (n_past=" + std::to_string(target_context->n_past) + ")";
-        }
-        
-        // For very first generation, n_past could be 0, which is acceptable
-        // But we need to ensure the context has been properly prepared
-        if (target_context->n_past == 0 && target_context->message_history.empty()) {
-            return "Error: Context is completely empty - no messages and n_past=0";
-        }
-          
-        // Ensure we have logits available for generation (if context has been built)
-        if (target_context->n_past > 0) {
-            float* logits = llama_get_logits(target_context->context);
-            if (!logits) {
-                LLAMA_LOG("Warning: No logits available after context rebuild, but proceeding with generation");
-                // Don't fail here - let LlamaResponse handle this case
-            }
-        }
-        
-        LLAMA_LOG("Pre-generation validation passed - context ready for generation");
-        
-        // Setup callback functions for LlamaResponse
-        auto token_adder = [this, target_context](llama_token token, int32_t pos, const std::vector<llama_seq_id>& seq_ids, bool output_logits) -> bool {
-            return target_context->add_tokens_to_batch({token}, pos, seq_ids, output_logits);
-        };
-          auto context_updater = [target_context]() -> void {
-            // Update context length tracking after generation
-            std::string updated_content;
-            if (target_context->apply_template(false, updated_content)) {
-                target_context->prev_len = static_cast<int32_t>(updated_content.length());
-            }
-        };
-          
-        // Single attempt at generation
-        // Context should already be properly prepared by prepare_context_for_generation()
-        LLAMA_LOG("Delegating to LlamaResponse for token generation");
-        std::string response = response_generator.generate_response("generate", "assistant", target_context, token_adder, context_updater);
-        
-        if (!response.empty() && !response.starts_with("Error:")) {
-            LLAMA_LOG("Response generation completed successfully: " + std::to_string(response.length()) + " characters");
-            return response;
-        }
-        
-        // If generation failed, log the error but don't attempt aggressive recovery
-        LLAMA_LOG("Response generation failed: " + response);
-        return response.empty() ? "Error: Failed to generate response - empty result" : response;
-    }
+  
 
 public:
 
@@ -586,9 +548,21 @@ public:
                 return "Error: Failed to prepare context for generation";
             }
         }
+          // STEP 3: Generate response tokens
+        // Setup callback functions for LlamaResponse
+        auto token_adder = [this, target_context](llama_token token, int32_t pos, const std::vector<llama_seq_id>& seq_ids, bool output_logits) -> bool {
+            return target_context->add_tokens_to_batch({token}, pos, seq_ids, output_logits);
+        };
+        auto context_updater = [target_context]() -> void {
+            // Update context length tracking after generation
+            std::string updated_content;
+            if (target_context->apply_template(false, updated_content)) {
+                target_context->prev_len = static_cast<int32_t>(updated_content.length());
+            }
+        };
         
-        // STEP 3: Generate response tokens
-        std::string response = generate_response_tokens(target_context);
+        LLAMA_LOG("Delegating to LlamaResponse for token generation");
+        std::string response = response_generator.generate_response("generate", "assistant", target_context, token_adder, context_updater);
         
         // STEP 4: Update conversation with response (if successful)
         if (!response.empty() && !response.starts_with("Error:")) {
