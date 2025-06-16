@@ -404,8 +404,7 @@ private:
         // Initialize verification n-gram data
         ngrams_cur.clear();
         ngrams_cur.reserve(config.max_verification);
-        
-        // Initialize lookahead token history
+          // Initialize lookahead token history following the working example
         tokens_j_prev.clear();
         tokens_j_prev.resize(config.window_size, 0);
         
@@ -414,102 +413,159 @@ private:
         for (int32_t j = 0; j < config.ngram_size - 1; ++j) {
             tokens_j[j].resize(config.window_size);
             
-            // Initialize with sequence of tokens (can be randomized if needed)
+            // Initialize with simple increasing sequence like the working example
             for (int32_t i = 0; i < config.window_size; ++i) {
-                tokens_j[j][i] = 100 + i; // Simple initialization
+                tokens_j[j][i] = 100 + i;  // Simple initialization like working example
             }
         }
         
         LLAMA_LOG("Lookahead decoding initialized: W=" + std::to_string(config.window_size) + 
                   ", N=" + std::to_string(config.ngram_size) + 
                   ", G=" + std::to_string(config.max_verification));
-    }    // Build lookahead batch with current token + verification n-grams + lookahead tokens
+    }    // Build lookahead batch directly (bypassing single-sequence BatchTokenAdder)
     template<typename BatchTokenAdder>
     bool build_lookahead_batch(llama_token current_token, int32_t n_past, ModelInfo* model_info,
                               BatchTokenAdder add_token_to_batch) const {
         const int32_t W = lookahead_config.window_size;
         const int32_t N = lookahead_config.ngram_size;
         const int32_t G = lookahead_config.max_verification;
+
+        // The issue: BatchTokenAdder uses single-sequence batch operations that clear the batch
+        // Solution: Return false to indicate we need to handle this specially
+        // The caller will create its own multi-sequence batch for lookahead
         
-        // Limit sequence count to avoid memory issues
-        const int32_t max_sequences = std::min(W + G + 1, 32); // Cap at 32 sequences
+        LLAMA_LOG("Lookahead batch building requires multi-sequence support - delegating to caller");
+        return false; // Signal that we need special multi-sequence batch handling
+    }    // Build lookahead batch directly like the working example
+    bool build_lookahead_batch_direct(llama_token current_token, int32_t n_past, ContextInfo* context_info) const {
+        const int32_t W = lookahead_config.window_size;
+        const int32_t N = lookahead_config.ngram_size;
+        const int32_t G = lookahead_config.max_verification;
+
+        // Create a new batch for lookahead with proper sequence support (like working example)
+        const int32_t max_batch_size = 1 + G * (N - 1) + (W - 1) + (N - 1) * W;
+        llama_batch lookahead_batch = llama_batch_init(max_batch_size, 0, W + G + 1);
         
-        // Clear any existing batch state (callback should handle this)
+        if (!lookahead_batch.token) {
+            LLAMA_LOG("Error: Failed to create lookahead batch");
+            return false;
+        }
+
+        // Clear the batch
+        lookahead_batch.n_tokens = 0;
+
+        // Step 1: Current token goes to ALL sequences (working example approach)
         std::vector<llama_seq_id> seq_id_all;
-        seq_id_all.reserve(max_sequences);
-        for (int32_t i = 0; i < max_sequences; ++i) {
+        seq_id_all.reserve(W + G + 1);
+        for (int32_t i = 0; i < W + G + 1; ++i) {
             seq_id_all.push_back(i);
         }
         
-        // Add current token - belongs to all sequences
-        if (!add_token_to_batch(current_token, n_past, seq_id_all, true)) {
-            LLAMA_LOG("Error: Failed to add current token to batch");
-            return false;
+        // Add current token like working example: common_batch_add(batch, id, n_past, seq_id_all, true);
+        lookahead_batch.token[lookahead_batch.n_tokens] = current_token;
+        lookahead_batch.pos[lookahead_batch.n_tokens] = n_past;
+        lookahead_batch.logits[lookahead_batch.n_tokens] = 1; // Request logits
+        
+        // Set all sequence IDs for current token
+        for (size_t i = 0; i < seq_id_all.size(); ++i) {
+            lookahead_batch.seq_id[lookahead_batch.n_tokens * lookahead_batch.n_seq_max + i] = seq_id_all[i];
         }
+        lookahead_batch.n_tokens++;
+
+        // Step 2: Add verification n-grams (working example order)
+        const int32_t g_cur = (ngrams_observed && current_token < static_cast<llama_token>(ngrams_observed->cnt.size())) 
+                             ? ngrams_observed->cnt[current_token] : 0;
         
-        // Add verification n-grams (limited to available sequences)
-        const int32_t g_cur = std::min(G, static_cast<int32_t>(ngrams_observed->cnt[current_token]));
-        const int32_t available_verification_seqs = std::min(g_cur, max_sequences - W - 1);
+        ngrams_cur.clear();
+        ngrams_cur.resize(g_cur);
         
-        ngrams_cur.resize(available_verification_seqs);
-        
-        for (int32_t g = 0; g < available_verification_seqs; ++g) {
+        for (int32_t g = 0; g < g_cur; ++g) {
             ngrams_cur[g].active = true;
-            ngrams_cur[g].seq_id = W + 1 + g; // Start verification sequences after lookahead
             ngrams_cur[g].tokens.resize(N);
             ngrams_cur[g].i_batch.resize(N);
+            ngrams_cur[g].seq_id = W + 1 + g;
+            ngrams_cur[g].i_batch[0] = 0; // Current token position
             ngrams_cur[g].tokens[0] = current_token;
-            ngrams_cur[g].i_batch[0] = 0; // Current token batch index
-            
-            // Add verification tokens for this n-gram
-            auto ngram_tokens = ngrams_observed->get_ngram_tokens(current_token, g, N, G);
-            for (int32_t j = 0; j < std::min(N - 1, static_cast<int32_t>(ngram_tokens.size())); ++j) {
-                ngrams_cur[g].tokens[j + 1] = ngram_tokens[j];
-                ngrams_cur[g].i_batch[j + 1] = 1 + g * (N - 1) + j; // Track batch position
-                
-                std::vector<llama_seq_id> verification_seq = {W + 1 + g};
-                if (!add_token_to_batch(ngram_tokens[j], n_past + j + 1, verification_seq, true)) {
-                    LLAMA_LOG("Warning: Failed to add verification token, continuing...");
+        }
+        
+        // Add verification tokens
+        for (int32_t j = 0; j < N - 1; ++j) {
+            for (int32_t g = 0; g < g_cur; ++g) {
+                auto ngram_tokens = ngrams_observed->get_ngram_tokens(current_token, g, N, G);
+                if (static_cast<size_t>(j) < ngram_tokens.size()) {
+                    const llama_token t = ngram_tokens[j];
+                    ngrams_cur[g].tokens[j + 1] = t;
+                    ngrams_cur[g].i_batch[j + 1] = lookahead_batch.n_tokens;
+                    
+                    // Add like: common_batch_add(batch, t, n_past + j + 1, { W + 1 + g }, true);
+                    lookahead_batch.token[lookahead_batch.n_tokens] = t;
+                    lookahead_batch.pos[lookahead_batch.n_tokens] = n_past + j + 1;
+                    lookahead_batch.logits[lookahead_batch.n_tokens] = 1; // Request logits
+                    lookahead_batch.seq_id[lookahead_batch.n_tokens * lookahead_batch.n_seq_max] = W + 1 + g;
+                    lookahead_batch.n_tokens++;
+                } else {
                     ngrams_cur[g].active = false;
-                    continue;
                 }
             }
         }
         
-        // Add lookahead tokens for the first level (fill remaining W-1 tokens)
-        for (int32_t i = 1; i < W && i < max_sequences - 1; ++i) {
+        // Step 3: Add lookahead tokens (working example structure)
+        // Fill the remaining W - 1 tokens for the first level
+        for (int32_t i = 1; i < W; ++i) {
             std::vector<llama_seq_id> seq_id_look;
             seq_id_look.reserve(W - i);
-            for (int32_t j = 0; j < W - i && (i + j) < max_sequences; ++j) {
-                seq_id_look.push_back(i + j);
+            for (int32_t j = 0; j < W - i; ++j) {
+                seq_id_look.push_back(i + j + 1);
             }
             
-            if (!seq_id_look.empty() && i < static_cast<int32_t>(tokens_j[0].size())) {
-                if (!add_token_to_batch(tokens_j[0][i], n_past + i, seq_id_look, false)) {
-                    LLAMA_LOG("Warning: Failed to add lookahead token at position " + std::to_string(i));
-                }
+            llama_token token_to_add = (tokens_j.empty() || tokens_j[0].empty() || i >= static_cast<int32_t>(tokens_j[0].size()))
+                                     ? static_cast<llama_token>(100 + i)
+                                     : tokens_j[0][i];
+            
+            // Add like: common_batch_add(batch, tokens_j[0][i], n_past + i, seq_id_look, false);
+            lookahead_batch.token[lookahead_batch.n_tokens] = token_to_add;
+            lookahead_batch.pos[lookahead_batch.n_tokens] = n_past + i;
+            lookahead_batch.logits[lookahead_batch.n_tokens] = 0; // No logits
+            
+            for (size_t k = 0; k < seq_id_look.size(); ++k) {
+                lookahead_batch.seq_id[lookahead_batch.n_tokens * lookahead_batch.n_seq_max + k] = seq_id_look[k];
             }
+            lookahead_batch.n_tokens++;
         }
         
-        // Add tokens for remaining levels (simplified to avoid complexity)
-        for (int32_t j = 1; j < N - 1 && j < static_cast<int32_t>(tokens_j.size()); ++j) {
-            for (int32_t i = 0; i < W && i < static_cast<int32_t>(tokens_j[j].size()) && (i + 1) < max_sequences; ++i) {
-                std::vector<llama_seq_id> level_seq = {i + 1};
-                bool request_logits = (j == N - 2); // Request logits on final level
+        // Fill the rest of the lookahead levels
+        for (int32_t j = 1; j < N - 1; ++j) {
+            for (int32_t i = 0; i < W; ++i) {
+                llama_token token_to_add = (tokens_j.size() <= static_cast<size_t>(j) || 
+                                          tokens_j[j].size() <= static_cast<size_t>(i))
+                                         ? static_cast<llama_token>(100 + i + j * W)
+                                         : tokens_j[j][i];
                 
-                if (!add_token_to_batch(tokens_j[j][i], n_past + j + i + 1, level_seq, request_logits)) {
-                    // Log warning but continue
-                    LLAMA_LOG("Warning: Failed to add level " + std::to_string(j) + " token at position " + std::to_string(i));
-                }
+                bool request_logits = (j == N - 2); // Last level requests logits
+                
+                // Add like: common_batch_add(batch, tokens_j[j][i], n_past + j + i, { i + 1 }, j == N - 2);
+                lookahead_batch.token[lookahead_batch.n_tokens] = token_to_add;
+                lookahead_batch.pos[lookahead_batch.n_tokens] = n_past + j + i;
+                lookahead_batch.logits[lookahead_batch.n_tokens] = request_logits ? 1 : 0;
+                lookahead_batch.seq_id[lookahead_batch.n_tokens * lookahead_batch.n_seq_max] = i + 1;
+                lookahead_batch.n_tokens++;
             }
         }
         
-        LLAMA_LOG("Built lookahead batch with " + std::to_string(available_verification_seqs) + " verification n-grams");
+        // Replace the context's batch with our lookahead batch
+        if (context_info->batch_initialized) {
+            llama_batch_free(context_info->batch);
+        }
+        context_info->batch = lookahead_batch;
+        context_info->batch_initialized = true;
+        
+        LLAMA_LOG("Built direct lookahead batch: " + std::to_string(lookahead_batch.n_tokens) + 
+                  " tokens, W=" + std::to_string(W) + ", N=" + std::to_string(N) + ", G=" + std::to_string(g_cur));
         return true;
-    }    // Update lookahead tokens after sampling
+    }// Update lookahead tokens following the working example approach
     template<typename Sampler>
     void update_lookahead_tokens(ContextInfo* context_info, Sampler sample_func, 
-                                int32_t verification_count, int32_t level) const {
+                                int32_t verification_count, int32_t level, bool is_first_token) const {
         const int32_t W = lookahead_config.window_size;
         const int32_t N = lookahead_config.ngram_size;
         
@@ -519,70 +575,96 @@ private:
             return;
         }
         
-        // Save previous tokens (with bounds checking)
+        // Step 1: Save previous tokens from first level (exactly like working example)
         for (int32_t i = 0; i < W && i < static_cast<int32_t>(tokens_j_prev.size()) && 
              i < static_cast<int32_t>(tokens_j[0].size()); ++i) {
             tokens_j_prev[i] = tokens_j[0][i];
         }
         
-        // Shift token levels
+        // Step 2: Shift token levels (exactly like working example)
         for (int32_t j = 0; j < N - 2 && j + 1 < static_cast<int32_t>(tokens_j.size()); ++j) {
             if (tokens_j[j].size() == tokens_j[j + 1].size()) {
                 tokens_j[j] = tokens_j[j + 1];
             }
         }
         
-        // Generate new tokens for the last level
+        // Step 3: Generate new tokens for the last level (following working example logic)
         if (N >= 2 && static_cast<size_t>(N - 2) < tokens_j.size()) {
             auto& last_level = tokens_j[N - 2];
             
             if (level == 0) {
-                // Sample from the last level using available batch positions
+                // Sample from the last level using the working example batch position calculation
                 for (int32_t i = 0; i < W && i < static_cast<int32_t>(last_level.size()); ++i) {
-                    // Calculate batch index more conservatively
-                    int32_t batch_idx = verification_count * (N - 1) + i;
+                    // Working example formula: ngrams_cur.size() * (N - 1) + W * (N - 2) + i
+                    int32_t batch_idx = verification_count * (N - 1) + W * (N - 2) + i;
                     
                     try {
                         last_level[i] = sample_func(batch_idx);
                     } catch (...) {
-                        // If sampling fails, use a simple fallback
-                        last_level[i] = 100 + i; // Simple sequence
-                        LLAMA_LOG("Warning: Failed to sample lookahead token, using fallback");
+                        // Fallback: use token from first level like working example
+                        if (i < static_cast<int32_t>(tokens_j[0].size())) {
+                            last_level[i] = tokens_j[0][i];
+                        } else {
+                            // Final fallback - simple initialization
+                            last_level[i] = static_cast<llama_token>(100 + i);
+                        }
+                        LLAMA_LOG("Warning: Failed to sample lookahead token " + std::to_string(i) + 
+                                 ", using fallback");
                     }
                 }
             } else {
-                // Initialize from previous level or with simple sequence
-                if (!tokens_j.empty() && tokens_j[0].size() == last_level.size()) {
-                    for (int32_t i = 0; i < W && i < static_cast<int32_t>(last_level.size()) && 
-                         i < static_cast<int32_t>(tokens_j[0].size()); ++i) {
+                // For verification levels > 0, reinitialize like working example
+                for (int32_t i = 0; i < W && i < static_cast<int32_t>(last_level.size()); ++i) {
+                    // Working example uses tokens from first level for reinitialization
+                    if (i < static_cast<int32_t>(tokens_j[0].size())) {
                         last_level[i] = tokens_j[0][i];
-                    }
-                } else {
-                    // Fallback initialization
-                    for (int32_t i = 0; i < W && i < static_cast<int32_t>(last_level.size()); ++i) {
-                        last_level[i] = 100 + i;
+                    } else {
+                        last_level[i] = static_cast<llama_token>(100 + i);
                     }
                 }
             }
         }
-    }
-      // Update observed n-grams with new patterns
+    }// Update observed n-grams with new patterns
     void update_observed_ngrams(llama_token first_token) const {
         const int32_t W = lookahead_config.window_size;
         const int32_t N = lookahead_config.ngram_size;
         
-        std::vector<llama_token> ngram(N - 1);
+        if (!ngrams_observed || tokens_j_prev.empty()) {
+            return;
+        }
         
-        // Generate n-grams from lookahead window
-        for (int32_t f = 0; f < W; ++f) {
+        // Generate n-grams from lookahead window using the previous tokens
+        for (int32_t f = 0; f < W && f < static_cast<int32_t>(tokens_j_prev.size()); ++f) {
             const llama_token ft = tokens_j_prev[f];
             
+            // Skip invalid tokens
+            if (ft <= 0) continue;
+            
+            std::vector<llama_token> ngram(N - 1);
+            bool valid_ngram = true;
+            
+            // Build n-gram from consecutive positions  
             for (int32_t j = 0; j < N - 1; ++j) {
-                ngram[j] = tokens_j[j][f];
+                int32_t pos = f + j + 1;
+                if (pos < W && pos < static_cast<int32_t>(tokens_j_prev.size())) {
+                    ngram[j] = tokens_j_prev[pos];
+                    if (ngram[j] <= 0) {
+                        valid_ngram = false;
+                        break;
+                    }
+                } else {
+                    valid_ngram = false;
+                    break;
+                }
             }
             
-            ngrams_observed->add_ngram(ft, ngram, N, lookahead_config.max_verification);
+            // Only add valid n-grams to the database
+            if (valid_ngram) {
+                ngrams_observed->add_ngram(ft, ngram, N, lookahead_config.max_verification);
+            }
         }
+        
+        LLAMA_LOG("Updated n-grams database, total: " + std::to_string(ngrams_observed->n_total));
     }
 
 public:
@@ -648,11 +730,11 @@ public:
         // Initialize generation state
         std::string response;
         response.reserve(max_new_tokens * LlamaResponseConstants::STRING_RESERVE_MULTIPLIER);
-        
-        auto generation_start = std::chrono::high_resolution_clock::now();
+          auto generation_start = std::chrono::high_resolution_clock::now();
         int32_t n_generated = 0;
         int32_t n_accept = 0;
-          // Sample first token using standard method
+        
+        // Sample first token using standard method
         llama_token current_id = llama_sampler_sample(context_info->model_info->sampler, context_info->context, -1);
         llama_sampler_accept(context_info->model_info->sampler, current_id);
         
@@ -661,98 +743,70 @@ public:
         if (!token_text.empty()) {
             response += token_text;
             LLAMA_LOG("First token generated: " + token_text);
-        }        // Main lookahead generation loop
-        while (n_generated < max_new_tokens) {
+        }
+          // Count the first token
+        n_generated++;
+        context_info->n_past++;
+          // Initialize all sequences following the working example approach
+        auto* memory = llama_get_memory(context_info->context);
+        if (memory) {
+            // Copy sequence 0 to all lookahead and verification sequences like working example
+            const int32_t W = config.window_size;
+            const int32_t G = config.max_verification;
+            for (int32_t s = 1; s < W + G + 1; ++s) {
+                llama_memory_seq_cp(memory, 0, s, -1, -1);
+            }
+            LLAMA_LOG("Initialized " + std::to_string(W + G) + " sequences from main sequence");
+        }
+          // Main lookahead generation loop
+        while (n_generated < max_new_tokens) {            LLAMA_LOG("Loop iteration: n_generated=" + std::to_string(n_generated) + 
+                     "/" + std::to_string(max_new_tokens) + ", current_token=" + std::to_string(current_id));
+            
             // Check for end-of-generation token
             if (llama_vocab_is_eog(context_info->model_info->vocab, current_id)) {
                 LLAMA_LOG("End of generation token encountered in lookahead");
                 break;
             }
-            
-            // Build lookahead batch
+              // Build lookahead batch
             if (!build_lookahead_batch(current_id, context_info->n_past, 
                                      context_info->model_info, add_token_to_batch)) {
-                LLAMA_LOG("Error: Failed to build lookahead batch");
-                break;
-            }
-            
-            // Decode the batch
-            if (llama_decode(context_info->context, context_info->batch) != 0) {
-                LLAMA_LOG("Error: Failed to decode lookahead batch");
-                break;
-            }
-            
-            // Process verification n-grams to find best accepted sequence
-            llama_seq_id best_seq_id = 0;
-            int32_t accepted_count = 0;
-            int32_t best_verification_length = 0;
-            
-            // Check verification n-grams for matches
-            for (size_t g = 0; g < ngrams_cur.size(); ++g) {
-                if (!ngrams_cur[g].active) continue;
+                LLAMA_LOG("BatchTokenAdder approach failed, using direct lookahead batch building");
                 
-                int32_t match_length = 0;
-                bool sequence_valid = true;
+                // Use direct batch building like the working example
+                if (!build_lookahead_batch_direct(current_id, context_info->n_past, context_info)) {
+                    LLAMA_LOG("Error: Direct lookahead batch building failed, falling back to standard generation");
+                    // Fall back to standard token generation
+                    current_id = llama_sampler_sample(context_info->model_info->sampler, context_info->context, -1);
+                    llama_sampler_accept(context_info->model_info->sampler, current_id);
+                    
+                    token_text = convert_token_to_text(current_id, context_info->model_info);
+                    if (!token_text.empty()) {
+                        response += token_text;
+                    }
+                    
+                    n_generated++;
+                    context_info->n_past++;
+                    continue;
+                }
+            }
+              // Decode the batch with error handling
+            int decode_result = llama_decode(context_info->context, context_info->batch);
+            if (decode_result != 0) {
+                LLAMA_LOG("Warning: Failed to decode lookahead batch (error " + std::to_string(decode_result) + "), falling back to standard generation");
                 
-                // Check how many tokens in this n-gram match
-                for (int32_t v = 1; v < config.ngram_size && sequence_valid; ++v) {
-                    if (static_cast<size_t>(v) < ngrams_cur[g].i_batch.size()) {
-                        int32_t i_batch = ngrams_cur[g].i_batch[v];
-                        llama_token expected_token = ngrams_cur[g].tokens[v];
-                        llama_token sampled_token = llama_sampler_sample(context_info->model_info->sampler, 
-                                                                        context_info->context, i_batch);
-                        
-                        if (sampled_token == expected_token) {
-                            match_length++;
-                        } else {
-                            sequence_valid = false;
-                        }
-                    } else {
-                        sequence_valid = false;
+                // Clear KV cache state and fall back to standard generation
+                auto* memory = llama_get_memory(context_info->context);
+                if (memory) {
+                    // Remove problematic sequences
+                    for (int32_t s = 1; s < 32; ++s) {
+                        llama_memory_seq_rm(memory, s, -1, -1);
                     }
                 }
                 
-                // Track best matching sequence
-                if (sequence_valid && match_length > best_verification_length) {
-                    best_verification_length = match_length;
-                    best_seq_id = ngrams_cur[g].seq_id;
-                    accepted_count = match_length;
-                }
-            }
-            
-            // Accept verified tokens or generate new token
-            if (accepted_count > 0 && best_seq_id != 0) {
-                // Accept the verified sequence
-                for (int32_t v = 0; v < accepted_count && n_generated < max_new_tokens; ++v) {
-                    // Find the correct n-gram and batch index
-                    for (size_t g = 0; g < ngrams_cur.size(); ++g) {
-                        if (ngrams_cur[g].active && ngrams_cur[g].seq_id == best_seq_id) {
-                            if (static_cast<size_t>(v + 1) < ngrams_cur[g].tokens.size()) {
-                                current_id = ngrams_cur[g].tokens[v + 1];
-                                llama_sampler_accept(context_info->model_info->sampler, current_id);
-                                
-                                // Convert and add to response
-                                token_text = convert_token_to_text(current_id, context_info->model_info);
-                                if (!token_text.empty()) {
-                                    response += token_text;
-                                }
-                                
-                                n_generated++;
-                                context_info->n_past++;
-                                n_accept++;
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                LLAMA_LOG("Accepted " + std::to_string(accepted_count) + " tokens via verification");
-            } else {
-                // No verification match, sample one new token normally
+                // Generate one token normally
                 current_id = llama_sampler_sample(context_info->model_info->sampler, context_info->context, -1);
                 llama_sampler_accept(context_info->model_info->sampler, current_id);
                 
-                // Convert and add to response
                 token_text = convert_token_to_text(current_id, context_info->model_info);
                 if (!token_text.empty()) {
                     response += token_text;
@@ -760,29 +814,133 @@ public:
                 
                 n_generated++;
                 context_info->n_past++;
+                
+                // Update n-grams and continue
+                update_observed_ngrams(current_id);
+                continue;
+            }            // Verification loop following the working example exactly
+            llama_seq_id best_seq_id = 0;
+            int32_t total_accepted = 0;
+            
+            // Iterate through verification levels like the working example (v = 0 to N)
+            for (int32_t v = 0; v < config.ngram_size; ++v) {
+                int32_t i_batch = 0;
+                
+                // If v > 0, check for active verification n-grams
+                if (v > 0) {
+                    bool found_active = false;
+                    for (size_t g = 0; g < ngrams_cur.size(); ++g) {
+                        if (ngrams_cur[g].active) {
+                            if (static_cast<size_t>(v) < ngrams_cur[g].i_batch.size()) {
+                                i_batch = ngrams_cur[g].i_batch[v];
+                                best_seq_id = ngrams_cur[g].seq_id;
+                                found_active = true;
+                                total_accepted++;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // No more active matches -> stop verification
+                    if (!found_active || i_batch == 0) {
+                        break;
+                    }
+                }
+                
+                // Sample the next token (working example approach)
+                current_id = llama_sampler_sample(context_info->model_info->sampler, context_info->context, i_batch);
+                llama_sampler_accept(context_info->model_info->sampler, current_id);
+                
+                // Convert and output token
+                token_text = convert_token_to_text(current_id, context_info->model_info);
+                if (!token_text.empty()) {
+                    if (v == 0) {
+                        response += token_text;
+                        LLAMA_LOG("Generated: " + token_text);
+                    } else {
+                        response += token_text;
+                        LLAMA_LOG("Verified: " + token_text);
+                    }
+                }
+                
+                // Check for EOS
+                if (llama_vocab_is_eog(context_info->model_info->vocab, current_id)) {
+                    LLAMA_LOG("End of generation token encountered");
+                    break;
+                }
+                
+                n_generated++;
+                context_info->n_past++;
+                
+                if (n_generated >= max_new_tokens) {
+                    break;
+                }
+                
+                // Verify against active n-grams (working example logic)
+                for (size_t g = 0; g < ngrams_cur.size(); ++g) {
+                    if (ngrams_cur[g].active) {
+                        if (v == config.ngram_size - 1) {
+                            // Reached end of n-gram
+                            ngrams_cur[g].active = false;
+                        } else {
+                            // Check if current token matches expected token
+                            if (static_cast<size_t>(v + 1) < ngrams_cur[g].tokens.size()) {
+                                if (current_id != ngrams_cur[g].tokens[v + 1]) {
+                                    ngrams_cur[g].active = false;
+                                }
+                            } else {
+                                ngrams_cur[g].active = false;
+                            }
+                        }
+                    }
+                }
+                
+                // Update lookahead tokens (working example approach)
+                auto sampler_func = [context_info](int32_t batch_idx) -> llama_token {
+                    return llama_sampler_sample(context_info->model_info->sampler, context_info->context, batch_idx);
+                };
+                
+                update_lookahead_tokens(context_info, sampler_func, static_cast<int32_t>(ngrams_cur.size()), v, v == 0);
+                
+                // Update observed n-grams on first token only (working example)
+                if (v == 0) {
+                    update_observed_ngrams(current_id);
+                }
             }
             
-            // Update lookahead tokens for next iteration
-            auto sampler_func = [context_info](int32_t batch_idx) -> llama_token {
-                return llama_sampler_sample(context_info->model_info->sampler, context_info->context, batch_idx);
-            };
-            
-            update_lookahead_tokens(context_info, sampler_func, static_cast<int32_t>(ngrams_cur.size()), 0);
-            
-            // Update observed n-grams
-            update_observed_ngrams(current_id);
-            
-            // Reset verification state for next iteration
-            for (auto& ngram : ngrams_cur) {
-                ngram.reset();
+            if (total_accepted > 0) {
+                n_accept += total_accepted;
+                LLAMA_LOG("Verified and accepted " + std::to_string(total_accepted) + " tokens");
+            }            // KV cache management following the working example exactly
+            if (n_generated >= max_new_tokens || llama_vocab_is_eog(context_info->model_info->vocab, current_id)) {
+                break;
             }
             
-            // Handle KV cache management - only keep main sequence
-            auto* memory = llama_get_memory(context_info->context);
+            // KV cache management - exactly like working example
+            memory = llama_get_memory(context_info->context);
             if (memory) {
-                // Remove all auxiliary sequences, keep only sequence 0
-                for (int32_t s = 1; s < config.window_size + config.max_verification + 1; ++s) {
-                    llama_memory_seq_rm(memory, s, -1, -1);
+                // Remove all positions after n_past (working example approach)
+                llama_memory_seq_rm(memory, -1, context_info->n_past, -1);
+                
+                if (best_seq_id != 0) {
+                    // Keep the best verification sequence and copy it back (working example)
+                    llama_memory_seq_keep(memory, best_seq_id);
+                    llama_memory_seq_cp(memory, best_seq_id, 0, -1, -1);
+                    llama_memory_seq_rm(memory, best_seq_id, -1, -1);
+                    
+                    // Copy main sequence to all lookahead and verification sequences
+                    const int32_t W = config.window_size;
+                    const int32_t G = config.max_verification;
+                    for (int32_t s = 1; s < W + G + 1; ++s) {
+                        llama_memory_seq_cp(memory, 0, s, -1, -1);
+                    }
+                } else {
+                    // No verification match - still copy to all sequences for next iteration
+                    const int32_t W = config.window_size;
+                    const int32_t G = config.max_verification;
+                    for (int32_t s = 1; s < W + G + 1; ++s) {
+                        llama_memory_seq_cp(memory, 0, s, -1, -1);
+                    }
                 }
             }
         }
