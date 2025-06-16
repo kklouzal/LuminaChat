@@ -603,19 +603,15 @@ public:
                   (input.length() > 50 ? input.substr(0, 50) + "..." : input));
 
         // STEP 1: Update conversation with new input
-        add_message_and_invalidate(username, input);
-          // STEP 2: Prepare context for generation (handles template, tokenization, pruning, rebuild)
+        add_message_and_invalidate(username, input);        // STEP 2: Prepare context for generation (handles template, tokenization, pruning, rebuild)
         auto token_processor = [this](const std::string& text, bool add_special) {
             return process_text_to_tokens(text, add_special);
         };
         auto pruning_callback = [this](float keep_ratio) {
             return prune_conversation_with_summary(keep_ratio);
         };
-        auto update_context_callback = [this]() {
-            return update_context_from_history();
-        };
         
-        if (!current_context->prepare_context_for_generation(token_processor, pruning_callback, active_context_id, update_context_callback)) {
+        if (!current_context->prepare_context_for_generation(token_processor, pruning_callback, active_context_id)) {
             LLAMA_LOG("Context preparation failed, attempting one recovery");
             
             // Single recovery attempt - clear context state and try again
@@ -625,8 +621,7 @@ public:
                 current_context->prev_len = 0;
                 current_context->message_cache_dirty = true;
                 current_context->conversation_state.invalidate();
-                
-                if (!current_context->prepare_context_for_generation(token_processor, pruning_callback, active_context_id, update_context_callback)) {
+                  if (!current_context->prepare_context_for_generation(token_processor, pruning_callback, active_context_id)) {
                     return "Error: Failed to prepare context for generation after recovery attempt";
                 }
                 LLAMA_LOG("Context preparation recovered successfully");
@@ -723,26 +718,16 @@ public:
         // Clean up all models - ModelInfo destructor handles model cleanup        models.clear();        
         LLAMA_LOG("Cleanup completed");
     }
-    
-    // Get context size for capacity calculations - uses current context's model
+      // Get context size for capacity calculations - uses current context's model
     int32_t get_context_size() const noexcept {
         return current_context ? current_context->get_context_size() : LlamaConstants::DEFAULT_CONTEXT_SIZE;
     }
     
-    // Context rebuild orchestrator - handles full rebuild from message history
+    // Context rebuild orchestrator - delegates to current context for better encapsulation
     bool update_context_from_history() {
         if (!current_context) return false;
 
-        LLAMA_LOG("Starting context rebuild: FULL (from message history) - rebuilding from " + 
-                  std::to_string(current_context->message_history.size()) + " messages");
-
-        // Generate formatted content from current message history
-        std::string formatted_content;
-        if (!current_context->apply_template(false, formatted_content)) {
-            LLAMA_LOG("Error: Failed to apply chat template");
-            return false;
-        }
-          // Delegate to the context's rebuild method
+        // Delegate to the context's rebuild method
         auto token_processor = [this](const std::string& text, bool add_special) {
             return process_text_to_tokens(text, add_special);
         };
@@ -750,22 +735,9 @@ public:
             return prune_conversation_with_summary(keep_ratio);
         };
         
-        bool success = current_context->rebuild_context_from_formatted_content(formatted_content, token_processor, pruning_callback);
-        
-        if (success) {
-            // Update the cached message history token count since we just rebuilt the context
-            current_context->message_history_token_count = current_context->n_past;
-            LLAMA_LOG("Updated cached message history token count: " + std::to_string(current_context->message_history_token_count));
-            
-            LLAMA_LOG("Successfully rebuilt context from " + std::to_string(current_context->message_history.size()) + 
-                      " messages, using " + std::to_string(current_context->n_past) + " tokens");
-        } else {
-            LLAMA_LOG("Failed to update context from history");
-        }
-        
-        return success;
+        return current_context->update_context_from_history(token_processor, pruning_callback);
     }
-
+    
 private:
 
     void clear_caches() const {

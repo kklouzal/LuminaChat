@@ -581,13 +581,11 @@ struct ContextInfo {
                  std::to_string((total_tokens + n_batch - 1) / n_batch) + " incremental batches");        
         return true;
     }
-    
-    // Prepare context for generation - centralized context preparation logic
+      // Prepare context for generation - centralized context preparation logic
     template<typename TokenProcessor, typename PruningCallback>
     bool prepare_context_for_generation(TokenProcessor&& process_text_to_tokens, 
                                        PruningCallback&& prune_conversation_with_summary,
-                                       const std::string& active_context_id,
-                                       std::function<bool()> update_context_from_history) {
+                                       const std::string& active_context_id) {
         // Early return if no rebuild needed (optimization)
         if (!conversation_state.needs_rebuild && !message_cache_dirty) {
             LLAMA_LOG("Context preparation skipped - conversation state up to date");
@@ -602,16 +600,15 @@ struct ContextInfo {
             reset_context_state();
             LLAMA_LOG("Conversation state validation failed, attempting recovery");
         }
-        
-        // Check for extremely long message history that might cause issues
+          // Check for extremely long message history that might cause issues
         if (message_history.size() > LlamaConstants::MAX_MESSAGE_HISTORY_SIZE) {
             LLAMA_LOG("Starting context rebuild: PARTIAL (history validation) - very large message history (" + 
                       std::to_string(message_history.size()) + " messages), triggering aggressive pruning");
             // Only trigger aggressive pruning if we're not already in a summary context
             if (active_context_id != "summary_context") {
-                // Trigger aggressive pruning and update context
-                if (prune_conversation_with_summary(SummarizerConstants::AGGRESSIVE_PRUNING_RATIO)) { // Keep only 30%
-                    update_context_from_history();
+                // Trigger aggressive pruning only - context rebuild will happen in the normal flow
+                if (!prune_conversation_with_summary(SummarizerConstants::AGGRESSIVE_PRUNING_RATIO)) { // Keep only 30%
+                    LLAMA_LOG("Warning: Failed to perform aggressive pruning for large message history");
                 }
             } else {
                 LLAMA_LOG("Skipping pruning for summary context");
@@ -848,6 +845,37 @@ struct ContextInfo {
         
         LLAMA_LOG("Pruning and rebuild completed successfully");
         return true;
+    }
+
+    // Update context from current message history - context-specific rebuilding
+    template<typename TokenProcessor, typename PruningCallback>
+    bool update_context_from_history(TokenProcessor&& process_text_to_tokens, 
+                                     PruningCallback&& prune_conversation_with_summary) {
+        LLAMA_LOG("Starting context rebuild: FULL (from message history) - rebuilding from " + 
+                  std::to_string(message_history.size()) + " messages");
+
+        // Generate formatted content from current message history
+        std::string formatted_content;
+        if (!apply_template(false, formatted_content)) {
+            LLAMA_LOG("Error: Failed to apply chat template");
+            return false;
+        }
+        
+        // Delegate to the context's rebuild method
+        bool success = rebuild_context_from_formatted_content(formatted_content, process_text_to_tokens, prune_conversation_with_summary);
+        
+        if (success) {
+            // Update the cached message history token count since we just rebuilt the context
+            message_history_token_count = n_past;
+            LLAMA_LOG("Updated cached message history token count: " + std::to_string(message_history_token_count));
+            
+            LLAMA_LOG("Successfully rebuilt context from " + std::to_string(message_history.size()) + 
+                      " messages, using " + std::to_string(n_past) + " tokens");
+        } else {
+            LLAMA_LOG("Failed to update context from history");
+        }
+        
+        return success;
     }
 
 private:
