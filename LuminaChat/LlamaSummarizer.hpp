@@ -97,7 +97,9 @@ public:    explicit LlamaSummarizer(ContextInfo* parent_ctx, ModelInfo* summary_
         summary_model = summary_mdl;
         summary_context = summary_ctx;
         generate_response_callback = std::move(response_callback);
-    }// Delete copy constructor and assignment operator
+    }
+    
+    // Delete copy constructor and assignment operator
     LlamaSummarizer(const LlamaSummarizer&) = delete;
     LlamaSummarizer& operator=(const LlamaSummarizer&) = delete;
 
@@ -106,7 +108,9 @@ public:    explicit LlamaSummarizer(ContextInfo* parent_ctx, ModelInfo* summary_
 
     // Enhanced prune message history using summary model to condense pruned messages
     void prune_message_history(std::vector<std::pair<std::string, std::string>>& message_history, 
-                              float keep_ratio);    // Summarize a collection of messages using the summary context
+                              float keep_ratio);
+                                  
+    // Summarize a collection of messages using the summary context
     std::string summarize_messages(const std::vector<std::pair<std::string, std::string>>& messages_to_summarize);
 
     // Summary slot information structure
@@ -340,7 +344,8 @@ inline void LlamaSummarizer::prune_message_history(std::vector<std::pair<std::st
         new_history.emplace_back("system", "[Note: " + std::to_string(summarized_count - fallback_keep) + 
                                 " older messages removed due to context limits]");
     }
-      // Do NOT add summary slots to message history during regular pruning
+    
+    // Do NOT add summary slots to message history during regular pruning
     // Summary slots are maintained separately and only used for rollover summarization
     // The actual summaries are not part of the conversation context
     
