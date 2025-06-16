@@ -142,7 +142,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <IgnoreSpecificDefaultLibraries>%(IgnoreSpecificDefaultLibraries)</IgnoreSpecificDefaultLibraries>
-      <AdditionalDependencies>llama.lib;ggml.lib;dpp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>llama.lib;ggml.lib;ggml-base.lib;dpp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

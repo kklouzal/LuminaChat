@@ -47,6 +47,7 @@
 #include <functional>
 #include "llama-cpp.h"
 #include "LogHandler.hpp"
+#include "lookahead/common_lookahead.hpp"
 
 // Forward declarations to avoid circular dependencies
 struct ModelInfo;
@@ -451,8 +452,8 @@ private:
             return false;
         }
 
-        // Clear the batch
-        lookahead_batch.n_tokens = 0;
+        // Clear the batch using common function
+        common_batch_clear(lookahead_batch);
 
         // Step 1: Current token goes to ALL sequences (working example approach)
         std::vector<llama_seq_id> seq_id_all;
@@ -461,16 +462,8 @@ private:
             seq_id_all.push_back(i);
         }
         
-        // Add current token like working example: common_batch_add(batch, id, n_past, seq_id_all, true);
-        lookahead_batch.token[lookahead_batch.n_tokens] = current_token;
-        lookahead_batch.pos[lookahead_batch.n_tokens] = n_past;
-        lookahead_batch.logits[lookahead_batch.n_tokens] = 1; // Request logits
-        
-        // Set all sequence IDs for current token
-        for (size_t i = 0; i < seq_id_all.size(); ++i) {
-            lookahead_batch.seq_id[lookahead_batch.n_tokens * lookahead_batch.n_seq_max + i] = seq_id_all[i];
-        }
-        lookahead_batch.n_tokens++;
+        // Add current token exactly like working example: common_batch_add(batch, id, n_past, seq_id_all, true);
+        common_batch_add(lookahead_batch, current_token, n_past, seq_id_all, true);
 
         // Step 2: Add verification n-grams (working example order)
         const int32_t g_cur = (ngrams_observed && current_token < static_cast<llama_token>(ngrams_observed->cnt.size())) 
@@ -497,12 +490,8 @@ private:
                     ngrams_cur[g].tokens[j + 1] = t;
                     ngrams_cur[g].i_batch[j + 1] = lookahead_batch.n_tokens;
                     
-                    // Add like: common_batch_add(batch, t, n_past + j + 1, { W + 1 + g }, true);
-                    lookahead_batch.token[lookahead_batch.n_tokens] = t;
-                    lookahead_batch.pos[lookahead_batch.n_tokens] = n_past + j + 1;
-                    lookahead_batch.logits[lookahead_batch.n_tokens] = 1; // Request logits
-                    lookahead_batch.seq_id[lookahead_batch.n_tokens * lookahead_batch.n_seq_max] = W + 1 + g;
-                    lookahead_batch.n_tokens++;
+                    // Add like working example: common_batch_add(batch, t, n_past + j + 1, { W + 1 + g }, true);
+                    common_batch_add(lookahead_batch, t, n_past + j + 1, { W + 1 + g }, true);
                 } else {
                     ngrams_cur[g].active = false;
                 }
@@ -522,15 +511,8 @@ private:
                                      ? static_cast<llama_token>(100 + i)
                                      : tokens_j[0][i];
             
-            // Add like: common_batch_add(batch, tokens_j[0][i], n_past + i, seq_id_look, false);
-            lookahead_batch.token[lookahead_batch.n_tokens] = token_to_add;
-            lookahead_batch.pos[lookahead_batch.n_tokens] = n_past + i;
-            lookahead_batch.logits[lookahead_batch.n_tokens] = 0; // No logits
-            
-            for (size_t k = 0; k < seq_id_look.size(); ++k) {
-                lookahead_batch.seq_id[lookahead_batch.n_tokens * lookahead_batch.n_seq_max + k] = seq_id_look[k];
-            }
-            lookahead_batch.n_tokens++;
+            // Add like working example: common_batch_add(batch, tokens_j[0][i], n_past + i, seq_id_look, false);
+            common_batch_add(lookahead_batch, token_to_add, n_past + i, seq_id_look, false);
         }
         
         // Fill the rest of the lookahead levels
@@ -543,12 +525,8 @@ private:
                 
                 bool request_logits = (j == N - 2); // Last level requests logits
                 
-                // Add like: common_batch_add(batch, tokens_j[j][i], n_past + j + i, { i + 1 }, j == N - 2);
-                lookahead_batch.token[lookahead_batch.n_tokens] = token_to_add;
-                lookahead_batch.pos[lookahead_batch.n_tokens] = n_past + j + i;
-                lookahead_batch.logits[lookahead_batch.n_tokens] = request_logits ? 1 : 0;
-                lookahead_batch.seq_id[lookahead_batch.n_tokens * lookahead_batch.n_seq_max] = i + 1;
-                lookahead_batch.n_tokens++;
+                // Add like working example: common_batch_add(batch, tokens_j[j][i], n_past + j + i, { i + 1 }, j == N - 2);
+                common_batch_add(lookahead_batch, token_to_add, n_past + j + i, { i + 1 }, request_logits);
             }
         }
         
@@ -822,6 +800,9 @@ public:
             llama_seq_id best_seq_id = 0;
             int32_t total_accepted = 0;
             
+            // Log start of verification round
+            LLAMA_LOG("Starting verification round with " + std::to_string(ngrams_cur.size()) + " active n-grams");
+            
             // Iterate through verification levels like the working example (v = 0 to N)
             for (int32_t v = 0; v < config.ngram_size; ++v) {
                 int32_t i_batch = 0;
@@ -850,8 +831,7 @@ public:
                 // Sample the next token (working example approach)
                 current_id = llama_sampler_sample(context_info->model_info->sampler, context_info->context, i_batch);
                 llama_sampler_accept(context_info->model_info->sampler, current_id);
-                
-                // Convert and output token
+                  // Convert and output token
                 token_text = convert_token_to_text(current_id, context_info->model_info);
                 if (!token_text.empty()) {
                     if (v == 0) {
@@ -859,7 +839,8 @@ public:
                         LLAMA_LOG("Generated: " + token_text);
                     } else {
                         response += token_text;
-                        LLAMA_LOG("Verified: " + token_text);
+                        // Add blue background for lookahead-verified tokens (ANSI code: \033[44m for blue background, \033[0m to reset)
+                        LLAMA_LOG("Verified (lookahead): \033[44m" + token_text + "\033[0m");
                     }
                 }
                 
@@ -907,11 +888,10 @@ public:
                     update_observed_ngrams(current_id);
                 }
             }
-            
-            if (total_accepted > 0) {
+              if (total_accepted > 0) {
                 n_accept += total_accepted;
-                LLAMA_LOG("Verified and accepted " + std::to_string(total_accepted) + " tokens");
-            }            // KV cache management following the working example exactly
+                LLAMA_LOG("Lookahead verification: accepted " + std::to_string(total_accepted) + " tokens via n-gram matching (total accepted: " + std::to_string(n_accept) + ")");
+            }// KV cache management following the working example exactly
             if (n_generated >= max_new_tokens || llama_vocab_is_eog(context_info->model_info->vocab, current_id)) {
                 break;
             }
