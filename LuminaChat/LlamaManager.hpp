@@ -451,7 +451,7 @@ public:
     void add_message_to_history(const std::string& role, const std::string& content) {
         if (!current_context) return;
         
-        LLAMA_LOG("Delegating message addition to context: " + role);
+        LLAMA_LOG("Delegating message addition from " + role + " to context");
         current_context->add_message(role, content);
     }
         // Forward declaration for summary slot info - implementation after LlamaSummarizer include
@@ -611,7 +611,7 @@ public:
             return prune_conversation_with_summary(keep_ratio);
         };
         
-        if (!current_context->prepare_context_for_generation(token_processor, pruning_callback, active_context_id)) {
+        if (!current_context->prepare_context_for_generation(token_processor, pruning_callback)) {
             LLAMA_LOG("Context preparation failed, attempting one recovery");
             
             // Single recovery attempt - clear context state and try again
@@ -621,7 +621,7 @@ public:
                 current_context->prev_len = 0;
                 current_context->message_cache_dirty = true;
                 current_context->conversation_state.invalidate();
-                  if (!current_context->prepare_context_for_generation(token_processor, pruning_callback, active_context_id)) {
+                  if (!current_context->prepare_context_for_generation(token_processor, pruning_callback)) {
                     return "Error: Failed to prepare context for generation after recovery attempt";
                 }
                 LLAMA_LOG("Context preparation recovered successfully");

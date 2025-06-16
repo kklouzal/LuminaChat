@@ -584,8 +584,7 @@ struct ContextInfo {
       // Prepare context for generation - centralized context preparation logic
     template<typename TokenProcessor, typename PruningCallback>
     bool prepare_context_for_generation(TokenProcessor&& process_text_to_tokens, 
-                                       PruningCallback&& prune_conversation_with_summary,
-                                       const std::string& active_context_id) {
+                                       PruningCallback&& prune_conversation_with_summary) {
         // Early return if no rebuild needed (optimization)
         if (!conversation_state.needs_rebuild && !message_cache_dirty) {
             LLAMA_LOG("Context preparation skipped - conversation state up to date");
@@ -604,8 +603,8 @@ struct ContextInfo {
         if (message_history.size() > LlamaConstants::MAX_MESSAGE_HISTORY_SIZE) {
             LLAMA_LOG("Starting context rebuild: PARTIAL (history validation) - very large message history (" + 
                       std::to_string(message_history.size()) + " messages), triggering aggressive pruning");
-            // Only trigger aggressive pruning if we're not already in a summary context
-            if (active_context_id != "summary_context") {
+            // Only trigger aggressive pruning if we dont reset after generation
+            if (!reset_after_generation) {
                 // Trigger aggressive pruning only - context rebuild will happen in the normal flow
                 if (!prune_conversation_with_summary(SummarizerConstants::AGGRESSIVE_PRUNING_RATIO)) { // Keep only 30%
                     LLAMA_LOG("Warning: Failed to perform aggressive pruning for large message history");
@@ -634,8 +633,8 @@ struct ContextInfo {
         bool pruning_needed = needs_pruning(total_token_count);
         
         // Skip pruning for summary contexts - they manage their own state
-        if (active_context_id == "summary_context") {
-            LLAMA_LOG("Pruning skipped - summary context manages its own state");
+        if (reset_after_generation) {
+            LLAMA_LOG("Pruning skipped - context resets after each generation");
             pruning_needed = false;
         }
         
