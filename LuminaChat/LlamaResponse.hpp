@@ -432,12 +432,11 @@ public:
         
         const auto generation_start = std::chrono::high_resolution_clock::now();
         int32_t n_generated = 0;
-        const std::vector<llama_seq_id> seq_ids = {0}; // C++17: const for immutable data        // Main generation loop - C++17 optimized
-        while (n_generated < max_new_tokens) {
+        const std::vector<llama_seq_id> seq_ids = {0}; // C++17: const for immutable data        // Main generation loop - C++17 optimized with fluid streaming
+        while (true) { // Remove hard token limit, rely on EOS detection
             // Periodic sampler validation during long generation
             if (n_generated % ResponseConstants::SAMPLER_VALIDATION_INTERVAL == 0 && 
                 !context_info->model_info->sampler) [[unlikely]] {
-                // C++17 optimization: Efficient error message
                 std::string error_msg;
                 error_msg.reserve(80);
                 error_msg.append("CRITICAL: Sampler became null during generation at token ")
@@ -445,12 +444,18 @@ public:
                 LLAMA_LOG(std::move(error_msg));
                 return "Error: Sampler failed during generation";
             }
-              // Sample next token with exception safety
+
+            // Check context space before sampling (soft limit)
+            if (context_info->n_past >= (n_ctx - LlamaResponseConstants::TOKEN_SAFETY_MARGIN)) [[unlikely]] {
+                LLAMA_LOG("Warning: Approaching context limit, attempting graceful termination");
+                break;
+            }
+
+            // Sample next token with exception safety
             llama_token new_token;
             try {
                 new_token = llama_sampler_sample(context_info->model_info->sampler, context_info->context, -1);
             } catch (const std::exception& e) {
-                // C++17 optimization: Efficient exception handling
                 std::string error_msg;
                 error_msg.reserve(64);
                 error_msg.append("Exception during token sampling: ").append(e.what());
@@ -460,7 +465,7 @@ public:
                 LLAMA_LOG("Unknown exception during token sampling");
                 return "Error: Unknown exception during generation";
             }
-            
+
             // Validate generated token
             if (new_token < 0) [[unlikely]] {
                 std::string error_msg;
@@ -469,15 +474,17 @@ public:
                 LLAMA_LOG(std::move(error_msg));
                 break;
             }
-            
-            // Check for end-of-generation token
-            if (llama_vocab_is_eog(context_info->model_info->vocab, new_token)) [[unlikely]] {
-                LLAMA_LOG("End of generation token encountered");
+
+            // PRIMARY: Check for end-of-generation token (this takes priority)
+            if (llama_vocab_is_eog(context_info->model_info->vocab, new_token)) [[likely]] {
+                LLAMA_LOG("End of generation token encountered - natural completion");
                 break;
-            }            // Convert token to text
+            }
+
+            // Convert token to text and add to response
             auto token_text = convert_token_to_text(new_token, context_info->model_info);
             if (!token_text.empty()) [[likely]] {
-                response += std::move(token_text); // C++17: Use move semantics
+                response += std::move(token_text);
             } else [[unlikely]] {
                 std::string warning_msg;
                 warning_msg.reserve(48);
@@ -485,7 +492,8 @@ public:
                 LLAMA_LOG(std::move(warning_msg));
                 continue;
             }
-              // Add token to batch and decode
+
+            // Add token to batch and decode
             if (!add_token_to_batch(new_token, context_info->n_past, seq_ids, true)) [[unlikely]] {
                 LLAMA_LOG("Error: Failed to add token to batch during generation");
                 return "Error: Token processing failed";
@@ -493,7 +501,6 @@ public:
             
             if (context_info->batch.n_tokens > 0 && 
                 llama_decode(context_info->context, context_info->batch) != 0) [[unlikely]] {
-                // C++17 optimization: Efficient error message
                 std::string error_msg;
                 error_msg.reserve(64);
                 error_msg.append("Error: Failed to decode during generation at token ")
@@ -504,6 +511,11 @@ public:
             
             context_info->n_past++;
             n_generated++;
+
+            // Optional: Soft limit warning (but don't break)
+            if (n_generated >= max_new_tokens) [[unlikely]] {
+                LLAMA_LOG("Warning: Exceeded predicted token count, continuing until EOS or context limit");
+            }
         }        // Update performance statistics - C++17 optimized
         const auto generation_end = std::chrono::high_resolution_clock::now();
         context_info->last_decode_time_us = std::chrono::duration_cast<std::chrono::microseconds>(generation_end - generation_start).count();
