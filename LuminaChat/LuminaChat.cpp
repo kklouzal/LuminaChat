@@ -43,12 +43,14 @@
 #include <wx/scrolwin.h>
 #include <wx/timer.h>
 #include <wx/datetime.h>
+#include <wx/listbox.h>
 #include <string>
 #include <cstdint>
 #include <memory>
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <algorithm>
 #include "LlamaManager.hpp"
 #include "DiscordManager.hpp" 
 #include "SettingsManager.hpp"
@@ -787,8 +789,7 @@ private:
     
     // Context monitoring timer
     wxTimer* context_monitor_timer;
-    
-    // UI controls with better organization
+      // UI controls with better organization
     struct UIControls {
         wxButton *start_btn, *stop_btn, *settings_btn, *discord_btn, *prune_btn, *summary_slots_btn;
         wxGauge* progress_bar;
@@ -799,6 +800,7 @@ private:
         wxStaticBoxSizer* context_buffer_box;
         wxRichTextCtrl* chat_history;
         wxTextCtrl *input_text, *logs_text, *summaries_text;
+        wxListBox* message_history_list;
         wxNotebook* notebook;
         wxPanel* main_panel;
     } ui;
@@ -959,12 +961,12 @@ private:
         // Initialize cache stats display
         UpdateCacheStats();
     }
-    
-    void CreateNotebook() {
+      void CreateNotebook() {
         ui.notebook = new wxNotebook(ui.main_panel, wxID_ANY);
         
         CreateChatTab();
         CreateSummariesTab();
+        CreateMessageHistoryTab();
         CreateLogsTab();
     }
     
@@ -999,6 +1001,30 @@ private:
         sizer->Add(ui.summaries_text, 1, wxEXPAND | wxALL, 5);
         panel->SetSizer(sizer);
         ui.notebook->AddPage(panel, "Summaries");
+    }
+    
+    void CreateMessageHistoryTab() {
+        auto* panel = new wxPanel(ui.notebook);
+        auto* sizer = new wxBoxSizer(wxVERTICAL);
+        
+        // Add a refresh button at the top
+        auto* refresh_btn = new wxButton(panel, wxID_ANY, "Refresh Message History");
+        sizer->Add(refresh_btn, 0, wxEXPAND | wxALL, 5);
+        
+        // Create the listbox for message history
+        ui.message_history_list = new wxListBox(panel, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                              0, nullptr, wxLB_SINGLE | wxLB_HSCROLL);
+        ui.message_history_list->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+        
+        sizer->Add(ui.message_history_list, 1, wxEXPAND | wxALL, 5);
+        
+        // Bind refresh button event
+        refresh_btn->Bind(wxEVT_COMMAND_BUTTON_CLICKED, [this](wxCommandEvent&) {
+            RefreshMessageHistory();
+        });
+        
+        panel->SetSizer(sizer);
+        ui.notebook->AddPage(panel, "Message History");
     }
     
     void CreateLogsTab() {
@@ -1455,12 +1481,14 @@ private:
             if (main_context) {
                 main_context->reset_performance_stats();
             }
-            
-            // Reset generation stats display
+              // Reset generation stats display
             ui.gen_stats_label->SetLabel("Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");
             
             // Initialize cache stats display after model is loaded
             UpdateCacheStats();
+            
+            // Initialize message history display
+            RefreshMessageHistory();
         } else {
             LLAMA_LOG_ERROR("Failed to load model or create context");
         }
@@ -1501,10 +1529,15 @@ private:
         
         // Reset streaming state
         is_streaming_response = false;
-        current_stream_position = 0;
-          UpdateButtonStates();
+        current_stream_position = 0;          UpdateButtonStates();
         LLAMA_LOG("LuminaChat stopped.");
         ui.gen_stats_label->SetLabel("Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");
+        
+        // Clear message history display when model is stopped
+        if (ui.message_history_list) {
+            ui.message_history_list->Clear();
+            ui.message_history_list->Append("Model stopped - no message history available");
+        }
     }
     
     void OnConnectDiscord(wxCommandEvent& event) {
@@ -1651,8 +1684,7 @@ private:
             UpdateButtonStates();
             AddSystemMessage("Error: Failed to start response generation thread");
         }
-    }
-      void OnResponseReady(wxCommandEvent& event) {
+    }      void OnResponseReady(wxCommandEvent& event) {
         is_processing = false;
         worker_thread = nullptr; // Thread is detached and will clean itself up
         
@@ -1681,6 +1713,9 @@ private:
             
             // Update cache statistics after response generation
             UpdateCacheStats();
+            
+            // Refresh message history to show the new conversation state
+            RefreshMessageHistory();
         }
         
         UpdateButtonStates();
@@ -1689,8 +1724,7 @@ private:
         // Auto-scroll to bottom
         ui.chat_history->SetInsertionPointEnd();
         ui.chat_history->ShowPosition(ui.chat_history->GetLastPosition());
-    }
-      // Token streaming event handler for real-time response display
+    }// Token streaming event handler for real-time response display
     void OnTokenStream(wxCommandEvent& event) {
         wxString token_text = event.GetString();
         
@@ -1712,8 +1746,28 @@ private:
             ui.chat_history->EndBold();
         }
         
-        // Append the token text immediately
-        ui.chat_history->WriteText(token_text);
+        // Handle line breaks properly - replace \n with proper line breaks
+        wxString processed_text = token_text;
+        processed_text.Replace("\n", "\n", true); // Ensure newlines are preserved
+        
+        // For wxRichTextCtrl, we need to handle newlines explicitly
+        if (processed_text.Contains('\n')) {
+            // Split on newlines and write each part, adding line breaks manually
+            wxArrayString lines = wxSplit(processed_text, '\n');
+            for (size_t i = 0; i < lines.GetCount(); ++i) {
+                if (i > 0) {
+                    // Add a line break for subsequent lines
+                    ui.chat_history->Newline();
+                }
+                if (!lines[i].IsEmpty()) {
+                    ui.chat_history->WriteText(lines[i]);
+                }
+            }
+        } else {
+            // No newlines, write directly
+            ui.chat_history->WriteText(processed_text);
+        }
+        
         ui.chat_history->SetInsertionPointEnd();
         ui.chat_history->ShowPosition(ui.chat_history->GetLastPosition());
         
@@ -1804,6 +1858,51 @@ private:
         } else {
             ui.context_label->SetLabel("Buffer: 0/0");
             ui.context_progress_bar->SetValue(0);
+        }
+    }
+    
+    void RefreshMessageHistory() {
+        if (!ui.message_history_list || !is_started || !llama_manager) {
+            return;
+        }
+        
+        // Clear existing items
+        ui.message_history_list->Clear();
+        
+        // Get the main chat context
+        auto main_context = llama_manager->get_context_info("main_chat");
+        if (!main_context) {
+            ui.message_history_list->Append("No main chat context available");
+            return;
+        }
+        
+        // Add each message to the listbox
+        if (main_context->message_history.empty()) {
+            ui.message_history_list->Append("No messages in history");        } else {
+            for (size_t i = 0; i < main_context->message_history.size(); ++i) {
+                const auto& msg = main_context->message_history[i];
+                
+                // Format: [index] role: content (truncated if too long)
+                std::string content = msg.second;  // content is the second element of the pair
+                if (content.length() > 100) {
+                    content = content.substr(0, 97) + "...";
+                }
+                
+                // Replace newlines with spaces for better display
+                std::replace(content.begin(), content.end(), '\n', ' ');
+                std::replace(content.begin(), content.end(), '\r', ' ');
+                
+                wxString formatted = wxString::Format("[%zu] %s: %s", 
+                                                    i, 
+                                                    wxString::FromUTF8(msg.first),   // role is the first element of the pair
+                                                    wxString::FromUTF8(content));
+                ui.message_history_list->Append(formatted);
+            }
+        }
+        
+        // Scroll to the bottom to show most recent messages
+        if (ui.message_history_list->GetCount() > 0) {
+            ui.message_history_list->SetSelection(ui.message_history_list->GetCount() - 1);
         }
     }
 };
