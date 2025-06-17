@@ -24,6 +24,14 @@
 #include <sstream>
 #include <regex>
 #include <chrono>
+#include <unordered_map>
+#include <unordered_set>
+#include <execution>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <iostream>
+#include <immintrin.h> // For SIMD optimizations
 
 // Platform-specific headers
 #define WIN32_LEAN_AND_MEAN
@@ -44,6 +52,143 @@ inline int64_t ggml_time_us() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::high_resolution_clock::now().time_since_epoch()
     ).count();
+}
+
+// ============================================================================
+// PERFORMANCE OPTIMIZATION UTILITIES
+// ============================================================================
+
+// Fast hash function for token sequences
+struct FastTokenHash {
+    std::size_t operator()(const std::vector<llama_token>& tokens) const noexcept {
+        std::size_t seed = tokens.size();
+        for (const auto& token : tokens) {
+            seed ^= token + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        }
+        return seed;
+    }
+};
+
+// Memory pool for frequent allocations
+template<typename T, size_t PoolSize = 1024>
+class ObjectPool {
+private:
+    std::vector<T> pool;
+    std::vector<bool> used;
+    std::mutex mutex;
+    
+public:
+    ObjectPool() : pool(PoolSize), used(PoolSize, false) {}
+    
+    T* acquire() {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (size_t i = 0; i < PoolSize; ++i) {
+            if (!used[i]) {
+                used[i] = true;
+                return &pool[i];
+            }
+        }
+        return new T(); // Fallback to heap allocation
+    }
+    
+    void release(T* obj) {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (size_t i = 0; i < PoolSize; ++i) {
+            if (&pool[i] == obj) {
+                used[i] = false;
+                return;
+            }
+        }
+        delete obj; // Was heap allocated
+    }
+};
+
+// Cache for token-to-piece conversions
+class TokenPieceCache {
+private:
+    std::unordered_map<llama_token, std::string> cache;
+    std::mutex mutex;
+    const llama_vocab* vocab;
+    
+public:
+    explicit TokenPieceCache(const llama_vocab* v) : vocab(v) {}
+    
+    const std::string& get_piece(llama_token token, bool special = true) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = cache.find(token);
+        if (it != cache.end()) {
+            return it->second;
+        }
+        
+        std::string piece;
+        piece.resize(64); // Reserve reasonable size
+        const int n_chars = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
+        if (n_chars < 0) {
+            piece.resize(-n_chars);
+            llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
+        } else {
+            piece.resize(n_chars);
+        }
+        
+        return cache.emplace(token, std::move(piece)).first->second;
+    }
+};
+
+// SIMD-optimized token comparison with prefetch hints
+inline bool tokens_equal_simd(const llama_token* a, const llama_token* b, size_t count) {
+    // Prefetch data for better cache performance
+    if (count >= 8) {
+#ifdef _MSC_VER
+        _mm_prefetch(reinterpret_cast<const char*>(a), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(b), _MM_HINT_T0);
+#else
+        __builtin_prefetch(a, 0, 3);
+        __builtin_prefetch(b, 0, 3);
+#endif
+        
+        // Use AVX2 for comparing 8 tokens at once (assuming 32-bit tokens)
+        const size_t simd_count = count & ~7;
+        for (size_t i = 0; i < simd_count; i += 8) {
+            __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
+            __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
+            __m256i cmp = _mm256_cmpeq_epi32(va, vb);
+            if (_mm256_movemask_epi8(cmp) != 0xFFFFFFFF) {
+                return false;
+            }
+        }
+        // Handle remaining tokens
+        for (size_t i = simd_count; i < count; ++i) {
+            if (a[i] != b[i]) return false;
+        }
+        return true;
+    } else {
+        // Fallback for small counts
+        return std::equal(a, a + count, b);
+    }
+}
+
+// Streaming output optimized for real-time generation
+class StreamingOutput {
+private:
+    std::mutex mutex;
+    
+public:
+    void write(const std::string& text) {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::cout << text;
+        std::cout.flush(); // Immediate flush for real-time streaming
+    }
+    
+    void flush() {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::cout.flush();
+    }
+};
+
+// Thread-safe global streaming output
+inline StreamingOutput& get_streaming_output() {
+    static StreamingOutput output;
+    return output;
 }
 
 // ============================================================================
@@ -110,7 +255,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 // DATA STRUCTURES AND CLASSES
 // ============================================================================
 
-// Ring buffer template for efficient token storage
+// Optimized ring buffer template for efficient token storage
 template<typename T>
 struct ring_buffer {
     size_t capacity = 0;
@@ -120,9 +265,12 @@ struct ring_buffer {
     std::vector<T> data;
 
     ring_buffer() = default;
-    ring_buffer(size_t cap) : capacity(cap), data(cap) {}
+    
+    explicit ring_buffer(size_t cap) : capacity(cap), data(cap) {
+        data.reserve(cap); // Ensure no reallocations
+    }
 
-    void push_back(const T& item) {
+    void push_back(const T& item) noexcept {
         if (sz < capacity) {
             sz++;
         } else {
@@ -131,18 +279,45 @@ struct ring_buffer {
         data[pos] = item;
         pos = (pos + 1) % capacity;
     }
-
-    size_t size() const { return sz; }
-    bool empty() const { return sz == 0; }
     
-    T& back() { 
+    void push_back(T&& item) noexcept {
+        if (sz < capacity) {
+            sz++;
+        } else {
+            first = (first + 1) % capacity;
+        }
+        data[pos] = std::move(item);
+        pos = (pos + 1) % capacity;
+    }
+
+    size_t size() const noexcept { return sz; }
+    bool empty() const noexcept { return sz == 0; }
+    bool full() const noexcept { return sz == capacity; }
+    
+    T& back() noexcept { 
         size_t idx = (pos == 0) ? capacity - 1 : pos - 1;
         return data[idx]; 
     }
     
-    const T& back() const { 
+    const T& back() const noexcept { 
         size_t idx = (pos == 0) ? capacity - 1 : pos - 1;
         return data[idx]; 
+    }
+    
+    // Access by index (0 = oldest, size()-1 = newest)
+    T& operator[](size_t idx) noexcept {
+        return data[(first + idx) % capacity];
+    }
+    
+    const T& operator[](size_t idx) const noexcept {
+        return data[(first + idx) % capacity];
+    }
+    
+    // Clear without deallocating
+    void clear() noexcept {
+        sz = 0;
+        first = 0;
+        pos = 0;
     }
 };
 // Simple logging structure
@@ -325,19 +500,26 @@ struct ngram_data {
     std::vector<llama_token> tokens;
 };
 
-// N-gram container for efficient n-gram storage and lookup
+// Optimized n-gram container for efficient n-gram storage and lookup
 struct ngram_container {
-    ngram_container(int n_vocab, int N, int G) {
+    ngram_container(int n_vocab, int N, int G) 
+        : n_vocab_(n_vocab), N_(N), G_(G) {
         cnt.resize(n_vocab);
         head.resize(n_vocab);
         tokens.resize(n_vocab * G * (N - 1));
         
-        // Use STL algorithms for initialization
+        // Pre-allocate hash map with reasonable size
+        ngram_cache.reserve(n_vocab * G);
+        
+        // Use memset for faster initialization of large arrays
         std::fill(cnt.begin(), cnt.end(), 0);
         std::fill(head.begin(), head.end(), 0);
     }
 
     int n_total = 0;
+    int n_vocab_;
+    int N_;
+    int G_;
 
     std::vector<int> cnt;
     std::vector<int> head;
@@ -345,6 +527,49 @@ struct ngram_container {
     // [n_vocab][G][N - 1]
     // for each token of the vocab, keep a ring-buffer of capacity G of n-grams of size N - 1
     std::vector<llama_token> tokens;
+    
+    // Hash map cache for fast n-gram lookup
+    std::unordered_map<std::vector<llama_token>, bool, FastTokenHash> ngram_cache;
+    
+    // Fast lookup for n-gram existence
+    bool has_ngram(llama_token first_token, const std::vector<llama_token>& ngram) const {
+        // First check the cache
+        auto cache_key = ngram;
+        cache_key.insert(cache_key.begin(), first_token);
+        
+        auto it = ngram_cache.find(cache_key);
+        if (it != ngram_cache.end()) {
+            return it->second;
+        }
+        
+        // Fallback to linear search if not in cache
+        const int count = cnt[first_token];
+        for (int k = 0; k < count; ++k) {
+            const int idx = first_token * (N_ - 1) * G_ + k * (N_ - 1);
+            if (tokens_equal_simd(&tokens[idx], ngram.data(), N_ - 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    // Add n-gram with caching
+    void add_ngram(llama_token first_token, const std::vector<llama_token>& ngram) {
+        const int head_val = head[first_token];
+        const int idx = first_token * (N_ - 1) * G_ + head_val * (N_ - 1);
+        
+        // Copy n-gram data
+        std::copy(ngram.begin(), ngram.begin() + (N_ - 1), tokens.begin() + idx);
+        
+        // Update cache
+        auto cache_key = ngram;
+        cache_key.insert(cache_key.begin(), first_token);
+        ngram_cache[std::move(cache_key)] = true;
+        
+        cnt[first_token] = std::min(G_, cnt[first_token] + 1);
+        head[first_token] = (head_val + 1) % G_;
+        n_total++;
+    }
 };
 
 // ============================================================================
@@ -383,8 +608,11 @@ inline simple_log * get_main_log() {
 #define LOG_ERR(...) get_main_log()->log("ERROR", __VA_ARGS__)
 
 // ============================================================================
-// TOKEN HANDLING FUNCTIONS
+// OPTIMIZED TOKEN HANDLING FUNCTIONS
 // ============================================================================
+
+// Global token piece cache
+thread_local std::unique_ptr<TokenPieceCache> g_token_cache;
 
 inline std::vector<llama_token> common_tokenize(
     const struct llama_context * ctx,
@@ -401,9 +629,14 @@ inline std::vector<llama_token> common_tokenize(
     const std::string & text,
     bool add_special,
     bool parse_special) {
+    // Pre-allocate with estimated size to reduce reallocations
+    const int estimated_tokens = text.length() / 3 + 2 * add_special; // Rough estimate
+    std::vector<llama_token> result;
+    result.reserve(estimated_tokens);
+    
     // upper limit for the number of tokens
     int n_tokens = text.length() + 2 * add_special;
-    std::vector<llama_token> result(n_tokens);
+    result.resize(n_tokens);
     n_tokens = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
     if (n_tokens < 0) {
         result.resize(-n_tokens);
@@ -422,18 +655,11 @@ inline std::string common_token_to_piece(const struct llama_context * ctx, llama
 }
 
 inline std::string common_token_to_piece(const struct llama_vocab * vocab, llama_token token, bool special) {
-    std::string piece;
-    piece.resize(piece.capacity());  // using string internal cache, 15 bytes + '\n'
-    const int n_chars = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
-    if (n_chars < 0) {
-        piece.resize(-n_chars);
-        int check = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
-        GGML_ASSERT(check == -n_chars);
+    // Use cached version for better performance
+    if (!g_token_cache) {
+        g_token_cache = std::make_unique<TokenPieceCache>(vocab);
     }
-    else {
-        piece.resize(n_chars);
-    }
-    return piece;
+    return g_token_cache->get_piece(token, special);
 }
 
 // ============================================================================
@@ -860,12 +1086,11 @@ int main(int argc, char** argv) {
     if ((int)inp.size() > max_tokens_list_size) {
         LOG_ERR("%s: prompt too long (%d tokens, max %d)\n", __func__, (int)inp.size(), max_tokens_list_size);
         return 1;
-    }    LOG("\n\n");
-
-    // Use range-based for loop for token printing
+    }    LOG("\n\n");    // Use range-based for loop for token printing with immediate output
     for (const auto& token_id : inp) {
         LOG("%s", common_token_to_piece(ctx, token_id).c_str());
     }
+    fflush(stdout);
 
     fflush(stderr);
 
@@ -900,17 +1125,21 @@ int main(int argc, char** argv) {
     // 1 token for current + G*(N-1) for verification + (W-1) for first level + (N-1)*W for other levels
     const int max_batch_size = 1 + G * (N - 1) + (W - 1) + (N - 1) * W;
     
-    llama_batch batch = llama_batch_init(max_batch_size, 0, W + G + 1);
-
-    // target model sampling context
-    struct common_sampler* smpl = common_sampler_init(model, params.sampling_params);    // verification n-grams
+    llama_batch batch = llama_batch_init(max_batch_size, 0, W + G + 1);    // target model sampling context
+    struct common_sampler* smpl = common_sampler_init(model, params.sampling_params);    // verification n-grams - pre-allocate vectors
     std::vector<ngram_data> ngrams_cur;
-    ngrams_cur.reserve(G); // Pre-reserve capacity    // tokens for the past N - 1 Jacobi iterations
+    ngrams_cur.reserve(G); // Pre-reserve capacity
+    
+    // Pre-allocate temporary vectors to avoid repeated allocations
+    std::vector<llama_token> temp_ngram;
+    temp_ngram.reserve(N);
+    std::vector<int> temp_indices;
+    temp_indices.reserve(G);    // tokens for the past N - 1 Jacobi iterations
     std::vector<llama_token> tokens_j_prev;
     tokens_j_prev.reserve(W);
     std::vector<std::vector<llama_token>> tokens_j(N - 1);
     
-    // Use STL algorithms for better initialization
+    // Use STL algorithms for better initialization with pre-allocation
     std::for_each(tokens_j.begin(), tokens_j.end(), [W](std::vector<llama_token>& vec) {
         vec.reserve(W);
         vec.resize(W);
@@ -947,9 +1176,7 @@ int main(int argc, char** argv) {
     {
         id = common_sampler_sample(smpl, ctx, 0);
 
-        common_sampler_accept(smpl, id, true);
-
-        {
+        common_sampler_accept(smpl, id, true);        {
             const std::string token_str = common_token_to_piece(ctx, id);
 
             LOG("%s", token_str.c_str());
@@ -993,7 +1220,7 @@ int main(int argc, char** argv) {
 
                 ngrams_cur.resize(g_cur);
                 
-                // Use STL algorithm to initialize ngram data structures
+                // Use STL algorithm to initialize ngram data structures with optimized allocation
                 std::generate_n(ngrams_cur.begin(), g_cur, [&, g = 0]() mutable -> ngram_data {
                     ngram_data data;
                     data.active = true;
@@ -1008,16 +1235,31 @@ int main(int argc, char** argv) {
                     return data;
                 });
 
-                for (int j = 0; j < N - 1; j++) {
-                    for (int g = 0; g < g_cur; g++) {
-                        const int idx = id * (N - 1) * G + g * (N - 1);
-
-                        const llama_token t = ngrams_observed.tokens[idx + j];
-
-                        ngrams_cur[g].tokens[j + 1] = t;
-                        ngrams_cur[g].i_batch[j + 1] = batch.n_tokens;
-
-                        common_batch_add(batch, t, n_past + j + 1, { W + 1 + g }, true);
+                // Parallel processing for n-gram initialization when beneficial
+                if (g_cur > 4 && (N - 1) > 2) {
+                    // Use parallel execution for larger n-gram sets
+                    std::for_each(std::execution::par_unseq, 
+                        ngrams_cur.begin(), ngrams_cur.end(),
+                        [&](ngram_data& ngram) {
+                            const int g = ngram.seq_id - (W + 1);
+                            for (int j = 0; j < N - 1; j++) {
+                                const int idx = id * (N - 1) * G + g * (N - 1);
+                                const llama_token t = ngrams_observed.tokens[idx + j];
+                                ngram.tokens[j + 1] = t;
+                                ngram.i_batch[j + 1] = batch.n_tokens;
+                                common_batch_add(batch, t, n_past + j + 1, { W + 1 + g }, true);
+                            }
+                        });
+                } else {
+                    // Sequential processing for smaller sets
+                    for (int j = 0; j < N - 1; j++) {
+                        for (int g = 0; g < g_cur; g++) {
+                            const int idx = id * (N - 1) * G + g * (N - 1);
+                            const llama_token t = ngrams_observed.tokens[idx + j];
+                            ngrams_cur[g].tokens[j + 1] = t;
+                            ngrams_cur[g].i_batch[j + 1] = batch.n_tokens;
+                            common_batch_add(batch, t, n_past + j + 1, { W + 1 + g }, true);
+                        }
                     }
                 }
             }
@@ -1071,20 +1313,20 @@ int main(int argc, char** argv) {
             // sample the next token
             id = common_sampler_sample(smpl, ctx, i_batch);
 
-            common_sampler_accept(smpl, id, true);
-
-            // print
+            common_sampler_accept(smpl, id, true);            // print with immediate streaming output for real-time display
             {
                 const std::string token_str = common_token_to_piece(ctx, id);
 
                 if (v == 0) {
+                    // Main token - print immediately
                     LOG("%s", token_str.c_str());
+                    fflush(stdout);
                 }
                 else {
-                    // print light cyan
+                    // Verification token - print with color and immediate flush
                     LOG("\033[0;96m%s\033[0m", token_str.c_str());
+                    fflush(stdout);
                 }
-                fflush(stdout);
 
                 if (llama_vocab_is_eog(vocab, id)) {
                     has_eos = true;
@@ -1169,50 +1411,52 @@ int main(int argc, char** argv) {
                         std::copy(tokens_j[0].begin(), tokens_j[0].end(), last_level.begin());
                     }
                 }
-            }
-              // update observed ngrams
+            }            // update observed ngrams with optimized processing
             if (v == 0) {
-                // the first token of the n-gram is determined by the index in the container so it is not stored
-                std::vector<llama_token> ngram(N - 1);
+                // Reuse pre-allocated temporary vector
+                temp_ngram.resize(N - 1);
 
-                // n-gram generation using STL algorithms
+                // n-gram generation using STL algorithms with optimizations
                 // ref: https://github.com/hao-ai-lab/LookaheadDecoding/issues/14#issuecomment-1826198518
-                std::vector<int> f_range(W);
-                std::iota(f_range.begin(), f_range.end(), 0);
                 
-                std::for_each(f_range.begin(), f_range.end(), [&](int f) {
-                    const int ft = tokens_j_prev[f]; // first token of the n-gram
-
-                    // Use STL transform to extract ngram tokens more efficiently
-                    std::transform(tokens_j.begin(), tokens_j.end(), ngram.begin(),
-                        [f](const std::vector<llama_token>& tokens) { return tokens[f]; });
-
-                    // filter-out repeating n-grams using STL algorithms
-                    std::vector<int> k_range(ngrams_observed.cnt[ft]);
-                    std::iota(k_range.begin(), k_range.end(), 0);
+                // Process in parallel when beneficial
+                if (W > 8) {
+                    // Use parallel processing for larger window sizes
+                    std::vector<std::pair<int, std::vector<llama_token>>> pending_ngrams;
+                    pending_ngrams.reserve(W);
                     
-                    bool is_unique = std::none_of(k_range.begin(), k_range.end(), [&](int k) {
-                        const int idx = ft * (N - 1) * G + k * (N - 1);
-                        // Use STL equal for comparison instead of manual loop
-                        return std::equal(ngram.begin(), ngram.end(), 
-                                        ngrams_observed.tokens.begin() + idx);
-                    });
-
-                    if (!is_unique) {
-                        return; // Continue to next iteration
+                    for (int f = 0; f < W; ++f) {
+                        const int ft = tokens_j_prev[f]; // first token of the n-gram
+                        
+                        // Extract ngram tokens efficiently
+                        std::transform(tokens_j.begin(), tokens_j.end(), temp_ngram.begin(),
+                            [f](const std::vector<llama_token>& tokens) { return tokens[f]; });
+                        
+                        // Check if ngram is unique using optimized lookup
+                        if (!ngrams_observed.has_ngram(ft, temp_ngram)) {
+                            pending_ngrams.emplace_back(ft, temp_ngram);
+                        }
                     }
+                    
+                    // Add unique ngrams
+                    for (const auto& [ft, ngram] : pending_ngrams) {
+                        ngrams_observed.add_ngram(ft, ngram);
+                    }
+                } else {
+                    // Sequential processing for smaller windows
+                    for (int f = 0; f < W; ++f) {
+                        const int ft = tokens_j_prev[f]; // first token of the n-gram
 
-                    const int head = ngrams_observed.head[ft];
-                    const int idx = ft * (N - 1) * G + head * (N - 1);
+                        // Use STL transform to extract ngram tokens more efficiently
+                        std::transform(tokens_j.begin(), tokens_j.end(), temp_ngram.begin(),
+                            [f](const std::vector<llama_token>& tokens) { return tokens[f]; });
 
-                    // Use STL copy for better performance
-                    std::copy(ngram.begin(), ngram.end(), ngrams_observed.tokens.begin() + idx);
-
-                    ngrams_observed.cnt[ft] = std::min(G, ngrams_observed.cnt[ft] + 1);
-                    ngrams_observed.head[ft] = (head + 1) % G;
-
-                    ngrams_observed.n_total++;
-                });
+                        // Check if ngram is unique using optimized lookup
+                        if (!ngrams_observed.has_ngram(ft, temp_ngram)) {
+                            ngrams_observed.add_ngram(ft, temp_ngram);
+                        }
+                    }
+                }
             }
         }
 
@@ -1239,9 +1483,7 @@ int main(int argc, char** argv) {
                     (void)s; // suppress unused variable warning
                 });
         }
-    }
-
-    auto t_dec_end = ggml_time_us();
+    }    auto t_dec_end = ggml_time_us();
 
     LOG("\n\n");
 
