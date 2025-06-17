@@ -118,9 +118,8 @@ private:
     // Lookahead configuration
     LookaheadConfig lookahead_config;
     
-public:
-    LlamaManager() : token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE) {
-        // Initialize lookahead with default configuration (disabled)
+public:    LlamaManager() : token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE) {
+        // Initialize lookahead with default configuration (enabled by default)
         lookahead_config.enabled = true;
         lookahead_config.window_size = ResponseConstants::DEFAULT_LOOKAHEAD_WINDOW;
         lookahead_config.ngram_size = ResponseConstants::DEFAULT_NGRAM_SIZE;
@@ -574,7 +573,7 @@ public:
                      std::to_string(lookahead_config.ngram_size) + ", G=" + 
                      std::to_string(lookahead_config.max_verification) + ")");
         } else {
-            LLAMA_LOG("Delegating to LlamaResponse for token generation with standard decoding");
+            LLAMA_LOG("WARNING: Lookahead is disabled - generation may fail");
         }
         
         std::string response = response_generator.generate_response("generate", "assistant", target_context, token_adder, context_updater);

@@ -1,30 +1,29 @@
 # LlamaManager Lookahead Integration
 
 ## Overview
-The LlamaManager class now includes full support for lookahead decoding, which can significantly improve text generation performance by using speculative execution and n-gram pattern matching.
+The LlamaManager class uses **only lookahead decoding** for all text generation. Standard sequential token generation has been completely removed in favor of the superior lookahead decoding approach.
 
 ## How It Works
-The integration is automatic and seamless:
-1. **LlamaManager** handles lookahead configuration and status
-2. **LlamaResponse** automatically uses lookahead when enabled
-3. No changes needed to existing generation code
+Lookahead decoding is automatic and mandatory:
+1. **LlamaManager** always has lookahead enabled by default  
+2. **LlamaResponse** uses only lookahead decoding for all generation
+3. All existing generation code continues to work with improved performance
 
 ## Configuration Methods
 
-### 1. Enable with Default Parameters
+### 1. Enabled by Default
 ```cpp
 LlamaManager manager;
-manager.enable_lookahead();
-// Uses: W=15, N=5, G=15 (window=15, ngram_size=5, max_verification=15)
+// Lookahead is automatically enabled with optimal defaults: W=15, N=5, G=15
 ```
 
-### 2. Enable with Custom Parameters
+### 2. Customize Parameters (Optional)
 ```cpp
 manager.enable_lookahead(20, 4, 10);
 // W=20, N=4, G=10
 ```
 
-### 3. Advanced Configuration
+### 3. Advanced Configuration (Optional)
 ```cpp
 LookaheadConfig config;
 config.enabled = true;
@@ -34,9 +33,10 @@ config.max_verification = 8;    // G - max verification n-grams
 manager.configure_lookahead(config);
 ```
 
-### 4. Disable Lookahead
+### 4. Disable Lookahead (Not Recommended)
 ```cpp
 manager.disable_lookahead();
+// WARNING: This will cause generation failures since standard generation is removed
 ```
 
 ## Status and Monitoring
@@ -56,17 +56,14 @@ std::cout << "W=" << config.window_size
 
 ## Automatic Usage
 
-Once configured, lookahead is used automatically in all text generation:
+Lookahead is used automatically in all text generation:
 
 ```cpp
 // Load model and create context (standard setup)
 manager.load_model("model.gguf", "my_model");
 manager.create_context("main_context", "my_model", "You are a helpful assistant.");
 
-// Enable lookahead
-manager.enable_lookahead(15, 5, 15);
-
-// Generate response - lookahead is used automatically
+// Generate response - lookahead is used automatically (no configuration needed)
 auto* context = manager.get_context_info("main_context");
 std::string response = manager.generate_response("Hello!", context);
 ```
@@ -107,7 +104,7 @@ manager.enable_lookahead(32, 8, 32);
 The system automatically validates configurations:
 - Invalid parameters are rejected with log messages
 - Out-of-range values are caught and logged
-- Graceful fallback to standard generation if lookahead fails
+- Generation fails if lookahead cannot be initialized (no fallback)
 
 ## Logging
 
@@ -120,26 +117,22 @@ Lookahead generated 45 tokens in 234.5ms (192.1 t/s, 73.3% acceptance)
 
 ## Migration from Standard Generation
 
-**No code changes required!** Existing generation code works exactly the same:
+**No code changes required!** Existing generation code now uses lookahead automatically:
 
 ```cpp
-// This code works with or without lookahead
+// This code automatically uses lookahead (no changes needed)
 std::string response = manager.generate_response(input, context, username);
 ```
 
-The only change is enabling lookahead before generation:
-```cpp
-manager.enable_lookahead(); // Add this line
-std::string response = manager.generate_response(input, context, username); // No changes
-```
+All existing generation code receives the performance benefits of lookahead decoding without any modifications.
 
 ## Best Practices
 
-1. **Enable lookahead after model loading** but before generation
-2. **Use default parameters** initially, then tune based on performance needs
+1. **Use default parameters** initially - they're optimized for most use cases
+2. **Tune parameters** based on performance needs and memory constraints
 3. **Monitor memory usage** with aggressive settings on large models
 4. **Check logs** for acceptance rates to validate effectiveness
-5. **Disable for debugging** if you need deterministic token-by-token behavior
+5. **Don't disable** lookahead as there's no fallback generation method
 
 ## Example Integration
 
@@ -154,8 +147,7 @@ int main() {
     manager.load_model("llama-7b.gguf", "main_model");
     manager.create_context("main_context", "main_model", "You are a helpful AI assistant.");
     
-    // Enable lookahead for better performance
-    manager.enable_lookahead(); // Default: W=15, N=5, G=15
+    // Lookahead is automatically enabled - no configuration needed!
     
     // Generate responses - lookahead automatically used
     auto* context = manager.get_context_info("main_context");
@@ -172,4 +164,4 @@ int main() {
 }
 ```
 
-This integration provides significant performance improvements with minimal code changes and maintains full backward compatibility.
+This implementation provides significant performance improvements with zero code changes and is the only generation method available.

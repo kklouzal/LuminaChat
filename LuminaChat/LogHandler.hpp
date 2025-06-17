@@ -1,6 +1,11 @@
 // LogHandler.hpp - header-only implementation for unified logging system
 // Handles centralized logging with component identification and thread safety.
 //
+// DEBUG LOGGING CONTROL:
+// Define LUMINA_ENABLE_DEBUG_LOGGING to enable verbose debug output during generation.
+// When disabled, LLAMA_LOG() and LLAMA_LOG_DEBUG() become no-ops for performance.
+// Error logging (LLAMA_LOG_ERROR) is always enabled regardless of debug setting.
+//
 // Project Settings:
 // C++ Language Standard: ISO C++20 Standard (/std:c++20)
 // C Language Standard: ISO C17 (2018) Standard (/std:c17)
@@ -27,6 +32,11 @@
 // 15. Continuous Refinement: Regularly refactor and confirm that updates preserve stable functionality.
 
 #pragma once
+
+// Debug logging control - uncomment to enable debug output during generation
+// This can significantly slow down generation, so disable in production builds
+// To enable: uncomment the line below or add /D LUMINA_ENABLE_DEBUG_LOGGING to compiler flags
+// #define LUMINA_ENABLE_DEBUG_LOGGING
 
 #include <string>
 #include <functional>
@@ -221,9 +231,18 @@ public:
 #define LOG_WARNING(component, message) LogHandler::warning(LogComponent::component, message)
 #define LOG_ERROR(component, message) LogHandler::error(LogComponent::component, message)
 
-// Component-specific macros
-#define LLAMA_LOG(message) LogHandler::llama_log(message)
+// Component-specific macros with debug control
+#ifdef LUMINA_ENABLE_DEBUG_LOGGING
+    #define LLAMA_LOG(message) LogHandler::llama_log(message)
+    #define LLAMA_LOG_DEBUG(message) LogHandler::llama_log(message)
+#else
+    #define LLAMA_LOG(message) do { } while(0)  // No-op when debug disabled
+    #define LLAMA_LOG_DEBUG(message) do { } while(0)  // No-op when debug disabled
+#endif
+
+// Error logging always enabled regardless of debug setting
 #define LLAMA_LOG_ERROR(message) LogHandler::llama_log(message, LogLevel::ERR)
+
 #define DISCORD_LOG(message) LogHandler::discord_log(message)
 #define DISCORD_LOG_ERROR(message) LogHandler::discord_log(message, LogLevel::ERR)
 #define DISCORD_HISTORY_LOG(message) LogHandler::discord_history_log(message)

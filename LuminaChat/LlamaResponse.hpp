@@ -658,7 +658,7 @@ public:
             ngrams_cur.clear();
             tokens_j_prev.clear();
             tokens_j.clear();
-            LLAMA_LOG("Lookahead decoding disabled");
+            LLAMA_LOG_DEBUG("Lookahead decoding disabled");
         }
     }
     
@@ -688,10 +688,9 @@ public:
         }
         
         // Initialize lookahead structures
-        initialize_lookahead(context_info->model_info, config);
-          if (!config.enabled || !ngrams_observed) {
-            LLAMA_LOG("Falling back to standard generation (lookahead disabled or failed)");
-            return generate_response(input, username, context_info, add_token_to_batch, update_context);
+        initialize_lookahead(context_info->model_info, config);        if (!config.enabled || !ngrams_observed) {
+            LLAMA_LOG("Error: Lookahead decoding is required but disabled or initialization failed");
+            return "Error: Lookahead decoding initialization failed";
         }
 
         // Calculate available space for generation
@@ -703,7 +702,7 @@ public:
                    std::to_string(context_info->n_past) + "/" + std::to_string(context_info->model_info->n_ctx) + ")";
         }
 
-        LLAMA_LOG("Starting lookahead generation with " + std::to_string(max_new_tokens) + " max tokens, n_past=" + std::to_string(context_info->n_past));
+        LLAMA_LOG_DEBUG("Starting lookahead generation with " + std::to_string(max_new_tokens) + " max tokens, n_past=" + std::to_string(context_info->n_past));
 
         // Initialize generation state
         std::string response;
@@ -720,7 +719,7 @@ public:
         std::string token_text = convert_token_to_text(current_id, context_info->model_info);
         if (!token_text.empty()) {
             response += token_text;
-            LLAMA_LOG("First token generated: " + token_text);
+            LLAMA_LOG_DEBUG("First token generated: " + token_text);
         }
           // Count the first token
         n_generated++;
@@ -734,10 +733,11 @@ public:
             for (int32_t s = 1; s < W + G + 1; ++s) {
                 llama_memory_seq_cp(memory, 0, s, -1, -1);
             }
-            LLAMA_LOG("Initialized " + std::to_string(W + G) + " sequences from main sequence");
+            LLAMA_LOG_DEBUG("Initialized " + std::to_string(W + G) + " sequences from main sequence");
         }
           // Main lookahead generation loop
-        while (n_generated < max_new_tokens) {            LLAMA_LOG("Loop iteration: n_generated=" + std::to_string(n_generated) + 
+          while (n_generated < max_new_tokens) {
+              LLAMA_LOG_DEBUG("Loop iteration: n_generated=" + std::to_string(n_generated) + 
                      "/" + std::to_string(max_new_tokens) + ", current_token=" + std::to_string(current_id));
             
             // Check for end-of-generation token
@@ -748,60 +748,23 @@ public:
               // Build lookahead batch
             if (!build_lookahead_batch(current_id, context_info->n_past, 
                                      context_info->model_info, add_token_to_batch)) {
-                LLAMA_LOG("BatchTokenAdder approach failed, using direct lookahead batch building");
-                
-                // Use direct batch building like the working example
+                LLAMA_LOG_DEBUG("BatchTokenAdder approach failed, using direct lookahead batch building");
+                  // Use direct batch building like the working example
                 if (!build_lookahead_batch_direct(current_id, context_info->n_past, context_info)) {
-                    LLAMA_LOG("Error: Direct lookahead batch building failed, falling back to standard generation");
-                    // Fall back to standard token generation
-                    current_id = llama_sampler_sample(context_info->model_info->sampler, context_info->context, -1);
-                    llama_sampler_accept(context_info->model_info->sampler, current_id);
-                    
-                    token_text = convert_token_to_text(current_id, context_info->model_info);
-                    if (!token_text.empty()) {
-                        response += token_text;
-                    }
-                    
-                    n_generated++;
-                    context_info->n_past++;
-                    continue;
+                    LLAMA_LOG("Error: Direct lookahead batch building failed");
+                    return "Error: Lookahead batch building failed - unable to proceed with generation";
                 }
             }
               // Decode the batch with error handling
             int decode_result = llama_decode(context_info->context, context_info->batch);
-            if (decode_result != 0) {
-                LLAMA_LOG("Warning: Failed to decode lookahead batch (error " + std::to_string(decode_result) + "), falling back to standard generation");
-                
-                // Clear KV cache state and fall back to standard generation
-                auto* memory = llama_get_memory(context_info->context);
-                if (memory) {
-                    // Remove problematic sequences
-                    for (int32_t s = 1; s < 32; ++s) {
-                        llama_memory_seq_rm(memory, s, -1, -1);
-                    }
-                }
-                
-                // Generate one token normally
-                current_id = llama_sampler_sample(context_info->model_info->sampler, context_info->context, -1);
-                llama_sampler_accept(context_info->model_info->sampler, current_id);
-                
-                token_text = convert_token_to_text(current_id, context_info->model_info);
-                if (!token_text.empty()) {
-                    response += token_text;
-                }
-                
-                n_generated++;
-                context_info->n_past++;
-                
-                // Update n-grams and continue
-                update_observed_ngrams(current_id);
-                continue;
+            if (decode_result != 0) {                LLAMA_LOG("Error: Failed to decode lookahead batch (error " + std::to_string(decode_result) + ")");
+                return "Error: Lookahead batch decode failed - unable to proceed with generation";
             }            // Verification loop following the working example exactly
             llama_seq_id best_seq_id = 0;
             int32_t total_accepted = 0;
             
             // Log start of verification round
-            LLAMA_LOG("Starting verification round with " + std::to_string(ngrams_cur.size()) + " active n-grams");
+            LLAMA_LOG_DEBUG("Starting verification round with " + std::to_string(ngrams_cur.size()) + " active n-grams");
             
             // Iterate through verification levels like the working example (v = 0 to N)
             for (int32_t v = 0; v < config.ngram_size; ++v) {
@@ -836,11 +799,11 @@ public:
                 if (!token_text.empty()) {
                     if (v == 0) {
                         response += token_text;
-                        LLAMA_LOG("Generated: " + token_text);
+                        LLAMA_LOG_DEBUG("Generated: " + token_text);
                     } else {
                         response += token_text;
                         // Add blue background for lookahead-verified tokens (ANSI code: \033[44m for blue background, \033[0m to reset)
-                        LLAMA_LOG("Verified (lookahead): \033[44m" + token_text + "\033[0m");
+                        LLAMA_LOG_DEBUG("Verified (lookahead): \033[44m" + token_text + "\033[0m");
                     }
                 }
                 
@@ -950,168 +913,13 @@ public:
         }
 
         return response;
-    }
-
-    // Main response generation function
+    }    // Main response generation function - always uses lookahead decoding
     // Dependencies: Requires valid ModelInfo, ContextInfo, and proper LlamaManager integration
     template<typename BatchTokenAdder, typename ContextUpdater>
     std::string generate_response(const std::string& input, const std::string& username,
                                 ContextInfo* context_info,
                                 BatchTokenAdder add_token_to_batch, ContextUpdater update_context) const {
-        // Check if lookahead is enabled and delegate to lookahead method
-        if (lookahead_config.enabled && lookahead_config.validate()) {
-            return generate_response_with_lookahead(input, username, context_info, lookahead_config, add_token_to_batch, update_context);
-        }
-        
-        // Original generation method (preserved for backward compatibility)
-        if (input.empty()) {
-            LLAMA_LOG("Error: input is empty");
-            return "Error: Invalid generation parameters";
-        }
-
-        // Comprehensive validation of all generation components
-        if (!validate_generation_components(context_info, context_info->model_info)) {
-            return "Error: Model components not properly initialized or invalid context state";
-        }// Validate and recover sampler if needed
-        if (!validate_and_recover_sampler(context_info->model_info)) {
-            return "Error: Sampler validation/recovery failed";
-        }
-        
-        // Validate or attempt to recover logits
-        float* logits = llama_get_logits(context_info->context);
-        if (!logits) {
-            if (context_info->n_past > 0) {
-                // Context has been processed but no logits - attempt recovery
-                if (!recover_logits(context_info, context_info->model_info)) {
-                    return "Error: Context state invalid - no logits available and recovery failed";
-                }
-            } else {
-                // n_past == 0, this might be normal for initial generation
-                // We'll try to proceed and let the generation loop handle the decode
-                LLAMA_LOG("Warning: No logits available at n_past=0, will attempt initial decode during generation");
-            }
-        }
-          // Calculate available space for generation
-        const int32_t max_new_tokens = std::min(context_info->model_info->n_predict, 
-                                               context_info->model_info->n_ctx - context_info->n_past - LlamaResponseConstants::TOKEN_SAFETY_MARGIN);
-        
-        if (max_new_tokens <= 0) {
-            return "Error: No space left in context for generation (context: " + 
-                   std::to_string(context_info->n_past) + "/" + std::to_string(context_info->model_info->n_ctx) + ")";
-        }
-
-        LLAMA_LOG("Starting generation with " + std::to_string(max_new_tokens) + " max tokens, n_past=" + std::to_string(context_info->n_past));        // Initialize generation state
-        std::string response;
-        response.reserve(max_new_tokens * LlamaResponseConstants::STRING_RESERVE_MULTIPLIER);
-        
-        auto generation_start = std::chrono::high_resolution_clock::now();
-        int32_t n_generated = 0;
-        std::vector<llama_seq_id> seq_ids = {0};        // Main generation loop
-        while (n_generated < max_new_tokens) {
-            // Periodic sampler validation during long generation
-            if (n_generated % ResponseConstants::SAMPLER_VALIDATION_INTERVAL == 0 && !context_info->model_info->sampler) {
-                LLAMA_LOG("CRITICAL: Sampler became null during generation at token " + std::to_string(n_generated));
-                return "Error: Sampler failed during generation";
-            }
-            
-            // Sample next token
-            llama_token new_token;
-            try {
-                new_token = llama_sampler_sample(context_info->model_info->sampler, context_info->context, -1);
-            } catch (const std::exception& e) {
-                LLAMA_LOG("Exception during token sampling: " + std::string(e.what()));
-                return "Error: Exception during token generation";
-            } catch (...) {
-                LLAMA_LOG("Unknown exception during token sampling");
-                return "Error: Unknown exception during generation";
-            }
-            
-            // Validate generated token
-            if (new_token < 0) {
-                LLAMA_LOG("Error: Invalid token generated: " + std::to_string(new_token));
-                break;
-            }
-            
-            // Check for end-of-generation token
-            if (llama_vocab_is_eog(context_info->model_info->vocab, new_token)) {
-                LLAMA_LOG("End of generation token encountered");
-                break;
-            }
-
-            // Convert token to text
-            std::string token_text = convert_token_to_text(new_token, context_info->model_info);
-            if (token_text.empty()) {
-                LLAMA_LOG("Warning: Empty token text for token " + std::to_string(new_token));
-                continue;
-            }
-            
-            response += token_text;
-
-            // Add token to batch and decode
-            if (!add_token_to_batch(new_token, context_info->n_past, seq_ids, true)) {
-                LLAMA_LOG("Error: Failed to add token to batch during generation");
-                return "Error: Token processing failed";
-            }
-            
-            if (context_info->batch.n_tokens > 0 && llama_decode(context_info->context, context_info->batch) != 0) {
-                LLAMA_LOG("Error: Failed to decode during generation at token " + std::to_string(n_generated));
-                return "Error: Token decode failed";
-            }
-            
-            context_info->n_past++;
-            n_generated++;
-        }
-
-        // Update performance statistics
-        auto generation_end = std::chrono::high_resolution_clock::now();
-        context_info->last_decode_time_us = std::chrono::duration_cast<std::chrono::microseconds>(generation_end - generation_start).count();
-        context_info->total_generation_tokens += n_generated;
-
-        // Log generation performance
-        if (n_generated > 0) {
-            float tokens_per_second = static_cast<float>(n_generated) / (static_cast<float>(context_info->last_decode_time_us) / 1000000.0f);
-            LLAMA_LOG("Generated " + std::to_string(n_generated) + " tokens in " + 
-                     std::to_string(context_info->last_decode_time_us / 1000.0f) + "ms (" + 
-                     std::to_string(tokens_per_second) + " t/s)");
-        }
-        
-        // Do NOT automatically update conversation history - let LlamaManager handle this
-        // The linear flow in LlamaManager will add the response to conversation history
-        if (!response.empty()) {
-            // Update context length using provided updater
-            update_context();
-        }
-
-        // Handle reset-after-generation contexts (e.g., summary contexts)
-        if (context_info->reset_after_generation) {
-            LLAMA_LOG("Context marked for reset after generation (reset_after_generation flag is set)");
-            
-            // Preserve system message but clear everything else
-            std::string saved_system_message = context_info->system_message;
-
-            // Clear context state
-            if (context_info->context) {
-                llama_memory_clear(llama_get_memory(context_info->context), true); // Ensure kv memory/cache is cleared
-            }
-            context_info->n_past = 0;
-            context_info->prev_len = 0;
-            context_info->clear_conversation();
-            
-            // Restore system message for next task
-            if (!saved_system_message.empty()) {
-                context_info->system_message = saved_system_message;
-                context_info->add_message("system", saved_system_message);
-                // Token count will be updated during next context processing
-                LLAMA_LOG("Restored system message for next task");
-            }
-        }
-
-        // Final sampler validation
-        if (!context_info->model_info->sampler) {
-            LLAMA_LOG("WARNING: Sampler is NULL at end of generation!");
-        }
-
-        return response;
+        return generate_response_with_lookahead(input, username, context_info, lookahead_config, add_token_to_batch, update_context);
     }
 };
 
