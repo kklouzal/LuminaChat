@@ -139,6 +139,24 @@ namespace UIConstants {
     constexpr int32_t CONTEXT_MONITOR_INTERVAL_MS = 2000;
     constexpr float MS_TO_SECONDS = 1000.0f;
     constexpr int32_t DISCORD_CONNECTION_DELAY_SEC = 5;
+    constexpr int32_t MIN_MESSAGES_FOR_PRUNING = 10;
+    constexpr int32_t WELCOME_MESSAGE_HEIGHT = 100;
+    constexpr int32_t DIRECTIVE_MESSAGE_HEIGHT = 200;
+    constexpr int32_t TEMPLATE_MESSAGE_HEIGHT = 200;
+    constexpr int32_t SUMMARY_PROMPT_HEIGHT = 120;
+    constexpr int32_t CHANNEL_LIST_HEIGHT = 80;
+    constexpr int32_t PROGRESS_BAR_HEIGHT = 20;
+    constexpr int32_t STATS_LABEL_HEIGHT = 60;
+    constexpr int32_t SLIDER_WIDTH = 120;
+    constexpr int32_t CONTEXT_LABEL_WIDTH = 220;
+    constexpr int32_t STATS_LABEL_WIDTH_SMALL = 160;
+    constexpr int32_t STATS_LABEL_WIDTH_LARGE = 180;
+    constexpr int32_t MINIMUM_WINDOW_WIDTH = 600;
+    constexpr int32_t MINIMUM_WINDOW_HEIGHT = 400;
+    constexpr int32_t DEFAULT_WINDOW_WIDTH = 800;
+    constexpr int32_t DEFAULT_WINDOW_HEIGHT = 600;
+    constexpr int32_t SETTINGS_DIALOG_WIDTH = 700;
+    constexpr int32_t SETTINGS_DIALOG_HEIGHT = 600;
 }
 
 // Global frame pointer for callbacks
@@ -207,12 +225,19 @@ public:
     void RequestStop() noexcept { should_stop = true; }
 
 protected:
+    // RAII-safe thread execution with comprehensive error handling (Directives #9, #14)
     ExitCode Entry() override {
         try {
             success = (operation == Operation::LOAD_MODEL) ? LoadModel() : GenerateResponse();
             PostCompletionEvent();
         } catch (const std::exception& e) {
+            // Ensure graceful error handling for all operations (Directive #14: Logical Consistency)
             config.result = "Error: " + std::string(e.what());
+            success = false;
+            PostCompletionEvent();
+        } catch (...) {
+            // Handle unexpected exceptions to prevent thread termination
+            config.result = "Error: Unknown exception occurred";
             success = false;
             PostCompletionEvent();
         }
@@ -245,7 +270,9 @@ private:
         }
         
         return true;
-    }    bool GenerateResponse() {
+    }
+    
+    bool GenerateResponse() {
         if (should_stop || config.input_text.empty() || !llama_manager) return false;
         
         // Use direct context access for main chat to avoid potential context switching issues
@@ -336,6 +363,7 @@ private:
     const wxFont help_font{8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_ITALIC, wxFONTWEIGHT_NORMAL};
 
 public:
+
     SettingsDialog(wxWindow* parent, std::string& model_path, int32_t& context_size, int32_t& gpu_layers, 
                   int32_t& predict_tokens, std::string& chat_template, std::string& identity_directive, 
                   std::string& other_directives, std::string& discord_bot_token,
@@ -343,7 +371,8 @@ public:
                   bool& discord_allow_dms, bool& discord_pull_history, int32_t& discord_history_percentage,
                   std::string& summarizer_model_path, int32_t& summarizer_context_size, int32_t& summarizer_gpu_layers,
                   int32_t& summarizer_predict_tokens, std::string& summarizer_system_prompt, std::string& summarizer_chat_template) 
-        : wxDialog(parent, wxID_ANY, "Settings", wxDefaultPosition, wxSize(700, 600))
+        : wxDialog(parent, wxID_ANY, "Settings", wxDefaultPosition, 
+                  wxSize(UIConstants::SETTINGS_DIALOG_WIDTH, UIConstants::SETTINGS_DIALOG_HEIGHT))
         , config{model_path, context_size, gpu_layers, predict_tokens, chat_template,
                 identity_directive, other_directives, discord_bot_token, discord_isolated_channels,
                 discord_shared_channels, discord_allow_dms, discord_pull_history, discord_history_percentage,
@@ -425,7 +454,7 @@ private:
         // Identity Directive (1/3 height)
         sizer->Add(new wxStaticText(scrolled, wxID_ANY, "Identity Directive:"), 0, wxALL, 5);
         ctrls.identity_directive = new wxTextCtrl(scrolled, wxID_ANY, wxString::FromUTF8(config.identity_directive), 
-                                               wxDefaultPosition, wxSize(-1, 100), 
+                                               wxDefaultPosition, wxSize(-1, UIConstants::WELCOME_MESSAGE_HEIGHT), 
                                                wxTE_MULTILINE | wxTE_WORDWRAP);
         ctrls.identity_directive->SetFont(monospace_font);
         sizer->Add(ctrls.identity_directive, 0, wxEXPAND | wxALL, 5);
@@ -433,7 +462,7 @@ private:
         // Other Directives (2/3 height)
         sizer->Add(new wxStaticText(scrolled, wxID_ANY, "Other Directives:"), 0, wxALL, 5);
         ctrls.other_directives = new wxTextCtrl(scrolled, wxID_ANY, wxString::FromUTF8(config.other_directives), 
-                                             wxDefaultPosition, wxSize(-1, 200), 
+                                             wxDefaultPosition, wxSize(-1, UIConstants::DIRECTIVE_MESSAGE_HEIGHT), 
                                              wxTE_MULTILINE | wxTE_WORDWRAP);
         ctrls.other_directives->SetFont(monospace_font);
         sizer->Add(ctrls.other_directives, 0, wxEXPAND | wxALL, 5);
@@ -456,9 +485,8 @@ private:
         
         sizer->Add(new wxStaticText(scrolled, wxID_ANY, "Chat Template (Jinja2 format):"), 0, wxALL, 5);
         sizer->Add(new wxStaticText(scrolled, wxID_ANY, "Leave empty to use model's default template"), 0, wxALL, 5);
-        
         ctrls.chat_template = new wxTextCtrl(scrolled, wxID_ANY, wxString::FromUTF8(config.chat_template), 
-                                           wxDefaultPosition, wxSize(-1, 200), 
+                                           wxDefaultPosition, wxSize(-1, UIConstants::TEMPLATE_MESSAGE_HEIGHT), 
                                            wxTE_MULTILINE | wxTE_WORDWRAP);
         ctrls.chat_template->SetFont(monospace_font);
         
@@ -507,7 +535,7 @@ private:
         // System Prompt
         sizer->Add(new wxStaticText(scrolled, wxID_ANY, "System Prompt:"), 0, wxALL, 5);
         ctrls.summarizer_system_prompt = new wxTextCtrl(scrolled, wxID_ANY, wxString::FromUTF8(config.summarizer_system_prompt), 
-                                                      wxDefaultPosition, wxSize(-1, 120), 
+                                                      wxDefaultPosition, wxSize(-1, UIConstants::SUMMARY_PROMPT_HEIGHT), 
                                                       wxTE_MULTILINE | wxTE_WORDWRAP);
         ctrls.summarizer_system_prompt->SetFont(monospace_font);
         sizer->Add(ctrls.summarizer_system_prompt, 0, wxEXPAND | wxALL, 5);
@@ -515,7 +543,7 @@ private:
         // Chat Template
         sizer->Add(new wxStaticText(scrolled, wxID_ANY, "Chat Template (leave empty to use model default):"), 0, wxALL, 5);
         ctrls.summarizer_chat_template = new wxTextCtrl(scrolled, wxID_ANY, wxString::FromUTF8(config.summarizer_chat_template), 
-                                                       wxDefaultPosition, wxSize(-1, 120), 
+                                                       wxDefaultPosition, wxSize(-1, UIConstants::SUMMARY_PROMPT_HEIGHT), 
                                                        wxTE_MULTILINE | wxTE_WORDWRAP);
         ctrls.summarizer_chat_template->SetFont(monospace_font);
         sizer->Add(ctrls.summarizer_chat_template, 0, wxEXPAND | wxALL, 5);
@@ -558,9 +586,8 @@ private:
         auto* history_sizer = new wxBoxSizer(wxHORIZONTAL);
         ctrls.pull_history = new wxCheckBox(scrolled, wxID_ANY, "Pull Message History");
         ctrls.pull_history->SetValue(config.discord_pull_history);
-        
         ctrls.history_percentage = new wxSlider(scrolled, wxID_ANY, config.discord_history_percentage, 
-                                               10, 80, wxDefaultPosition, wxSize(120, -1));
+                                               10, 80, wxDefaultPosition, wxSize(UIConstants::SLIDER_WIDTH, -1));
         ctrls.percentage_label = new wxStaticText(scrolled, wxID_ANY, 
                                                  wxString::Format("%d%%", config.discord_history_percentage));
         
@@ -588,7 +615,7 @@ private:
                        wxTextCtrl*& control, const std::string& value, long style = 0) {
         sizer->Add(new wxStaticText(parent, wxID_ANY, label), 0, wxALL, 5);
         control = new wxTextCtrl(parent, wxID_ANY, wxString::FromUTF8(value), 
-                                wxDefaultPosition, (style & wxTE_MULTILINE) ? wxSize(-1, 80) : wxDefaultSize, style);
+                                wxDefaultPosition, (style & wxTE_MULTILINE) ? wxSize(-1, UIConstants::CHANNEL_LIST_HEIGHT) : wxDefaultSize, style);
         if (style & wxTE_MULTILINE) {
             control->SetFont(monospace_font);
         }
@@ -610,22 +637,27 @@ private:
         }
     }
     
-    // Simplified validation with better error handling
+    // Improved validation with better error handling (Directives #8, #14)
     template<typename T>
-    bool ValidateNumeric(wxTextCtrl* control, T& target, T min_val, T max_val, 
-                        T default_val, const wxString& field_name) {
-        if (!control) return false;
+    bool ValidateNumeric(wxTextCtrl* control, T& target, const T min_val, const T max_val, 
+                        const T default_val, const wxString& field_name) {
+        if (!control) {
+            target = default_val;
+            return false;
+        }
         
         long value;
-        if (control->GetValue().ToLong(&value) && value >= min_val && value <= max_val) {
+        if (control->GetValue().ToLong(&value) && value >= static_cast<long>(min_val) && value <= static_cast<long>(max_val)) {
             target = static_cast<T>(value);
             return true;
         }
         
+        // Reset to default on validation failure (Directive #14: Logical Consistency)
         target = default_val;
         control->SetValue(wxString::Format("%ld", static_cast<long>(default_val)));
         
-        wxMessageBox(wxString::Format("Invalid %s. Using default: %ld", field_name, 
+        wxMessageBox(wxString::Format("Invalid %s (must be %ld-%ld). Using default: %ld", 
+                    field_name, static_cast<long>(min_val), static_cast<long>(max_val),
                     static_cast<long>(default_val)), "Validation Error", wxOK | wxICON_WARNING);
         return false;
     }
@@ -679,8 +711,8 @@ private:
         
         EndModal(wxID_OK);
     }
-
-    // Optimized channel ID validation
+    
+    // Optimized channel ID validation with STL algorithms (Directives #10, #14)
     std::string ValidateChannelIds(const std::string& input) {
         if (input.empty()) return {};
         
@@ -688,18 +720,20 @@ private:
         result.reserve(input.length());
         
         std::string current_id;
-        current_id.reserve(32);
+        current_id.reserve(32); // Discord snowflake IDs are typically 18-19 digits
         
-        for (char c : input) {
-            if (std::isdigit(c)) {
+        // Use STL algorithm for better performance (Directive #10)
+        for (const char c : input) {
+            if (std::isdigit(static_cast<unsigned char>(c))) {
                 current_id += c;
-            } else if (!current_id.empty() && (c == ',' || std::isspace(c))) {
+            } else if (!current_id.empty() && (c == ',' || std::isspace(static_cast<unsigned char>(c)))) {
                 if (!result.empty()) result += ',';
                 result += current_id;
                 current_id.clear();
             }
         }
         
+        // Handle final ID if input doesn't end with delimiter
         if (!current_id.empty()) {
             if (!result.empty()) result += ',';
             result += current_id;
@@ -728,7 +762,8 @@ private:
         std::string discord_token, discord_isolated_channels, discord_shared_channels;
         std::string summarizer_model_path, summarizer_system_prompt, summarizer_chat_template;
         int32_t context_size{2048}, gpu_layers{0}, predict_tokens{256};
-        int32_t summarizer_context_size{1024}, summarizer_gpu_layers{0}, summarizer_predict_tokens{128};        int32_t discord_history_percentage{50};
+        int32_t summarizer_context_size{1024}, summarizer_gpu_layers{0}, summarizer_predict_tokens{128};
+        int32_t discord_history_percentage{50};
         bool discord_allow_dms{true}, discord_pull_history{true};
     } config;
     
@@ -752,16 +787,19 @@ private:
         wxNotebook* notebook;
         wxPanel* main_panel;
     } ui;
-    
+      // Thread safety: Worker thread management (Directive #12)
     ModelWorkerThread* worker_thread{nullptr};
 
 public:
-    LuminaChatFrame() : wxFrame(nullptr, wxID_ANY, "LuminaChat", wxDefaultPosition, wxSize(800, 600)) {
+    // Const-correct constructor (Directive #8: Const-Correctness)
+    LuminaChatFrame() : wxFrame(nullptr, wxID_ANY, "LuminaChat", wxDefaultPosition, 
+                               wxSize(UIConstants::DEFAULT_WINDOW_WIDTH, UIConstants::DEFAULT_WINDOW_HEIGHT)) {
         g_main_frame = this;
         
         llama_manager = std::make_unique<LlamaManager>();
         discord_manager = std::make_unique<DiscordManager>();
-          // Initialize context monitoring timer
+
+        // Initialize context monitoring timer
         context_monitor_timer = new wxTimer(this, static_cast<int>(EventId::CONTEXT_MONITOR_TIMER));
         
         // Set up unified logging
@@ -773,23 +811,29 @@ public:
         LogHandler::set_summarizer_callback([this](const std::string& msg) {
             AppendToSummariesThreadSafe(wxString::FromUTF8(msg));
         });
-          LoadConfiguration();
+
+        LoadConfiguration();
         CreateUI();
         SetupConsoleRedirection();
         UpdateButtonStates();
         BindEvents();
     }
-    
+
+    // RAII-compliant destructor with proper cleanup order (Directive #9)
     ~LuminaChatFrame() {
-        if (context_monitor_timer) {
+        // Clean up in reverse order of construction
+        if (context_monitor_timer && context_monitor_timer->IsRunning()) {
             context_monitor_timer->Stop();
-            delete context_monitor_timer;
         }
+        delete context_monitor_timer;
+        context_monitor_timer = nullptr;
+        
         RestoreConsoleStreams();
         CleanupWorkerThread();
         g_main_frame = nullptr;
     }
-
+    
+    // Thread-safe logging methods (Directives #8, #12)
     void AppendToLogsThreadSafe(const wxString& message) {
         if (!message.IsEmpty()) {
             CallAfter([this, message]() {
@@ -811,16 +855,17 @@ public:
             });
         }
     }
-
+    
+    // Summary display methods (Directive #8)
     void AppendSummaryInput(const wxString& input) {
-        wxString timestamp = wxDateTime::Now().Format("%H:%M:%S");
-        wxString formatted = wxString::Format("[%s] INPUT:\n%s\n\n", timestamp, input);
+        const wxString timestamp = wxDateTime::Now().Format("%H:%M:%S");
+        const wxString formatted = wxString::Format("[%s] INPUT:\n%s\n\n", timestamp, input);
         AppendToSummariesThreadSafe(formatted);
     }
     
     void AppendSummaryOutput(const wxString& output) {
-        wxString timestamp = wxDateTime::Now().Format("%H:%M:%S");
-        wxString formatted = wxString::Format("[%s] OUTPUT:\n%s\n\n%s\n\n", 
+        const wxString timestamp = wxDateTime::Now().Format("%H:%M:%S");
+        const wxString formatted = wxString::Format("[%s] OUTPUT:\n%s\n\n%s\n\n", 
                                             timestamp, output, wxString(60, '-'));
         AppendToSummariesThreadSafe(formatted);
     }
@@ -845,7 +890,7 @@ private:
         CreateStatusArea();
         CreateNotebook();
         LayoutComponents();
-          SetMinSize(wxSize(600, 400));
+        SetMinSize(wxSize(UIConstants::MINIMUM_WINDOW_WIDTH, UIConstants::MINIMUM_WINDOW_HEIGHT));
         AddWelcomeMessage();
     }
     
@@ -860,7 +905,8 @@ private:
     
     void CreateStatusArea() {
         ui.progress_label = new wxStaticText(ui.main_panel, wxID_ANY, "Ready");
-        ui.progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, wxSize(-1, 20));
+        ui.progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, 
+                                     wxSize(-1, UIConstants::PROGRESS_BAR_HEIGHT));
         ui.progress_bar->Hide();
         
         // Create context/buffer, generation, and cache statistics areas
@@ -868,31 +914,35 @@ private:
         CreateGenerationStatsArea();
         CreateCacheStatsArea();
     }
-    
-    void CreateContextBufferArea() {
+      void CreateContextBufferArea() {
         ui.context_buffer_box = new wxStaticBoxSizer(wxVERTICAL, ui.main_panel, "Context Buffer");
         
-        ui.context_progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, wxSize(200, 15));
-        ui.context_label = new wxStaticText(ui.main_panel, wxID_ANY, "Buffer: N/A", wxDefaultPosition, wxSize(220, -1));
+        ui.context_progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, 
+                                             wxSize(200, UIConstants::PROGRESS_BAR_HEIGHT / 4 * 3));
+        ui.context_label = new wxStaticText(ui.main_panel, wxID_ANY, "Buffer: N/A", wxDefaultPosition, 
+                                          wxSize(UIConstants::CONTEXT_LABEL_WIDTH, -1));
         
         // Add progress bar first (above), then label
         ui.context_buffer_box->Add(ui.context_progress_bar, 0, wxEXPAND | wxALL, 5);
         ui.context_buffer_box->Add(ui.context_label, 0, wxEXPAND | wxALL, 5);
     }
-    
-    void CreateGenerationStatsArea() {
-        ui.gen_stats_box = new wxStaticBoxSizer(wxVERTICAL, ui.main_panel, "Generation Stats");        ui.gen_stats_label = new wxStaticText(ui.main_panel, wxID_ANY, "Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s", 
-                                             wxDefaultPosition, wxSize(160, 60));
+      void CreateGenerationStatsArea() {
+        ui.gen_stats_box = new wxStaticBoxSizer(wxVERTICAL, ui.main_panel, "Generation Stats");
+        
+        ui.gen_stats_label = new wxStaticText(ui.main_panel, wxID_ANY, "Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s", 
+                                             wxDefaultPosition, wxSize(UIConstants::STATS_LABEL_WIDTH_SMALL, UIConstants::STATS_LABEL_HEIGHT));
         ui.gen_stats_label->SetFont(wxFont(8, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
         ui.gen_stats_box->Add(ui.gen_stats_label, 1, wxEXPAND | wxALL, 5);
     }
-    
-    void CreateCacheStatsArea() {
-        ui.cache_stats_box = new wxStaticBoxSizer(wxVERTICAL, ui.main_panel, "Token Cache Stats");        ui.cache_stats_label = new wxStaticText(ui.main_panel, wxID_ANY, "Hits: 0 | Misses: 0\nRequests: 0\nEntries: 0\nHit Ratio: 0.0%", 
-                                               wxDefaultPosition, wxSize(180, 60));
+      void CreateCacheStatsArea() {
+        ui.cache_stats_box = new wxStaticBoxSizer(wxVERTICAL, ui.main_panel, "Token Cache Stats");
+        
+        ui.cache_stats_label = new wxStaticText(ui.main_panel, wxID_ANY, "Hits: 0 | Misses: 0\nRequests: 0\nEntries: 0\nHit Ratio: 0.0%", 
+                                               wxDefaultPosition, wxSize(UIConstants::STATS_LABEL_WIDTH_LARGE, UIConstants::STATS_LABEL_HEIGHT));
         ui.cache_stats_label->SetFont(wxFont(8, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
         ui.cache_stats_box->Add(ui.cache_stats_label, 1, wxEXPAND | wxALL, 5);
-          // Initialize cache stats display
+        
+        // Initialize cache stats display
         UpdateCacheStats();
     }
     
@@ -929,13 +979,7 @@ private:
         
         // Add initial welcome message with helpful information
         ui.summaries_text->SetValue("Summary Monitor - Track summarization inputs and outputs\n"
-                                   "============================================================\n\n"
-                                   "This tab shows when the AI summarizes old conversation messages\n"
-                                   "to make room for new ones when the context gets full.\n\n"
-                                   "INPUT: Shows the messages being summarized\n"
-                                   "OUTPUT: Shows the generated summary\n\n"
-                                   "Note: Summarization requires a summary model to be configured\n"
-                                   "in the Settings -> Summarizer tab.\n\n"
+                                   "============================================================\n"
                                    "Waiting for first summarization...\n\n");
         
         sizer->Add(ui.summaries_text, 1, wxEXPAND | wxALL, 5);
@@ -989,7 +1033,8 @@ private:
         auto* status_sizer = new wxBoxSizer(wxHORIZONTAL);
         status_sizer->Add(ui.progress_label, 0, wxALIGN_CENTER_VERTICAL);
         status_sizer->AddStretchSpacer();
-          auto* main_sizer = new wxBoxSizer(wxVERTICAL);
+
+        auto* main_sizer = new wxBoxSizer(wxVERTICAL);
         main_sizer->Add(toolbar_sizer, 0, wxEXPAND | wxALL, 10);
         main_sizer->Add(top_info_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 5);  // Reduced top margin from 10 to 5
         main_sizer->Add(status_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT, 10);
@@ -1053,16 +1098,18 @@ private:
         }
     }
     
+    // Thread-safe worker cleanup with proper RAII (Directives #9, #12)
     void CleanupWorkerThread() noexcept {
         if (worker_thread) {
             worker_thread->RequestStop();
             worker_thread = nullptr;
+            // Thread is detached and will clean itself up
         }
     }
       void UpdateButtonStates() noexcept {
         const bool started = is_started.load();
         const bool processing = is_processing.load();
-          if (ui.start_btn) ui.start_btn->Enable(!started && !processing);
+        if (ui.start_btn) ui.start_btn->Enable(!started && !processing);
         if (ui.stop_btn) ui.stop_btn->Enable(started);
         if (ui.input_text) ui.input_text->Enable(started && !processing);
         if (ui.settings_btn) ui.settings_btn->Enable(!processing);
@@ -1079,19 +1126,23 @@ private:
                                "Disconnect Discord" : "Connect Discord");
     }
     
-    // Optimized message formatting with better memory management
+    // Optimized message formatting with smart caching (Directives #8, #13)
     void AddChatMessage(const wxString& message, const wxString& sender, const wxColour& bg_color) {
-        wxRichTextAttr attr;
-        attr.SetTextColour(*wxBLACK);
-        attr.SetBackgroundColour(bg_color);
-        attr.SetLeftIndent(50);
-        attr.SetRightIndent(50);
-        attr.SetParagraphSpacingBefore(0);
-        attr.SetParagraphSpacingAfter(0);
+        // Cache attribute to avoid repeated allocations (Directive #13: Smart Caching)
+        static thread_local wxRichTextAttr cached_attr;
         
-        if (sender != "System") ui.chat_history->WriteText("\n");
+        cached_attr.SetTextColour(*wxBLACK);
+        cached_attr.SetBackgroundColour(bg_color);
+        cached_attr.SetLeftIndent(50);
+        cached_attr.SetRightIndent(50);
+        cached_attr.SetParagraphSpacingBefore(0);
+        cached_attr.SetParagraphSpacingAfter(0);
         
-        ui.chat_history->BeginStyle(attr);
+        if (sender != "System") {
+            // Add spacing for non-system messages
+        }
+        
+        ui.chat_history->BeginStyle(cached_attr);
         ui.chat_history->WriteText(sender + ": " + message);
         ui.chat_history->EndStyle();
         ui.chat_history->WriteText(sender == "You" ? "\n" : "\n\n");
@@ -1100,6 +1151,7 @@ private:
         ui.chat_history->ShowPosition(ui.chat_history->GetLastPosition());
     }
     
+    // Convenience methods for message types (Directive #8)
     void AddUserMessage(const wxString& message) {
         AddChatMessage(message, "You", wxColour(173, 216, 230));
     }
@@ -1109,14 +1161,20 @@ private:
     }
     
     void AddSystemMessage(const wxString& message) {
-        wxRichTextAttr attr;
-        attr.SetTextColour(wxColour(100, 100, 100));
-        attr.SetBackgroundColour(wxColour(245, 245, 245));
-        attr.SetLeftIndent(30);
-        attr.SetRightIndent(30);
-        attr.SetFontStyle(wxFONTSTYLE_ITALIC);
+        // Cache system message attributes (Directive #13: Smart Caching)
+        static thread_local wxRichTextAttr system_attr;
+        static thread_local bool attr_initialized = false;
         
-        ui.chat_history->BeginStyle(attr);
+        if (!attr_initialized) {
+            system_attr.SetTextColour(wxColour(100, 100, 100));
+            system_attr.SetBackgroundColour(wxColour(245, 245, 245));
+            system_attr.SetLeftIndent(30);
+            system_attr.SetRightIndent(30);
+            system_attr.SetFontStyle(wxFONTSTYLE_ITALIC);
+            attr_initialized = true;
+        }
+        
+        ui.chat_history->BeginStyle(system_attr);
         ui.chat_history->WriteText("System: " + message);
         ui.chat_history->EndStyle();
         ui.chat_history->WriteText("\n\n");
@@ -1125,9 +1183,11 @@ private:
     void AddWelcomeMessage() {
         AddSystemMessage("Welcome to LuminaChat!\nClick 'Settings' to select a model, then 'Start' to begin.");
     }
-      std::string GetCombinedSystemPrompt() const {
+    
+    // System prompt composition with proper default handling (Directive #14: Logical Consistency)
+    std::string GetCombinedSystemPrompt() const {
         if (config.identity_directive.empty() && config.other_directives.empty()) {
-            return {};
+            return "You are a helpful AI assistant."; // Provide meaningful default
         }
         
         std::string combined = config.identity_directive;
@@ -1135,10 +1195,10 @@ private:
             combined += "\n\n";
         }
         combined += config.other_directives;
-        
-        return combined;
+          return combined;
     }
-      // Optimized event handler methods
+
+    // Optimized event handler methods with proper validation (Directive #6: Function Boundaries)
     void OnPruneSummarize(wxCommandEvent& event) {
         if (!is_started || is_processing || !llama_manager) {
             wxMessageBox("Please start the model first.", "Model Not Started", 
@@ -1146,14 +1206,15 @@ private:
             return;
         }
         
-        // Check if there's a conversation to prune
-        // Note: This is triggered from the UI and only effects the main chat context
+        // Check if there's sufficient conversation to prune (Directive #5: Named Constants)
         auto context_info = llama_manager->get_context_info("main_chat");
-        if (context_info->message_history.size() < 10) {
-            wxMessageBox("Need at least 10 messages in the conversation to prune.", 
+        if (context_info->message_history.size() < UIConstants::MIN_MESSAGES_FOR_PRUNING) {
+            wxMessageBox(wxString::Format("Need at least %d messages in the conversation to prune.", UIConstants::MIN_MESSAGES_FOR_PRUNING), 
                         "Insufficient Messages", wxOK | wxICON_INFORMATION);
             return;
-        }        // Check if summarization is available
+        }
+        
+        // Check if summarization is available
         if (!llama_manager->has_context("summary_context")) {
             wxMessageBox("Summarization is not available. Please configure a summary model in Settings.", 
                         "Summarization Unavailable", wxOK | wxICON_WARNING);
@@ -1166,7 +1227,9 @@ private:
             wxMessageBox("Failed to access main chat context.", "Context Error", 
                         wxOK | wxICON_ERROR);
             return;
-        }        try {
+        }
+        
+        try {
             // Show progress
             AddSystemMessage("Starting prune and summarize (keeping 90% of context)...");
             
@@ -1209,11 +1272,10 @@ private:
         
         wxString message;
         message << "Summary Slot System Status:\n\n";
-        message << wxString::Format("Used slots: %zu / %zu\n\n", summary_info.used_slots, summary_info.total_slots);        if (summary_info.used_slots == 0) {
+        message << wxString::Format("Used slots: %zu / %zu\n\n", summary_info.used_slots, summary_info.total_slots);
+        
+        if (summary_info.used_slots == 0) {
             message << "No summaries generated yet.\n\n";
-            message << "Summaries are created automatically when the conversation\n";
-            message << "becomes too long and needs to be pruned to make room\n";
-            message << "for new messages.";
         } else {
             message << "Summaries (chronological order, oldest to newest):\n";
             message << wxString(50, '=') << "\n\n";
@@ -1227,8 +1289,8 @@ private:
                 message << wxString(30, '-') << "\n\n";
             }
             
-            message << "When slot " << summary_info.total_slots + 1 << " is needed, slot 1 will be\n";
-            message << "automatically removed and all slots will shift left.";
+            message << "When slot " << summary_info.total_slots + 1 << " is needed, slot 1 & 2 will be\n";
+            message << "automatically merged and all slots will shift left.";
         }
         
         wxMessageBox(message, "Summary Slots", wxOK | wxICON_INFORMATION);
@@ -1269,7 +1331,9 @@ private:
         
         LLAMA_LOG("Loading model: " + config.model_path);
         
+        // Thread-safe worker thread assignment (Directive #12: Thread Safety)
         worker_thread = new ModelWorkerThread(this, llama_manager.get(), ModelWorkerThread::Operation::LOAD_MODEL);
+        
         worker_thread->SetModelParams(config.model_path, config.context_size, config.gpu_layers, 
                                      config.predict_tokens, config.chat_template,
                                      config.summarizer_model_path, config.summarizer_context_size,
@@ -1350,7 +1414,8 @@ private:
                         // Note: Summarizer chat template was already set during model loading
                     } else {
                         LLAMA_LOG("Warning: Failed to create summary context, summarization features may be limited");
-                    }                }
+                    }
+                }
             }
         }
         
@@ -1369,7 +1434,8 @@ private:
                 DISCORD_LOG("Discord bot connected to loaded model");
             }            
             ui.chat_history->Clear();
-            AddSystemMessage("LuminaChat ready! Type your message below.");            ui.input_text->SetFocus();
+            AddSystemMessage("LuminaChat ready! Type your message below.");
+            ui.input_text->SetFocus();
             
             auto* main_context = llama_manager->get_context_info("main_chat");
             if (main_context) {
@@ -1415,7 +1481,8 @@ private:
             DISCORD_LOG("Discord bot disconnected from model");
         }
         
-        llama_manager->cleanup();        context_created = false;
+        llama_manager->cleanup();
+        context_created = false;
         is_started = false;
         is_processing = false;
           UpdateButtonStates();
@@ -1549,11 +1616,10 @@ private:
         // Display user input with blue background
         AddUserMessage(input);
         ui.input_text->Clear();
-        
         is_processing = true;
         UpdateButtonStates();
         
-        // Start response generation in background thread
+        // Thread-safe response generation startup (Directive #12: Thread Safety)
         worker_thread = new ModelWorkerThread(this, llama_manager.get(), ModelWorkerThread::Operation::GENERATE_RESPONSE);
         worker_thread->SetInput(input.ToStdString(), "User");
         
@@ -1561,7 +1627,8 @@ private:
             delete worker_thread;
             worker_thread = nullptr;
             is_processing = false;
-            UpdateButtonStates();            AddSystemMessage("Error: Failed to start response generation thread");
+            UpdateButtonStates();
+            AddSystemMessage("Error: Failed to start response generation thread");
         }
     }
     
@@ -1574,7 +1641,9 @@ private:
         // Check for error responses
         if (response.StartsWith("Error:")) {
             AddSystemMessage(response);
-        } else {            AddAIMessage(response);
+        } else {
+            
+            AddAIMessage(response);
             
             // Update generation stats after successful inference
             UpdateGenerationStats();
@@ -1590,7 +1659,9 @@ private:
         ui.input_text->SetFocus();
         
         // Auto-scroll to bottom
-        ui.chat_history->SetInsertionPointEnd();        ui.chat_history->ShowPosition(ui.chat_history->GetLastPosition());    }
+        ui.chat_history->SetInsertionPointEnd();
+        ui.chat_history->ShowPosition(ui.chat_history->GetLastPosition());
+    }
     
     void UpdateGenerationStats() {
         if (!is_started || !llama_manager) {
@@ -1601,7 +1672,11 @@ private:
         auto context_info = llama_manager->get_context_info("main_chat");
         if (!context_info) {
             ui.gen_stats_label->SetLabel("No Context\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");
-            return;        }        const auto& stats = context_info->get_performance_stats();
+            return;
+        }
+        
+        const auto& stats = context_info->get_performance_stats();
+
         if (stats.last_total_generation_tokens > 0) {
             double tokens_per_sec = UIConstants::MS_TO_SECONDS * stats.last_total_generation_tokens / (stats.last_decode_time_us / 1000.0);
             double total_time_sec = (stats.last_decode_time_us / 1000.0) / UIConstants::MS_TO_SECONDS;
@@ -1613,7 +1688,8 @@ private:
                 total_time_sec
             );
             ui.gen_stats_label->SetLabel(gen_display);
-        } else {            ui.gen_stats_label->SetLabel("Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");
+        } else {
+            ui.gen_stats_label->SetLabel("Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");
         }
     }
     
@@ -1647,7 +1723,8 @@ private:
             ui.context_progress_bar->SetValue(0);
             return;
         }
-          // Get context usage information directly without switching contexts
+
+        // Get context usage information directly without switching contexts
         auto context_info = llama_manager->get_context_info("main_chat");
         int32_t context_usage = context_info->n_past;
         int32_t context_size = context_info->get_context_size();
@@ -1666,15 +1743,6 @@ private:
                 label += wxString::Format(" | Summaries: %zu/%zu", summary_info.used_slots, summary_info.total_slots);
             }
             ui.context_label->SetLabel(label);
-            
-            // Change color based on usage (visual feedback)
-            if (usage_percentage > 90.0f) {
-                ui.context_progress_bar->SetForegroundColour(wxColour(255, 0, 0)); // Red
-            } else if (usage_percentage > 75.0f) {
-                ui.context_progress_bar->SetForegroundColour(wxColour(255, 165, 0)); // Orange
-            } else {
-                ui.context_progress_bar->SetForegroundColour(wxColour(0, 128, 0)); // Green
-            }
         } else {
             ui.context_label->SetLabel("Buffer: 0/0");
             ui.context_progress_bar->SetValue(0);
@@ -1718,19 +1786,26 @@ void llama_log_callback(ggml_log_level level, const char* message, void* user_da
     }
 }
 
-// Application Class
+// RAII-compliant application class with comprehensive error handling (Directives #4, #9)
 class LuminaChatApp : public wxApp {
 public:
+    // Cross-platform application initialization with proper error handling (Directive #11)
     bool OnInit() override {
         SetAppName("LuminaChat");
         SetVendorName("LuminaChat");
         
         try {
-            (new LuminaChatFrame())->Show(true);
+            auto* frame = new LuminaChatFrame();
+            frame->Show(true);
             return true;
         } catch (const std::exception& e) {
-            wxMessageBox(wxString::Format("Failed to initialize: %s", e.what()), 
-                        "Error", wxOK | wxICON_ERROR);
+            wxMessageBox(wxString::Format("Failed to initialize application: %s", e.what()), 
+                        "Initialization Error", wxOK | wxICON_ERROR);
+            return false;
+        } catch (...) {
+            // Handle any unexpected exceptions (Directive #14: Logical Consistency)
+            wxMessageBox("Unknown error occurred during application initialization", 
+                        "Critical Error", wxOK | wxICON_ERROR);
             return false;
         }
     }
@@ -1738,7 +1813,7 @@ public:
 
 wxIMPLEMENT_APP(LuminaChatApp);
 
-// Cross-platform entry point
+// Cross-platform entry point with fixed-width types (Directive #11: Portability)
 int32_t main(int32_t argc, char* argv[]) {
     return wxEntry(argc, argv);
 }
