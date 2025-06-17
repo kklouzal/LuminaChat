@@ -125,10 +125,12 @@ enum class EventId : int32_t {
 wxDECLARE_EVENT(wxEVT_MODEL_LOADED, wxCommandEvent);
 wxDECLARE_EVENT(wxEVT_RESPONSE_READY, wxCommandEvent);
 wxDECLARE_EVENT(wxEVT_PROGRESS_UPDATE, wxCommandEvent);
+wxDECLARE_EVENT(wxEVT_TOKEN_STREAM, wxCommandEvent);
 
 wxDEFINE_EVENT(wxEVT_MODEL_LOADED, wxCommandEvent);
 wxDEFINE_EVENT(wxEVT_RESPONSE_READY, wxCommandEvent);
 wxDEFINE_EVENT(wxEVT_PROGRESS_UPDATE, wxCommandEvent);
+wxDEFINE_EVENT(wxEVT_TOKEN_STREAM, wxCommandEvent);
 
 // Forward declarations for callback functions
 bool model_loading_progress_callback(float progress, void* user_data);
@@ -271,8 +273,7 @@ private:
         
         return true;
     }
-    
-    bool GenerateResponse() {
+      bool GenerateResponse() {
         if (should_stop || config.input_text.empty() || !llama_manager) return false;
         
         // Use direct context access for main chat to avoid potential context switching issues
@@ -282,7 +283,18 @@ private:
             return false;
         }
         
-        config.result = llama_manager->generate_response(config.input_text, main_context, config.input_username);
+        // Create streaming callback that posts tokens to UI thread in real-time
+        auto stream_callback = [this](std::string_view token_text) {
+            if (should_stop || !parent) return;
+            
+            // Thread-safe streaming to UI
+            wxCommandEvent event(wxEVT_TOKEN_STREAM);
+            event.SetString(wxString::FromUTF8(token_text.data(), token_text.length()));
+            wxQueueEvent(parent, event.Clone());
+        };
+        
+        // Use the streaming version of generate_response
+        config.result = llama_manager->generate_response_streaming(config.input_text, main_context, config.input_username, stream_callback);
         return !config.result.empty() && !config.result.starts_with("Error:");
     }
     
@@ -766,9 +778,12 @@ private:
         int32_t discord_history_percentage{50};
         bool discord_allow_dms{true}, discord_pull_history{true};
     } config;
-    
-    // State management
+      // State management
     std::atomic<bool> is_started{false}, is_processing{false}, context_created{false};
+    
+    // Streaming state management
+    std::atomic<bool> is_streaming_response{false};
+    long current_stream_position{0};
     
     // Context monitoring timer
     wxTimer* context_monitor_timer;
@@ -1041,8 +1056,7 @@ private:
         main_sizer->Add(ui.notebook, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
           ui.main_panel->SetSizer(main_sizer);
     }
-    
-    void BindEvents() {
+      void BindEvents() {
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnStart, this, static_cast<int>(EventId::START));
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnStop, this, static_cast<int>(EventId::STOP));
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnSettings, this, static_cast<int>(EventId::SETTINGS));
@@ -1053,6 +1067,7 @@ private:
         Bind(wxEVT_MODEL_LOADED, &LuminaChatFrame::OnModelLoaded, this);
         Bind(wxEVT_RESPONSE_READY, &LuminaChatFrame::OnResponseReady, this);
         Bind(wxEVT_PROGRESS_UPDATE, &LuminaChatFrame::OnProgressUpdate, this);
+        Bind(wxEVT_TOKEN_STREAM, &LuminaChatFrame::OnTokenStream, this);
         
         // Bind context monitoring timer
         Bind(wxEVT_TIMER, &LuminaChatFrame::OnContextMonitorTimer, this, static_cast<int>(EventId::CONTEXT_MONITOR_TIMER));
@@ -1479,11 +1494,14 @@ private:
             discord_manager->set_llama_manager(nullptr);
             DISCORD_LOG("Discord bot disconnected from model");
         }
-        
-        llama_manager->cleanup();
+          llama_manager->cleanup();
         context_created = false;
         is_started = false;
         is_processing = false;
+        
+        // Reset streaming state
+        is_streaming_response = false;
+        current_stream_position = 0;
           UpdateButtonStates();
         LLAMA_LOG("LuminaChat stopped.");
         ui.gen_stats_label->SetLabel("Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");
@@ -1611,10 +1629,14 @@ private:
         
         wxString input = ui.input_text->GetValue().Trim();
         if (input.IsEmpty()) return;
-        
-        // Display user input with blue background
+          // Display user input with blue background
         AddUserMessage(input);
         ui.input_text->Clear();
+        
+        // Reset streaming state for new generation
+        is_streaming_response = false;
+        current_stream_position = 0;
+        
         is_processing = true;
         UpdateButtonStates();
         
@@ -1630,8 +1652,7 @@ private:
             AddSystemMessage("Error: Failed to start response generation thread");
         }
     }
-    
-    void OnResponseReady(wxCommandEvent& event) {
+      void OnResponseReady(wxCommandEvent& event) {
         is_processing = false;
         worker_thread = nullptr; // Thread is detached and will clean itself up
         
@@ -1640,9 +1661,17 @@ private:
         // Check for error responses
         if (response.StartsWith("Error:")) {
             AddSystemMessage(response);
-        } else {
-            
-            AddAIMessage(response);
+        } else {            // If we were streaming, finish the stream formatting
+            if (is_streaming_response) {
+                is_streaming_response = false;
+                
+                // End the style formatting for the streamed message
+                ui.chat_history->EndStyle();
+                ui.chat_history->WriteText("\n\n");
+            } else {
+                // Fallback: display the complete response if streaming didn't work
+                AddAIMessage(response);
+            }
             
             // Update generation stats after successful inference
             UpdateGenerationStats();
@@ -1660,6 +1689,36 @@ private:
         // Auto-scroll to bottom
         ui.chat_history->SetInsertionPointEnd();
         ui.chat_history->ShowPosition(ui.chat_history->GetLastPosition());
+    }
+      // Token streaming event handler for real-time response display
+    void OnTokenStream(wxCommandEvent& event) {
+        wxString token_text = event.GetString();
+        
+        // Check if we need to start a new AI message
+        if (!is_streaming_response) {
+            is_streaming_response = true;
+            current_stream_position = ui.chat_history->GetLastPosition();
+            
+            // Start AI message formatting with distinctive appearance
+            wxRichTextAttr ai_attr;
+            ai_attr.SetTextColour(*wxBLACK);
+            ai_attr.SetBackgroundColour(wxColour(144, 238, 144)); // Light green background
+            ai_attr.SetLeftIndent(50);
+            ai_attr.SetRightIndent(50);
+            
+            ui.chat_history->BeginStyle(ai_attr);
+            ui.chat_history->BeginBold();
+            ui.chat_history->WriteText("AI: ");
+            ui.chat_history->EndBold();
+        }
+        
+        // Append the token text immediately
+        ui.chat_history->WriteText(token_text);
+        ui.chat_history->SetInsertionPointEnd();
+        ui.chat_history->ShowPosition(ui.chat_history->GetLastPosition());
+        
+        // Force immediate UI update for smooth streaming effect
+        ui.chat_history->Update();
     }
     
     void UpdateGenerationStats() {

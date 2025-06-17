@@ -358,12 +358,33 @@ public:
     explicit LlamaResponse(const TokenCache* cache) : token_cache_ref(cache) {
         temp_string_buffer.reserve(ResponseConstants::MIN_STRING_RESERVE); // Pre-allocate reasonable buffer size
         log_buffer.reserve(ResponseConstants::LOG_MESSAGE_RESERVE); // Pre-allocate log buffer
-    }// Main response generation function - C++17 optimized
+    }    // Main response generation function - C++17 optimized
     // Dependencies: Requires valid ModelInfo, ContextInfo, and proper LlamaManager integration
     template<typename BatchTokenAdder, typename ContextUpdater>
     std::string generate_response(std::string_view input, std::string_view username,
                                 ContextInfo* context_info,
                                 BatchTokenAdder add_token_to_batch, ContextUpdater update_context) const {
+        return generate_response_impl(input, username, context_info, add_token_to_batch, update_context, nullptr);
+    }
+
+    // Streaming response generation function - C++20 optimized
+    // Dependencies: Requires valid ModelInfo, ContextInfo, and proper LlamaManager integration
+    // StreamCallback signature: void(std::string_view token_text)
+    template<typename BatchTokenAdder, typename ContextUpdater, typename StreamCallback>
+    std::string generate_response(std::string_view input, std::string_view username,
+                                ContextInfo* context_info,
+                                BatchTokenAdder add_token_to_batch, ContextUpdater update_context,
+                                StreamCallback stream_callback) const {
+        return generate_response_impl(input, username, context_info, add_token_to_batch, update_context, stream_callback);
+    }
+
+private:
+    // Implementation method that handles both streaming and non-streaming cases
+    template<typename BatchTokenAdder, typename ContextUpdater, typename StreamCallback = std::nullptr_t>
+    std::string generate_response_impl(std::string_view input, std::string_view username,
+                                     ContextInfo* context_info,
+                                     BatchTokenAdder add_token_to_batch, ContextUpdater update_context,
+                                     StreamCallback stream_callback) const {
         if (input.empty()) [[unlikely]] {
             LLAMA_LOG("Error: input is empty");
             return "Error: Invalid generation parameters";
@@ -479,11 +500,12 @@ public:
             if (llama_vocab_is_eog(context_info->model_info->vocab, new_token)) [[likely]] {
                 LLAMA_LOG("End of generation token encountered - natural completion");
                 break;
-            }
-
-            // Convert token to text and add to response
-            auto token_text = convert_token_to_text(new_token, context_info->model_info);
-            if (!token_text.empty()) [[likely]] {
+            }            // Convert token to text and add to response
+            auto token_text = convert_token_to_text(new_token, context_info->model_info);            if (!token_text.empty()) [[likely]] {
+                // Stream the token immediately if callback is provided
+                if constexpr (!std::is_same_v<StreamCallback, std::nullptr_t>) {
+                    stream_callback(std::string_view{token_text});
+                }
                 response += std::move(token_text);
             } else [[unlikely]] {
                 std::string warning_msg;

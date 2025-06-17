@@ -626,6 +626,81 @@ public:
         return response;
     }
     
+    // Context-specific response generation with streaming support
+     // StreamCallback signature: void(std::string_view token_text)
+     template<typename StreamCallback>
+     std::string generate_response_streaming(const std::string& input, ContextInfo* target_context, const std::string& username, StreamCallback stream_callback) {
+        // Pre-flight validation
+        if (!target_context->context || !target_context->model_info || 
+            !target_context->model_info->model_loaded || !target_context->model_info->model || 
+            !target_context->model_info->vocab || !target_context->batch_initialized) {
+            return "Error: Model components not properly initialized for generation";
+        }
+
+        if (input.empty()) {
+            return "Error: Empty input";
+        }
+
+        LLAMA_LOG("Starting streaming generation flow for input: " + 
+                  (input.length() > 50 ? input.substr(0, 50) + "..." : input));
+
+        // STEP 1: Update conversation with new input
+        target_context->add_message(username, input);
+        
+        // STEP 2: Prepare context for generation (handles template, tokenization, pruning, rebuild)
+        auto token_processor = [this, target_context](const std::string& text, bool add_special) {
+            return process_text_to_tokens(text, target_context, add_special);
+        };
+        auto pruning_callback = [this, target_context](float keep_ratio) {
+            return target_context->prune_with_summarization(keep_ratio);
+        };
+        
+        if (!target_context->prepare_context_for_generation(token_processor, pruning_callback)) {
+            LLAMA_LOG("Context preparation failed, attempting one recovery");
+            
+            // Single recovery attempt - clear context state and try again
+            if (target_context->context) {
+                llama_memory_clear(llama_get_memory(target_context->context), true);
+                target_context->n_past = 0;
+                target_context->prev_len = 0;
+                target_context->message_cache_dirty = true;
+                target_context->conversation_state.invalidate();
+                  if (!target_context->prepare_context_for_generation(token_processor, pruning_callback)) {
+                    return "Error: Failed to prepare context for generation after recovery attempt";
+                }
+                LLAMA_LOG("Context preparation recovered successfully");
+            } else {
+                return "Error: Failed to prepare context for generation";
+            }
+        }
+          
+        // STEP 3: Generate response tokens with streaming
+        // Setup callback functions for LlamaResponse
+        auto token_adder = [this, target_context](llama_token token, int32_t pos, const std::vector<llama_seq_id>& seq_ids, bool output_logits) -> bool {
+            return target_context->add_tokens_to_batch({token}, pos, seq_ids, output_logits);
+        };
+        auto context_updater = [target_context]() -> void {
+            // Update context length tracking after generation
+            std::string updated_content;
+            if (target_context->apply_template(false, updated_content)) {
+                target_context->prev_len = static_cast<int32_t>(updated_content.length());
+            }
+        };
+        
+        LLAMA_LOG("Delegating to LlamaResponse for streaming token generation");
+        std::string response = response_generator.generate_response("generate", "assistant", target_context, token_adder, context_updater, stream_callback);
+        
+        // STEP 4: Update conversation with response (if successful)
+        if (!response.empty() && !response.starts_with("Error:")) {
+            target_context->add_message("assistant", response);
+            LLAMA_LOG("Streaming generation flow completed successfully");
+        } else {
+            LLAMA_LOG("Streaming generation flow failed: " + response);
+        }
+        
+        return response;
+    }
+    
     // Enhanced cleanup with memory optimization
     void cleanup() {
         LLAMA_LOG("Cleanup called - cleaning up " + std::to_string(contexts.size()) + " contexts");
