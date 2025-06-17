@@ -77,14 +77,14 @@ private:
     // Context ID for summary operations (for logging/validation)
     static constexpr const char* SUMMARY_CONTEXT_ID = "summary_context";
 
-public:    // 5-slot summary system: maintains chronological order of conversation summaries
+public:
+
+    // 5-slot summary system: maintains chronological order of conversation summaries
     // When the 6th summary is generated, slot 0 is dropped, slots shift left, and new summary goes to slot 4
     // Direct access per Directive #7: favor direct access over thin accessors
     std::vector<std::string> summary_slots;
-
-private:
     
-public:    explicit LlamaSummarizer(ContextInfo* parent_ctx, ModelInfo* summary_mdl = nullptr, ContextInfo* summary_ctx = nullptr,
+    explicit LlamaSummarizer(ContextInfo* parent_ctx, ModelInfo* summary_mdl = nullptr, ContextInfo* summary_ctx = nullptr,
                            std::function<std::string(const std::string&, const std::string&, ContextInfo*)> response_callback = nullptr) 
         : parent_context(parent_ctx), summary_model(summary_mdl), summary_context(summary_ctx), 
           generate_response_callback(std::move(response_callback)) {

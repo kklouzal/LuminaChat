@@ -59,15 +59,12 @@
 #include <unordered_map>
 #include <functional>
 #include "llama-cpp.h"
-#include "LogHandler.hpp"
-#include "TokenCache.hpp"
-#include "LlamaContext.hpp"
 
-// Forward declarations
-class LlamaSummarizer;
+// llama.cpp backend callbacks for model loading progress etc..
 bool model_loading_progress_callback(float progress, void *user_data);
 
-// Constants for configuration and performance (Directive #13: Zero Magic & Strong Typing)
+// Constants for configuration and performance
+// We place these just before the application includes so all constants can be grouped in one place for all files
 namespace LlamaConstants {
     // Additional constants specific to LlamaManager (core constants are in LlamaContext.hpp)
     constexpr int32_t DEFAULT_TOKEN_CACHE_SIZE = 1024;
@@ -88,7 +85,13 @@ namespace LlamaConstants {
     constexpr int32_t RETRY_BACKOFF_MS = 50;
 }
 
+// Application includes
+// We place these just after the LlamaConstants so all constants can be grouped in one place for all files
+#include "LogHandler.hpp"
+#include "TokenCache.hpp"
+#include "LlamaContext.hpp"
 #include "LlamaResponse.hpp"
+#include "LlamaSummarizer.hpp"
 
 // Thread Safety Contract (Directive #12):
 // This class is NOT thread-safe. External synchronization is required for concurrent access.
@@ -106,10 +109,9 @@ private:
     
     std::unordered_map<std::string, std::unique_ptr<ModelInfo>> models;
     std::unordered_map<std::string, std::unique_ptr<ContextInfo>> contexts;
-    //std::string active_context_id;    ContextInfo* current_context;
-      // Working buffers
+
+    // Bidirectional cache for token-to-text and text-to-token mappings
     mutable TokenCache token_cache;
-    mutable std::string temp_string_buffer;// Working buffers
 
     // Response generation handler
     mutable LlamaResponse response_generator;
@@ -217,6 +219,7 @@ public:
         ctx_params.flash_attn = true;
         ctx_params.op_offload = true;
         ctx_params.offload_kqv = true;
+        ctx_params.defrag_thold = 0.33f; // auto-defrag KV cache if holes > 33% of size
         
         // Create context
         context_info->context = llama_init_from_model(model_info->model, ctx_params);
@@ -257,7 +260,8 @@ public:
         
         // Set the reset after generation flag
         context_info->reset_after_generation = reset_after_generation;
-          // Initialize summarizer for this context with parent context only (summary resources will be set later)
+        
+        // Initialize summarizer for this context with parent context only (summary resources will be set later)
         context_info->summarizer = std::make_unique<LlamaSummarizer>(context_info.get());
         
         // If summary resources are already available, set them up immediately
@@ -322,7 +326,8 @@ public:
         }
         return it->second.get();
     }
-      // Context-specific tokenization with bidirectional caching
+
+    // Context-specific tokenization with bidirectional caching
     std::vector<llama_token> process_text_to_tokens(const std::string& text, ContextInfo* target_context, bool add_special = true) const {
         if (text.empty()) return {};
         
@@ -386,7 +391,8 @@ public:
         
         return tokens;
     }
-      // Context-specific detokenization with bidirectional caching (reverse lookup)
+      
+    // Context-specific detokenization with bidirectional caching (reverse lookup)
     std::string process_tokens_to_text(const std::vector<llama_token>& tokens, ContextInfo* target_context) const {
         if (tokens.empty()) return {};
         
@@ -440,7 +446,9 @@ public:
         token_cache.put(cache_key, result, tokens);
         
         return result;
-    }    // Cache-aware token-to-text conversion with bidirectional caching
+    }
+    
+    // Cache-aware token-to-text conversion with bidirectional caching
     std::string convert_token_to_text_cached(llama_token token, ContextInfo* target_context) const {
         if (!target_context->model_info || !target_context->model_info->vocab) {
             LLAMA_LOG("Error: No vocabulary available for token conversion");
@@ -489,18 +497,6 @@ public:
         
         return result;
     }
-
-    // Forward declaration for summary slot info - implementation after LlamaSummarizer include
-    // TODO: Move this into LlamaSummarizer and access it through the parent ContextInfo
-    struct SummarySlotInfo {
-        size_t total_slots;
-        size_t used_slots;
-        std::vector<std::string> summaries;
-    };
-
-    // Context-specific summary slot information
-    // TODO: Move this into LlamaSummarizer and access it through the parent ContextInfo
-    SummarySlotInfo get_summary_slot_info(ContextInfo* target_context) const;
     
     // Initialize summarizer resources for all contexts when summary context becomes available
     void initialize_summarizer_resources() {
@@ -530,8 +526,6 @@ public:
         
         LLAMA_LOG("Successfully initialized summarizer resources for " + std::to_string(initialized_count) + " contexts");
     }
-  
-public:
 
 /* 
      * IMPROVED LINEAR LOGIC FLOW FOR RESPONSE GENERATION
@@ -604,7 +598,8 @@ public:
                 return "Error: Failed to prepare context for generation";
             }
         }
-          // STEP 3: Generate response tokens
+          
+        // STEP 3: Generate response tokens
         // Setup callback functions for LlamaResponse
         auto token_adder = [this, target_context](llama_token token, int32_t pos, const std::vector<llama_seq_id>& seq_ids, bool output_logits) -> bool {
             return target_context->add_tokens_to_batch({token}, pos, seq_ids, output_logits);
@@ -629,7 +624,8 @@ public:
         }
         
         return response;
-    }    
+    }
+    
     // Enhanced cleanup with memory optimization
     void cleanup() {
         LLAMA_LOG("Cleanup called - cleaning up " + std::to_string(contexts.size()) + " contexts");
@@ -705,18 +701,6 @@ private:
         }
     }
 };
-
-// Include LlamaSummarizer implementation after class declaration to avoid circular dependency
-#include "LlamaSummarizer.hpp"
-
-// Implementation of LlamaManager methods that depend on LlamaSummarizer
-inline LlamaManager::SummarySlotInfo LlamaManager::get_summary_slot_info(ContextInfo* target_context) const {
-    if (!target_context->summarizer) {
-        return {SummarizerConstants::MAX_SUMMARY_SLOTS, 0, {}};
-    }
-    auto summarizer_info = target_context->summarizer->get_summary_slot_info();
-    return {summarizer_info.total_slots, summarizer_info.used_slots, summarizer_info.summaries};
-}
 
 //
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!

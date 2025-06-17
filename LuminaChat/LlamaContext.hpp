@@ -206,7 +206,9 @@ struct ContextInfo {
     bool reset_after_generation = false;
 
     // Summarizer for handling conversation summarization per context
-    std::unique_ptr<LlamaSummarizer> summarizer;    ContextInfo() : context(nullptr), batch{}, batch_initialized(false), 
+    std::unique_ptr<LlamaSummarizer> summarizer;
+    
+    ContextInfo() : context(nullptr), batch{}, batch_initialized(false), 
                    n_past(0), prev_len(0), message_history_token_count(0), model_info(nullptr) {
     }
     

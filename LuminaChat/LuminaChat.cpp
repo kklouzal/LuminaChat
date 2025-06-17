@@ -1204,7 +1204,8 @@ private:
             return;
         }
         
-        auto summary_info = llama_manager->get_summary_slot_info(main_context);
+        //auto summary_info = llama_manager->get_summary_slot_info(main_context);
+		auto summary_info = main_context->summarizer->get_summary_slot_info();
         
         wxString message;
         message << "Summary Slot System Status:\n\n";
@@ -1657,7 +1658,7 @@ private:
               ui.context_progress_bar->SetValue(std::min(progress_value, 100));
             
             // Get summary slot information
-            auto summary_info = llama_manager->get_summary_slot_info(context_info);
+            auto summary_info = context_info->summarizer->get_summary_slot_info();
             
             // More descriptive label showing context buffer usage and summary slots
             wxString label = wxString::Format("Buffer: %d/%d", context_usage, context_size);
