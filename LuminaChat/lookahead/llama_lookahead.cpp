@@ -37,7 +37,6 @@
 // PLATFORM-SPECIFIC DEFINITIONS AND MACROS
 // ============================================================================
 
-#define DIRECTORY_SEPARATOR '\\'
 #define strdup _strdup
 
 // Helper function for timing
@@ -76,28 +75,6 @@ enum common_grammar_trigger_type {
     COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL,
 };
 
-// Example types for different llama use cases
-enum llama_example {
-    LLAMA_EXAMPLE_COMMON,
-    LLAMA_EXAMPLE_SPECULATIVE,
-    LLAMA_EXAMPLE_MAIN,
-    LLAMA_EXAMPLE_EMBEDDING,
-    LLAMA_EXAMPLE_PERPLEXITY,
-    LLAMA_EXAMPLE_RETRIEVAL,
-    LLAMA_EXAMPLE_PASSKEY,
-    LLAMA_EXAMPLE_IMATRIX,
-    LLAMA_EXAMPLE_BENCH,
-    LLAMA_EXAMPLE_SERVER,
-    LLAMA_EXAMPLE_CVECTOR_GENERATOR,
-    LLAMA_EXAMPLE_EXPORT_LORA,
-    LLAMA_EXAMPLE_MTMD,
-    LLAMA_EXAMPLE_LOOKUP,
-    LLAMA_EXAMPLE_PARALLEL,
-    LLAMA_EXAMPLE_TTS,
-
-    LLAMA_EXAMPLE_COUNT,
-};
-
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
@@ -128,8 +105,6 @@ std::string common_token_to_piece(
 // Sampler functions
 struct common_sampler * common_sampler_init(const struct llama_model * model, const struct common_params_sampling & params);
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
-
-// Batch handling functions
 
 // ============================================================================
 // DATA STRUCTURES AND CLASSES
@@ -172,8 +147,6 @@ struct ring_buffer {
 };
 // Simple logging structure
 struct simple_log {
-    bool enable_debug = false;
-    
     void log(const char* level, const char* fmt, ...) {
         va_list args;
         va_start(args, fmt);
@@ -192,19 +165,11 @@ struct simple_log {
 // CPU parameters for thread configuration
 struct cpu_params {
     int      n_threads                   = -1;
-    bool     cpumask[GGML_MAX_N_THREADS] = {false};
-    bool     mask_valid                  = false;
-    ggml_sched_priority  priority   = GGML_SCHED_PRIO_NORMAL;
-    bool     strict_cpu                  = false;
-    uint32_t poll                        = 50;
 };
 
 // Model parameters structure
 struct common_params_model {
     std::string path    = "";
-    std::string url     = "";
-    std::string hf_repo = "";
-    std::string hf_file = "";
 };
 
 // Grammar trigger configuration
@@ -307,8 +272,6 @@ struct common_params {
 struct common_init_result {
     llama_model_ptr   model;
     llama_context_ptr context;
-
-    std::vector<llama_adapter_lora_ptr> lora;
     
     common_init_result() : model(nullptr), context(nullptr) {}
     
@@ -572,7 +535,7 @@ void common_init() {
 }
 
 // Parameter parsing function - simplified for lookahead decoding
-inline bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
+inline bool common_params_parse(int argc, char ** argv, common_params & params, void(*print_usage)(int, char **)) {
     // Simple argument parsing for lookahead-specific parameters
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -613,8 +576,8 @@ inline bool common_params_parse(int argc, char ** argv, common_params & params, 
 }
 
 // Overload for backward compatibility
-inline bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex) {
-    return common_params_parse(argc, argv, params, ex, nullptr);
+inline bool common_params_parse(int argc, char ** argv, common_params & params) {
+    return common_params_parse(argc, argv, params, nullptr);
 }
 
 // ============================================================================
@@ -859,104 +822,10 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     }
 }
 
-// ============================================================================
-// PARAMETER OPTIMIZATION NOTES
-// ============================================================================
-// The following parameters were removed from common_params as they are not used 
-// in the lookahead decoding implementation:
-//
-// MODEL PARAMETERS (unused):
-// - n_keep, n_draft, n_chunks, n_sequences, p_split, n_gpu_layers_draft
-// - split_mode, grp_attn_n, grp_attn_w, n_print, pooling_type, attention_type
-// - model_alias, model_url, hf_token, hf_repo, hf_file
-//
-// INPUT/OUTPUT PARAMETERS (unused):
-// - prompt_file, path_prompt_cache, input_prefix, input_suffix, logdir
-// - antiprompt, control_vector_layer_start, control_vector_layer_end
-// - devices, in_files, tensor_buft_overrides
-//
-// CPU/THREADING PARAMETERS (unused):
-// - draft_cpuparams, draft_cpuparams_batch
-//
-// BENCHMARK/TEST PARAMETERS (unused):
-// - hellaswag, winogrande, multiple_choice, kl_divergence
-// - hellaswag_tasks, winogrande_tasks, multiple_choice_tasks
-//
-// UI/INTERACTION PARAMETERS (unused):
-// - usage, completion, use_color, special, interactive, interactive_first
-// - prompt_cache_all, prompt_cache_ro, escape, multiline_input, simple_io
-// - cont_batching, ctx_shift, swa_full, input_prefix_bos, verbose_prompt
-// - display_prompt, warmup, no_op_offload, single_turn, offline
-// - lora_init_without_apply
-//
-// CACHE PARAMETERS (unused):
-// - cache_type_k, cache_type_v
-//
-// MULTIMODAL PARAMETERS (unused):
-// - mmproj_use_gpu, no_mmproj, image
-//
-// EMBEDDING PARAMETERS (unused):
-// - embedding, embd_normalize, embd_out, embd_sep, reranking
-//
-// SERVER PARAMETERS (unused):
-// - port, timeout_read, timeout_write, n_threads_http, n_cache_reuse
-// - hostname, public_path, chat_template, use_jinja, enable_chat_template
-// - reasoning_budget, prefill_assistant, api_keys, ssl_file_key, ssl_file_cert
-// - webui, endpoint_slots, endpoint_props, endpoint_metrics, log_json
-// - slot_save_path, slot_prompt_similarity
-//
-// BATCH BENCHMARK PARAMETERS (unused):
-// - is_pp_shared, n_pp, n_tg, n_pl
-//
-// MISCELLANEOUS PARAMETERS (unused):
-// - context_files, chunk_size, chunk_separator, n_junk, i_pos, n_out_freq
-// - n_save_freq, i_chunk, process_output, compute_ppl, parse_special
-// - n_pca_batch, n_pca_iterations, cvector_positive_file, cvector_negative_file
-// - spm_infill, batched_bench_output_jsonl, out_file, verbosity, ppl_stride
-// - ppl_output_type, lookup_cache_static, lookup_cache_dynamic, logits_file
-// - system_prompt, load_progress_callback, load_progress_callback_user_data
-//
-// SAMPLING PARAMETERS (unused):
-// - n_probs, ignore_eos, timing_per_token, print() method
-// ============================================================================
-
-// ============================================================================
-// STREAMLINED PARAMETERS SUMMARY
-// ============================================================================
-// The common_params struct has been streamlined from ~100+ parameters down to
-// only the essential parameters needed for lookahead decoding:
-//
-// CORE PARAMETERS (15):
-// - seed, n_ctx, n_batch, n_ubatch, n_predict, n_parallel
-// - n_gpu_layers, main_gpu, tensor_split
-// - rope_freq_base, rope_freq_scale, rope_scaling_type
-// - yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow, yarn_orig_ctx
-// - defrag_thold, numa
-//
-// NESTED STRUCTURES (4):
-// - sampling_params (common_params_sampling)
-// - model (common_params_model)
-// - cpuparams (cpu_params)
-// - cpuparams_batch (cpu_params)
-//
-// CONFIGURATION VECTORS (2):
-// - kv_overrides
-//
-// BOOLEAN FLAGS (6):
-// - flash_attn, no_perf, use_mmap, use_mlock, no_kv_offload, check_tensors
-//
-// STRING PARAMETERS (1):
-// - prompt
-//
-// Total: ~28 essential parameters vs 100+ original parameters
-// This represents a ~75% reduction in complexity while maintaining full functionality
-// for the lookahead decoding use case.
-// ============================================================================
-
 int main(int argc, char** argv) {
     common_params params;
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
+    if (!common_params_parse(argc, argv, params)) {
         return 1;
     }
 
