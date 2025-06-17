@@ -801,15 +801,14 @@ public:
 
         // Initialize context monitoring timer
         context_monitor_timer = new wxTimer(this, static_cast<int>(EventId::CONTEXT_MONITOR_TIMER));
-        
-        // Set up unified logging
-        LogHandler::set_output_callback([this](const std::string& msg) {
-            AppendToLogsThreadSafe(wxString::FromUTF8(msg));
+          // Set up unified logging
+        LogHandler::set_output_callback([this](std::string_view msg) {
+            AppendToLogsThreadSafe(wxString::FromUTF8(msg.data(), msg.length()));
         });
         
         // Set up summarizer-specific logging to route to summaries tab
-        LogHandler::set_summarizer_callback([this](const std::string& msg) {
-            AppendToSummariesThreadSafe(wxString::FromUTF8(msg));
+        LogHandler::set_summarizer_callback([this](std::string_view msg) {
+            AppendToSummariesThreadSafe(wxString::FromUTF8(msg.data(), msg.length()));
         });
 
         LoadConfiguration();
