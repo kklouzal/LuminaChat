@@ -1366,12 +1366,14 @@ private:
                 discord_manager->main_context_id = "main_chat";
                 discord_manager->model_id = "main_model";
                 DISCORD_LOG("Discord bot connected to loaded model");
-            }
-            
+            }            
             ui.chat_history->Clear();
             AddSystemMessage("LuminaChat ready! Type your message below.");            ui.input_text->SetFocus();
             
-            llama_manager->reset_timings(llama_manager->get_context_info("main_chat"));
+            auto* main_context = llama_manager->get_context_info("main_chat");
+            if (main_context) {
+                main_context->reset_performance_stats();
+            }
             
             // Reset generation stats display
             ui.gen_stats_label->SetLabel("Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");
@@ -1598,17 +1600,14 @@ private:
         auto context_info = llama_manager->get_context_info("main_chat");
         if (!context_info) {
             ui.gen_stats_label->SetLabel("No Context\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");
-            return;
-        }
-        
-        auto timings = llama_manager->get_timings(context_info);
-        if (timings.n_eval > 0) {
-            double tokens_per_sec = UIConstants::MS_TO_SECONDS * timings.n_eval / timings.t_eval_ms;
-            double total_time_sec = timings.t_eval_ms / UIConstants::MS_TO_SECONDS;
+            return;        }        const auto& stats = context_info->get_performance_stats();
+        if (stats.last_total_generation_tokens > 0) {
+            double tokens_per_sec = UIConstants::MS_TO_SECONDS * stats.last_total_generation_tokens / (stats.last_decode_time_us / 1000.0);
+            double total_time_sec = (stats.last_decode_time_us / 1000.0) / UIConstants::MS_TO_SECONDS;
             
             wxString gen_display = wxString::Format(
-                "Generated\nTokens: %d\nSpeed: %.1f tok/s\nTime: %.1fs",
-                timings.n_eval,
+                "Generated\nTokens: %lld\nSpeed: %.1f tok/s\nTime: %.1fs",
+                stats.last_total_generation_tokens,
                 tokens_per_sec,
                 total_time_sec
             );

@@ -74,6 +74,8 @@ namespace LlamaConstants {
     // Additional constants needed for batch processing
     constexpr int32_t MAX_BATCH_SIZE = 8192;
     constexpr int32_t BATCH_DIVISOR = 4;
+    // Time conversion constants
+    constexpr float MS_TO_MICROSECONDS = 1000.0f;
 }
 
 // ModelInfo definition - moved from LlamaManager.hpp
@@ -128,10 +130,39 @@ struct ContextInfo {
     
     // Template buffer - context-specific to avoid conflicts
     mutable std::string template_buffer;
-    
-    // Performance tracking
+      // Performance tracking
     int64_t total_generation_tokens = 0;
     int64_t last_decode_time_us = 0;
+    
+    // Performance statistics - context-specific performance data
+    struct PerformanceStats {
+        int64_t last_total_generation_tokens = 0;
+        int64_t last_decode_time_us = 0;
+        float last_average_tokens_per_second = 0.0f;
+        
+        // Update performance stats from context data
+        void update(int64_t total_tokens, int64_t decode_time_us) {
+            last_total_generation_tokens = total_tokens;
+            last_decode_time_us = decode_time_us;
+            
+            // Calculate average tokens per second
+            if (decode_time_us > 0 && total_tokens > 0) {
+                last_average_tokens_per_second = static_cast<float>(total_tokens) / (static_cast<float>(decode_time_us) / 1000000.0f);
+            } else {
+                last_average_tokens_per_second = 0.0f;
+            }
+        }
+        
+        // Reset performance statistics
+        void reset() {
+            last_total_generation_tokens = 0;
+            last_decode_time_us = 0;
+            last_average_tokens_per_second = 0.0f;
+        }
+          // Legacy compatibility accessors for backward compatibility
+        int32_t last_n_eval() const { return static_cast<int32_t>(last_total_generation_tokens); }
+        float last_t_eval_ms() const { return static_cast<float>(last_decode_time_us) / LlamaConstants::MS_TO_MICROSECONDS; }
+    } performance_stats;
     
     // Cache state - enhanced with conversation state tracking
     mutable bool message_cache_dirty = true;
@@ -175,10 +206,21 @@ struct ContextInfo {
     bool reset_after_generation = false;
 
     // Summarizer for handling conversation summarization per context
-    std::unique_ptr<LlamaSummarizer> summarizer;
-
-    ContextInfo() : context(nullptr), batch{}, batch_initialized(false), 
+    std::unique_ptr<LlamaSummarizer> summarizer;    ContextInfo() : context(nullptr), batch{}, batch_initialized(false), 
                    n_past(0), prev_len(0), message_history_token_count(0), model_info(nullptr) {
+    }
+    
+    // Get current performance statistics
+    const PerformanceStats& get_performance_stats() {
+        performance_stats.update(total_generation_tokens, last_decode_time_us);
+        return performance_stats;
+    }
+    
+    // Reset performance statistics
+    void reset_performance_stats() {
+        total_generation_tokens = 0;
+        last_decode_time_us = 0;
+        performance_stats.reset();
     }
     
     // Get context size directly from associated model

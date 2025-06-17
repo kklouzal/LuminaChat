@@ -81,13 +81,11 @@ namespace LlamaConstants {
     constexpr float DEFAULT_TEMPERATURE = 0.8f;
     constexpr float DEFAULT_MIN_P = 0.05f;
     constexpr float DEFAULT_TOP_P = 0.9f;
-    constexpr int32_t DEFAULT_TOP_K = 40;
-    // String processing constants
+    constexpr int32_t DEFAULT_TOP_K = 40;    // String processing constants
     constexpr size_t MAX_TEXT_PREVIEW_LENGTH = 50;
     constexpr int32_t MAX_RETRY_ATTEMPTS = 2;
     // Timing and sleep constants
     constexpr int32_t RETRY_BACKOFF_MS = 50;
-    constexpr float MS_TO_MICROSECONDS = 1000.0f;
 }
 
 #include "LlamaResponse.hpp"
@@ -631,48 +629,7 @@ public:
         }
         
         return response;
-    }
-    
-    // Get performance statistics - overloaded for specific context
-    // TODO: PerformanceStats should probably integrate Timings and be moved into ContextInfo
-    struct PerformanceStats {
-        int64_t total_generation_tokens;
-        int64_t last_decode_time_us;
-        float average_tokens_per_second;
-    };
-    
-    PerformanceStats get_performance_stats(ContextInfo* target_context) const {
-        float avg_tps = 0.0f;
-        if (target_context->last_decode_time_us > 0 && target_context->total_generation_tokens > 0) {
-            avg_tps = static_cast<float>(target_context->total_generation_tokens) / (static_cast<float>(target_context->last_decode_time_us) / 1000000.0f);
-        }
-        
-        return {
-            target_context->total_generation_tokens,
-            target_context->last_decode_time_us,
-            avg_tps
-        };
-    }
-    
-    // Timing API methods for compatibility with UI - overloaded for specific context
-    // TODO: Should probably integrate into PerformanceStats and be moved into ContextInfo
-    struct Timings {
-        int32_t n_eval = 0;
-        float t_eval_ms = 0.0f;
-    };
-    
-    void reset_timings(ContextInfo* target_context) {
-        target_context->total_generation_tokens = 0;
-        target_context->last_decode_time_us = 0;
-    }
-    
-    Timings get_timings(ContextInfo* target_context) const {
-        Timings timings;
-        timings.n_eval = static_cast<int32_t>(target_context->total_generation_tokens);
-        timings.t_eval_ms = static_cast<float>(target_context->last_decode_time_us) / LlamaConstants::MS_TO_MICROSECONDS;
-        return timings;
-    }
-    
+    }    
     // Enhanced cleanup with memory optimization
     void cleanup() {
         LLAMA_LOG("Cleanup called - cleaning up " + std::to_string(contexts.size()) + " contexts");
