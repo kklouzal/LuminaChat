@@ -712,13 +712,7 @@ public:
         };
         auto pruning_callback = [this, target_context](float keep_ratio) {
             return target_context->prune_with_summarization(keep_ratio);        };
-        
-        return target_context->update_context_from_history(token_processor, pruning_callback);
-    }
-
-private:
-    void clear_caches() const {
-        token_cache.clear();
+          return target_context->update_context_from_history(token_processor, pruning_callback);
     }
     
     // TokenCache management and statistics
@@ -734,7 +728,13 @@ private:
         LLAMA_LOG("Token cache configured - Policy: " + std::to_string(static_cast<int>(policy)) + 
                   ", Thread Safety: " + (enable_thread_safety ? "enabled" : "disabled"));
     }
-      // Helper method for summarizer callback - generates response on a specific context without context switching
+
+private:
+    void clear_caches() const {
+        token_cache.clear();
+    }
+    
+    // Helper method for summarizer callback - generates response on a specific context without context switching
     std::string generate_response_on_context(const std::string& input, const std::string& username, ContextInfo* target_context) {
         // Generate response directly on the target context without switching
         LLAMA_LOG("Generating response directly on target context without switching");

@@ -728,19 +728,25 @@ private:
         std::string discord_token, discord_isolated_channels, discord_shared_channels;
         std::string summarizer_model_path, summarizer_system_prompt, summarizer_chat_template;
         int32_t context_size{2048}, gpu_layers{0}, predict_tokens{256};
-        int32_t summarizer_context_size{1024}, summarizer_gpu_layers{0}, summarizer_predict_tokens{128};
-        int32_t discord_history_percentage{50};
+        int32_t summarizer_context_size{1024}, summarizer_gpu_layers{0}, summarizer_predict_tokens{128};        int32_t discord_history_percentage{50};
         bool discord_allow_dms{true}, discord_pull_history{true};
-    } config;    // State management
+    } config;
+    
+    // State management
     std::atomic<bool> is_started{false}, is_processing{false}, context_created{false};
     
     // Context monitoring timer
-    wxTimer* context_monitor_timer;    // UI controls with better organization
+    wxTimer* context_monitor_timer;
+    
+    // UI controls with better organization
     struct UIControls {
         wxButton *start_btn, *stop_btn, *settings_btn, *discord_btn, *prune_btn, *summary_slots_btn;
         wxGauge* progress_bar;
         wxGauge* context_progress_bar;
-        wxStaticText *progress_label, *timings_label, *context_label;
+        wxStaticText *progress_label, *context_label, *cache_stats_label, *gen_stats_label;
+        wxStaticBoxSizer* cache_stats_box;
+        wxStaticBoxSizer* gen_stats_box;
+        wxStaticBoxSizer* context_buffer_box;
         wxRichTextCtrl* chat_history;
         wxTextCtrl *input_text, *logs_text, *summaries_text;
         wxNotebook* notebook;
@@ -755,9 +761,10 @@ public:
         
         llama_manager = std::make_unique<LlamaManager>();
         discord_manager = std::make_unique<DiscordManager>();
+          // Initialize context monitoring timer
+        context_monitor_timer = new wxTimer(this, static_cast<int>(EventId::CONTEXT_MONITOR_TIMER));
         
-        // Initialize context monitoring timer
-        context_monitor_timer = new wxTimer(this, static_cast<int>(EventId::CONTEXT_MONITOR_TIMER));        // Set up unified logging
+        // Set up unified logging
         LogHandler::set_output_callback([this](const std::string& msg) {
             AppendToLogsThreadSafe(wxString::FromUTF8(msg));
         });
@@ -766,18 +773,14 @@ public:
         LogHandler::set_summarizer_callback([this](const std::string& msg) {
             AppendToSummariesThreadSafe(wxString::FromUTF8(msg));
         });
-        
-        // Set up summarizer-specific logging to summaries tab
-        LogHandler::set_summarizer_callback([this](const std::string& msg) {
-            AppendToSummariesThreadSafe(wxString::FromUTF8(msg));
-        });
-        
-        LoadConfiguration();
+          LoadConfiguration();
         CreateUI();
         SetupConsoleRedirection();
         UpdateButtonStates();
         BindEvents();
-    }    ~LuminaChatFrame() {
+    }
+    
+    ~LuminaChatFrame() {
         if (context_monitor_timer) {
             context_monitor_timer->Stop();
             delete context_monitor_timer;
@@ -842,27 +845,58 @@ private:
         CreateStatusArea();
         CreateNotebook();
         LayoutComponents();
-        
-        SetMinSize(wxSize(600, 400));
+          SetMinSize(wxSize(600, 400));
         AddWelcomeMessage();
-    }      void CreateToolbar() {
+    }
+    
+    void CreateToolbar() {
         ui.start_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::START), "Start");
         ui.stop_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::STOP), "Stop");
         ui.settings_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::SETTINGS), "Settings");
         ui.discord_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::CONNECT_DISCORD), "Connect Discord");
         ui.prune_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::PRUNE_SUMMARIZE), "Prune && Summarize");
         ui.summary_slots_btn = new wxButton(ui.main_panel, static_cast<int>(EventId::VIEW_SUMMARY_SLOTS), "View Summaries");
-    }    void CreateStatusArea() {
+    }
+    
+    void CreateStatusArea() {
         ui.progress_label = new wxStaticText(ui.main_panel, wxID_ANY, "Ready");
         ui.progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, wxSize(-1, 20));
         ui.progress_bar->Hide();
         
-        ui.context_label = new wxStaticText(ui.main_panel, wxID_ANY, "Context: N/A", wxDefaultPosition, wxSize(220, -1));
-        ui.context_progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, wxSize(200, 15));
-        
-        ui.timings_label = new wxStaticText(ui.main_panel, wxID_ANY, "");
+        // Create context/buffer, generation, and cache statistics areas
+        CreateContextBufferArea();
+        CreateGenerationStatsArea();
+        CreateCacheStatsArea();
     }
-      void CreateNotebook() {
+    
+    void CreateContextBufferArea() {
+        ui.context_buffer_box = new wxStaticBoxSizer(wxVERTICAL, ui.main_panel, "Context Buffer");
+        
+        ui.context_progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, wxSize(200, 15));
+        ui.context_label = new wxStaticText(ui.main_panel, wxID_ANY, "Buffer: N/A", wxDefaultPosition, wxSize(220, -1));
+        
+        // Add progress bar first (above), then label
+        ui.context_buffer_box->Add(ui.context_progress_bar, 0, wxEXPAND | wxALL, 5);
+        ui.context_buffer_box->Add(ui.context_label, 0, wxEXPAND | wxALL, 5);
+    }
+    
+    void CreateGenerationStatsArea() {
+        ui.gen_stats_box = new wxStaticBoxSizer(wxVERTICAL, ui.main_panel, "Generation Stats");        ui.gen_stats_label = new wxStaticText(ui.main_panel, wxID_ANY, "Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s", 
+                                             wxDefaultPosition, wxSize(160, 60));
+        ui.gen_stats_label->SetFont(wxFont(8, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+        ui.gen_stats_box->Add(ui.gen_stats_label, 1, wxEXPAND | wxALL, 5);
+    }
+    
+    void CreateCacheStatsArea() {
+        ui.cache_stats_box = new wxStaticBoxSizer(wxVERTICAL, ui.main_panel, "Token Cache Stats");        ui.cache_stats_label = new wxStaticText(ui.main_panel, wxID_ANY, "Hits: 0 | Misses: 0\nRequests: 0\nEntries: 0\nHit Ratio: 0.0%", 
+                                               wxDefaultPosition, wxSize(180, 60));
+        ui.cache_stats_label->SetFont(wxFont(8, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+        ui.cache_stats_box->Add(ui.cache_stats_label, 1, wxEXPAND | wxALL, 5);
+          // Initialize cache stats display
+        UpdateCacheStats();
+    }
+    
+    void CreateNotebook() {
         ui.notebook = new wxNotebook(ui.main_panel, wxID_ANY);
         
         CreateChatTab();
@@ -881,11 +915,11 @@ private:
         
         sizer->Add(ui.chat_history, 1, wxEXPAND | wxALL, 5);
         sizer->Add(ui.input_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
-        
-        panel->SetSizer(sizer);
+          panel->SetSizer(sizer);
         ui.notebook->AddPage(panel, "Chat");
     }
-      void CreateSummariesTab() {
+    
+    void CreateSummariesTab() {
         auto* panel = new wxPanel(ui.notebook);
         auto* sizer = new wxBoxSizer(wxVERTICAL);
         
@@ -920,34 +954,51 @@ private:
         sizer->Add(ui.logs_text, 1, wxEXPAND | wxALL, 5);
         panel->SetSizer(sizer);
         ui.notebook->AddPage(panel, "Logs");
-    }    void LayoutComponents() {
+    }
+      void LayoutComponents() {
         auto* toolbar_sizer = new wxBoxSizer(wxHORIZONTAL);
-        toolbar_sizer->Add(ui.start_btn, 0, wxRIGHT, 5);        toolbar_sizer->Add(ui.stop_btn, 0, wxRIGHT, 5);  
+        toolbar_sizer->Add(ui.start_btn, 0, wxRIGHT, 5);
+        toolbar_sizer->Add(ui.stop_btn, 0, wxRIGHT, 5);  
         toolbar_sizer->Add(ui.settings_btn, 0, wxRIGHT, 5);
         toolbar_sizer->Add(ui.discord_btn, 0, wxRIGHT, 5);
         toolbar_sizer->Add(ui.prune_btn, 0, wxRIGHT, 5);
         toolbar_sizer->Add(ui.summary_slots_btn, 0);
         toolbar_sizer->AddStretchSpacer();
-          // Context monitoring area - fixed sizing and spacing
-        auto* context_sizer = new wxBoxSizer(wxHORIZONTAL);
-        context_sizer->Add(ui.context_label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
-        context_sizer->Add(ui.context_progress_bar, 0, wxALIGN_CENTER_VERTICAL);
-        context_sizer->AddStretchSpacer();
         
+        // Top info area with three sections evenly spaced and center-aligned
+        auto* top_info_sizer = new wxBoxSizer(wxHORIZONTAL);
+        
+        // Add flexible space before the first box
+        top_info_sizer->AddStretchSpacer(1);
+        
+        // Context buffer box (left)
+        top_info_sizer->Add(ui.context_buffer_box, 0, wxALIGN_CENTER);
+        top_info_sizer->AddStretchSpacer(1);
+        
+        // Generation statistics box (center)
+        top_info_sizer->Add(ui.gen_stats_box, 0, wxALIGN_CENTER);
+        top_info_sizer->AddStretchSpacer(1);
+        
+        // Cache statistics box (right)
+        top_info_sizer->Add(ui.cache_stats_box, 0, wxALIGN_CENTER);
+        
+        // Add flexible space after the last box
+        top_info_sizer->AddStretchSpacer(1);
+        
+        // Status area for progress label only
         auto* status_sizer = new wxBoxSizer(wxHORIZONTAL);
         status_sizer->Add(ui.progress_label, 0, wxALIGN_CENTER_VERTICAL);
-        status_sizer->AddSpacer(20);
-        status_sizer->Add(ui.timings_label, 1, wxALIGN_CENTER_VERTICAL);
-        
-        auto* main_sizer = new wxBoxSizer(wxVERTICAL);
+        status_sizer->AddStretchSpacer();
+          auto* main_sizer = new wxBoxSizer(wxVERTICAL);
         main_sizer->Add(toolbar_sizer, 0, wxEXPAND | wxALL, 10);
-        main_sizer->Add(context_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 10);
+        main_sizer->Add(top_info_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 5);  // Reduced top margin from 10 to 5
         main_sizer->Add(status_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT, 10);
         main_sizer->Add(ui.progress_bar, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
         main_sizer->Add(ui.notebook, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
-        
-        ui.main_panel->SetSizer(main_sizer);
-    }      void BindEvents() {
+          ui.main_panel->SetSizer(main_sizer);
+    }
+    
+    void BindEvents() {
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnStart, this, static_cast<int>(EventId::START));
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnStop, this, static_cast<int>(EventId::STOP));
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &LuminaChatFrame::OnSettings, this, static_cast<int>(EventId::SETTINGS));
@@ -1298,10 +1349,10 @@ private:
                         // Note: Summarizer chat template was already set during model loading
                     } else {
                         LLAMA_LOG("Warning: Failed to create summary context, summarization features may be limited");
-                    }
-                }
+                    }                }
             }
         }
+        
         if (success) {
             is_started = true;
             
@@ -1318,11 +1369,15 @@ private:
             }
             
             ui.chat_history->Clear();
-            AddSystemMessage("LuminaChat ready! Type your message below.");
-            ui.input_text->SetFocus();
+            AddSystemMessage("LuminaChat ready! Type your message below.");            ui.input_text->SetFocus();
             
             llama_manager->reset_timings(llama_manager->get_context_info("main_chat"));
-            ui.timings_label->SetLabel("");
+            
+            // Reset generation stats display
+            ui.gen_stats_label->SetLabel("Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");
+            
+            // Initialize cache stats display after model is loaded
+            UpdateCacheStats();
         } else {
             LLAMA_LOG_ERROR("Failed to load model or create context");
         }
@@ -1357,13 +1412,12 @@ private:
             DISCORD_LOG("Discord bot disconnected from model");
         }
         
-        llama_manager->cleanup();
-        context_created = false;
+        llama_manager->cleanup();        context_created = false;
         is_started = false;
         is_processing = false;
-        UpdateButtonStates();
+          UpdateButtonStates();
         LLAMA_LOG("LuminaChat stopped.");
-        ui.timings_label->SetLabel("");
+        ui.gen_stats_label->SetLabel("Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");
     }
     
     void OnConnectDiscord(wxCommandEvent& event) {
@@ -1504,11 +1558,11 @@ private:
             delete worker_thread;
             worker_thread = nullptr;
             is_processing = false;
-            UpdateButtonStates();
-            AddSystemMessage("Error: Failed to start response generation thread");
+            UpdateButtonStates();            AddSystemMessage("Error: Failed to start response generation thread");
         }
     }
-      void OnResponseReady(wxCommandEvent& event) {
+    
+    void OnResponseReady(wxCommandEvent& event) {
         is_processing = false;
         worker_thread = nullptr; // Thread is detached and will clean itself up
         
@@ -1517,49 +1571,74 @@ private:
         // Check for error responses
         if (response.StartsWith("Error:")) {
             AddSystemMessage(response);
-        } else {
-            AddAIMessage(response);
+        } else {            AddAIMessage(response);
             
-            // Update timings after successful inference
-            UpdateTimingsDisplay();
+            // Update generation stats after successful inference
+            UpdateGenerationStats();
             
             // Update context progress immediately after response
             UpdateContextProgress();
+            
+            // Update cache statistics after response generation
+            UpdateCacheStats();
         }
         
         UpdateButtonStates();
         ui.input_text->SetFocus();
         
         // Auto-scroll to bottom
-        ui.chat_history->SetInsertionPointEnd();
-        ui.chat_history->ShowPosition(ui.chat_history->GetLastPosition());
-    }
+        ui.chat_history->SetInsertionPointEnd();        ui.chat_history->ShowPosition(ui.chat_history->GetLastPosition());    }
     
-    void UpdateTimingsDisplay() {
+    void UpdateGenerationStats() {
         if (!is_started || !llama_manager) {
+            ui.gen_stats_label->SetLabel("Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");
             return;
         }
         
-        // Get timings from llama manager
         auto context_info = llama_manager->get_context_info("main_chat");
+        if (!context_info) {
+            ui.gen_stats_label->SetLabel("No Context\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");
+            return;
+        }
+        
         auto timings = llama_manager->get_timings(context_info);
         if (timings.n_eval > 0) {
             double tokens_per_sec = UIConstants::MS_TO_SECONDS * timings.n_eval / timings.t_eval_ms;
+            double total_time_sec = timings.t_eval_ms / UIConstants::MS_TO_SECONDS;
             
-            // Get additional statistics for comprehensive display
-            auto perf_stats = llama_manager->get_performance_stats(context_info);
-            
-            ui.timings_label->SetLabel(wxString::Format("Generated: %d tokens, %.2f tok/s (%.2fms)", 
-                                                       timings.n_eval, 
-                                                       tokens_per_sec,
-                                                       timings.t_eval_ms));
-        } else {
-            ui.timings_label->SetLabel("");
+            wxString gen_display = wxString::Format(
+                "Generated\nTokens: %d\nSpeed: %.1f tok/s\nTime: %.1fs",
+                timings.n_eval,
+                tokens_per_sec,
+                total_time_sec
+            );
+            ui.gen_stats_label->SetLabel(gen_display);
+        } else {            ui.gen_stats_label->SetLabel("Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");
         }
     }
     
     void OnContextMonitorTimer(wxTimerEvent& event) {
         UpdateContextProgress();
+        UpdateCacheStats();
+        UpdateGenerationStats();
+    }
+      void UpdateCacheStats() {
+        if (!llama_manager) {
+            ui.cache_stats_label->SetLabel("Hits: 0 | Misses: 0\nRequests: 0\nEntries: 0\nHit Ratio: 0.0%");
+            return;
+        }
+        
+        auto stats = llama_manager->get_token_cache_stats();
+        size_t misses = stats.requests > stats.hits ? stats.requests - stats.hits : 0;
+        
+        wxString cache_display = wxString::Format(
+            "Hits: %zu | Misses: %zu\nRequests: %zu\nEntries: %zu\nHit Ratio: %.1f%%",
+            stats.hits, misses,
+            stats.requests, stats.entries,
+            stats.hit_ratio * 100.0f
+        );
+        
+        ui.cache_stats_label->SetLabel(cache_display);
     }
     
     void UpdateContextProgress() {
@@ -1658,8 +1737,9 @@ public:
 };
 
 wxIMPLEMENT_APP(LuminaChatApp);
-// Cross-platform entry point* argv[]) {
-int32_t main(int32_t argc, char* argv[]) {   return wxEntry(argc, argv);
+
+// Cross-platform entry point
+int32_t main(int32_t argc, char* argv[]) {
     return wxEntry(argc, argv);
 }
 
