@@ -117,7 +117,7 @@ private:
     mutable LlamaResponse response_generator;
     
 public:
-    LlamaManager() : token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE) {
+    LlamaManager() : token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE), response_generator(&token_cache) {
     }
 
     ~LlamaManager() noexcept {
@@ -324,8 +324,7 @@ public:
         }
         return it->second.get();
     }
-    
-    // Context-specific tokenization with caching
+      // Context-specific tokenization with bidirectional caching
     std::vector<llama_token> process_text_to_tokens(const std::string& text, ContextInfo* target_context, bool add_special = true) const {
         if (text.empty()) return {};
         
@@ -337,18 +336,18 @@ public:
         
         std::string cache_key = text + (add_special ? ":s" : ":n");
         
-        // Check cache first
-        std::vector<llama_token> cached_tokens = token_cache.get(cache_key);
-        if (!cached_tokens.empty()) {
-            return cached_tokens;
-        }        
+        // Check cache first - bidirectional lookup
+        if (auto cached_tokens = token_cache.get_tokens(cache_key)) {
+            return *cached_tokens;
+        }
+        
         // Get required buffer size for tokenization
         const int32_t n_tokens_required = -llama_tokenize(target_context->model_info->vocab, text.c_str(), text.size(), nullptr, 0, add_special, true);
         if (n_tokens_required <= 0) {
             // Don't treat empty tokenization as warning for whitespace-only text
             if (std::all_of(text.begin(), text.end(), [](char c) { return std::isspace(c); })) {
                 // Cache empty result for whitespace-only strings
-                token_cache.put(cache_key, {});
+                token_cache.put(cache_key, text, {});
                 return {};
             }
             
@@ -384,12 +383,115 @@ public:
             tokens.resize(std::max(0, n_tokens_actual)); // Ensure non-negative size
         }
         
-        // Cache the result
-        token_cache.put(cache_key, tokens);
+        // Cache the result with bidirectional mapping for detokenization
+        token_cache.put(cache_key, text, tokens);
         
         return tokens;
     }
-    
+      // Context-specific detokenization with bidirectional caching (reverse lookup)
+    std::string process_tokens_to_text(const std::vector<llama_token>& tokens, ContextInfo* target_context) const {
+        if (tokens.empty()) return {};
+        
+        // Get vocab from specified context's model
+        if (!target_context->model_info || !target_context->model_info->vocab) {
+            LLAMA_LOG("Error: No vocabulary available from specified context's model for detokenization");
+            return {};
+        }
+        
+        // Check reverse cache first - bidirectional lookup
+        if (auto cached_text = token_cache.get_text(tokens)) {
+            return *cached_text;
+        }
+        
+        // Fallback to llama.cpp detokenization
+        std::string result;
+        result.reserve(tokens.size() * 4); // Rough estimate for token-to-text expansion
+        
+        for (const auto& token : tokens) {
+            std::vector<char> buffer(32); // Start with reasonable buffer size
+            
+            int32_t result_length = llama_token_to_piece(
+                target_context->model_info->vocab, 
+                token, 
+                buffer.data(), 
+                buffer.size(), 
+                0, 
+                true
+            );
+            
+            if (result_length < 0) {
+                // Buffer too small, resize and retry
+                buffer.resize(-result_length);
+                result_length = llama_token_to_piece(
+                    target_context->model_info->vocab, 
+                    token, 
+                    buffer.data(), 
+                    buffer.size(), 
+                    0, 
+                    true
+                );
+            }
+            
+            if (result_length > 0) {
+                result.append(buffer.data(), result_length);
+            }
+        }
+        
+        // Cache the result bidirectionally for future lookups
+        std::string cache_key = "detok:" + std::to_string(std::hash<std::string>{}(result));
+        token_cache.put(cache_key, result, tokens);
+        
+        return result;
+    }    // Cache-aware token-to-text conversion with bidirectional caching
+    std::string convert_token_to_text_cached(llama_token token, ContextInfo* target_context) const {
+        if (!target_context->model_info || !target_context->model_info->vocab) {
+            LLAMA_LOG("Error: No vocabulary available for token conversion");
+            return {};
+        }
+        
+        // Try reverse cache lookup first for single token
+        std::vector<llama_token> single_token = {token};
+        if (auto cached_text = token_cache.get_text(single_token)) {
+            return *cached_text;
+        }
+        
+        // Fallback to direct llama.cpp conversion
+        std::vector<char> buffer(32); // Start with reasonable buffer size
+        
+        int32_t result_length = llama_token_to_piece(
+            target_context->model_info->vocab, 
+            token, 
+            buffer.data(), 
+            buffer.size(), 
+            0, 
+            true
+        );
+        
+        if (result_length < 0) {
+            // Buffer too small, resize and retry
+            buffer.resize(-result_length);
+            result_length = llama_token_to_piece(
+                target_context->model_info->vocab, 
+                token, 
+                buffer.data(), 
+                buffer.size(), 
+                0, 
+                true
+            );
+        }
+        
+        std::string result;
+        if (result_length > 0) {
+            result.assign(buffer.data(), result_length);
+            
+            // Cache the result bidirectionally
+            std::string cache_key = "tok:" + std::to_string(token);
+            token_cache.put(cache_key, result, single_token);
+        }
+        
+        return result;
+    }
+
     // Forward declaration for summary slot info - implementation after LlamaSummarizer include
     // TODO: Move this into LlamaSummarizer and access it through the parent ContextInfo
     struct SummarySlotInfo {
@@ -609,16 +711,28 @@ public:
             return process_text_to_tokens(text, target_context, add_special);
         };
         auto pruning_callback = [this, target_context](float keep_ratio) {
-            return target_context->prune_with_summarization(keep_ratio);
-        };
+            return target_context->prune_with_summarization(keep_ratio);        };
         
         return target_context->update_context_from_history(token_processor, pruning_callback);
     }
-    
-private:
 
+private:
     void clear_caches() const {
         token_cache.clear();
+    }
+    
+    // TokenCache management and statistics
+    // Get token cache performance statistics for monitoring and optimization
+    TokenCache::CacheStats get_token_cache_stats() const {
+        return token_cache.get_stats();
+    }
+    
+    // Configure token cache settings
+    void configure_token_cache(TokenCache::EvictionPolicy policy = TokenCache::EvictionPolicy::LRU, 
+                              bool enable_thread_safety = false) {
+        token_cache.configure(policy, enable_thread_safety);
+        LLAMA_LOG("Token cache configured - Policy: " + std::to_string(static_cast<int>(policy)) + 
+                  ", Thread Safety: " + (enable_thread_safety ? "enabled" : "disabled"));
     }
       // Helper method for summarizer callback - generates response on a specific context without context switching
     std::string generate_response_on_context(const std::string& input, const std::string& username, ContextInfo* target_context) {
