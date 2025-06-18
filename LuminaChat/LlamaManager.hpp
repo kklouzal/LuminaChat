@@ -278,11 +278,10 @@ public:
         initialize_context_size_manager(*context_info, *model_info);
         LLAMA_LOG("Initialized ContextSizeManager for context '" + context_id + "' with " + 
                   std::to_string(model_info->n_ctx) + " token capacity");
-        
-        // Integrate LlamaSummarizer with ContextSizeManager for coordinated summary management
+          // Integrate LlamaSummarizer with ContextSizeManager for coordinated summary management
         if (context_info->summarizer && context_info->context_size_manager) {
-            context_info->summarizer->integrate_with_context_size_manager(context_info->context_size_manager.get());
-            LLAMA_LOG("Integrated LlamaSummarizer with ContextSizeManager for context '" + context_id + "'");
+            context_info->summarizer->integrate_with_context_size_manager(context_info->context_size_manager.get(), context_info.get());
+            LLAMA_LOG("Integrated LlamaSummarizer with ContextSizeManager and ContextInfo reference for context '" + context_id + "'");
         }
         
         contexts[context_id] = std::move(context_info);
@@ -538,11 +537,10 @@ public:
         for (auto& [context_id, context_info] : contexts) {
             if (context_info->summarizer) {
                 context_info->summarizer->set_summary_resources(summary_mdl, summary_ctx, response_callback);
-                
-                // Ensure ContextSizeManager integration if both are available
+                  // Ensure ContextSizeManager integration if both are available
                 if (context_info->context_size_manager) {
-                    context_info->summarizer->integrate_with_context_size_manager(context_info->context_size_manager.get());
-                    LLAMA_LOG("Integrated LlamaSummarizer with ContextSizeManager for context: " + context_id);
+                    context_info->summarizer->integrate_with_context_size_manager(context_info->context_size_manager.get(), context_info.get());
+                    LLAMA_LOG("Integrated LlamaSummarizer with ContextSizeManager and ContextInfo reference for context: " + context_id);
                 }
                 
                 initialized_count++;
@@ -584,8 +582,7 @@ public:
         if (!target_context) return "Error: Invalid context";
         
         LLAMA_LOG("Starting response generation for: " + username);
-        
-        // STEP 1: Track user message for pattern analysis
+          // STEP 1: Track user message for pattern analysis
         std::vector<llama_token> input_tokens = process_text_to_tokens(input, target_context, false);
         track_user_message(*target_context, *target_context->model_info, static_cast<int32_t>(input_tokens.size()));
         
@@ -865,3 +862,68 @@ private:
 //
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!
 //
+
+// Implementation of ContextInfo::prune_with_summarization method
+// (moved here because LlamaSummarizer.hpp is included in LlamaManager.hpp)
+inline bool ContextInfo::prune_with_summarization(float keep_ratio) {
+    LLAMA_LOG("Starting conversation pruning with summarization (keep ratio: " + std::to_string(keep_ratio) + ")");
+    
+    if (message_history.empty()) {
+        LLAMA_LOG("No messages to prune - message history is empty");
+        return true;
+    }
+    
+    // Use actual summarization if summarizer is available
+    if (summarizer) {
+        LLAMA_LOG("Using LlamaSummarizer for intelligent conversation pruning");
+        summarizer->prune_message_history(message_history, keep_ratio);
+        
+        // Mark cache as dirty to force rebuild
+        message_cache_dirty = true;
+        conversation_state.invalidate();
+        
+        LLAMA_LOG("Summarization-based pruning completed successfully");
+        return true;
+    }
+    
+    // Fallback: simple pruning without summarization if summarizer is not available
+    LLAMA_LOG("Warning: LlamaSummarizer not available, falling back to simple pruning");
+    size_t total_messages = message_history.size();
+    bool has_system = !message_history.empty() && message_history[0].first == "system";
+    size_t system_offset = has_system ? 1 : 0;
+    size_t non_system_messages = total_messages - system_offset;
+    
+    size_t messages_to_keep = std::max(size_t(2), static_cast<size_t>(non_system_messages * keep_ratio));
+    
+    if (messages_to_keep >= non_system_messages) {
+        LLAMA_LOG("No pruning needed - keeping all messages");
+        return true;
+    }
+    
+    // Build new message history with system message + recent messages
+    std::vector<std::pair<std::string, std::string>> new_history;
+    if (has_system) {
+        new_history.push_back(message_history[0]);
+    }
+    
+    // Add note about removed messages
+    size_t removed_count = non_system_messages - messages_to_keep;
+    new_history.emplace_back("system", "[Note: " + std::to_string(removed_count) + 
+                            " older messages removed due to context limits]");
+    
+    // Keep recent messages
+    size_t start_idx = total_messages - messages_to_keep;
+    for (size_t i = start_idx; i < total_messages; ++i) {
+        new_history.push_back(message_history[i]);
+    }
+    
+    message_history = std::move(new_history);
+    
+    // Mark cache as dirty to force rebuild
+    message_cache_dirty = true;
+    conversation_state.invalidate();
+    
+    LLAMA_LOG("Fallback pruning completed successfully - kept " + std::to_string(messages_to_keep) + 
+              " of " + std::to_string(non_system_messages) + " non-system messages");
+    return true;
+}

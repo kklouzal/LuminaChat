@@ -59,13 +59,7 @@
 #include "SettingsManager.hpp"
 #include "LogHandler.hpp"
 
-// Define SummarizerConstants to avoid multiple definition errors
-namespace SummarizerConstants {
-    const size_t MAX_SUMMARY_SLOTS = 5;
-    const float MAX_CONTEXT_USAGE = 0.90f;
-    const float TARGET_CONTEXT_USAGE = 0.60f;
-    const float AGGRESSIVE_PRUNING_RATIO = 0.3f;
-}
+// SummarizerConstants are defined in LlamaSummarizer.hpp
 
 // Forward declarations
 class LuminaChatFrame;

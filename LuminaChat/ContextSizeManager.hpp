@@ -427,10 +427,10 @@ private:
     size_t merge_operations_count_ = 0;
     mutable UsagePatternTracker usage_tracker_;
     
-public:
-    void set_context_size(int32_t size) {
+public:    void set_context_size(int32_t size) {
         std::lock_guard<std::mutex> lock(mutex_);
         context_size_ = size;
+        LLAMA_LOG("DynamicSummarySlotManager: Set context size to " + std::to_string(size));
     }
     
     void track_usage_pattern(float context_usage, int32_t ai_tokens = 0, int32_t user_tokens = 0) const {
@@ -457,8 +457,7 @@ public:
         float current_usage = get_usage_percentage_unsafe();
         return current_usage > dynamic_threshold;
     }
-    
-    void add_summary_slot(int32_t tokens) {
+      void add_summary_slot(int32_t tokens) {
         std::lock_guard<std::mutex> lock(mutex_);
         slot_sizes_.push_back(tokens);
         total_summary_tokens_ += tokens;
@@ -922,62 +921,11 @@ private:
     }
 };
 
-// Implementation of analyze_context method
-inline EnhancedContextAnalysis EnhancedContextSizeManager::analyze_context(const ContextInfo& context) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    EnhancedContextAnalysis analysis{};
-    
-    // Basic context state
-    analysis.context_size = context.model_info ? context.model_info->n_ctx : 2048;
-    analysis.total_used_tokens = context.n_past;
-    analysis.available_tokens = analysis.context_size - analysis.total_used_tokens;
-    
-    // Get summary statistics
-    analysis.summary_slot_stats = summary_slot_manager_.get_statistics();
-    analysis.summary_tokens = analysis.summary_slot_stats.total_tokens;
-    analysis.active_history_tokens = analysis.total_used_tokens - analysis.summary_tokens;
-    
-    // Calculate allocations based on current strategy and usage patterns
-    auto ai_stats = ai_response_tracker_.get_statistics();
-    auto summary_stats = summary_tracker_.get_statistics();
-    
-    // Dynamic space requirements with strategy-based multipliers
-    analysis.required_ai_space = static_cast<int32_t>(ai_stats.estimated_size * ContextSizeConstants::DYNAMIC_BUFFER_MULTIPLIER);
-    analysis.required_summary_space = static_cast<int32_t>(summary_stats.estimated_size * ContextSizeConstants::DYNAMIC_BUFFER_MULTIPLIER);
-    analysis.emergency_buffer_space = static_cast<int32_t>(analysis.context_size * ContextSizeConstants::GLOBAL_EMERGENCY_BUFFER);
-    
-    // Calculate dynamic allocation percentages
-    analysis.emergency_buffer_percentage = ContextSizeConstants::GLOBAL_EMERGENCY_BUFFER;
-    analysis.summary_allocation_percentage = static_cast<float>(analysis.summary_tokens) / analysis.context_size;
-    analysis.ai_allocation_percentage = static_cast<float>(analysis.required_ai_space) / analysis.context_size;
-    analysis.active_content_percentage = static_cast<float>(analysis.active_history_tokens) / analysis.context_size;
-    
-    // Action flags
-    analysis.emergency_buffer_violated = analysis.available_tokens < analysis.emergency_buffer_space;
-    analysis.summary_hard_cap_exceeded = analysis.summary_allocation_percentage > ContextSizeConstants::MAX_TOTAL_SUMMARY_ALLOCATION;
-    analysis.needs_summary_merge = analysis.summary_slot_stats.needs_merge || analysis.summary_hard_cap_exceeded;
-    analysis.needs_pruning = analysis.emergency_buffer_violated || 
-                            (analysis.available_tokens < analysis.required_ai_space);
-    
-    // Strategy assessment
-    auto conversation_metrics = conversation_analyzer_.get_metrics();
-    ContextStrategy suggested_strategy = conversation_analyzer_.suggest_optimal_strategy(ai_response_tracker_, summary_tracker_);
-    analysis.strategy_change_recommended = (suggested_strategy != current_strategy_);
-    analysis.recommended_strategy = suggested_strategy;
-    
-    // Performance metrics
-    analysis.ai_stats = ai_stats;
-    analysis.summary_stats = summary_stats;
-    analysis.conversation_metrics = conversation_metrics;
-    
-    // Efficiency calculations
-    float total_required_space = analysis.emergency_buffer_space + analysis.required_ai_space + 
-                                analysis.required_summary_space + analysis.active_history_tokens;
-    analysis.context_utilization_efficiency = std::min(1.0f, static_cast<float>(analysis.total_used_tokens) / total_required_space);
-    
-    // Prediction accuracy (average of AI and summary trackers)
-    analysis.prediction_accuracy_score = (ai_stats.prediction_accuracy + summary_stats.prediction_accuracy) / 2.0f;
-    
-    return analysis;
-}
+// Implementation note: EnhancedContextSizeManager::analyze_context method 
+// implementation is moved to LlamaContext.hpp to avoid circular dependencies
+
+//
+//  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!
+//
+
+
