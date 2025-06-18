@@ -146,7 +146,7 @@ namespace UIConstants {
     constexpr int32_t TEMPLATE_MESSAGE_HEIGHT = 200;
     constexpr int32_t SUMMARY_PROMPT_HEIGHT = 120;
     constexpr int32_t CHANNEL_LIST_HEIGHT = 80;
-    constexpr int32_t PROGRESS_BAR_HEIGHT = 20;
+    constexpr int32_t PROGRESS_BAR_HEIGHT = 16;
     constexpr int32_t STATS_LABEL_HEIGHT = 60;
     constexpr int32_t SLIDER_WIDTH = 120;
     constexpr int32_t CONTEXT_LABEL_WIDTH = 220;
@@ -346,11 +346,16 @@ private:
     
     // Context monitoring timer
     wxTimer* context_monitor_timer;    // UI controls with better organization
+
     struct UIControls {
         wxButton *start_btn, *stop_btn, *settings_btn, *discord_btn, *prune_btn, *summary_slots_btn;
         wxGauge* progress_bar;
-        wxGauge* context_progress_bar;
-        wxStaticText *progress_label, *context_label, *cache_stats_label, *gen_stats_label;
+        
+        // Detailed context breakdown UI elements
+        wxGauge *overall_progress_bar, *summary_progress_bar, *history_progress_bar, *ai_space_progress_bar, *buffer_progress_bar;
+        wxStaticText *overall_label, *summary_label, *history_label, *ai_space_label, *buffer_label;
+        
+        wxStaticText *progress_label, *cache_stats_label, *gen_stats_label;
         wxStaticBoxSizer* cache_stats_box;
         wxStaticBoxSizer* gen_stats_box;
         wxStaticBoxSizer* context_buffer_box;
@@ -360,7 +365,7 @@ private:
         wxChoice* context_selector;
         wxNotebook* notebook;
         wxPanel* main_panel;
-    } ui;
+    }ui;
       // Thread safety: Worker thread management (Directive #12)
     ModelWorkerThread* worker_thread{nullptr};
 
@@ -484,18 +489,57 @@ private:
         CreateContextBufferArea();
         CreateGenerationStatsArea();
         CreateCacheStatsArea();
-    }
-      void CreateContextBufferArea() {
-        ui.context_buffer_box = new wxStaticBoxSizer(wxVERTICAL, ui.main_panel, "Context Buffer");
-        
-        ui.context_progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, 
-                                             wxSize(200, UIConstants::PROGRESS_BAR_HEIGHT / 4 * 3));
-        ui.context_label = new wxStaticText(ui.main_panel, wxID_ANY, "Buffer: N/A", wxDefaultPosition, 
+    }    void CreateContextBufferArea() {
+        ui.context_buffer_box = new wxStaticBoxSizer(wxVERTICAL, ui.main_panel, "Context Usage Breakdown");
+          // Overall context usage (main indicator)
+        auto* overall_sizer = new wxBoxSizer(wxHORIZONTAL);
+        ui.overall_progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, 
+                                             wxSize(150, UIConstants::PROGRESS_BAR_HEIGHT));
+        ui.overall_label = new wxStaticText(ui.main_panel, wxID_ANY, "Overall: N/A", wxDefaultPosition, 
                                           wxSize(UIConstants::CONTEXT_LABEL_WIDTH, -1));
+        overall_sizer->Add(ui.overall_progress_bar, 1, wxEXPAND | wxRIGHT, 5);
+        overall_sizer->Add(ui.overall_label, 0, wxALIGN_CENTER_VERTICAL);
+        ui.context_buffer_box->Add(overall_sizer, 0, wxEXPAND | wxALL, 2);
         
-        // Add progress bar first (above), then label
-        ui.context_buffer_box->Add(ui.context_progress_bar, 0, wxEXPAND | wxALL, 5);
-        ui.context_buffer_box->Add(ui.context_label, 0, wxEXPAND | wxALL, 5);
+        // Summary usage
+        auto* summary_sizer = new wxBoxSizer(wxHORIZONTAL);
+        ui.summary_progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, 
+                                             wxSize(150, UIConstants::PROGRESS_BAR_HEIGHT));
+        ui.summary_label = new wxStaticText(ui.main_panel, wxID_ANY, "Summaries: N/A", wxDefaultPosition, 
+                                          wxSize(UIConstants::CONTEXT_LABEL_WIDTH, -1));
+        summary_sizer->Add(ui.summary_progress_bar, 1, wxEXPAND | wxRIGHT, 5);
+        summary_sizer->Add(ui.summary_label, 0, wxALIGN_CENTER_VERTICAL);
+        ui.context_buffer_box->Add(summary_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 2);
+        
+        // Active history usage
+        auto* history_sizer = new wxBoxSizer(wxHORIZONTAL);
+        ui.history_progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, 
+                                             wxSize(150, UIConstants::PROGRESS_BAR_HEIGHT));
+        ui.history_label = new wxStaticText(ui.main_panel, wxID_ANY, "History: N/A", wxDefaultPosition, 
+                                          wxSize(UIConstants::CONTEXT_LABEL_WIDTH, -1));
+        history_sizer->Add(ui.history_progress_bar, 1, wxEXPAND | wxRIGHT, 5);
+        history_sizer->Add(ui.history_label, 0, wxALIGN_CENTER_VERTICAL);
+        ui.context_buffer_box->Add(history_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 2);
+        
+        // AI response space allocation
+        auto* ai_space_sizer = new wxBoxSizer(wxHORIZONTAL);
+        ui.ai_space_progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, 
+                                              wxSize(150, UIConstants::PROGRESS_BAR_HEIGHT));
+        ui.ai_space_label = new wxStaticText(ui.main_panel, wxID_ANY, "AI Space: N/A", wxDefaultPosition, 
+                                           wxSize(UIConstants::CONTEXT_LABEL_WIDTH, -1));
+        ai_space_sizer->Add(ui.ai_space_progress_bar, 1, wxEXPAND | wxRIGHT, 5);
+        ai_space_sizer->Add(ui.ai_space_label, 0, wxALIGN_CENTER_VERTICAL);
+        ui.context_buffer_box->Add(ai_space_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 2);
+        
+        // Emergency buffer
+        auto* buffer_sizer = new wxBoxSizer(wxHORIZONTAL);
+        ui.buffer_progress_bar = new wxGauge(ui.main_panel, wxID_ANY, 100, wxDefaultPosition, 
+                                            wxSize(150, UIConstants::PROGRESS_BAR_HEIGHT));
+        ui.buffer_label = new wxStaticText(ui.main_panel, wxID_ANY, "Buffer: N/A", wxDefaultPosition, 
+                                         wxSize(UIConstants::CONTEXT_LABEL_WIDTH, -1));
+        buffer_sizer->Add(ui.buffer_progress_bar, 1, wxEXPAND | wxRIGHT, 5);
+        buffer_sizer->Add(ui.buffer_label, 0, wxALIGN_CENTER_VERTICAL);
+        ui.context_buffer_box->Add(buffer_sizer, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 2);
     }
       void CreateGenerationStatsArea() {
         ui.gen_stats_box = new wxStaticBoxSizer(wxVERTICAL, ui.main_panel, "Generation Stats");
@@ -1074,11 +1118,25 @@ private:
             ui.progress_bar->Hide();
             ui.progress_label->SetLabel("Ready");
             ui.main_panel->Layout();
-        }
-          // Reset context progress display
-        ui.context_label->SetLabel("Buffer: N/A");
-        ui.context_progress_bar->SetValue(0);
-        ui.context_progress_bar->SetForegroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_HIGHLIGHT));
+        }          // Reset context progress display
+        ui.overall_label->SetLabel("Overall: N/A");
+        ui.summary_label->SetLabel("Summaries: N/A");
+        ui.history_label->SetLabel("History: N/A");
+        ui.ai_space_label->SetLabel("AI Space: N/A");
+        ui.buffer_label->SetLabel("Buffer: N/A");
+        
+        ui.overall_progress_bar->SetValue(0);
+        ui.summary_progress_bar->SetValue(0);
+        ui.history_progress_bar->SetValue(0);
+        ui.ai_space_progress_bar->SetValue(0);
+        ui.buffer_progress_bar->SetValue(0);
+        
+        // Reset colors to default
+        ui.overall_progress_bar->SetForegroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_HIGHLIGHT));
+        ui.summary_progress_bar->SetForegroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_HIGHLIGHT));
+        ui.history_progress_bar->SetForegroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_HIGHLIGHT));
+        ui.ai_space_progress_bar->SetForegroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_HIGHLIGHT));
+        ui.buffer_progress_bar->SetForegroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_HIGHLIGHT));
         
         // Disconnect Discord manager from LlamaManager when model is stopped
         if (discord_manager && discord_manager->is_running.load()) {
@@ -1389,36 +1447,115 @@ private:
         
         ui.cache_stats_label->SetLabel(cache_display);
     }
-    
-    void UpdateContextProgress() {
+      void UpdateContextProgress() {
         if (!is_started || !llama_manager || !context_created || !llama_manager->has_context("main_chat")) {
-            ui.context_label->SetLabel("Buffer: N/A");
-            ui.context_progress_bar->SetValue(0);
+            // Reset all progress bars and labels when not available
+            ui.overall_label->SetLabel("Overall: N/A");
+            ui.summary_label->SetLabel("Summaries: N/A");
+            ui.history_label->SetLabel("History: N/A");
+            ui.ai_space_label->SetLabel("AI Space: N/A");
+            ui.buffer_label->SetLabel("Buffer: N/A");
+            
+            ui.overall_progress_bar->SetValue(0);
+            ui.summary_progress_bar->SetValue(0);
+            ui.history_progress_bar->SetValue(0);
+            ui.ai_space_progress_bar->SetValue(0);
+            ui.buffer_progress_bar->SetValue(0);
             return;
         }
 
-        // Get context usage information directly without switching contexts
+        // Get context usage information using ContextSizeManager
         auto context_info = llama_manager->get_context_info("main_chat");
-        int32_t context_usage = context_info->n_past;
-        int32_t context_size = context_info->get_context_size();
+        if (!context_info || !context_info->model_info) {
+            return;
+        }
         
-        if (context_size > 0) {
-            float usage_percentage = static_cast<float>(context_usage) / static_cast<float>(context_size) * 100.0f;
-            int32_t progress_value = static_cast<int32_t>(usage_percentage);
-              ui.context_progress_bar->SetValue(std::min(progress_value, 100));
+        // Get detailed analysis from ContextSizeManager
+        auto analysis = analyze_context_usage(*context_info, *context_info->model_info);
+        
+        if (analysis.context_size > 0) {
+            // Overall context usage - main indicator
+            float overall_percentage = static_cast<float>(analysis.total_used_tokens) / analysis.context_size * 100.0f;
+            ui.overall_progress_bar->SetValue(static_cast<int32_t>(std::min(overall_percentage, 100.0f)));
             
-            // Get summary slot information
-            auto summary_info = context_info->summarizer->get_summary_slot_info();
-            
-            // More descriptive label showing context buffer usage and summary slots
-            wxString label = wxString::Format("Buffer: %d/%d", context_usage, context_size);
-            if (summary_info.used_slots > 0) {
-                label += wxString::Format(" | Summaries: %zu/%zu", summary_info.used_slots, summary_info.total_slots);
+            // Color coding for overall progress bar based on usage
+            if (overall_percentage >= 90.0f) {
+                ui.overall_progress_bar->SetForegroundColour(wxColour(220, 20, 20)); // Red - critical
+            } else if (overall_percentage >= 75.0f) {
+                ui.overall_progress_bar->SetForegroundColour(wxColour(255, 165, 0)); // Orange - warning
+            } else {
+                ui.overall_progress_bar->SetForegroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_HIGHLIGHT)); // Normal
             }
-            ui.context_label->SetLabel(label);
+            
+            // Summary usage breakdown
+            float summary_percentage = static_cast<float>(analysis.summary_tokens) / analysis.context_size * 100.0f;
+            ui.summary_progress_bar->SetValue(static_cast<int32_t>(std::min(summary_percentage, 100.0f)));
+            
+            // Color summary bar based on hard cap (30%)
+            if (analysis.summary_hard_cap_exceeded) {
+                ui.summary_progress_bar->SetForegroundColour(wxColour(220, 20, 20)); // Red - exceeded hard cap
+            } else if (summary_percentage >= 25.0f) {
+                ui.summary_progress_bar->SetForegroundColour(wxColour(255, 165, 0)); // Orange - approaching cap
+            } else {
+                ui.summary_progress_bar->SetForegroundColour(wxColour(100, 200, 100)); // Green - healthy
+            }
+            
+            // Active history usage breakdown
+            float history_percentage = static_cast<float>(analysis.active_history_tokens) / analysis.context_size * 100.0f;
+            ui.history_progress_bar->SetValue(static_cast<int32_t>(std::min(history_percentage, 100.0f)));
+            ui.history_progress_bar->SetForegroundColour(wxColour(100, 150, 255)); // Blue for active content
+            
+            // AI response space allocation
+            float ai_space_percentage = static_cast<float>(analysis.required_ai_space) / analysis.context_size * 100.0f;
+            ui.ai_space_progress_bar->SetValue(static_cast<int32_t>(std::min(ai_space_percentage, 100.0f)));
+            
+            // Color AI space based on minimum requirements
+            if (analysis.available_tokens < analysis.required_ai_space) {
+                ui.ai_space_progress_bar->SetForegroundColour(wxColour(220, 20, 20)); // Red - insufficient space
+            } else {
+                ui.ai_space_progress_bar->SetForegroundColour(wxColour(150, 100, 255)); // Purple for AI space
+            }
+            
+            // Emergency buffer allocation
+            float buffer_percentage = static_cast<float>(analysis.emergency_buffer_space) / analysis.context_size * 100.0f;
+            ui.buffer_progress_bar->SetValue(static_cast<int32_t>(std::min(buffer_percentage, 100.0f)));
+            
+            // Color buffer based on violation status
+            if (analysis.emergency_buffer_violated) {
+                ui.buffer_progress_bar->SetForegroundColour(wxColour(220, 20, 20)); // Red - buffer violated
+            } else {
+                ui.buffer_progress_bar->SetForegroundColour(wxColour(255, 200, 100)); // Yellow for buffer space
+            }
+            
+            // Update labels with detailed information
+            ui.overall_label->SetLabel(wxString::Format("Overall: %d/%d (%.1f%%)", 
+                analysis.total_used_tokens, analysis.context_size, overall_percentage));
+                
+            ui.summary_label->SetLabel(wxString::Format("Summaries: %d tokens (%.1f%%) [%zu slots]", 
+                analysis.summary_tokens, summary_percentage, analysis.summary_slot_stats.slot_count));
+                
+            ui.history_label->SetLabel(wxString::Format("History: %d tokens (%.1f%%)", 
+                analysis.active_history_tokens, history_percentage));
+                
+            ui.ai_space_label->SetLabel(wxString::Format("AI Space: %d tokens (%.1f%%)", 
+                analysis.required_ai_space, ai_space_percentage));
+                
+            ui.buffer_label->SetLabel(wxString::Format("Buffer: %d tokens (%.1f%%)", 
+                analysis.emergency_buffer_space, buffer_percentage));
+                
         } else {
-            ui.context_label->SetLabel("Buffer: 0/0");
-            ui.context_progress_bar->SetValue(0);
+            // Reset to default values
+            ui.overall_label->SetLabel("Overall: 0/0");
+            ui.summary_label->SetLabel("Summaries: 0 tokens");
+            ui.history_label->SetLabel("History: 0 tokens");
+            ui.ai_space_label->SetLabel("AI Space: 0 tokens");
+            ui.buffer_label->SetLabel("Buffer: 0 tokens");
+            
+            ui.overall_progress_bar->SetValue(0);
+            ui.summary_progress_bar->SetValue(0);
+            ui.history_progress_bar->SetValue(0);
+            ui.ai_space_progress_bar->SetValue(0);
+            ui.buffer_progress_bar->SetValue(0);
         }
     }
       void RefreshMessageHistory() {        if (!ui.message_history_list || !is_started || !llama_manager) {
