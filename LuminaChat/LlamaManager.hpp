@@ -808,12 +808,7 @@ public:
         models.clear();        
         LLAMA_LOG("Cleanup completed");
     }
-    
-    // Get context size for capacity calculations
-    // TODO: This function should be removed and callers directly access ContextInfo::get_context_size()
-    int32_t get_context_size(ContextInfo* target_context) const noexcept {
-        return target_context->get_context_size();
-    }
+  
     
     bool update_context_from_history(ContextInfo* target_context) {
         // Delegate to the context's rebuild method

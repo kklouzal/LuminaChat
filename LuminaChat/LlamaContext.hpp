@@ -174,11 +174,7 @@ struct ContextInfo {
         void reset() {
             last_total_generation_tokens = 0;
             last_decode_time_us = 0;
-            last_average_tokens_per_second = 0.0f;
-        }
-          // Legacy compatibility accessors for backward compatibility
-        int32_t last_n_eval() const { return static_cast<int32_t>(last_total_generation_tokens); }
-        float last_t_eval_ms() const { return static_cast<float>(last_decode_time_us) / LlamaConstants::MS_TO_MICROSECONDS; }
+            last_average_tokens_per_second = 0.0f;        }
     } performance_stats;
     
     // Cache state - enhanced with conversation state tracking
@@ -323,13 +319,7 @@ struct ContextInfo {
         conversation_state.invalidate();
         message_cache_dirty = true;
     }
-    
-    // Check if context needs pruning based on token count
-    bool needs_pruning(int32_t token_count) const {
-        if (!model_info) return false;
-        int32_t max_threshold = static_cast<int32_t>(model_info->n_ctx * 0.9f);
-        return token_count > max_threshold;
-    }
+  
     
     // Batch management methods - context-specific
     void clear_batch() {
@@ -500,10 +490,7 @@ public:
             LLAMA_LOG("Error: Invalid batch size calculated: " + std::to_string(n_batch));
             return false;
         }
-        
-        std::vector<llama_seq_id> seq_ids = {0};
-        // Check context capacity using model's n_ctx
-        int32_t max_threshold = static_cast<int32_t>(model_info->n_ctx * 0.9f);
+          std::vector<llama_seq_id> seq_ids = {0};
         if (!is_incremental) {
             LLAMA_LOG("Starting context rebuild: FULL (non-incremental) - processing " + std::to_string(tokens.size()) + " tokens");
             n_past = 0; // Reset for full context rebuild
