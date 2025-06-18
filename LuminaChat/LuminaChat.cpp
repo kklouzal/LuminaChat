@@ -44,6 +44,7 @@
 #include <wx/timer.h>
 #include <wx/datetime.h>
 #include <wx/listbox.h>
+#include <wx/choice.h>
 #include <string>
 #include <cstdint>
 #include <memory>
@@ -51,6 +52,8 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <vector>
+#include <iterator>
 #include "LlamaManager.hpp"
 #include "DiscordManager.hpp" 
 #include "SettingsManager.hpp"
@@ -348,8 +351,7 @@ private:
     long current_stream_position{0};
     
     // Context monitoring timer
-    wxTimer* context_monitor_timer;
-      // UI controls with better organization
+    wxTimer* context_monitor_timer;    // UI controls with better organization
     struct UIControls {
         wxButton *start_btn, *stop_btn, *settings_btn, *discord_btn, *prune_btn, *summary_slots_btn;
         wxGauge* progress_bar;
@@ -361,6 +363,7 @@ private:
         wxRichTextCtrl* chat_history;
         wxTextCtrl *input_text, *logs_text, *summaries_text;
         wxListBox* message_history_list;
+        wxChoice* context_selector;
         wxNotebook* notebook;
         wxPanel* main_panel;
     } ui;
@@ -386,9 +389,7 @@ public:
         // Set up summarizer-specific logging to route to summaries tab
         LogHandler::set_summarizer_callback([this](std::string_view msg) {
             AppendToSummariesThreadSafe(wxString::FromUTF8(msg.data(), msg.length()));
-        });
-
-        LoadConfiguration();
+        });        LoadConfiguration();
         CreateUI();
         SetupConsoleRedirection();
         UpdateButtonStates();
@@ -562,14 +563,24 @@ private:
         panel->SetSizer(sizer);
         ui.notebook->AddPage(panel, "Summaries");
     }
-    
-    void CreateMessageHistoryTab() {
+      void CreateMessageHistoryTab() {
         auto* panel = new wxPanel(ui.notebook);
         auto* sizer = new wxBoxSizer(wxVERTICAL);
         
-        // Add a refresh button at the top
+        // Add a top controls row with refresh button and context selector
+        auto* controls_sizer = new wxBoxSizer(wxHORIZONTAL);
         auto* refresh_btn = new wxButton(panel, wxID_ANY, "Refresh Message History");
-        sizer->Add(refresh_btn, 0, wxEXPAND | wxALL, 5);
+        
+        // Create context selector dropdown
+        ui.context_selector = new wxChoice(panel, wxID_ANY);
+        ui.context_selector->SetMinSize(wxSize(150, -1));
+        
+        controls_sizer->Add(refresh_btn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
+        controls_sizer->Add(new wxStaticText(panel, wxID_ANY, "Context:"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
+        controls_sizer->Add(ui.context_selector, 0, wxALIGN_CENTER_VERTICAL);
+        controls_sizer->AddStretchSpacer();
+        
+        sizer->Add(controls_sizer, 0, wxEXPAND | wxALL, 5);
         
         // Create the listbox for message history
         ui.message_history_list = new wxListBox(panel, wxID_ANY, wxDefaultPosition, wxDefaultSize,
@@ -1042,9 +1053,7 @@ private:
                 main_context->reset_performance_stats();
             }
               // Reset generation stats display
-            ui.gen_stats_label->SetLabel("Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");
-            
-            // Initialize cache stats display after model is loaded
+            ui.gen_stats_label->SetLabel("Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");            // Initialize cache stats display after model is loaded
             UpdateCacheStats();
             
             // Initialize message history display
@@ -1091,9 +1100,7 @@ private:
         is_streaming_response = false;
         current_stream_position = 0;          UpdateButtonStates();
         LLAMA_LOG("LuminaChat stopped.");
-        ui.gen_stats_label->SetLabel("Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");
-        
-        // Clear message history display when model is stopped
+        ui.gen_stats_label->SetLabel("Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");        // Clear message history display when model is stopped
         if (ui.message_history_list) {
             ui.message_history_list->Clear();
             ui.message_history_list->Append("Model stopped - no message history available");
@@ -1420,27 +1427,43 @@ private:
             ui.context_progress_bar->SetValue(0);
         }
     }
-    
-    void RefreshMessageHistory() {
-        if (!ui.message_history_list || !is_started || !llama_manager) {
+      void RefreshMessageHistory() {        if (!ui.message_history_list || !is_started || !llama_manager) {
+            if (ui.message_history_list) {
+                ui.message_history_list->Clear();
+                ui.message_history_list->Append("Model not started - no message history available");
+            }
+            if (ui.context_selector) {
+                ui.context_selector->Clear();
+                ui.context_selector->Append("No contexts available");
+                ui.context_selector->SetSelection(0);
+                ui.context_selector->Enable(false);
+            }
             return;
         }
         
+        // First, update the context selector dropdown with all available contexts
+        UpdateContextSelector();
+        
         // Clear existing items
         ui.message_history_list->Clear();
+          // Get selected context from dropdown
+        wxString selected_context = "main_chat"; // Default
+        if (ui.context_selector && ui.context_selector->GetSelection() != wxNOT_FOUND) {
+            selected_context = ui.context_selector->GetStringSelection();
+        }
         
-        // Get the main chat context
-        auto main_context = llama_manager->get_context_info("main_chat");
-        if (!main_context) {
-            ui.message_history_list->Append("No main chat context available");
+        // Get the selected context
+        auto context_info = llama_manager->get_context_info(selected_context.ToStdString());
+        if (!context_info) {
+            ui.message_history_list->Append(wxString::Format("Context '%s' not found or not available", selected_context));
             return;
         }
         
         // Add each message to the listbox
-        if (main_context->message_history.empty()) {
+        if (context_info->message_history.empty()) {
             ui.message_history_list->Append("No messages in history");        } else {
-            for (size_t i = 0; i < main_context->message_history.size(); ++i) {
-                const auto& msg = main_context->message_history[i];
+            for (size_t i = 0; i < context_info->message_history.size(); ++i) {
+                const auto& msg = context_info->message_history[i];
                 
                 // Format: [index] role: content (truncated if too long)
                 std::string content = msg.second;  // content is the second element of the pair
@@ -1463,6 +1486,49 @@ private:
         // Scroll to the bottom to show most recent messages
         if (ui.message_history_list->GetCount() > 0) {
             ui.message_history_list->SetSelection(ui.message_history_list->GetCount() - 1);
+        }
+    }    void UpdateContextSelector() {
+        if (!ui.context_selector || !llama_manager) return;
+        
+        // Store current selection
+        wxString current_selection = ui.context_selector->GetStringSelection();
+        
+        // Clear and repopulate the dropdown
+        ui.context_selector->Clear();
+        
+        if (!is_started) {
+            ui.context_selector->Append("No contexts available");
+            ui.context_selector->SetSelection(0);
+            ui.context_selector->Enable(false);
+            return;
+        }
+        
+        // Get all available contexts directly from LlamaManager
+        auto context_ids = llama_manager->get_context_ids();
+        
+        if (context_ids.empty()) {
+            ui.context_selector->Append("No contexts available");
+            ui.context_selector->SetSelection(0);
+            ui.context_selector->Enable(false);
+        } else {
+            // Add all available contexts
+            for (const auto& context_id : context_ids) {
+                ui.context_selector->Append(wxString::FromUTF8(context_id.c_str()));
+            }
+            
+            // Try to restore previous selection, otherwise default to "main_chat" or first item
+            int selection_index = ui.context_selector->FindString(current_selection);
+            if (selection_index == wxNOT_FOUND) {
+                selection_index = ui.context_selector->FindString("main_chat");
+                if (selection_index == wxNOT_FOUND && ui.context_selector->GetCount() > 0) {
+                    selection_index = 0;
+                }
+            }
+            
+            if (selection_index != wxNOT_FOUND) {
+                ui.context_selector->SetSelection(selection_index);
+            }
+            ui.context_selector->Enable(true);
         }
     }
 };

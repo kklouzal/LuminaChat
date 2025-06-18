@@ -306,8 +306,7 @@ public:
     bool has_context(const std::string& context_id) const noexcept {
         return contexts.find(context_id) != contexts.end();
     }
-    
-    // Retrieve a ContextInfo object by its ID
+      // Retrieve a ContextInfo object by its ID
     // Critical Needed for context access in various operations
     ContextInfo* get_context_info(const std::string& context_id) const {
         auto it = contexts.find(context_id);
@@ -315,6 +314,17 @@ public:
             return nullptr;
         }
         return it->second.get();
+    }
+
+    // Get all available context IDs
+    // Needed for UI dropdown population
+    std::vector<std::string> get_context_ids() const {
+        std::vector<std::string> context_ids;
+        context_ids.reserve(contexts.size());
+        for (const auto& pair : contexts) {
+            context_ids.push_back(pair.first);
+        }
+        return context_ids;
     }
 
     // Retrieve a ModelInfo object by its ID
