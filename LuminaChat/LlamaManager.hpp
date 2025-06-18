@@ -161,13 +161,13 @@ public:
         if (!model_info->model) {
             LLAMA_LOG("Error: Failed to load model from " + model_path);
             return false;
-        }
-
-        model_info->vocab = llama_model_get_vocab(model_info->model);
+        }        model_info->vocab = llama_model_get_vocab(model_info->model);
         model_info->model_path = model_path;
+        model_info->model_name = actual_model_id;
         model_info->n_ctx = context_size;
         model_info->n_gpu_layers = gpu_layers;
         model_info->n_predict = predict_tokens; // Store predict tokens in model info
+        model_info->n_batch = std::min(LlamaConstants::MAX_BATCH_SIZE, context_size / LlamaConstants::BATCH_DIVISOR);
         model_info->model_loaded = true;
         
         // Store custom chat template if provided
@@ -273,6 +273,16 @@ public:
             };
             context_info->summarizer->set_summary_resources(summary_mdl, summary_ctx, response_callback);
             LLAMA_LOG("Set summarizer resources for new context '" + context_id + "'");
+        }
+          // Initialize ContextSizeManager for adaptive context management
+        initialize_context_size_manager(*context_info, *model_info);
+        LLAMA_LOG("Initialized ContextSizeManager for context '" + context_id + "' with " + 
+                  std::to_string(model_info->n_ctx) + " token capacity");
+        
+        // Integrate LlamaSummarizer with ContextSizeManager for coordinated summary management
+        if (context_info->summarizer && context_info->context_size_manager) {
+            context_info->summarizer->integrate_with_context_size_manager(context_info->context_size_manager.get());
+            LLAMA_LOG("Integrated LlamaSummarizer with ContextSizeManager for context '" + context_id + "'");
         }
         
         contexts[context_id] = std::move(context_info);
@@ -523,12 +533,18 @@ public:
         auto response_callback = [this](const std::string& input, const std::string& username, ContextInfo* target_context) -> std::string {
             return generate_response_on_context(input, username, target_context);
         };
-        
-        // Initialize summarizer resources for ALL contexts that have summarizers
+          // Initialize summarizer resources for ALL contexts that have summarizers
         int32_t initialized_count = 0;
         for (auto& [context_id, context_info] : contexts) {
             if (context_info->summarizer) {
                 context_info->summarizer->set_summary_resources(summary_mdl, summary_ctx, response_callback);
+                
+                // Ensure ContextSizeManager integration if both are available
+                if (context_info->context_size_manager) {
+                    context_info->summarizer->integrate_with_context_size_manager(context_info->context_size_manager.get());
+                    LLAMA_LOG("Integrated LlamaSummarizer with ContextSizeManager for context: " + context_id);
+                }
+                
                 initialized_count++;
                 LLAMA_LOG("Initialized summarizer resources for context: " + context_id);
             }
@@ -565,6 +581,23 @@ public:
     
      // Context-specific response generation
      std::string generate_response(const std::string& input, ContextInfo* target_context, const std::string& username = "Schwi") {
+        if (!target_context) return "Error: Invalid context";
+        
+        LLAMA_LOG("Starting response generation for: " + username);
+        
+        // STEP 1: Track user message for pattern analysis
+        std::vector<llama_token> input_tokens = process_text_to_tokens(input, target_context, false);
+        track_user_message(*target_context, *target_context->model_info, static_cast<int32_t>(input_tokens.size()));
+        
+        // STEP 2: Get context analysis and recommendations before generation
+        auto pre_analysis = analyze_context_usage(*target_context, *target_context->model_info);
+        auto recommendations = target_context->context_size_manager->get_optimization_recommendations(pre_analysis);
+        for (const auto& rec : recommendations) {
+            LLAMA_LOG("Pre-generation recommendation: " + rec);
+        }
+        
+        // STEP 3: Prepare context for generation with enhanced error recovery
+        // ...existing code...
         // Pre-flight validation
         if (!target_context->context || !target_context->model_info || 
             !target_context->model_info->model_loaded || !target_context->model_info->model || 
@@ -623,12 +656,31 @@ public:
         };
         
         LLAMA_LOG("Delegating to LlamaResponse for token generation");
+        
+        // Get AI response size prediction for tracking
+        int32_t predicted_tokens = target_context->context_size_manager->get_estimated_ai_response_size();
+        
         std::string response = response_generator.generate_response("generate", "assistant", target_context, token_adder, context_updater);
         
-        // STEP 4: Update conversation with response (if successful)
+        // STEP 4: Track AI response and update conversation
         if (!response.empty() && !response.starts_with("Error:")) {
+            // Track actual AI response size for learning
+            std::vector<llama_token> response_tokens = process_text_to_tokens(response, target_context, false);
+            int32_t actual_tokens = static_cast<int32_t>(response_tokens.size());
+            track_ai_response(*target_context, *target_context->model_info, actual_tokens, predicted_tokens);
+            
             target_context->add_message("assistant", response);
-            LLAMA_LOG("Linear generation flow completed successfully");
+            
+            // Post-generation analysis and recommendations
+            auto post_analysis = analyze_context_usage(*target_context, *target_context->model_info);
+            auto post_recommendations = target_context->context_size_manager->get_optimization_recommendations(post_analysis);
+            for (const auto& rec : post_recommendations) {
+                LLAMA_LOG("Post-generation recommendation: " + rec);
+            }
+            
+            LLAMA_LOG("Linear generation flow completed successfully - tracked " + 
+                      std::to_string(actual_tokens) + " response tokens (predicted: " + 
+                      std::to_string(predicted_tokens) + ")");
         } else {
             LLAMA_LOG("Linear generation flow failed: " + response);
         }
@@ -640,12 +692,7 @@ public:
      // StreamCallback signature: void(std::string_view token_text)
      template<typename StreamCallback>
      std::string generate_response_streaming(const std::string& input, ContextInfo* target_context, const std::string& username, StreamCallback stream_callback) {
-        // Pre-flight validation
-        if (!target_context->context || !target_context->model_info || 
-            !target_context->model_info->model_loaded || !target_context->model_info->model || 
-            !target_context->model_info->vocab || !target_context->batch_initialized) {
-            return "Error: Model components not properly initialized for generation";
-        }
+        if (!target_context) return "Error: Invalid context";
 
         if (input.empty()) {
             return "Error: Empty input";
@@ -654,10 +701,20 @@ public:
         LLAMA_LOG("Starting streaming generation flow for input: " + 
                   (input.length() > 50 ? input.substr(0, 50) + "..." : input));
 
-        // STEP 1: Update conversation with new input
+        // STEP 1: Track user message and get context analysis
+        std::vector<llama_token> input_tokens = process_text_to_tokens(input, target_context, false);
+        track_user_message(*target_context, *target_context->model_info, static_cast<int32_t>(input_tokens.size()));
+        
+        auto pre_analysis = analyze_context_usage(*target_context, *target_context->model_info);
+        auto recommendations = target_context->context_size_manager->get_optimization_recommendations(pre_analysis);
+        for (const auto& rec : recommendations) {
+            LLAMA_LOG("Pre-streaming recommendation: " + rec);
+        }
+
+        // STEP 2: Update conversation with new input
         target_context->add_message(username, input);
         
-        // STEP 2: Prepare context for generation (handles template, tokenization, pruning, rebuild)
+        // STEP 3: Prepare context for generation with enhanced monitoring
         auto token_processor = [this, target_context](const std::string& text, bool add_special) {
             return process_text_to_tokens(text, target_context, add_special);
         };
@@ -684,7 +741,7 @@ public:
             }
         }
           
-        // STEP 3: Generate response tokens with streaming
+        // STEP 4: Generate response tokens with streaming
         // Setup callback functions for LlamaResponse
         auto token_adder = [this, target_context](llama_token token, int32_t pos, const std::vector<llama_seq_id>& seq_ids, bool output_logits) -> bool {
             return target_context->add_tokens_to_batch({token}, pos, seq_ids, output_logits);
@@ -698,12 +755,30 @@ public:
         };
         
         LLAMA_LOG("Delegating to LlamaResponse for streaming token generation");
+          // Get AI response prediction for tracking
+        int32_t predicted_tokens = target_context->context_size_manager->get_estimated_ai_response_size();
+        
         std::string response = response_generator.generate_response("generate", "assistant", target_context, token_adder, context_updater, stream_callback);
         
-        // STEP 4: Update conversation with response (if successful)
+        // STEP 5: Track response and update conversation (if successful)
         if (!response.empty() && !response.starts_with("Error:")) {
+            // Track actual AI response size for learning
+            std::vector<llama_token> response_tokens = process_text_to_tokens(response, target_context, false);
+            int32_t actual_tokens = static_cast<int32_t>(response_tokens.size());
+            track_ai_response(*target_context, *target_context->model_info, actual_tokens, predicted_tokens);
+            
             target_context->add_message("assistant", response);
-            LLAMA_LOG("Streaming generation flow completed successfully");
+            
+            // Post-streaming analysis and recommendations
+            auto post_analysis = analyze_context_usage(*target_context, *target_context->model_info);
+            auto post_recommendations = target_context->context_size_manager->get_optimization_recommendations(post_analysis);
+            for (const auto& rec : post_recommendations) {
+                LLAMA_LOG("Post-streaming recommendation: " + rec);
+            }
+            
+            LLAMA_LOG("Streaming generation flow completed successfully - tracked " + 
+                      std::to_string(actual_tokens) + " response tokens (predicted: " + 
+                      std::to_string(predicted_tokens) + ")");
         } else {
             LLAMA_LOG("Streaming generation flow failed: " + response);
         }

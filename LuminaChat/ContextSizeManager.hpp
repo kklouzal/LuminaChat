@@ -22,18 +22,9 @@
 #include <mutex>
 #include "LogHandler.hpp"
 
-// Context information structures (simplified for this header)
-struct ModelInfo {
-    int32_t n_ctx = 0;      // Context size
-    int32_t n_batch = 0;    // Batch size
-    std::string model_name;
-};
-
-struct ContextInfo {
-    std::shared_ptr<ModelInfo> model_info;
-    int32_t n_past = 0;     // Number of tokens processed so far
-    bool is_valid = true;
-};
+// Forward declarations - actual definitions in LlamaContext.hpp
+struct ModelInfo;
+struct ContextInfo;
 
 // Context management strategies (auto-adaptive only)
 enum class ContextStrategy : uint8_t {
@@ -750,10 +741,19 @@ public:
     void track_user_message() {
         conversation_analyzer_.track_message();
     }
-    
-    // Track pruning events
+      // Track pruning events
     void track_pruning_event() {
         conversation_analyzer_.track_pruning_event();
+    }
+    
+    // Get estimated AI response size
+    int32_t get_estimated_ai_response_size() const {
+        return ai_response_tracker_.get_estimated_size();
+    }
+    
+    // Get estimated summary size  
+    int32_t get_estimated_summary_size() const {
+        return summary_tracker_.get_estimated_size();
     }
     
     // Comprehensive context analysis with all dynamic features
@@ -915,117 +915,69 @@ private:
     
     static std::string strategy_to_string(ContextStrategy strategy) {
         switch (strategy) {
-            case ContextStrategy::BALANCED: return "BALANCED";
-            case ContextStrategy::AI_HEAVY: return "AI_HEAVY";
+            case ContextStrategy::BALANCED: return "BALANCED";            case ContextStrategy::AI_HEAVY: return "AI_HEAVY";
             case ContextStrategy::SUMMARY_HEAVY: return "SUMMARY_HEAVY";
             default: return "UNKNOWN";
         }
     }
 };
 
-// Implementation of analyze_context method (separate to avoid circular dependencies)
+// Implementation of analyze_context method
 inline EnhancedContextAnalysis EnhancedContextSizeManager::analyze_context(const ContextInfo& context) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
     EnhancedContextAnalysis analysis{};
     
-    if (!context.model_info) {
-        return analysis;  // Return empty analysis if no model info
-    }
-    
-    analysis.context_size = context.model_info->n_ctx;
+    // Basic context state
+    analysis.context_size = context.model_info ? context.model_info->n_ctx : 2048;
     analysis.total_used_tokens = context.n_past;
     analysis.available_tokens = analysis.context_size - analysis.total_used_tokens;
-    
-    // Update usage patterns
-    float current_context_usage = static_cast<float>(analysis.total_used_tokens) / analysis.context_size;
-    summary_slot_manager_.track_usage_pattern(current_context_usage);
     
     // Get summary statistics
     analysis.summary_slot_stats = summary_slot_manager_.get_statistics();
     analysis.summary_tokens = analysis.summary_slot_stats.total_tokens;
     analysis.active_history_tokens = analysis.total_used_tokens - analysis.summary_tokens;
     
-    // Calculate dynamic space requirements
-    analysis.required_ai_space = ai_response_tracker_.get_required_space();
-    analysis.required_summary_space = summary_tracker_.get_required_space();
+    // Calculate allocations based on current strategy and usage patterns
+    auto ai_stats = ai_response_tracker_.get_statistics();
+    auto summary_stats = summary_tracker_.get_statistics();
+    
+    // Dynamic space requirements with strategy-based multipliers
+    analysis.required_ai_space = static_cast<int32_t>(ai_stats.estimated_size * ContextSizeConstants::DYNAMIC_BUFFER_MULTIPLIER);
+    analysis.required_summary_space = static_cast<int32_t>(summary_stats.estimated_size * ContextSizeConstants::DYNAMIC_BUFFER_MULTIPLIER);
     analysis.emergency_buffer_space = static_cast<int32_t>(analysis.context_size * ContextSizeConstants::GLOBAL_EMERGENCY_BUFFER);
     
-    // Calculate dynamic percentage allocations
-    analysis.ai_allocation_percentage = static_cast<float>(analysis.required_ai_space) / analysis.context_size;
-    analysis.summary_allocation_percentage = static_cast<float>(analysis.required_summary_space) / analysis.context_size;
+    // Calculate dynamic allocation percentages
     analysis.emergency_buffer_percentage = ContextSizeConstants::GLOBAL_EMERGENCY_BUFFER;
+    analysis.summary_allocation_percentage = static_cast<float>(analysis.summary_tokens) / analysis.context_size;
+    analysis.ai_allocation_percentage = static_cast<float>(analysis.required_ai_space) / analysis.context_size;
+    analysis.active_content_percentage = static_cast<float>(analysis.active_history_tokens) / analysis.context_size;
     
-    // Remaining space for active content
-    analysis.active_content_percentage = 1.0f - analysis.ai_allocation_percentage - 
-                                        analysis.summary_allocation_percentage - analysis.emergency_buffer_percentage;
-    
-    // Ensure minimum allocations
-    analysis.ai_allocation_percentage = std::max(analysis.ai_allocation_percentage, ContextSizeConstants::MIN_AI_ALLOCATION);
-    analysis.summary_allocation_percentage = std::max(analysis.summary_allocation_percentage, ContextSizeConstants::MAX_TOTAL_SUMMARY_ALLOCATION);
-    analysis.active_content_percentage = std::max(analysis.active_content_percentage, ContextSizeConstants::MIN_ACTIVE_CONTENT);
-    
-    // Normalize if total exceeds 100%
-    float total_allocation = analysis.ai_allocation_percentage + analysis.summary_allocation_percentage + 
-                           analysis.active_content_percentage + analysis.emergency_buffer_percentage;
-    if (total_allocation > 1.0f) {
-        float scale_factor = (1.0f - analysis.emergency_buffer_percentage) / (total_allocation - analysis.emergency_buffer_percentage);
-        analysis.ai_allocation_percentage *= scale_factor;
-        analysis.summary_allocation_percentage *= scale_factor;
-        analysis.active_content_percentage *= scale_factor;
-    }
-    
-    // Determine action flags
-    analysis.needs_pruning = analysis.available_tokens < (analysis.required_ai_space + analysis.emergency_buffer_space);
+    // Action flags
     analysis.emergency_buffer_violated = analysis.available_tokens < analysis.emergency_buffer_space;
-    analysis.needs_summary_merge = analysis.summary_slot_stats.needs_merge;
-    analysis.summary_hard_cap_exceeded = analysis.summary_slot_stats.exceeds_hard_cap;
+    analysis.summary_hard_cap_exceeded = analysis.summary_allocation_percentage > ContextSizeConstants::MAX_TOTAL_SUMMARY_ALLOCATION;
+    analysis.needs_summary_merge = analysis.summary_slot_stats.needs_merge || analysis.summary_hard_cap_exceeded;
+    analysis.needs_pruning = analysis.emergency_buffer_violated || 
+                            (analysis.available_tokens < analysis.required_ai_space);
     
-    // Strategy analysis
-    analysis.recommended_strategy = conversation_analyzer_.suggest_optimal_strategy(ai_response_tracker_, summary_tracker_);
-    analysis.strategy_change_recommended = (analysis.recommended_strategy != current_strategy_);
+    // Strategy assessment
+    auto conversation_metrics = conversation_analyzer_.get_metrics();
+    ContextStrategy suggested_strategy = conversation_analyzer_.suggest_optimal_strategy(ai_response_tracker_, summary_tracker_);
+    analysis.strategy_change_recommended = (suggested_strategy != current_strategy_);
+    analysis.recommended_strategy = suggested_strategy;
     
-    // Get statistics
-    analysis.ai_stats = ai_response_tracker_.get_statistics();
-    analysis.summary_stats = summary_tracker_.get_statistics();
-    analysis.conversation_metrics = conversation_analyzer_.get_metrics();
+    // Performance metrics
+    analysis.ai_stats = ai_stats;
+    analysis.summary_stats = summary_stats;
+    analysis.conversation_metrics = conversation_metrics;
     
-    // Calculate efficiency metrics
-    float total_useful_space = static_cast<float>(analysis.active_history_tokens + analysis.summary_tokens);
-    analysis.context_utilization_efficiency = total_useful_space / analysis.context_size;
-    analysis.prediction_accuracy_score = (analysis.ai_stats.prediction_accuracy + analysis.summary_stats.prediction_accuracy) / 2.0f;
+    // Efficiency calculations
+    float total_required_space = analysis.emergency_buffer_space + analysis.required_ai_space + 
+                                analysis.required_summary_space + analysis.active_history_tokens;
+    analysis.context_utilization_efficiency = std::min(1.0f, static_cast<float>(analysis.total_used_tokens) / total_required_space);
     
-    // Track context usage for pattern analysis
-    conversation_analyzer_.track_context_usage(current_context_usage);
+    // Prediction accuracy (average of AI and summary trackers)
+    analysis.prediction_accuracy_score = (ai_stats.prediction_accuracy + summary_stats.prediction_accuracy) / 2.0f;
     
     return analysis;
 }
-
-//
-// PRODUCTION-READY INTEGRATION EXAMPLE:
-//
-// 1. Initialize:
-//    auto context_manager = std::make_unique<EnhancedContextSizeManager>();
-//    context_manager->set_context_size(model_info.n_ctx);
-//
-// 2. Track responses:
-//    context_manager->track_ai_response(actual_tokens, predicted_tokens);
-//    context_manager->track_user_message();
-//
-// 3. Plan and execute summary addition:
-//    auto plan = context_manager->plan_summary_addition(estimated_size);
-//    if (plan.needs_merge_first) {
-//        // Prepare for merge
-//    }
-//    
-//    bool success = context_manager->execute_summary_addition(actual_size, [&]() -> int32_t {
-//        // Perform actual merge operation and return merged size
-//        return perform_merge_operation();
-//    });
-//
-// 4. Get analysis and recommendations:
-//    auto analysis = context_manager->analyze_context(context);
-//    auto recommendations = context_manager->get_optimization_recommendations(analysis);
-//    
-//    for (const auto& rec : recommendations) {
-//        LLAMA_LOG("Recommendation: " + rec);
-//    }
-//

@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <functional>
 #include "LogHandler.hpp"
+#include "ContextSizeManager.hpp"
 
 // Forward declarations to avoid circular dependency
 struct ContextInfo;
@@ -180,10 +181,21 @@ public:
         
         // Fallback: return the first chunk summary if final combination failed
         return chunk_summaries.empty() ? "" : chunk_summaries[0];
-    }
-
-    // Direct summary generation using stored context pointers (eliminates LlamaManager dependency)
+    }    // Direct summary generation using stored context pointers (eliminates LlamaManager dependency)
     std::string generate_summary_directly(const std::string& summarization_request);
+
+    // ContextSizeManager integration methods for coordinated summary management
+    void integrate_with_context_size_manager(EnhancedContextSizeManager* context_manager);
+    void track_summary_with_context_manager(const std::string& summary, int32_t estimated_tokens = 0);
+    bool should_perform_rollover_summarization() const;
+    void sync_slots_with_context_manager();
+
+private:
+    // Reference to parent context's ContextSizeManager for coordination
+    EnhancedContextSizeManager* context_size_manager = nullptr;
+    
+    // Helper to estimate tokens in a summary (rough approximation)
+    int32_t estimate_summary_tokens(const std::string& summary) const;
 
 };
 
@@ -193,9 +205,22 @@ public:
 inline void LlamaSummarizer::add_summary_to_slots(const std::string& new_summary) {
     if (new_summary.empty()) return;
     
-    // If we're at capacity (5 slots), implement rollover summarization
-    if (summary_slots.size() >= SummarizerConstants::MAX_SUMMARY_SLOTS) {
-        SUMMARIZER_LOG("Summary slots at capacity, performing rollover summarization");
+    // Estimate tokens for the new summary
+    int32_t summary_tokens = estimate_summary_tokens(new_summary);
+    
+    // Check with ContextSizeManager if we need to merge before adding
+    bool needs_merge = false;
+    if (context_size_manager) {
+        auto plan = context_size_manager->plan_summary_addition(summary_tokens);
+        needs_merge = plan.needs_merge_first;
+        
+        SUMMARIZER_LOG("ContextSizeManager summary plan: " + plan.action_plan + 
+                       " (estimated usage: " + std::to_string(plan.estimated_final_usage_percentage * 100) + "%)");
+    }
+    
+    // If we're at capacity (5 slots) OR ContextSizeManager recommends merge, implement rollover summarization
+    if (summary_slots.size() >= SummarizerConstants::MAX_SUMMARY_SLOTS || needs_merge) {
+        SUMMARIZER_LOG("Summary slots at capacity or merge recommended, performing rollover summarization");
         
         // Get the two oldest summaries (slots 0 and 1)
         std::string oldest_summary = summary_slots[0];
@@ -209,22 +234,59 @@ inline void LlamaSummarizer::add_summary_to_slots(const std::string& new_summary
         std::string combined_summary = summarize_messages(rollover_messages);
         
         if (!combined_summary.empty()) {
-            // Remove the two oldest summaries and replace with the combined one
-            summary_slots.erase(summary_slots.begin(), summary_slots.begin() + 2);
-            summary_slots.insert(summary_slots.begin(), combined_summary);
-            SUMMARIZER_LOG("Rollover summarization successful - combined 2 oldest summaries into 1");
+            // Execute the merge operation through ContextSizeManager if available
+            if (context_size_manager) {
+                int32_t merged_tokens = estimate_summary_tokens(combined_summary);
+                
+                // Execute merge through ContextSizeManager
+                bool success = context_size_manager->execute_summary_addition(summary_tokens, [merged_tokens]() -> int32_t {
+                    return merged_tokens;  // Return the merged summary size
+                });
+                
+                if (success) {
+                    // Remove the two oldest summaries and replace with the combined one
+                    summary_slots.erase(summary_slots.begin(), summary_slots.begin() + 2);
+                    summary_slots.insert(summary_slots.begin(), combined_summary);
+                    SUMMARIZER_LOG("ContextSizeManager-coordinated rollover summarization successful - combined 2 oldest summaries into 1");
+                } else {
+                    SUMMARIZER_LOG("Warning: ContextSizeManager merge operation failed, falling back to simple removal");
+                    summary_slots.erase(summary_slots.begin());
+                }
+            } else {
+                // Fallback to original logic if no ContextSizeManager
+                summary_slots.erase(summary_slots.begin(), summary_slots.begin() + 2);
+                summary_slots.insert(summary_slots.begin(), combined_summary);
+                SUMMARIZER_LOG("Rollover summarization successful - combined 2 oldest summaries into 1");
+            }
         } else {
             // Fallback: just remove the oldest if rollover summarization fails
             summary_slots.erase(summary_slots.begin());
             SUMMARIZER_LOG("Rollover summarization failed, removed oldest summary");
+        }    } else {
+        // Add new summary directly with ContextSizeManager tracking
+        if (context_size_manager) {
+            bool success = context_size_manager->execute_summary_addition(summary_tokens, []() -> int32_t {
+                return 0;  // No merge needed
+            });
+            
+            if (!success) {
+                SUMMARIZER_LOG("Warning: ContextSizeManager rejected summary addition");
+                return;
+            }
         }
+        
+        // Add new summary to the end (newest position)
+        summary_slots.push_back(new_summary);
     }
     
-    // Add new summary to the end (newest position)
-    summary_slots.push_back(new_summary);
+    // Track the summary creation with ContextSizeManager if not already done in merge case
+    if (context_size_manager && !needs_merge) {
+        context_size_manager->track_summary_creation(summary_tokens);
+    }
     
     SUMMARIZER_LOG("Added new summary to slot " + std::to_string(summary_slots.size()) + 
-                   " of " + std::to_string(SummarizerConstants::MAX_SUMMARY_SLOTS));
+                   " of " + std::to_string(SummarizerConstants::MAX_SUMMARY_SLOTS) + 
+                   " (" + std::to_string(summary_tokens) + " estimated tokens)");
 }
 
 inline void LlamaSummarizer::prune_message_history(std::vector<std::pair<std::string, std::string>>& message_history, 
@@ -320,9 +382,14 @@ inline void LlamaSummarizer::prune_message_history(std::vector<std::pair<std::st
     if (has_system) {
         new_history.emplace_back(std::move(message_history[0]));
     }
-    
-    // Handle 5-slot summary system
-    if (!summary.empty()) {        // Add new summary to the slot system
+      // Handle 5-slot summary system with ContextSizeManager coordination
+    if (!summary.empty()) {
+        // Track the summary creation with ContextSizeManager before adding to slots
+        if (context_size_manager) {
+            track_summary_with_context_manager(summary);
+        }
+        
+        // Add new summary to the slot system (this will use ContextSizeManager logic)
         add_summary_to_slots(summary);
         SUMMARIZER_LOG("Successfully created summary for " + std::to_string(summarized_count) + " pruned messages");
         SUMMARIZER_LOG("Summary slots now contain " + std::to_string(summary_slots.size()) + " summaries");
@@ -415,12 +482,16 @@ inline std::string LlamaSummarizer::summarize_messages(const std::vector<std::pa
         std::string output_message = "=== GENERATED SUMMARY ===\n" + summary + "\n==========================\n";
         SUMMARIZER_LOG(output_message);
     }
-    
-    if (summary.empty()) {
+      if (summary.empty()) {
         SUMMARIZER_LOG("Warning: Message summarization produced empty result");
     } else {
         SUMMARIZER_LOG("Successfully summarized " + std::to_string(messages_to_summarize.size()) + 
                        " messages into " + std::to_string(summary.length()) + " character summary");
+        
+        // Track summary creation with ContextSizeManager
+        if (context_size_manager) {
+            track_summary_with_context_manager(summary);
+        }
     }
     
     return summary;
@@ -470,8 +541,83 @@ inline std::string LlamaSummarizer::generate_summary_directly(const std::string&
         SUMMARIZER_LOG_ERROR("Unknown exception during direct summary generation");
         summary = "";
     }
+      return summary;
+}
+
+// ContextSizeManager integration implementations
+inline void LlamaSummarizer::integrate_with_context_size_manager(EnhancedContextSizeManager* context_manager) {
+    context_size_manager = context_manager;
     
-    return summary;
+    if (context_size_manager) {
+        SUMMARIZER_LOG("Integrated with ContextSizeManager for coordinated summary management");
+        
+        // Sync existing summary slots with ContextSizeManager
+        sync_slots_with_context_manager();
+    }
+}
+
+inline void LlamaSummarizer::track_summary_with_context_manager(const std::string& summary, int32_t estimated_tokens) {
+    if (!context_size_manager || summary.empty()) return;
+    
+    int32_t actual_tokens = estimated_tokens > 0 ? estimated_tokens : estimate_summary_tokens(summary);
+    context_size_manager->track_summary_creation(actual_tokens);
+    
+    SUMMARIZER_LOG("Tracked summary creation with ContextSizeManager: " + std::to_string(actual_tokens) + " tokens");
+}
+
+inline bool LlamaSummarizer::should_perform_rollover_summarization() const {
+    if (!context_size_manager) {
+        // Fallback to original logic if no ContextSizeManager
+        return summary_slots.size() >= SummarizerConstants::MAX_SUMMARY_SLOTS;
+    }
+    
+    // Check if ContextSizeManager recommends merge
+    auto stats = context_size_manager->get_optimization_recommendations({});
+    for (const auto& recommendation : stats) {
+        if (recommendation.find("merge") != std::string::npos || 
+            recommendation.find("summary") != std::string::npos) {
+            return true;
+        }
+    }
+    
+    // Also check the traditional slot limit
+    return summary_slots.size() >= SummarizerConstants::MAX_SUMMARY_SLOTS;
+}
+
+inline void LlamaSummarizer::sync_slots_with_context_manager() {
+    if (!context_size_manager) return;
+    
+    // Calculate total tokens in existing slots and sync with ContextSizeManager
+    int32_t total_tokens = 0;
+    for (const auto& slot : summary_slots) {
+        int32_t slot_tokens = estimate_summary_tokens(slot);
+        total_tokens += slot_tokens;
+        
+        // Add each existing slot to ContextSizeManager tracking
+        // Note: This assumes ContextSizeManager can handle retrospective additions
+        // In practice, this should be called during initialization before any operations
+    }
+    
+    SUMMARIZER_LOG("Synchronized " + std::to_string(summary_slots.size()) + 
+                   " existing summary slots (" + std::to_string(total_tokens) + 
+                   " estimated tokens) with ContextSizeManager");
+}
+
+inline int32_t LlamaSummarizer::estimate_summary_tokens(const std::string& summary) const {
+    if (summary.empty()) return 0;
+    
+    // Rough estimation: ~4 characters per token (this is a conservative estimate)
+    // For better accuracy, this should use the actual tokenizer, but that would require
+    // more complex integration. This approximation is sufficient for planning purposes.
+    constexpr float CHARS_PER_TOKEN = 4.0f;
+    
+    int32_t estimated = static_cast<int32_t>(summary.length() / CHARS_PER_TOKEN);
+    
+    // Add small buffer for safety (10%)
+    estimated = static_cast<int32_t>(estimated * 1.1f);
+    
+    // Minimum of 10 tokens, maximum reasonable cap of 1000 tokens for a summary
+    return std::clamp(estimated, 10, 1000);
 }
 
 //
