@@ -5,8 +5,6 @@ VisualStudioVersion = 17.14.36202.13
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "LuminaChat", "LuminaChat\LuminaChat.vcxproj", "{650A7BE9-9BC0-4587-8BD9-678D5F8A206B}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Lookahead_Example", "Lookahead_Example\Lookahead_Example.vcxproj", "{147C3BAC-5422-43CA-922A-579B74BCA03C}"
-EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -23,14 +21,6 @@ Global
 		{650A7BE9-9BC0-4587-8BD9-678D5F8A206B}.Release|x64.Build.0 = Release|x64
 		{650A7BE9-9BC0-4587-8BD9-678D5F8A206B}.Release|x86.ActiveCfg = Release|Win32
 		{650A7BE9-9BC0-4587-8BD9-678D5F8A206B}.Release|x86.Build.0 = Release|Win32
-		{147C3BAC-5422-43CA-922A-579B74BCA03C}.Debug|x64.ActiveCfg = Debug|x64
-		{147C3BAC-5422-43CA-922A-579B74BCA03C}.Debug|x64.Build.0 = Debug|x64
-		{147C3BAC-5422-43CA-922A-579B74BCA03C}.Debug|x86.ActiveCfg = Debug|Win32
-		{147C3BAC-5422-43CA-922A-579B74BCA03C}.Debug|x86.Build.0 = Debug|Win32
-		{147C3BAC-5422-43CA-922A-579B74BCA03C}.Release|x64.ActiveCfg = Release|x64
-		{147C3BAC-5422-43CA-922A-579B74BCA03C}.Release|x64.Build.0 = Release|x64
-		{147C3BAC-5422-43CA-922A-579B74BCA03C}.Release|x86.ActiveCfg = Release|Win32
-		{147C3BAC-5422-43CA-922A-579B74BCA03C}.Release|x86.Build.0 = Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
