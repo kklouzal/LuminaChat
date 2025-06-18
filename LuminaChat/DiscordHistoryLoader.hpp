@@ -72,7 +72,8 @@ struct PendingMessage {
 };
 
 class DiscordHistoryLoader {
-private:    // Core dependencies
+private:
+    // Core dependencies
     dpp::cluster* bot = nullptr;
     LlamaManager* llama_manager = nullptr;
     std::string main_context_id;
@@ -93,12 +94,15 @@ private:    // Core dependencies
     // Channel processing
     std::unordered_map<uint64_t, ChannelState> channel_states;
     std::vector<uint64_t> shared_channels_list;
-    size_t shared_channel_index = 0;
-    mutable std::mutex state_mutex;
+    size_t shared_channel_index = 0;    mutable std::mutex state_mutex;
     
     // Message collection
     std::vector<PendingMessage> pending_messages;
     std::mutex pending_messages_mutex;
+    
+    // Deduplication tracking
+    std::unordered_set<uint64_t> processed_message_ids;
+    std::mutex processed_ids_mutex;
     
     // Capacity tracking
     std::unordered_map<std::string, int32_t> context_capacity_limits;
@@ -106,8 +110,7 @@ private:    // Core dependencies
     std::mutex capacity_mutex;
     
     // State
-    std::atomic<bool> backfill_in_progress{false};
-      // Constants
+    std::atomic<bool> backfill_in_progress{false};    // Constants
     static constexpr int32_t MESSAGES_PER_FETCH = 10;
     static constexpr float BASE_MAX_CONTEXT_FILL_RATIO = 0.01f;
     static constexpr int32_t MAX_ITERATIONS = 1000;
@@ -116,6 +119,9 @@ private:    // Core dependencies
     static constexpr int32_t RETRY_DELAY_MS = 1000;
     static constexpr int32_t PROGRESS_DELAY_MS = 250;
     static constexpr int32_t INITIALIZATION_DELAY_SEC = 2;
+    static constexpr int32_t MAX_MESSAGE_TOKENS = 2048;
+    static constexpr int32_t MIN_FILL_PERCENTAGE = 10;
+    static constexpr int32_t MAX_FILL_PERCENTAGE = 80;
     
     bool should_backfill_channel(uint64_t channel_id) const {
         return (isolated_channels && isolated_channels->count(channel_id)) ||
@@ -191,8 +197,7 @@ private:    // Core dependencies
         
         auto promise = std::make_shared<std::promise<bool>>();
         auto future = promise->get_future();
-        
-        bot->messages_get(channel_id, state.last_message_id, 0, 0, MESSAGES_PER_FETCH,
+          bot->messages_get(channel_id, 0, state.last_message_id, 0, MESSAGES_PER_FETCH,
             [this, channel_id, promise](const dpp::confirmation_callback_t& callback) {
                 bool success = false;
                 
@@ -219,7 +224,8 @@ private:    // Core dependencies
                     promise->set_value(false);
                 }
             });
-          // Wait for result with timeout
+        
+        // Wait for result with timeout
         auto status = future.wait_for(std::chrono::seconds(TIMEOUT_SECONDS));
         if (status == std::future_status::ready) {
             return future.get();
@@ -234,12 +240,30 @@ private:    // Core dependencies
     bool collect_messages_for_later(const dpp::message_map& messages, uint64_t channel_id) {
         if (messages.empty()) return false;
         
-        auto& state = channel_states[channel_id];
-        
-        // Process messages with exact tokenization
+        auto& state = channel_states[channel_id];        // Process messages with exact tokenization
         std::vector<PendingMessage> batch_messages;
         uint64_t oldest_id = UINT64_MAX; // Track oldest message ID for next iteration
-        int32_t total_exact_tokens = 0;          for (const auto& [id, msg] : messages) {
+        int32_t total_exact_tokens = 0;
+        int32_t new_messages_count = 0;
+        int32_t duplicate_count = 0;
+          for (const auto& [id, msg] : messages) {
+            uint64_t msg_id = static_cast<uint64_t>(msg.id);
+            
+            // Track the oldest message ID for pagination
+            oldest_id = std::min(oldest_id, msg_id);
+            
+            // Check for duplicate messages (safety net - should be rare with correct API usage)
+            {
+                std::lock_guard<std::mutex> lock(processed_ids_mutex);
+                if (processed_message_ids.count(msg_id)) {
+                    duplicate_count++;
+                    DISCORD_HISTORY_LOG("Skipping duplicate message ID: " + std::to_string(msg_id));
+                    continue;
+                }
+            }
+            
+            new_messages_count++;
+            
             // Check if this is a user message OR our bot's own message
             bool is_our_bot = msg.author.is_bot() && (static_cast<uint64_t>(msg.author.id) == bot_user_id);
             
@@ -267,13 +291,12 @@ private:    // Core dependencies
                     if (!embed.description.empty()) {
                         actual_content = embed.description;
                     }
-                }
-                
-                pending.content = safe_trim(actual_content);
+                }                pending.content = safe_trim(actual_content);
                 pending.timestamp = std::chrono::system_clock::time_point(std::chrono::seconds(msg.sent));
-                pending.message_id = static_cast<uint64_t>(msg.id);
+                pending.message_id = msg_id;
                 pending.target_context_id = state.context_id;
-                  // Use LlamaManager's context-specific tokenization method
+                
+                // Use LlamaManager's context-specific tokenization method
                 std::string formatted_message;
                 if (is_our_bot) {
                     // For bot messages, don't include username prefix since it's "assistant"
@@ -281,7 +304,8 @@ private:    // Core dependencies
                 } else {
                     formatted_message = msg.author.username + ": " + actual_content;
                 }
-                  // Get the specific context for tokenization to ensure consistency
+                
+                // Get the specific context for tokenization to ensure consistency
                 ContextInfo* target_context = llama_manager->get_context_info(state.context_id);
                 if (target_context) {
                     pending.tokenized_content = llama_manager->process_text_to_tokens(formatted_message, target_context, false);
@@ -291,29 +315,38 @@ private:    // Core dependencies
                 }
                 
                 // Check for reasonable token count limits
-                if (pending.tokenized_content.size() > 2048) {
+                if (pending.tokenized_content.size() > MAX_MESSAGE_TOKENS) {
                     DISCORD_HISTORY_LOG("Warning: Message from " + (is_our_bot ? "bot" : msg.author.username) + " would produce " + 
                                std::to_string(pending.tokenized_content.size()) + " tokens, skipping");
-                    continue;
-                }
+                    continue;}
                 
                 pending.actual_token_count = static_cast<int32_t>(pending.tokenized_content.size());
                 
                 if (pending.actual_token_count > 0) {
                     batch_messages.push_back(pending);
                     total_exact_tokens += pending.actual_token_count;
-                    // Track the oldest message ID (smallest value) for next iteration
-                    oldest_id = std::min(oldest_id, pending.message_id);
+                    
+                    // Mark message as processed to prevent duplicates
+                    {
+                        std::lock_guard<std::mutex> lock(processed_ids_mutex);
+                        processed_message_ids.insert(msg_id);
+                    }
                 } else {
                     DISCORD_HISTORY_LOG("Warning: Tokenization produced 0 tokens for message from " + 
                                (is_our_bot ? "bot" : msg.author.username) + ", skipping");
                 }
-            } else {
-                // Still need to track message IDs even for other bot messages to ensure proper pagination
-                uint64_t msg_id = static_cast<uint64_t>(msg.id);
-                oldest_id = std::min(oldest_id, msg_id);
             }
+            // Note: we don't update any tracking for non-processable messages (other bots)
+            // This ensures pagination is only based on messages we actually care about
         }
+        
+        DISCORD_HISTORY_LOG("Batch analysis - Channel " + std::to_string(channel_id) + 
+                   ": " + std::to_string(new_messages_count) + " new, " + 
+                   std::to_string(duplicate_count) + " duplicates, " + 
+                   std::to_string(batch_messages.size()) + " processable");
+        
+        // Determine how to handle pagination based on what we found
+        bool should_continue_pagination = false;
         
         // Check if we can add all messages using exact token counts
         if (!batch_messages.empty() && can_add_more_messages_estimated_no_switch(state.context_id, total_exact_tokens)) {
@@ -325,22 +358,23 @@ private:    // Core dependencies
             
             // Update exact token usage
             update_estimated_token_usage(state.context_id, total_exact_tokens);
-            
-            // Update state
+              // Update state with success
             {
                 std::lock_guard<std::mutex> lock(state_mutex);
                 state.messages_fetched += static_cast<int32_t>(batch_messages.size());
-                // Set last_message_id to oldest message for next API call to fetch older messages
+                  // Update pagination to continue from oldest message in this batch
                 if (oldest_id != UINT64_MAX) {
                     state.last_message_id = oldest_id;
+                    should_continue_pagination = true;
                 }
             }
             
-            DISCORD_HISTORY_LOG("Collected " + std::to_string(batch_messages.size()) + " messages from channel " + 
-                       std::to_string(channel_id) + " (exact " + std::to_string(total_exact_tokens) + 
-                       " tokens), next fetch before ID: " + std::to_string(oldest_id));
-            return true;
-        } else if (!batch_messages.empty()) {
+            if (should_continue_pagination) {
+                DISCORD_HISTORY_LOG("Collected " + std::to_string(batch_messages.size()) + " messages from channel " + 
+                           std::to_string(channel_id) + " (exact " + std::to_string(total_exact_tokens) + 
+                           " tokens), next fetch before ID: " + std::to_string(oldest_id));
+            }
+            return should_continue_pagination;        } else if (!batch_messages.empty()) {
             // Mark channel as complete if we can't fit more
             std::lock_guard<std::mutex> lock(state_mutex);
             channel_states[channel_id].fetch_complete = true;
@@ -357,17 +391,31 @@ private:    // Core dependencies
             }
             
             DISCORD_HISTORY_LOG("Channel " + std::to_string(channel_id) + " completed - context capacity reached (" + capacity_info + ")");
+            return false;
         } else {
-            // Even if no messages were added, update the last_message_id to continue pagination
+            // No processable messages found in this batch
             std::lock_guard<std::mutex> lock(state_mutex);
-            if (oldest_id != UINT64_MAX) {
-                state.last_message_id = oldest_id;
-                DISCORD_HISTORY_LOG("Updated last_message_id for channel " + std::to_string(channel_id) + 
-                           " to " + std::to_string(oldest_id) + " (no messages collected this batch)");
+            
+            if (new_messages_count == 0) {
+                // No new messages - likely reached the end of available messages
+                state.fetch_complete = true;
+                DISCORD_HISTORY_LOG("Channel " + std::to_string(channel_id) + " completed - no new messages found");
+                return false;
+            } else {
+                // We had new messages but none were processable (all bots, etc.)                // Continue pagination to find processable messages
+                if (oldest_id != UINT64_MAX) {
+                    state.last_message_id = oldest_id;
+                    DISCORD_HISTORY_LOG("No processable messages for channel " + std::to_string(channel_id) + 
+                               ", continuing pagination from " + std::to_string(oldest_id));
+                    return true;
+                } else {
+                    // Shouldn't happen but handle gracefully
+                    state.fetch_complete = true;
+                    DISCORD_HISTORY_LOG("Channel " + std::to_string(channel_id) + " completed - unable to determine pagination");
+                    return false;
+                }
             }
         }
-        
-        return false;
     }
     
     // Apply collected messages using pre-tokenized content
@@ -558,16 +606,21 @@ public:
         isolated_channels = isolated;
         shared_history_channels = shared_history;
     }
-    
-    void set_history_settings(bool enabled, int32_t fill_percentage) {
+      void set_history_settings(bool enabled, int32_t fill_percentage) {
         history_enabled = enabled;
-        context_fill_percentage = std::clamp(fill_percentage, 10, 80);
+        context_fill_percentage = std::clamp(fill_percentage, MIN_FILL_PERCENTAGE, MAX_FILL_PERCENTAGE);
     }
-    
-    void start_backfill() {
+      void start_backfill() {
         if (!history_enabled || backfill_in_progress || !bot || !llama_manager) return;
         
         backfill_in_progress = true;
+        
+        // Clear processed message IDs for new backfill session
+        {
+            std::lock_guard<std::mutex> lock(processed_ids_mutex);
+            processed_message_ids.clear();
+        }
+        
         DISCORD_HISTORY_LOG("Starting simplified chat history backfill...");
         
         // Get channels and setup states
@@ -582,12 +635,17 @@ public:
             setup_channel_states(guilds);
         });
     }
-    
-    void setup_channel_states(const dpp::guild_map& guilds) {
+      void setup_channel_states(const dpp::guild_map& guilds) {
         std::lock_guard<std::mutex> lock(state_mutex);
         channel_states.clear();
         shared_channels_list.clear();
         shared_channel_index = 0;
+        
+        // Clear pending messages and processed IDs for fresh start
+        {
+            std::lock_guard<std::mutex> pmsg_lock(pending_messages_mutex);
+            pending_messages.clear();
+        }
         
         // Validate prerequisites before proceeding
         if (model_id.empty()) {
