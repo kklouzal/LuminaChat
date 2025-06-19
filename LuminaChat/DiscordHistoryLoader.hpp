@@ -44,10 +44,13 @@
 #include <thread>
 #include <algorithm>
 #include <future>
+#include <locale>
+#include <codecvt>
 
 #include <dpp/dpp.h>
 #include "LogHandler.hpp"
 #include "common_utils.hpp"
+#include "Sanitizer.hpp"
 
 class LlamaManager;
 
@@ -282,8 +285,7 @@ private:
                 } else {
                     pending.username = msg.author.username;
                 }
-                
-                // For bot messages, extract content from embeds if they exist, otherwise use regular content
+                  // For bot messages, extract content from embeds if they exist, otherwise use regular content
                 std::string actual_content = msg.content;
                 if (is_our_bot && !msg.embeds.empty()) {
                     // Extract content from the first embed's description
@@ -291,7 +293,10 @@ private:
                     if (!embed.description.empty()) {
                         actual_content = embed.description;
                     }
-                }                pending.content = safe_trim(actual_content);
+                }                
+                // Sanitize the content to prevent tokenization issues
+                actual_content = TextSanitizer::sanitize_text(actual_content);
+                pending.content = safe_trim(actual_content);
                 pending.timestamp = std::chrono::system_clock::time_point(std::chrono::seconds(msg.sent));
                 pending.message_id = msg_id;
                 pending.target_context_id = state.context_id;

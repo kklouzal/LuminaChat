@@ -48,6 +48,7 @@
 
 #include "DiscordHistoryLoader.hpp"
 #include "LogHandler.hpp"
+#include "Sanitizer.hpp"
 
 // Discord bot configuration structure
 struct DiscordBotConfig {
@@ -173,10 +174,16 @@ private:
             send_message(event.msg.channel_id, response);
         }
     }
-    
-    std::string process_user_message(const std::string& message, const std::string& username, 
+      std::string process_user_message(const std::string& message, const std::string& username, 
                                    uint64_t user_id, uint64_t channel_id, uint64_t guild_id) {
         if (!llama_manager) return "Error: AI backend not available";        
+        
+        // Sanitize the incoming message to prevent tokenization issues
+        std::string sanitized_message = TextSanitizer::sanitize_text(message);
+        if (sanitized_message.empty()) {
+            return "I'm sorry, but your message couldn't be processed. Please try rephrasing your message.";
+        }
+        
         total_messages_processed++;
         last_activity = std::chrono::system_clock::now();
         
@@ -189,7 +196,7 @@ private:
             return "Error: Failed to access your chat context";
         }
         
-        std::string response = llama_manager->generate_response(message, target_context, username);
+        std::string response = llama_manager->generate_response(sanitized_message, target_context, username);
         return response.empty() ? "I'm not sure how to respond to that. Could you try rephrasing?" : response;
     }
     
