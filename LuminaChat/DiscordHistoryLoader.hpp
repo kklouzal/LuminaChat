@@ -17,7 +17,7 @@
 // CRITICAL CODING DIRECTIVES:
 // 1.  Minimalism & Performance: Deliver lean, efficient solutions; do not create or preserve unused helpers, wrappers, trivial accessors (setters/getters), or scaffolding.
 // 2.  Redundancy Elimination: Remove unused, obsolete, and legacy code—including unneeded interfaces, includes, helper or accessor methods.
-// 3.  Consistent Style: Adopt a uniform coding style and structure for clarity and maintainability.
+// 3.  Consistent Style: Adopt a uniform coding style and structure for clarity and maintainability, ensure no syntatical or stylization errors.
 // 4.  Documentation: Write concise comments that explain complex logic and key design decisions.
 // 5.  Zero Magic & Strong Typing: Replace magic literals with named constants, enums, or constexpr; prefer scoped enums over raw ints.
 // 6.  Function Boundaries: Define clear responsibilities; reduce overlap and avoid unnecessary layers of indirection.
