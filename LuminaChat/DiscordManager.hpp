@@ -187,7 +187,7 @@ public:
 private:
 
 void setup_event_handlers() {
-        if (!bot) return;
+        if (!bot) [[unlikely]] return;
           bot->on_ready([this](const dpp::ready_t& event) {
             is_connected = true;
             DISCORD_LOG("Discord bot ready! Logged in as: " + bot->me.username);
@@ -218,20 +218,19 @@ void setup_event_handlers() {
             }
         });
     }
-    
-    void handle_message(const dpp::message_create_t& event) {
-        if (event.msg.author.is_bot() || event.msg.content.empty()) return;
+      void handle_message(const dpp::message_create_t& event) {
+        if (event.msg.author.is_bot() || event.msg.content.empty()) [[unlikely]] return;
         
         const bool is_dm = (event.msg.guild_id == 0);
           // Early exit for disabled DMs
-        if (is_dm && !allow_dms.load()) {
+        if (is_dm && !allow_dms.load()) [[unlikely]] {
             send_message(event.msg.channel_id, 
                 "Sorry, Direct Messages are currently disabled. Please use the appropriate server channels.");
             return;
         }
         
         // Early exit for unconfigured channels
-        if (!is_dm && !is_channel_configured(event.msg.channel_id)) return;
+        if (!is_dm && !is_channel_configured(event.msg.channel_id)) [[unlikely]] return;
         
         // Smart response logic: only respond when directly addressed or in general conversation
         // If user mentions/replies to others but not the bot, just add to history (listening mode)
@@ -269,11 +268,10 @@ void setup_event_handlers() {
         if (is_mentioning_other_user && !bot_is_mentioned_or_replied_to) {
             should_generate_response = false;
         }
-        
-        // Always add to message history for context, but only generate response if appropriate
-        if (should_generate_response) {
+          // Always add to message history for context, but only generate response if appropriate
+        if (should_generate_response) [[likely]] {
             // Rate limiting check only for responses
-            if (is_rate_limited(event.msg.author.id)) return;
+            if (is_rate_limited(event.msg.author.id)) [[unlikely]] return;
             
             // Queue message for processing (prevents concurrent context access)
             queue_user_message(
@@ -294,13 +292,13 @@ void setup_event_handlers() {
                            uint64_t user_id, uint64_t channel_id, uint64_t guild_id) {
         // Sanitize the incoming message to prevent tokenization issues
         std::string sanitized_message = TextSanitizer::sanitize_text(message);
-        if (sanitized_message.empty()) {
+        if (sanitized_message.empty()) [[unlikely]] {
             send_message(channel_id, "I'm sorry, but your message couldn't be processed. Please try rephrasing your message.");
             return;
         }
         
         std::string context_id = get_or_create_user_context(user_id, username, channel_id, guild_id);
-        if (context_id.empty()) {
+        if (context_id.empty()) [[unlikely]] {
             send_message(channel_id, "Error: Failed to access chat context");
             return;
         }
@@ -314,10 +312,9 @@ void setup_event_handlers() {
             sanitized_message, username, user_id, channel_id, guild_id,
             std::chrono::system_clock::now()
         };
-        
-        // Add message to history immediately using direct context access
+          // Add message to history immediately using direct context access
         ContextInfo* target_context = llama_manager ? llama_manager->get_context_info(context_id) : nullptr;
-        if (target_context) {
+        if (target_context) [[likely]] {
             target_context->add_message("user", username + ": " + sanitized_message);
             ++total_messages_processed;
             last_activity = std::chrono::system_clock::now();
@@ -325,10 +322,9 @@ void setup_event_handlers() {
         
         {
             std::lock_guard<std::mutex> lock(collectors_mutex);
-            
-            // Get or create collector for this user/context combination
+              // Get or create collector for this user/context combination
             auto& collector = pending_collectors[collector_key];
-            if (!collector) {
+            if (!collector) [[unlikely]] {
                 collector = std::make_unique<MessageCollector>();
                 collector->user_id = user_id;
                 collector->context_id = context_id;
@@ -339,7 +335,7 @@ void setup_event_handlers() {
             collector->last_message_time = std::chrono::system_clock::now();
             
             // If timer is already running, let it continue (it will pick up this new message)
-            if (!collector->timer_active.exchange(true)) {
+            if (!collector->timer_active.exchange(true)) [[likely]] {
                 // Start new timer
                 collector->timer_thread = std::make_unique<std::thread>([this, collector_key]() {
                     std::this_thread::sleep_for(MESSAGE_COLLECTION_DELAY);
@@ -356,21 +352,19 @@ void setup_event_handlers() {
     void process_collected_messages(const std::string& collector_key) {
         std::vector<PendingMessage> messages_to_process;
         std::string context_id;
-        
-        {
+          {
             std::lock_guard<std::mutex> lock(collectors_mutex);
             auto it = pending_collectors.find(collector_key);
-            if (it == pending_collectors.end() || !it->second) {
+            if (it == pending_collectors.end() || !it->second) [[unlikely]] {
                 return; // Collector was already processed or removed
             }
             
             auto& collector = it->second;
-            
-            // Check if we should wait longer (if a very recent message was added)
+              // Check if we should wait longer (if a very recent message was added)
             auto now = std::chrono::system_clock::now();
             auto time_since_last = std::chrono::duration_cast<std::chrono::milliseconds>(now - collector->last_message_time);
             
-            if (time_since_last < MESSAGE_COLLECTION_DELAY) {
+            if (time_since_last < MESSAGE_COLLECTION_DELAY) [[unlikely]] {
                 // Recent message detected, restart timer
                 collector->timer_active = false;
                 collector->timer_thread = std::make_unique<std::thread>([this, collector_key]() {
@@ -390,7 +384,7 @@ void setup_event_handlers() {
             pending_collectors.erase(it);
         }
         
-        if (messages_to_process.empty()) return;
+        if (messages_to_process.empty()) [[unlikely]] return;
         
         // Combine all messages into a single prompt for the AI
         std::string combined_message;
@@ -427,17 +421,14 @@ void setup_event_handlers() {
     }
     
     // Process queued messages for a specific context (one at a time)
-    void process_context_queue(const std::string& context_id) {
-        // Check if already processing this context
+    void process_context_queue(const std::string& context_id) {        // Check if already processing this context
         {
             std::lock_guard<std::mutex> lock(message_queue_mutex);
-            if (context_processing_flags[context_id].exchange(true)) {
+            if (context_processing_flags[context_id].exchange(true)) [[unlikely]] {
                 DISCORD_LOG("Context '" + context_id + "' already processing - message queued");
                 return; // Already processing this context
             }
-        }
-        
-        // Process messages in queue sequentially
+        }        // Process messages in queue sequentially
         std::thread([this, context_id]() {
             try {
                 while (true) {
@@ -447,14 +438,14 @@ void setup_event_handlers() {
                     // Get next message from queue
                     {
                         std::lock_guard<std::mutex> lock(message_queue_mutex);
-                        if (!context_message_queues[context_id].empty()) {
+                        if (!context_message_queues[context_id].empty()) [[likely]] {
                             msg = context_message_queues[context_id].front();
                             context_message_queues[context_id].pop();
                             has_message = true;
                         }
                     }
                     
-                    if (!has_message) {
+                    if (!has_message) [[unlikely]] {
                         break; // No more messages
                     }
                     
@@ -463,7 +454,7 @@ void setup_event_handlers() {
                                                                      msg.user_id, msg.channel_id, msg.guild_id);
                     
                     // Send response if not empty and not an error
-                    if (!response.empty() && !response.starts_with("Error:")) {
+                    if (!response.empty() && !response.starts_with("Error:")) [[likely]] {
                         send_message(msg.channel_id, response);
                     }
                     
@@ -484,46 +475,43 @@ void setup_event_handlers() {
             }
         }).detach();
     }
-    
-    std::string process_user_message_direct(const std::string& message, const std::string& username, 
+      std::string process_user_message_direct(const std::string& message, const std::string& username, 
                                            uint64_t user_id, uint64_t channel_id, uint64_t guild_id) {
-        if (!llama_manager) return "Error: AI backend not available";        
+        if (!llama_manager) [[unlikely]] return "Error: AI backend not available";        
         
         std::string context_id = get_or_create_user_context(user_id, username, channel_id, guild_id);
-        if (context_id.empty()) return "Error: Failed to access chat context";
+        if (context_id.empty()) [[unlikely]] return "Error: Failed to access chat context";
           // Use direct context access for better performance
         ContextInfo* target_context = llama_manager ? llama_manager->get_context_info(context_id) : nullptr;
-        if (!target_context) {
+        if (!target_context) [[unlikely]] {
             return "Error: Failed to access your chat context";
         }
         
         std::string response = llama_manager->generate_response(message, target_context, username);
         return response.empty() ? "I'm not sure how to respond to that. Could you try rephrasing?" : response;
     }
-    
-    // Add message to history without generating a response (for listening mode)
+      // Add message to history without generating a response (for listening mode)
     void add_message_to_history_only(const std::string& message, const std::string& username,
                                     uint64_t user_id, uint64_t channel_id, uint64_t guild_id) {
-        if (!llama_manager) return;
+        if (!llama_manager) [[unlikely]] return;
         
         // Sanitize the incoming message to prevent tokenization issues
         std::string sanitized_message = TextSanitizer::sanitize_text(message);
-        if (sanitized_message.empty()) return;
+        if (sanitized_message.empty()) [[unlikely]] return;
         
         std::string context_id = get_or_create_user_context(user_id, username, channel_id, guild_id);
-        if (context_id.empty()) return;
+        if (context_id.empty()) [[unlikely]] return;
           // Use direct context access to add message to history
         ContextInfo* target_context = llama_manager ? llama_manager->get_context_info(context_id) : nullptr;
-        if (target_context) {
+        if (target_context) [[likely]] {
             target_context->add_message("user", username + ": " + sanitized_message);
             ++total_messages_processed;
             last_activity = std::chrono::system_clock::now();
             DISCORD_LOG("Added message to history (listening mode) for context '" + context_id + "'");
         }
     }
-    
-    std::vector<std::string> split_message(const std::string& message, size_t max_length = MAX_MESSAGE_LENGTH) const {
-        if (message.length() <= max_length) {
+      std::vector<std::string> split_message(const std::string& message, size_t max_length = MAX_MESSAGE_LENGTH) const {
+        if (message.length() <= max_length) [[likely]] {
             return {message};
         }
         
@@ -549,12 +537,11 @@ void setup_event_handlers() {
         }
         return parts;
     }
-    
-    void parse_channel_ids(const std::string& channel_ids_str, std::unordered_set<uint64_t>& target_set) {
+      void parse_channel_ids(const std::string& channel_ids_str, std::unordered_set<uint64_t>& target_set) {
         std::lock_guard<std::mutex> lock(channel_config_mutex);
         target_set.clear();
         
-        if (channel_ids_str.empty()) return;
+        if (channel_ids_str.empty()) [[unlikely]] return;
         
         // Reserve space based on comma count for efficiency
         target_set.reserve(std::count(channel_ids_str.begin(), channel_ids_str.end(), ',') + 1);
@@ -571,9 +558,7 @@ void setup_event_handlers() {
                                            [](char c) { return std::isspace(static_cast<unsigned char>(c)); });
             auto id_end = std::find_if_not(std::reverse_iterator(channel_ids_str.begin() + end_pos),
                                          std::reverse_iterator(channel_ids_str.begin() + start),
-                                         [](char c) { return std::isspace(static_cast<unsigned char>(c)); }).base();
-            
-            if (id_start < id_end) {
+                                         [](char c) { return std::isspace(static_cast<unsigned char>(c)); }).base();            if (id_start < id_end) [[likely]] {
                 try {
                     target_set.emplace(std::stoull(std::string(id_start, id_end)));
                 } catch (const std::exception&) {
@@ -598,28 +583,25 @@ void setup_event_handlers() {
     bool is_rate_limited(uint64_t user_id) {
         const auto now = std::chrono::system_clock::now();
         std::lock_guard<std::mutex> lock(data_mutex);
-        
-        auto& last_time = last_response_time[user_id]; // Direct access with automatic insertion
-        if (last_time != std::chrono::system_clock::time_point{} && (now - last_time) < MIN_RESPONSE_INTERVAL) {
+          auto& last_time = last_response_time[user_id]; // Direct access with automatic insertion
+        if (last_time != std::chrono::system_clock::time_point{} && (now - last_time) < MIN_RESPONSE_INTERVAL) [[unlikely]] {
             return true;
         }
         
         last_time = now;
         return false;
     }
-    
-    // Create contexts for all isolated channels that the bot can access
+      // Create contexts for all isolated channels that the bot can access
     void create_isolated_channel_contexts() {
-        if (!llama_manager || model_id.empty()) return;
+        if (!llama_manager || model_id.empty()) [[unlikely]] return;
         
         std::lock_guard<std::mutex> channel_lock(channel_config_mutex);
         std::string system_prompt = get_system_prompt_for_new_context();
         
         for (uint64_t channel_id : isolated_channels) {
             std::string context_id = "discord_channel_" + std::to_string(channel_id);
-            
-            // Check if context already exists
-            if (llama_manager->has_context(context_id)) {
+              // Check if context already exists
+            if (llama_manager->has_context(context_id)) [[likely]] {
                 std::lock_guard<std::mutex> data_lock(data_mutex);
                 channel_contexts[channel_id] = context_id;
                 DISCORD_LOG("Using existing context for isolated channel: " + std::to_string(channel_id));
@@ -655,10 +637,9 @@ void setup_event_handlers() {
         
         DISCORD_LOG("Initialized " + std::to_string(isolated_channels.size()) + " isolated channel contexts");
     }
-    
-    // Create shared context history system with coordination
+      // Create shared context history system with coordination
     void create_shared_context_history_system() {
-        if (!llama_manager || !pull_message_history.load() || !bot || shared_history_channels.empty()) return;
+        if (!llama_manager || !pull_message_history.load() || !bot || shared_history_channels.empty()) [[unlikely]] return;
         
         // Create shared coordinator
         shared_coordinator = std::make_shared<SharedContextCoordinator>(main_context_id, llama_manager);
@@ -691,15 +672,13 @@ void setup_event_handlers() {
         }
         
         DISCORD_LOG("Created shared context history system for " + std::to_string(shared_history_channels.size()) + " channels");
-    }
-
-    // Get system prompt from main context for new Discord contexts
+    }    // Get system prompt from main context for new Discord contexts
     std::string get_system_prompt_for_new_context() const {
-        if (!llama_manager || main_context_id.empty()) return "";
+        if (!llama_manager || main_context_id.empty()) [[unlikely]] return "";
         
         // Get the main context info to retrieve system prompt
         auto context_info = llama_manager->get_context_info(main_context_id);
-        if (!context_info) return ""; // Check for null pointer
+        if (!context_info) [[unlikely]] return ""; // Check for null pointer
         
         // get the system message from the main context
         std::string system_prompt = context_info->system_message;
@@ -804,15 +783,14 @@ void setup_event_handlers() {
         }
         
         // Clean up shared coordinator
-        shared_coordinator.reset();
-          // Clean up contexts in LlamaManager
-        if (llama_manager) {
+        shared_coordinator.reset();        // Clean up contexts in LlamaManager
+        if (llama_manager) [[likely]] {
             std::lock_guard<std::mutex> lock(data_mutex);
             
             // Use STL algorithms for efficient processing - single pass for both containers
             auto cleanup_contexts = [this](const auto& container) {
                 std::for_each(container.begin(), container.end(), [this](const auto& pair) {
-                                 if (pair.second != main_context_id) {
+                                 if (pair.second != main_context_id) [[likely]] {
                                      llama_manager->remove_context(pair.second);
                                  }
                              });
@@ -844,9 +822,8 @@ public:
     }
     
     ~DiscordManager() { shutdown(); }
-    
-    bool configure(const DiscordBotConfig& bot_config) {
-        if (is_running || bot_config.bot_token.empty()) return false;
+      bool configure(const DiscordBotConfig& bot_config) {
+        if (is_running || bot_config.bot_token.empty()) [[unlikely]] return false;
         config = bot_config;
         return true;
     }
@@ -870,23 +847,20 @@ public:
         DISCORD_LOG("History settings updated: pull=" + std::string(pull_history ? "true" : "false") + 
                    ", fill=" + std::to_string(fill_percentage) + "%");
     }
-    
-    void set_llama_manager(LlamaManager* manager) {
+      void set_llama_manager(LlamaManager* manager) {
         llama_manager = manager;
         
-        if (manager) {
+        if (manager) [[likely]] {
             // Ensure model_id is set
-            if (model_id.empty()) {
+            if (model_id.empty()) [[unlikely]] {
                 model_id = "main_model";
             }
             DISCORD_LOG("LlamaManager set with model_id: " + model_id);
         } else {
             cleanup_contexts();
         }
-    }
-    
-    bool initialize() {
-        if (config.bot_token.empty()) return false;
+    }    bool initialize() {
+        if (config.bot_token.empty()) [[unlikely]] return false;
         
         try {
             uint32_t intents = dpp::i_default_intents | dpp::i_message_content;
@@ -898,10 +872,8 @@ public:
             DISCORD_LOG("Error: Failed to initialize Discord bot: " + std::string(e.what()));
             return false;
         }
-    }
-    
-    bool start() {
-        if (is_running || !initialize()) return false;
+    }    bool start() {
+        if (is_running || !initialize()) [[unlikely]] return false;
         
         try {
             bot->start(dpp::st_return);
@@ -914,13 +886,12 @@ public:
             return false;
         }
     }
-    
-    void shutdown() {
-        if (!is_running) return;
+      void shutdown() {
+        if (!is_running) [[unlikely]] return;
         
         should_stop = true;
         
-        if (bot) {
+        if (bot) [[likely]] {
             bot->shutdown();
             bot.reset();
         }
@@ -929,21 +900,21 @@ public:
         is_connected = false;
         cleanup_contexts();
     }
-    
-    bool send_message(uint64_t channel_id, const std::string& message) {
-        if (!is_running.load() || !is_connected.load() || !bot || message.empty()) return false;
+      bool send_message(uint64_t channel_id, const std::string& message) {
+        if (!is_running.load() || !is_connected.load() || !bot || message.empty()) [[unlikely]] return false;
         
+        // Keep try-catch here as Discord API calls can fail due to network/rate limiting
         try {
             const auto message_parts = split_message(message);
             const std::string context_id = get_context_for_channel(channel_id, 0, 0);
             std::string footer_text = "🤖 LuminaChat AI";
               // Get context information once outside the loop using direct access
-            if (llama_manager && !context_id.empty()) {
-                if (const auto* context_info = llama_manager->get_context_info(context_id)) {
+            if (llama_manager && !context_id.empty()) [[likely]] {
+                if (const auto* context_info = llama_manager->get_context_info(context_id)) [[likely]] {
                     const int32_t context_usage = context_info->n_past;
                     const int32_t context_size = context_info->get_context_size();
                     
-                    if (context_size > 0) {
+                    if (context_size > 0) [[likely]] {
                         footer_text += " • Context: " + std::to_string(context_usage) + "/" + std::to_string(context_size);
                     }
                 }
@@ -961,8 +932,7 @@ public:
                 dpp::message msg(channel_id, "");
                 msg.add_embed(std::move(embed));
                 bot->message_create(std::move(msg));
-                
-                if (message_parts.size() > 1) {
+                  if (message_parts.size() > 1) [[unlikely]] {
                     std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_DELAY_MS));
                 }
             }
