@@ -357,7 +357,9 @@ private:
         }
         
         // Set the reset after generation flag
-        context_info->reset_after_generation = reset_after_generation;        // Initialize summarizer for this context with parent context only (summary resources will be set later)
+        context_info->reset_after_generation = reset_after_generation;
+        
+        // Initialize summarizer for this context with parent context only (summary resources will be set later)
         context_info->summarizer = std::make_unique<LlamaSummarizer>(context_info.get());
         
         // If summary resources are already available, set them up immediately
@@ -373,14 +375,12 @@ private:
           // Initialize ContextSizeManager for adaptive context management
         initialize_context_size_manager(*context_info, *model_info);
         LLAMA_LOG("Initialized ContextSizeManager for context '" + context_id + "' with " + 
-                  std::to_string(model_info->n_ctx) + " token capacity");          // Integrate LlamaSummarizer with ContextSizeManager for coordinated summary management
+                  std::to_string(model_info->n_ctx) + " token capacity");
+          // Integrate LlamaSummarizer with ContextSizeManager for coordinated summary management
         if (context_info->summarizer && context_info->context_size_manager) {
             context_info->summarizer->integrate_with_context_size_manager(context_info->context_size_manager.get(), context_info.get());
             LLAMA_LOG("Integrated LlamaSummarizer with ContextSizeManager and ContextInfo reference for context '" + context_id + "'");
         }
-        
-        // TODO: Setup summarizer callbacks - currently disabled due to context corruption issues
-        // context_info->setup_summarizer_callbacks();
         
         contexts[context_id] = std::move(context_info);
         LLAMA_LOG("Created context '" + context_id + "' with model '" + model_id + "' successfully");
