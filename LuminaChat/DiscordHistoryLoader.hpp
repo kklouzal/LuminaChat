@@ -1,9 +1,10 @@
-// DiscordHistoryLoader.hpp - header-only implementation for Discord chat history backfill
-// Handles Discord message history fetching and context population for LuminaChat backend.
+// DiscordHistoryLoader.hpp - header-only implementation for per-context Discord chat history backfill
+// Handles immediate Discord message history fetching with pre-tokenization for individual contexts.
 //
 // File Specific Directives:
-// Manage Discord chat history backfill with context capacity tracking and rate limiting.
-// Handle message fetching, token estimation, and context population efficiently.
+// Individual history loaders per context with immediate collection and pre-tokenization.
+// Isolated contexts: fill to target ratio then apply immediately.
+// Shared contexts: coordinate between multiple loaders before merging.
 //
 // Project Settings:
 // C++ Language Standard: ISO C++20 Standard (/std:c++20)
@@ -38,736 +39,696 @@
 #include <memory>
 #include <atomic>
 #include <chrono>
-#include <unordered_map>
 #include <unordered_set>
 #include <mutex>
 #include <thread>
 #include <algorithm>
 #include <future>
-#include <locale>
-#include <codecvt>
 
 #include <dpp/dpp.h>
+#include "llama-cpp.h"
 #include "LogHandler.hpp"
 #include "common_utils.hpp"
 #include "Sanitizer.hpp"
 
 class LlamaManager;
 
-// Essential structures only
-struct ChannelState {
-    uint64_t last_message_id = 0;
-    bool fetch_complete = false;
-    int32_t messages_fetched = 0;
-    std::string context_id;
-    bool is_isolated = false;
+// Forward declarations for ContextSizeManager integration
+struct ContextInfo;
+struct ModelInfo;
+void initialize_context_size_manager(ContextInfo& context_info, const ModelInfo& model_info);
+void track_user_message(ContextInfo& context_info, const ModelInfo& model_info, int32_t user_tokens);
+
+// Status structure for DiscordManager compatibility
+struct BackfillStatus {
+    bool in_progress;
+    int32_t total_channels;
+    int32_t completed_channels;
+    int32_t total_messages_fetched;
+    int32_t total_tokens_loaded_this_session;
 };
 
-struct PendingMessage {
-    uint64_t channel_id = 0;
+// Pre-tokenized message with exact token data
+struct PreTokenizedMessage {
+    uint64_t channel_id;
+    uint64_t message_id;
     std::string username;
     std::string content;
     std::chrono::system_clock::time_point timestamp;
-    uint64_t message_id = 0;
-    std::vector<llama_token> tokenized_content;
-    int32_t actual_token_count = 0;
-    std::string target_context_id;
+    std::vector<llama_token> tokens;
+    int32_t token_count;
+    
+    PreTokenizedMessage() : channel_id(0), message_id(0), token_count(0) {}
 };
 
-class DiscordHistoryLoader {
+// Forward declaration
+class DiscordHistoryLoader;
+
+// Coordinates multiple history loaders for shared context merging
+class SharedContextCoordinator {
 private:
-    // Core dependencies
-    dpp::cluster* bot = nullptr;
+    std::string shared_context_id;
+    std::vector<std::weak_ptr<DiscordHistoryLoader>> loaders;
+    std::atomic<int32_t> completed_loaders{0};
+    std::atomic<bool> merge_in_progress{false};
+    std::atomic<bool> merge_completed{false};  // Track if merge has been completed to prevent duplicates
+    mutable std::mutex coordination_mutex;
     LlamaManager* llama_manager = nullptr;
-    std::string main_context_id;
-    std::string model_id; // Store model ID for context creation
     
-    // Bot identification for recognizing own messages
+public:
+    explicit SharedContextCoordinator(const std::string& context_id, LlamaManager* llama_mgr) 
+        : shared_context_id(context_id), llama_manager(llama_mgr) {}
+    
+    void register_loader(std::weak_ptr<DiscordHistoryLoader> loader) {
+        std::lock_guard<std::mutex> lock(coordination_mutex);
+        loaders.push_back(loader);
+    }
+    
+    void notify_loader_complete();
+    bool all_loaders_complete() const;
+    void trigger_shared_merge();
+};
+
+// NOTE: For Discord history backfill, we use insert_historical_message() instead of add_message()
+// because Discord API returns messages from newest to oldest, and we want to maintain proper
+// chronological order by inserting historical messages right after system messages but before
+// the current conversation, rather than appending them to the end.
+
+// Individual history loader for a specific context
+class DiscordHistoryLoader : public std::enable_shared_from_this<DiscordHistoryLoader> {
+private:
+    // Context association - each loader tied to one context
+    std::string target_context_id;
+    ContextInfo* target_context = nullptr;
+    LlamaManager* llama_manager = nullptr;
+    std::string model_id;
+    
+    // Thread safety for context access
+    mutable std::mutex context_access_mutex;
+    
+    // Channel assignment and configuration
+    std::vector<uint64_t> assigned_channels;
+    bool is_shared_context = false;
+    // NOTE: context_fill_ratio represents the target percentage of context to fill with HISTORICAL MESSAGES ONLY
+    // The actual safe threshold must account for emergency buffer and AI response space
+    float context_fill_ratio = 0.5f;
+    
+    // Bot identification
     uint64_t bot_user_id = 0;
-    std::string bot_username;
     
-    // Channel configuration
-    const std::unordered_set<uint64_t>* isolated_channels = nullptr;
-    const std::unordered_set<uint64_t>* shared_history_channels = nullptr;
+    // Discord API access
+    dpp::cluster* bot = nullptr;
+      // Pre-tokenized message storage
+    std::vector<PreTokenizedMessage> collected_messages;
+    std::atomic<int32_t> total_tokens_collected{0};
+    std::atomic<bool> target_reached{false};
+    std::atomic<bool> collection_complete{false};
+    std::atomic<bool> messages_applied{false};  // Track if messages have been applied to prevent duplicates
+    mutable std::mutex messages_mutex;
     
-    // Settings
-    bool history_enabled = true;
-    int32_t context_fill_percentage = 50;
-    
-    // Channel processing
-    std::unordered_map<uint64_t, ChannelState> channel_states;
-    std::vector<uint64_t> shared_channels_list;
-    size_t shared_channel_index = 0;    mutable std::mutex state_mutex;
-    
-    // Message collection
-    std::vector<PendingMessage> pending_messages;
-    std::mutex pending_messages_mutex;
-    
-    // Deduplication tracking
+    // Processing state
+    uint64_t last_message_id = 0;
     std::unordered_set<uint64_t> processed_message_ids;
-    std::mutex processed_ids_mutex;
+    mutable std::mutex processed_ids_mutex;
     
-    // Capacity tracking
-    std::unordered_map<std::string, int32_t> context_capacity_limits;
-    std::unordered_map<std::string, int32_t> context_current_tokens;
-    std::mutex capacity_mutex;
-    
-    // State
-    std::atomic<bool> backfill_in_progress{false};    // Constants
+    // Shared context coordination
+    std::shared_ptr<SharedContextCoordinator> coordinator;
+      // Safe context validation with null checks
+    bool validate_context_safe() const {
+        std::lock_guard<std::mutex> lock(context_access_mutex);
+        if (!target_context) {
+            DISCORD_HISTORY_LOG("ERROR: target_context is null for '" + target_context_id + "'");
+            return false;
+        }
+        if (!llama_manager) {
+            DISCORD_HISTORY_LOG("ERROR: llama_manager is null for '" + target_context_id + "'");
+            return false;
+        }
+        if (!target_context->context_size_manager) {
+            DISCORD_HISTORY_LOG("ERROR: context_size_manager is null for '" + target_context_id + "'");
+            return false;
+        }
+        if (!target_context->model_info) {
+            DISCORD_HISTORY_LOG("ERROR: model_info is null for '" + target_context_id + "'");
+            return false;
+        }
+        return true;
+    }    // Safely restore context state after failed rebuild
+    // NOTE: This function must be called while holding context_access_mutex
+    bool restore_context_state(const std::vector<PreTokenizedMessage>& failed_messages) {
+        if (!target_context) return false;
+        
+        try {
+            // Remove the messages we just added
+            // Note: Direct access to message_history is safe here since we're in error recovery
+            for (size_t i = 0; i < failed_messages.size(); ++i) {
+                if (!target_context->message_history.empty()) {
+                    target_context->message_history.pop_back();
+                }
+            }
+            
+            // Mark cache as dirty and reset conversation state
+            target_context->message_cache_dirty = true;
+            if (target_context->conversation_state.needs_rebuild == false) {
+                target_context->conversation_state.invalidate();
+            }
+            
+            // Try to rebuild from remaining message history to restore valid state
+            // Note: update_context_from_history is now thread-safe with internal mutex
+            bool restore_success = llama_manager->update_context_from_history(target_context);
+            if (!restore_success) {
+                DISCORD_HISTORY_LOG("CRITICAL: Failed to restore context state for '" + target_context_id + "' - context may be corrupted");
+                return false;
+            }
+            
+            DISCORD_HISTORY_LOG("Successfully restored context state for '" + target_context_id + "' after failed rebuild");
+            return true;
+        } catch (const std::exception& e) {
+            DISCORD_HISTORY_LOG("CRITICAL: Exception while restoring context state for '" + target_context_id + "': " + e.what());
+            return false;
+        }
+    }
     static constexpr int32_t MESSAGES_PER_FETCH = 10;
-    static constexpr float BASE_MAX_CONTEXT_FILL_RATIO = 0.01f;
     static constexpr int32_t MAX_ITERATIONS = 1000;
     static constexpr int32_t TIMEOUT_SECONDS = 10;
     static constexpr int32_t RATE_LIMIT_DELAY_MS = 100;
-    static constexpr int32_t RETRY_DELAY_MS = 1000;
-    static constexpr int32_t PROGRESS_DELAY_MS = 250;
-    static constexpr int32_t INITIALIZATION_DELAY_SEC = 2;
     static constexpr int32_t MAX_MESSAGE_TOKENS = 2048;
-    static constexpr int32_t MIN_FILL_PERCENTAGE = 10;
-    static constexpr int32_t MAX_FILL_PERCENTAGE = 80;
     
-    bool should_backfill_channel(uint64_t channel_id) const {
-        return (isolated_channels && isolated_channels->count(channel_id)) ||
-               (shared_history_channels && shared_history_channels->count(channel_id));
-    }
-    
-    bool is_isolated_channel(uint64_t channel_id) const {
-        return isolated_channels && isolated_channels->count(channel_id);
-    }
-    
-    // Initialize context capacities once at start
-    void initialize_context_capacities() {
-        std::lock_guard<std::mutex> lock(capacity_mutex);
-        context_capacity_limits.clear();
-        context_current_tokens.clear();
+    // Fetch and process a batch of messages from assigned channel
+    bool process_channel_batch() {
+        if (assigned_channels.empty() || target_reached.load()) return false;
         
-        if (!llama_manager) return;
-        
-        // Get unique context IDs
-        std::unordered_set<std::string> unique_contexts;
-        for (const auto& [channel_id, state] : channel_states) {
-            unique_contexts.insert(state.context_id);
-        }
-        
-        // Initialize capacity data for each context
-        for (const std::string& context_id : unique_contexts) {
-            // Get the context info from LlamaManager
-            auto context = llama_manager->get_context_info(context_id);
-
-            int32_t current_tokens = context->message_history_token_count;
-            int32_t context_size = context->get_context_size();
-            float fill_ratio = BASE_MAX_CONTEXT_FILL_RATIO * context_fill_percentage;
-            int32_t capacity_limit = static_cast<int32_t>(context_size * fill_ratio);
-            
-            context_current_tokens[context_id] = current_tokens;
-            context_capacity_limits[context_id] = capacity_limit;
-            
-            DISCORD_HISTORY_LOG("Context '" + context_id + "' capacity: " + std::to_string(current_tokens) + 
-                        "/" + std::to_string(capacity_limit) + " tokens");
-        }
-        
-        DISCORD_HISTORY_LOG("Initialized capacity tracking for " + std::to_string(unique_contexts.size()) + " contexts");
-    }
-    
-    // Check capacity without context switching
-    bool can_add_more_messages_estimated_no_switch(const std::string& context_id, int32_t additional_tokens) {
-        std::lock_guard<std::mutex> lock(capacity_mutex);
-        
-        auto capacity_it = context_capacity_limits.find(context_id);
-        auto current_it = context_current_tokens.find(context_id);
-        
-        if (capacity_it == context_capacity_limits.end() || current_it == context_current_tokens.end()) {
-            return false; // Unknown context
-        }
-        
-        return (current_it->second + additional_tokens) < capacity_it->second;
-    }
-    
-    // Update estimated token usage without context switching
-    void update_estimated_token_usage(const std::string& context_id, int32_t additional_tokens) {
-        std::lock_guard<std::mutex> lock(capacity_mutex);
-        context_current_tokens[context_id] += additional_tokens;
-    }
-    
-    // Direct message fetching and processing
-    bool process_channel_batch(uint64_t channel_id) {
-        auto& state = channel_states[channel_id];
-        if (state.fetch_complete) {
-            return false;
-        }
-        
-        DISCORD_HISTORY_LOG("Fetching messages from channel " + std::to_string(channel_id));
+        uint64_t channel_id = assigned_channels[0]; // Single channel per loader
         
         auto promise = std::make_shared<std::promise<bool>>();
         auto future = promise->get_future();
-          bot->messages_get(channel_id, 0, state.last_message_id, 0, MESSAGES_PER_FETCH,
+        
+        bot->messages_get(channel_id, 0, last_message_id, 0, MESSAGES_PER_FETCH,
             [this, channel_id, promise](const dpp::confirmation_callback_t& callback) {
-                bool success = false;
-                
                 try {
                     if (callback.is_error()) {
-                        DISCORD_HISTORY_LOG("Error fetching messages for channel " + std::to_string(channel_id));
                         promise->set_value(false);
                         return;
                     }
                     
                     auto messages = callback.get<dpp::message_map>();
                     if (messages.empty()) {
-                        std::lock_guard<std::mutex> lock(state_mutex);
-                        channel_states[channel_id].fetch_complete = true;
                         promise->set_value(false);
                         return;
                     }
                     
-                    success = collect_messages_for_later(messages, channel_id);
-                    promise->set_value(success);
-                    
+                    promise->set_value(collect_and_tokenize_messages(messages, channel_id));
                 } catch (const std::exception& e) {
                     DISCORD_HISTORY_LOG("Exception processing channel " + std::to_string(channel_id) + ": " + e.what());
                     promise->set_value(false);
                 }
             });
         
-        // Wait for result with timeout
         auto status = future.wait_for(std::chrono::seconds(TIMEOUT_SECONDS));
-        if (status == std::future_status::ready) {
-            return future.get();
-        } else {
-            std::lock_guard<std::mutex> lock(state_mutex);
-            channel_states[channel_id].fetch_complete = true;
-            return false;
-        }
-    }
-    
-    // Collect messages with exact tokenization using LlamaManager
-    bool collect_messages_for_later(const dpp::message_map& messages, uint64_t channel_id) {
-        if (messages.empty()) return false;
+        return status == std::future_status::ready && future.get();
+    }    // Collect and immediately tokenize messages
+    bool collect_and_tokenize_messages(const dpp::message_map& messages, uint64_t channel_id) {
+        std::vector<PreTokenizedMessage> batch_messages;
+        uint64_t oldest_id = UINT64_MAX;
+        int32_t batch_tokens = 0;
         
-        auto& state = channel_states[channel_id];        // Process messages with exact tokenization
-        std::vector<PendingMessage> batch_messages;
-        uint64_t oldest_id = UINT64_MAX; // Track oldest message ID for next iteration
-        int32_t total_exact_tokens = 0;
-        int32_t new_messages_count = 0;
-        int32_t duplicate_count = 0;
-          for (const auto& [id, msg] : messages) {
+        for (const auto& [id, msg] : messages) {
             uint64_t msg_id = static_cast<uint64_t>(msg.id);
-            
-            // Track the oldest message ID for pagination
             oldest_id = std::min(oldest_id, msg_id);
             
-            // Check for duplicate messages (safety net - should be rare with correct API usage)
+            // Skip duplicates
             {
                 std::lock_guard<std::mutex> lock(processed_ids_mutex);
-                if (processed_message_ids.count(msg_id)) {
-                    duplicate_count++;
-                    DISCORD_HISTORY_LOG("Skipping duplicate message ID: " + std::to_string(msg_id));
+                if (processed_message_ids.count(msg_id)) continue;
+                processed_message_ids.insert(msg_id);
+            }
+              // Check if processable message
+            bool is_our_bot = msg.author.is_bot() && (static_cast<uint64_t>(msg.author.id) == bot_user_id);
+            if (!msg.author.is_bot() || is_our_bot) {
+                // Extract content first for blacklist checking
+                std::string content = msg.content;
+                if (is_our_bot && !msg.embeds.empty() && !msg.embeds[0].description.empty()) {
+                    content = msg.embeds[0].description;
+                }
+                content = safe_trim(TextSanitizer::sanitize_text(content));
+                  // Skip bot messages that match blacklist patterns
+                if (is_our_bot && llama_manager && llama_manager->is_blacklisted_response(content)) {
+                    DISCORD_HISTORY_LOG("Skipping blacklisted bot message from history: '" + 
+                                      (content.length() > 50 ? content.substr(0, 50) + "..." : content) + "'");
                     continue;
                 }
-            }
-            
-            new_messages_count++;
-            
-            // Check if this is a user message OR our bot's own message
-            bool is_our_bot = msg.author.is_bot() && (static_cast<uint64_t>(msg.author.id) == bot_user_id);
-            
-            // For bot messages, allow empty content if there are embeds; for user messages, content must be non-empty
-            bool has_content = !msg.content.empty();
-            bool has_embed_content = is_our_bot && !msg.embeds.empty() && !msg.embeds[0].description.empty();
-            bool should_process = (!msg.author.is_bot() || is_our_bot) && (has_content || has_embed_content);
-            
-            if (should_process) {
-                PendingMessage pending;
-                pending.channel_id = channel_id;
                 
-                // Use "assistant" role for our bot's messages, username for user messages
-                if (is_our_bot) {
-                    pending.username = "assistant";
-                } else {
-                    pending.username = msg.author.username;
-                }
-                  // For bot messages, extract content from embeds if they exist, otherwise use regular content
-                std::string actual_content = msg.content;
-                if (is_our_bot && !msg.embeds.empty()) {
-                    // Extract content from the first embed's description
-                    const auto& embed = msg.embeds[0];
-                    if (!embed.description.empty()) {
-                        actual_content = embed.description;
+                PreTokenizedMessage pre_msg;
+                pre_msg.channel_id = channel_id;
+                pre_msg.message_id = msg_id;
+                pre_msg.username = is_our_bot ? "assistant" : msg.author.username;
+                pre_msg.content = content;
+                pre_msg.timestamp = std::chrono::system_clock::time_point(std::chrono::seconds(msg.sent));
+                
+                // Simple tokenization for storage - exact counting happens after rebuild
+                std::string role = is_our_bot ? "assistant" : "user";
+                std::string formatted = is_our_bot ? content : (msg.author.username + ": " + content);
+                
+                // Store basic token info for reference (not used for capacity planning)
+                try {
+                    auto base_tokens = llama_manager->process_text_to_tokens(formatted, target_context, false);
+                    pre_msg.tokens = base_tokens;
+                    pre_msg.token_count = static_cast<int32_t>(base_tokens.size()); // Basic count for reference only
+
+                    if (pre_msg.token_count > 0 && pre_msg.token_count <= MAX_MESSAGE_TOKENS) {
+                        batch_messages.push_back(pre_msg);
+                        batch_tokens += pre_msg.token_count; // This is just for initial filtering
                     }
-                }                
-                // Sanitize the content to prevent tokenization issues
-                actual_content = TextSanitizer::sanitize_text(actual_content);
-                pending.content = safe_trim(actual_content);
-                pending.timestamp = std::chrono::system_clock::time_point(std::chrono::seconds(msg.sent));
-                pending.message_id = msg_id;
-                pending.target_context_id = state.context_id;
-                
-                // Use LlamaManager's context-specific tokenization method
-                std::string formatted_message;
-                if (is_our_bot) {
-                    // For bot messages, don't include username prefix since it's "assistant"
-                    formatted_message = actual_content;
-                } else {
-                    formatted_message = msg.author.username + ": " + actual_content;
-                }
-                
-                // Get the specific context for tokenization to ensure consistency
-                ContextInfo* target_context = llama_manager->get_context_info(state.context_id);
-                if (target_context) {
-                    pending.tokenized_content = llama_manager->process_text_to_tokens(formatted_message, target_context, false);
-                } else {
-                    DISCORD_HISTORY_LOG("Warning: Could not find context " + state.context_id + " for tokenization, skipping message");
-                    continue; // Skip this message if we can't find the appropriate context
-                }
-                
-                // Check for reasonable token count limits
-                if (pending.tokenized_content.size() > MAX_MESSAGE_TOKENS) {
-                    DISCORD_HISTORY_LOG("Warning: Message from " + (is_our_bot ? "bot" : msg.author.username) + " would produce " + 
-                               std::to_string(pending.tokenized_content.size()) + " tokens, skipping");
-                    continue;}
-                
-                pending.actual_token_count = static_cast<int32_t>(pending.tokenized_content.size());
-                
-                if (pending.actual_token_count > 0) {
-                    batch_messages.push_back(pending);
-                    total_exact_tokens += pending.actual_token_count;
-                    
-                    // Mark message as processed to prevent duplicates
-                    {
-                        std::lock_guard<std::mutex> lock(processed_ids_mutex);
-                        processed_message_ids.insert(msg_id);
-                    }
-                } else {
-                    DISCORD_HISTORY_LOG("Warning: Tokenization produced 0 tokens for message from " + 
-                               (is_our_bot ? "bot" : msg.author.username) + ", skipping");
+                } catch (const std::exception& e) {
+                    DISCORD_HISTORY_LOG("ERROR: Exception during tokenization for message " + std::to_string(msg_id) + ": " + e.what());
+                    continue; // Skip this message and continue
                 }
             }
-            // Note: we don't update any tracking for non-processable messages (other bots)
-            // This ensures pagination is only based on messages we actually care about
-        }
-        
-        DISCORD_HISTORY_LOG("Batch analysis - Channel " + std::to_string(channel_id) + 
-                   ": " + std::to_string(new_messages_count) + " new, " + 
-                   std::to_string(duplicate_count) + " duplicates, " + 
-                   std::to_string(batch_messages.size()) + " processable");
-        
-        // Determine how to handle pagination based on what we found
-        bool should_continue_pagination = false;
-        
-        // Check if we can add all messages using exact token counts
-        if (!batch_messages.empty() && can_add_more_messages_estimated_no_switch(state.context_id, total_exact_tokens)) {
-            // Add to pending collection
-            {
-                std::lock_guard<std::mutex> lock(pending_messages_mutex);
-                pending_messages.insert(pending_messages.end(), batch_messages.begin(), batch_messages.end());
-            }
+        }        // Add batch to context and rebuild to get exact token count
+        if (!batch_messages.empty()) {
+            // Note: No sorting needed since we're fetching from newest to oldest
+            // and will insert them in the correct chronological position using insert_historical_message()
             
-            // Update exact token usage
-            update_estimated_token_usage(state.context_id, total_exact_tokens);
-              // Update state with success
-            {
-                std::lock_guard<std::mutex> lock(state_mutex);
-                state.messages_fetched += static_cast<int32_t>(batch_messages.size());
-                  // Update pagination to continue from oldest message in this batch
-                if (oldest_id != UINT64_MAX) {
-                    state.last_message_id = oldest_id;
-                    should_continue_pagination = true;
-                }
-            }
+            // Store context state before modification for potential rollback
+            // Hold mutex for entire critical section to prevent concurrent access
+            std::lock_guard<std::mutex> lock(context_access_mutex);
             
-            if (should_continue_pagination) {
-                DISCORD_HISTORY_LOG("Collected " + std::to_string(batch_messages.size()) + " messages from channel " + 
-                           std::to_string(channel_id) + " (exact " + std::to_string(total_exact_tokens) + 
-                           " tokens), next fetch before ID: " + std::to_string(oldest_id));
-            }
-            return should_continue_pagination;        } else if (!batch_messages.empty()) {
-            // Mark channel as complete if we can't fit more
-            std::lock_guard<std::mutex> lock(state_mutex);
-            channel_states[channel_id].fetch_complete = true;
-            
-            // Get current capacity info for logging
-            std::string capacity_info = "unknown";
-            {
-                std::lock_guard<std::mutex> cap_lock(capacity_mutex);
-                auto current_it = context_current_tokens.find(state.context_id);
-                auto capacity_it = context_capacity_limits.find(state.context_id);
-                if (current_it != context_current_tokens.end() && capacity_it != context_capacity_limits.end()) {
-                    capacity_info = std::to_string(current_it->second) + "/" + std::to_string(capacity_it->second);
-                }
-            }
-            
-            DISCORD_HISTORY_LOG("Channel " + std::to_string(channel_id) + " completed - context capacity reached (" + capacity_info + ")");
-            return false;
-        } else {
-            // No processable messages found in this batch
-            std::lock_guard<std::mutex> lock(state_mutex);
-            
-            if (new_messages_count == 0) {
-                // No new messages - likely reached the end of available messages
-                state.fetch_complete = true;
-                DISCORD_HISTORY_LOG("Channel " + std::to_string(channel_id) + " completed - no new messages found");
+            // Validate context safety while holding mutex
+            if (!target_context) {
+                DISCORD_HISTORY_LOG("ERROR: target_context is null for '" + target_context_id + "'");
                 return false;
-            } else {
-                // We had new messages but none were processable (all bots, etc.)                // Continue pagination to find processable messages
-                if (oldest_id != UINT64_MAX) {
-                    state.last_message_id = oldest_id;
-                    DISCORD_HISTORY_LOG("No processable messages for channel " + std::to_string(channel_id) + 
-                               ", continuing pagination from " + std::to_string(oldest_id));
-                    return true;
-                } else {
-                    // Shouldn't happen but handle gracefully
-                    state.fetch_complete = true;
-                    DISCORD_HISTORY_LOG("Channel " + std::to_string(channel_id) + " completed - unable to determine pagination");
-                    return false;
-                }
             }
-        }
-    }
-    
-    // Apply collected messages using pre-tokenized content
-    void apply_collected_messages() {
-        std::lock_guard<std::mutex> lock(pending_messages_mutex);
-        if (pending_messages.empty()) return;
-        
-        DISCORD_HISTORY_LOG("Applying " + std::to_string(pending_messages.size()) + " collected tokenized messages to contexts...");
-        
-        // Sort messages by timestamp for chronological order
-        std::sort(pending_messages.begin(), pending_messages.end(),
-            [](const PendingMessage& a, const PendingMessage& b) {
-                return a.timestamp < b.timestamp;
-            });
-          // Group messages by target context
-        std::unordered_map<std::string, std::vector<PendingMessage>> context_groups;
-        for (const auto& msg : pending_messages) {
-            context_groups[msg.target_context_id].push_back(msg);
-        }
-        
-        // Apply messages to each context using direct context access instead of switching
-        for (const auto& [context_id, messages] : context_groups) {
-            DISCORD_HISTORY_LOG("Adding " + std::to_string(messages.size()) + " tokenized messages to context '" + context_id + "' directly");
+            if (!llama_manager) {
+                DISCORD_HISTORY_LOG("ERROR: llama_manager is null for '" + target_context_id + "'");
+                return false;
+            }
+            if (!target_context->context_size_manager) {
+                DISCORD_HISTORY_LOG("ERROR: context_size_manager is null for '" + target_context_id + "'");
+                return false;
+            }
+            if (!target_context->model_info) {
+                DISCORD_HISTORY_LOG("ERROR: model_info is null for '" + target_context_id + "'");
+                return false;
+            }
             
-            ContextInfo* target_context = llama_manager->get_context_info(context_id);
-            if (target_context) {
-                int32_t added_count = 0;
-                int32_t total_tokens_added = 0;
-                
-                for (const auto& msg : messages) {
-                    // Use the context-specific overload to avoid context switching
-                    DISCORD_HISTORY_LOG("Adding message from " + msg.username + " to specified context");
-                    target_context->add_message(msg.username, msg.content);
-                    added_count++;
-                    total_tokens_added += msg.actual_token_count;
+            size_t original_history_size = target_context->message_history.size();            // Temporarily add messages to context using historical insertion
+            std::string role;
+            try {
+                // Add messages while holding the mutex to prevent concurrent modifications
+                // Use reverse iterator to process messages from oldest to newest since we fetched newest to oldest
+                for (auto it = batch_messages.rbegin(); it != batch_messages.rend(); ++it) {
+                    const auto& msg = *it;
+                    role = (msg.username == "assistant") ? "assistant" : "user";
+                    target_context->insert_historical_message(role, msg.content);
                 }
-                
-                if (llama_manager->update_context_from_history(target_context)) {
-                    DISCORD_HISTORY_LOG("Successfully added " + std::to_string(added_count) + " messages (" + 
-                               std::to_string(total_tokens_added) + " tokens) to context " + context_id);
-                } else {
-                    DISCORD_HISTORY_LOG("Failed to update context " + context_id + " from history");
-                }
-            } else {
-                DISCORD_HISTORY_LOG("Failed to get context info for " + context_id);
+            } catch (const std::exception& e) {
+                DISCORD_HISTORY_LOG("ERROR: Exception while adding messages to context for '" + target_context_id + "': " + e.what());
+                return false;
             }
-        }
-        
-        // No need to restore context since we didn't switch
-        
-        // Clear processed messages
-        pending_messages.clear();
-        DISCORD_HISTORY_LOG("Tokenized message application phase completed");
-    }
-    
-    // Round-robin for shared channels
-    uint64_t get_next_shared_channel() {
-        if (shared_channels_list.empty()) return 0;
-        
-        uint64_t channel_id = shared_channels_list[shared_channel_index];
-        shared_channel_index = (shared_channel_index + 1) % shared_channels_list.size();
-        return channel_id;
-    }
-    
-    // Updated main processing loop with proper isolated vs shared handling
-    void process_all_channels() {
-        const int32_t MAX_ITERATIONS = DiscordHistoryLoader::MAX_ITERATIONS;
-        int32_t iteration = 0;
-        
-        // Initialize context capacities once
-        DISCORD_HISTORY_LOG("Initializing context capacity tracking...");
-        initialize_context_capacities();
-        
-        // Phase 1: Collect all messages
-        DISCORD_HISTORY_LOG("Phase 1: Collecting messages from all channels...");
-        
-        while (backfill_in_progress && iteration < MAX_ITERATIONS) {
-            bool made_progress = false;
-              // Process isolated channels sequentially to completion using STL algorithms (Directive #14)
-            // Since each has its own context, we can fill them completely without affecting others
-            std::vector<uint64_t> isolated_channels_to_process;
+              // Perform full context rebuild to get exact token count
+            bool rebuild_success = false;
+            try {
+                // Rebuild context while holding mutex to prevent concurrent access
+                rebuild_success = llama_manager->update_context_from_history(target_context);
+            } catch (const std::exception& e) {
+                DISCORD_HISTORY_LOG("ERROR: Exception during context rebuild for '" + target_context_id + "': " + e.what());
+                rebuild_success = false;
+            }
+            
+            if (!rebuild_success) {
+                DISCORD_HISTORY_LOG("ERROR: Failed to rebuild context during collection for '" + target_context_id + "'");
+                
+                // Attempt to restore context to valid state
+                if (!restore_context_state(batch_messages)) {
+                    DISCORD_HISTORY_LOG("CRITICAL: Failed to restore context state for '" + target_context_id + "' - context may be permanently corrupted");
+                    // Mark as failed to prevent further operations
+                    target_reached = true; // Stop collection to prevent further corruption
+                }
+                return false;
+            }
+              // Get exact context analysis after rebuild
+            EnhancedContextAnalysis analysis;
+            try {
+                // Analyze context while holding mutex
+                analysis = target_context->context_size_manager->analyze_context(*target_context);
+            } catch (const std::exception& e) {
+                DISCORD_HISTORY_LOG("ERROR: Exception during context analysis for '" + target_context_id + "': " + e.what());
+                return false;
+            }
+            
+            float current_usage = static_cast<float>(analysis.total_used_tokens) / analysis.context_size;
+            
+            // Calculate target threshold
+            float safe_target = std::min(
+                context_fill_ratio * (1.0f - analysis.emergency_buffer_percentage - analysis.ai_allocation_percentage),
+                1.0f - analysis.emergency_buffer_percentage - analysis.ai_allocation_percentage - 0.05f  // Extra 5% safety margin
+            );
+            
+            DISCORD_HISTORY_LOG("Context '" + target_context_id + "' after adding " + std::to_string(batch_messages.size()) + " messages:");
+            DISCORD_HISTORY_LOG("  Exact token count: " + std::to_string(analysis.total_used_tokens) + " / " + std::to_string(analysis.context_size));
+            DISCORD_HISTORY_LOG("  Current usage: " + std::to_string(current_usage * 100) + "%");
+            DISCORD_HISTORY_LOG("  Target threshold: " + std::to_string(safe_target * 100) + "%");
+              // Check if we've reached our target
+            if (current_usage >= safe_target) {
+                target_reached = true;
+                DISCORD_HISTORY_LOG("Target reached for context '" + target_context_id + "' at " + std::to_string(current_usage * 100) + "% usage");
+            }
+              // Update our tracking (messages are already added to context)
             {
-                std::lock_guard<std::mutex> lock(state_mutex);
-                std::for_each(channel_states.begin(), channel_states.end(), [&](const auto& pair) {
-                    const auto& [channel_id, state] = pair;
-                    if (state.is_isolated && !state.fetch_complete) {
-                        isolated_channels_to_process.push_back(channel_id);
-                    }
-                });
+                std::lock_guard<std::mutex> lock(messages_mutex);
+                collected_messages.insert(collected_messages.end(), batch_messages.begin(), batch_messages.end());
             }
-            
-            // Process all isolated channels until complete or no progress
-            for (uint64_t channel_id : isolated_channels_to_process) {
-                auto it = channel_states.find(channel_id);
-                if (it != channel_states.end() && !it->second.fetch_complete) {
-                    DISCORD_HISTORY_LOG("Processing isolated channel " + std::to_string(channel_id) + " to completion...");
-                    
-                    // Keep processing this isolated channel until it's done
-                    while (!it->second.fetch_complete && backfill_in_progress) {
-                        if (process_channel_batch(channel_id)) {
-                            made_progress = true;
-                            // Small delay between batches for rate limiting
-                            std::this_thread::sleep_for(std::chrono::milliseconds(RATE_LIMIT_DELAY_MS));
-                        } else {
-                            break; // Channel completed or error
+            total_tokens_collected.store(analysis.total_used_tokens);
+              // Track with ContextSizeManager
+            try {
+                // Note: ContextSizeManager operations are thread-safe
+                if (target_context->context_size_manager && target_context->model_info) {
+                    for (const auto& msg : batch_messages) {
+                        if (msg.username != "assistant") {
+                            track_user_message(*target_context, *target_context->model_info, msg.token_count);
                         }
                     }
-                    
-                    if (it->second.fetch_complete) {
-                        DISCORD_HISTORY_LOG("Completed isolated channel " + std::to_string(channel_id));
-                    }
                 }
+            } catch (const std::exception& e) {
+                DISCORD_HISTORY_LOG("ERROR: Exception during ContextSizeManager tracking for '" + target_context_id + "': " + e.what());
+                // Continue despite tracking failure
             }
             
-            // Process shared channels using round-robin (only one batch per iteration)
-            // This ensures fair distribution of the main context among shared channels
-            if (!shared_channels_list.empty()) {
-                uint64_t channel_id = get_next_shared_channel();
-                auto it = channel_states.find(channel_id);
-                if (it != channel_states.end() && !it->second.fetch_complete) {
-                    if (process_channel_batch(channel_id)) {
-                        made_progress = true;
-                        DISCORD_HISTORY_LOG("Processed batch for shared channel " + std::to_string(channel_id) + 
-                                   " (round-robin)");
-                    }
-                }
+            // Update pagination
+            if (oldest_id != UINT64_MAX) {
+                last_message_id = oldest_id;
             }
             
-            iteration++;
-            
-            if (!made_progress) {                // Check if all channels are complete using STL algorithms (Directive #14)
-                bool all_complete = true;
-                {
-                    std::lock_guard<std::mutex> lock(state_mutex);
-                    all_complete = std::all_of(channel_states.begin(), channel_states.end(),
-                        [](const auto& pair) { return pair.second.fetch_complete; });
+            return true; // Continue iteration
+        } else {
+            // No valid messages in this batch
+            return false;
+        }
+    }    // Collection thread main function
+    void collection_thread() {
+        DISCORD_HISTORY_LOG("Starting collection for context '" + target_context_id + "'");
+        
+        // Validate context safety before starting
+        if (!validate_context_safe()) {
+            DISCORD_HISTORY_LOG("ERROR: Context validation failed at start for '" + target_context_id + "' - aborting collection");
+            collection_complete = true;
+            return;
+        }        try {
+            // Initialize ContextSizeManager and log initial state with proper mutex protection
+            {
+                std::lock_guard<std::mutex> lock(context_access_mutex);
+                
+                // Re-validate context after acquiring mutex
+                if (!target_context || !target_context->model_info) {
+                    DISCORD_HISTORY_LOG("ERROR: Context became invalid after initial validation for '" + target_context_id + "'");
+                    collection_complete = true;
+                    return;
                 }
                 
-                if (all_complete) {
-                    DISCORD_HISTORY_LOG("All channels completed");
+                // Initialize ContextSizeManager if needed
+                if (!target_context->context_size_manager) {
+                    initialize_context_size_manager(*target_context, *target_context->model_info);
+                }
+                
+                // Log initial context state for debugging
+                if (target_context->context_size_manager) {
+                    auto initial_analysis = target_context->context_size_manager->analyze_context(*target_context);
+                    DISCORD_HISTORY_LOG("Initial context state - Size: " + std::to_string(initial_analysis.context_size) + 
+                               ", Used: " + std::to_string(initial_analysis.total_used_tokens) + 
+                               ", Available: " + std::to_string(initial_analysis.available_tokens) +
+                               ", Emergency Buffer: " + std::to_string(initial_analysis.emergency_buffer_percentage * 100) + "%");
+                }
+            }
+            // Collect messages until target reached
+            int32_t iterations = 0;
+            while (!target_reached.load() && iterations < MAX_ITERATIONS) {
+                if (!process_channel_batch()) {
                     break;
                 }
-                
-                // If no progress but channels remain, wait and try again
-                DISCORD_HISTORY_LOG("No progress made, waiting before retry...");
-                std::this_thread::sleep_for(std::chrono::milliseconds(RETRY_DELAY_MS));
-            } else {
-                // Short delay between iterations when making progress
-                std::this_thread::sleep_for(std::chrono::milliseconds(PROGRESS_DELAY_MS));
+                std::this_thread::sleep_for(std::chrono::milliseconds(RATE_LIMIT_DELAY_MS));
+                iterations++;
             }
+            
+        } catch (const std::exception& e) {
+            DISCORD_HISTORY_LOG("CRITICAL: Exception in collection thread for '" + target_context_id + "': " + e.what());
+            // Mark as failed to prevent further operations
+            target_reached = true;
         }
         
-        // Phase 2: Apply all collected messages
-        DISCORD_HISTORY_LOG("Phase 2: Applying collected messages to contexts...");
-        apply_collected_messages();
+        collection_complete = true;
         
-        backfill_in_progress = false;
-        DISCORD_HISTORY_LOG("Chat history backfill completed");
+        if (is_shared_context && coordinator) {
+            coordinator->notify_loader_complete();
+        } else {
+            // Isolated context - apply immediately
+            apply_to_isolated_context();
+        }
+        
+        DISCORD_HISTORY_LOG("Collection complete for context '" + target_context_id + "': " + 
+                   std::to_string(total_tokens_collected.load()) + " tokens collected");
     }
 
 public:
-    struct BackfillStatus {
-        bool in_progress;
-        int32_t total_channels;
-        int32_t completed_channels;
-        int32_t total_messages_fetched;
-    };
-
-    DiscordHistoryLoader() = default;
-    ~DiscordHistoryLoader() = default;
-      void configure(dpp::cluster* discord_bot, LlamaManager* llama_mgr, const std::string& main_ctx_id, const std::string& model_identifier = "") {
-        bot = discord_bot;
-        llama_manager = llama_mgr;
-        main_context_id = main_ctx_id;
-        model_id = model_identifier;
+    // Factory methods for creating loaders
+    static std::shared_ptr<DiscordHistoryLoader> create_for_isolated_context(
+        const std::string& context_id, uint64_t channel_id, 
+        ContextInfo* context, LlamaManager* llama_mgr, const std::string& model_identifier,
+        dpp::cluster* discord_bot, uint64_t bot_user_id, float fill_ratio) {
+        
+        auto loader = std::make_shared<DiscordHistoryLoader>();
+        loader->target_context_id = context_id;
+        loader->target_context = context;
+        loader->llama_manager = llama_mgr;
+        loader->model_id = model_identifier;
+        loader->assigned_channels = {channel_id};
+        loader->is_shared_context = false;
+        loader->context_fill_ratio = fill_ratio;
+        loader->bot = discord_bot;
+        loader->bot_user_id = bot_user_id;
+        
+        return loader;
     }
     
-    // Set bot identification information for recognizing own messages
-    void set_bot_identity(uint64_t user_id, const std::string& username) {
-        bot_user_id = user_id;
-        bot_username = username;
-        DISCORD_HISTORY_LOG("Bot identity set: ID=" + std::to_string(user_id) + ", Username=" + username);
+    static std::shared_ptr<DiscordHistoryLoader> create_for_shared_context(
+        const std::string& context_id, uint64_t channel_id,
+        ContextInfo* context, LlamaManager* llama_mgr, const std::string& model_identifier,
+        dpp::cluster* discord_bot, uint64_t bot_user_id, 
+        std::shared_ptr<SharedContextCoordinator> coord, float portion_ratio) {
+        
+        auto loader = std::make_shared<DiscordHistoryLoader>();
+        loader->target_context_id = context_id;
+        loader->target_context = context;
+        loader->llama_manager = llama_mgr;
+        loader->model_id = model_identifier;
+        loader->assigned_channels = {channel_id};
+        loader->is_shared_context = true;
+        loader->context_fill_ratio = portion_ratio;
+        loader->bot = discord_bot;
+        loader->bot_user_id = bot_user_id;
+        loader->coordinator = coord;
+        
+        return loader;
     }
     
-    void set_channel_configuration(const std::unordered_set<uint64_t>* allowed,
-                                  const std::unordered_set<uint64_t>* isolated,
-                                  const std::unordered_set<uint64_t>* shared_history) {
-        isolated_channels = isolated;
-        shared_history_channels = shared_history;
+    // Start collection immediately
+    void start_collection() {
+        std::thread(&DiscordHistoryLoader::collection_thread, this).detach();
     }
-      void set_history_settings(bool enabled, int32_t fill_percentage) {
-        history_enabled = enabled;
-        context_fill_percentage = std::clamp(fill_percentage, MIN_FILL_PERCENTAGE, MAX_FILL_PERCENTAGE);
-    }
-      void start_backfill() {
-        if (!history_enabled || backfill_in_progress || !bot || !llama_manager) return;
+    
+    // Status checks
+    bool is_ready_to_apply() const { return target_reached.load(); }
+    bool is_collection_complete() const { return collection_complete.load(); }    // Apply messages directly to isolated context
+    bool apply_to_isolated_context() {
+        if (is_shared_context) return false;
         
-        backfill_in_progress = true;
-        
-        // Clear processed message IDs for new backfill session
-        {
-            std::lock_guard<std::mutex> lock(processed_ids_mutex);
-            processed_message_ids.clear();
+        // Check if already applied to prevent duplicate applications
+        if (messages_applied.load()) {
+            DISCORD_HISTORY_LOG("Messages already applied to context '" + target_context_id + "' - skipping duplicate application");
+            return true;
         }
         
-        DISCORD_HISTORY_LOG("Starting simplified chat history backfill...");
+        std::lock_guard<std::mutex> lock(messages_mutex);
         
-        // Get channels and setup states
-        bot->current_user_get_guilds([this](const dpp::confirmation_callback_t& callback) {
-            if (callback.is_error()) {
-                DISCORD_HISTORY_LOG("Error getting guilds: " + callback.get_error().human_readable);
-                backfill_in_progress = false;
+        // Messages are already applied to context during collection
+        // Just mark as applied and log completion
+        messages_applied = true;
+        
+        DISCORD_HISTORY_LOG("Messages already applied to context '" + target_context_id + "' during collection");
+        DISCORD_HISTORY_LOG("Final context usage: " + std::to_string(total_tokens_collected.load()) + " tokens");
+        return true;
+    }
+    
+    // Get collected messages for shared context merging
+    std::vector<PreTokenizedMessage> get_collected_messages() const {
+        std::lock_guard<std::mutex> lock(messages_mutex);
+        return collected_messages;
+    }
+    
+    // Status information
+    struct LoaderStatus {
+        bool target_reached;
+        bool collection_complete;
+        int32_t total_tokens_collected;
+        size_t messages_collected;
+    };
+      LoaderStatus get_status() const {
+        std::lock_guard<std::mutex> lock(messages_mutex);
+        return {
+            target_reached.load(),
+            collection_complete.load(), 
+            total_tokens_collected.load(),
+            collected_messages.size()
+        };
+    }
+    
+    // Check if messages have been applied (for debugging and status monitoring)
+    bool are_messages_applied() const { return messages_applied.load(); }
+};
+
+// SharedContextCoordinator implementation
+inline void SharedContextCoordinator::notify_loader_complete() {
+    completed_loaders.fetch_add(1);
+    
+    if (all_loaders_complete()) {
+        trigger_shared_merge();
+    }
+}
+
+inline bool SharedContextCoordinator::all_loaders_complete() const {
+    std::lock_guard<std::mutex> lock(coordination_mutex);
+    int32_t active_loaders = 0;
+    
+    // Count active loaders (cannot modify container in const method)
+    for (const auto& weak_loader : loaders) {
+        if (auto loader = weak_loader.lock()) {
+            active_loaders++;
+        }
+    }
+    
+    return completed_loaders.load() >= active_loaders;
+}
+
+inline void SharedContextCoordinator::trigger_shared_merge() {
+    // Check if merge has already been completed
+    if (merge_completed.load()) {
+        DISCORD_HISTORY_LOG("Shared context merge already completed for '" + shared_context_id + "' - skipping duplicate merge");
+        return;
+    }
+    
+    if (merge_in_progress.exchange(true)) return;
+    
+    std::lock_guard<std::mutex> lock(coordination_mutex);
+    
+    // Double-check after acquiring lock
+    if (merge_completed.load()) {
+        DISCORD_HISTORY_LOG("Shared context merge already completed for '" + shared_context_id + "' - skipping duplicate merge");
+        merge_in_progress = false;
+        return;
+    }
+    
+    try {        // Collect all messages from all loaders
+        std::vector<PreTokenizedMessage> all_messages;
+        
+        for (auto& weak_loader : loaders) {
+            if (auto loader = weak_loader.lock()) {
+                auto messages = loader->get_collected_messages();
+                all_messages.insert(all_messages.end(), messages.begin(), messages.end());
+            }
+        }
+        
+        // Note: No sorting needed since we'll insert messages in chronological order using insert_historical_message()
+        
+        // Get shared context and apply messages
+        ContextInfo* shared_context = nullptr;
+        if (llama_manager) {
+            shared_context = llama_manager->get_context_info(shared_context_id);
+        }
+        
+        if (!shared_context) {
+            DISCORD_HISTORY_LOG("ERROR: Failed to get shared context '" + shared_context_id + "' for merge");
+            merge_in_progress = false;
+            return;
+        }
+        
+        // Calculate total tokens from all collected messages
+        int32_t total_collected_tokens = 0;
+        for (const auto& msg : all_messages) {
+            total_collected_tokens += msg.token_count;
+        }
+        
+        // Final safety check with exact rebuild
+        if (shared_context->context_size_manager) {
+            auto initial_analysis = shared_context->context_size_manager->analyze_context(*shared_context);
+              // Store original state for potential rollback
+            size_t original_history_size = shared_context->message_history.size();
+            
+            // Add all messages using historical insertion to maintain chronological order
+            // Process from newest to oldest (reverse order) so they're inserted in correct chronological sequence
+            for (auto it = all_messages.rbegin(); it != all_messages.rend(); ++it) {
+                const auto& msg = *it;
+                std::string role = (msg.username == "assistant") ? "assistant" : "user";
+                shared_context->insert_historical_message(role, msg.content);
+            }
+            
+            // Rebuild to get exact token count
+            bool rebuild_success = llama_manager->update_context_from_history(shared_context);
+            if (!rebuild_success) {
+                DISCORD_HISTORY_LOG("ERROR: Failed to rebuild shared context '" + shared_context_id + "' during merge");
+                
+                // Attempt rollback
+                while (shared_context->message_history.size() > original_history_size && !shared_context->message_history.empty()) {
+                    shared_context->message_history.pop_back();
+                }
+                shared_context->message_cache_dirty = true;
+                
+                // Try to restore original state
+                if (!llama_manager->update_context_from_history(shared_context)) {
+                    DISCORD_HISTORY_LOG("CRITICAL: Failed to restore shared context '" + shared_context_id + "' after failed merge - context may be corrupted");
+                }
+                
+                merge_in_progress = false;
                 return;
             }
             
-            auto guilds = callback.get<dpp::guild_map>();
-            setup_channel_states(guilds);
-        });
-    }
-      void setup_channel_states(const dpp::guild_map& guilds) {
-        std::lock_guard<std::mutex> lock(state_mutex);
-        channel_states.clear();
-        shared_channels_list.clear();
-        shared_channel_index = 0;
-        
-        // Clear pending messages and processed IDs for fresh start
-        {
-            std::lock_guard<std::mutex> pmsg_lock(pending_messages_mutex);
-            pending_messages.clear();
-        }
-        
-        // Validate prerequisites before proceeding
-        if (model_id.empty()) {
-            DISCORD_HISTORY_LOG("Error: No model_id configured for context creation");
-            backfill_in_progress = false;
-            return;
-        }
-        
-        if (!llama_manager) {
-            DISCORD_HISTORY_LOG("Error: No LlamaManager configured");
-            backfill_in_progress = false;
-            return;
-        }
-        
-        auto process_guilds = [this, guilds]() {
-            for (const auto& [guild_id, guild] : guilds) {
-                bot->channels_get(guild_id, [this, guild_id](const dpp::confirmation_callback_t& callback) {
-                    if (!callback.is_error()) {
-                        auto channels = callback.get<dpp::channel_map>();
-                        
-                        std::lock_guard<std::mutex> lock(state_mutex);
-                        for (const auto& [channel_id, channel] : channels) {
-                            if (channel.is_text_channel() && should_backfill_channel(channel_id)) {
-                                ChannelState state;
-                                state.is_isolated = is_isolated_channel(channel_id);
-                                  if (state.is_isolated) {
-                                    state.context_id = "discord_channel_" + std::to_string(channel_id);
-                                    
-                                    // Validate model_id and create context with proper system prompt
-                                    if (!model_id.empty()) {
-                                        if (!llama_manager->has_context(state.context_id)) {
-                                            // Get the main shared context info to retrieve system prompt
-                                            auto context_info = llama_manager->get_context_info(main_context_id);
-
-                                            // Get system prompt from main context
-                                            std::string system_prompt = context_info->system_message;
-                                            
-                                            if (llama_manager->create_context(state.context_id, model_id, system_prompt)) {
-                                                DISCORD_HISTORY_LOG("Created isolated context '" + state.context_id + 
-                                                           "' with model '" + model_id + "' and system prompt");
-                                            } else {
-                                                DISCORD_HISTORY_LOG("Error: Failed to create isolated context '" + 
-                                                           state.context_id + "' with model '" + model_id + "'");
-                                                continue; // Skip this channel if context creation failed
-                                            }
-                                        } else {
-                                            DISCORD_HISTORY_LOG("Using existing isolated context '" + state.context_id + "'");
-                                        }
-                                    } else {
-                                        DISCORD_HISTORY_LOG("Error: Cannot create isolated context - no model_id");
-                                        continue; // Skip this channel
-                                    }
-                                } else {
-                                    state.context_id = main_context_id;
-                                    shared_channels_list.push_back(channel_id);
-                                    
-                                    // Validate main context exists
-                                    if (!llama_manager->has_context(main_context_id)) {
-                                        DISCORD_HISTORY_LOG("Error: Main context '" + main_context_id + "' does not exist");
-                                        continue; // Skip this channel
-                                    }
-                                }
-                                
-                                channel_states[channel_id] = state;
-                                DISCORD_HISTORY_LOG("Configured channel " + std::to_string(channel_id) + 
-                                           " for " + (state.is_isolated ? "isolated" : "shared") + " context: " + state.context_id);
-                            }
-                        }
-                    } else {
-                        DISCORD_HISTORY_LOG("Error getting channels for guild " + std::to_string(guild_id) + 
-                                   ": " + callback.get_error().human_readable);
-                    }
-                });
+            auto final_analysis = shared_context->context_size_manager->analyze_context(*shared_context);
+            float final_usage = static_cast<float>(final_analysis.total_used_tokens) / final_analysis.context_size;
+            
+            DISCORD_HISTORY_LOG("Shared context merge completed for '" + shared_context_id + "':");
+            DISCORD_HISTORY_LOG("  Initial tokens: " + std::to_string(initial_analysis.total_used_tokens));
+            DISCORD_HISTORY_LOG("  Final tokens: " + std::to_string(final_analysis.total_used_tokens));
+            DISCORD_HISTORY_LOG("  Added messages: " + std::to_string(all_messages.size()));
+            DISCORD_HISTORY_LOG("  Final usage: " + std::to_string(final_usage * 100) + "%");
+            
+            if (final_usage > 0.95f) {
+                DISCORD_HISTORY_LOG("WARNING: Shared context usage exceeds 95% after merge");
+            }        } else {
+            // Fallback if no context size manager
+            // Add all messages using historical insertion to maintain chronological order
+            for (auto it = all_messages.rbegin(); it != all_messages.rend(); ++it) {
+                const auto& msg = *it;
+                std::string role = (msg.username == "assistant") ? "assistant" : "user";
+                shared_context->insert_historical_message(role, msg.content);
             }
             
-            // Start processing after a short delay
-            std::thread([this]() {
-                std::this_thread::sleep_for(std::chrono::seconds(INITIALIZATION_DELAY_SEC));
-                if (backfill_in_progress) {
-                    // Validate we have channels to process before starting
-                    {
-                        std::lock_guard<std::mutex> lock(state_mutex);
-                        if (channel_states.empty()) {
-                            DISCORD_HISTORY_LOG("No channels configured for backfill, stopping");
-                            backfill_in_progress = false;
-                            return;
-                        }
-                        DISCORD_HISTORY_LOG("Starting backfill for " + std::to_string(channel_states.size()) + " channels");
-                    }
-                    process_all_channels();
-                }
-            }).detach();
-        };
-        
-        std::thread(process_guilds).detach();
-    }
-    
-    BackfillStatus get_status() const {
-        std::lock_guard<std::mutex> lock(state_mutex);
-        
-        BackfillStatus status;
-        status.in_progress = backfill_in_progress;
-        status.total_channels = static_cast<int32_t>(channel_states.size());
-        status.completed_channels = 0;
-        status.total_messages_fetched = 0;
-        
-        for (const auto& [channel_id, state] : channel_states) {
-            if (state.fetch_complete) {
-                status.completed_channels++;
+            if (!llama_manager->update_context_from_history(shared_context)) {
+                DISCORD_HISTORY_LOG("ERROR: Failed to rebuild shared context '" + shared_context_id + "' during merge");
+                merge_in_progress = false;
+                return;
             }
-            status.total_messages_fetched += state.messages_fetched;
+            
+            DISCORD_HISTORY_LOG("Successfully merged " + std::to_string(all_messages.size()) + 
+                       " messages into shared context '" + shared_context_id + "'");
         }
         
-        return status;
+        // Mark as completed
+        merge_completed = true;
+        merge_in_progress = false;
+        
+    } catch (const std::exception& e) {
+        DISCORD_HISTORY_LOG("CRITICAL: Exception during shared context merge for '" + shared_context_id + "': " + e.what());
+        merge_in_progress = false;
     }
-      bool is_in_progress() const { return backfill_in_progress; }
-};
+}
 
 //
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODE DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!

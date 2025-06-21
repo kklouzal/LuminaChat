@@ -45,11 +45,6 @@ namespace SummarizerConstants {
     // Summary slot management
     constexpr size_t MAX_SUMMARY_SLOTS = 5;
     
-    // Context management ratios
-    constexpr float MAX_CONTEXT_USAGE = 0.90f;
-    constexpr float TARGET_CONTEXT_USAGE = 0.60f;
-    constexpr float AGGRESSIVE_PRUNING_RATIO = 0.30f;
-    
     // Performance constants
     constexpr size_t SUMMARY_CONTENT_RESERVE_SIZE = 4096;
     constexpr size_t MAX_MESSAGE_HISTORY_SIZE = 1000;
@@ -61,6 +56,34 @@ namespace SummarizerConstants {
 
 // Thread Safety Contract: This class is NOT thread-safe.
 // External synchronization is required for concurrent access.
+//
+// MESSAGE HISTORY STRUCTURE AND CHRONOLOGICAL ORDER:
+// =====================================================
+// The LlamaSummarizer maintains a specific order in message history to ensure proper context flow:
+//
+// 1. Original System Message (if any) - from ContextInfo::system_message
+// 2. Summary Messages (chronologically ordered: oldest → newest)
+//    - [Previous conversation summary]: <oldest_summary>
+//    - [Previous conversation summary]: <older_summary>
+//    - [Previous conversation summary]: <newer_summary>
+//    - [Previous conversation summary]: <newest_summary>
+// 3. All other messages (conversation history, other system messages, etc.)
+//
+// SUMMARY SLOT CHRONOLOGICAL ORDER:
+// =================================
+// summary_slots[0] = oldest summary (represents earliest conversation period)
+// summary_slots[1] = older summary
+// summary_slots[2] = newer summary
+// summary_slots[3] = newer summary  
+// summary_slots[4] = newest summary (represents most recent summarized period)
+//
+// During rollover (when 6th summary would be added):
+// - summary_slots[0] and summary_slots[1] are merged into a combined summary
+// - The combined summary replaces summary_slots[0] (maintaining oldest position)
+// - Remaining slots shift: [2]→[1], [3]→[2], [4]→[3]
+// - New summary becomes summary_slots[4]
+// - Result: [merged_oldest] [former_slot2] [former_slot3] [former_slot4] [new_summary]
+//
 class LlamaSummarizer {
 private:
     // Reference to the parent context that owns this summarizer
@@ -71,9 +94,11 @@ private:
     
     // Reference to the summary context for direct operations
     ContextInfo* summary_context;
-    
-    // Callback for generating responses (decouples from LlamaManager implementation)
+      // Callback for generating responses (decouples from LlamaManager implementation)
     std::function<std::string(const std::string&, const std::string&, ContextInfo*)> generate_response_callback;
+    
+    // Callback to notify when summary slots have been modified (for history updates)
+    std::function<void()> summary_slots_modified_callback;
     
     // Context ID for summary operations (for logging/validation)
     static constexpr const char* SUMMARY_CONTEXT_ID = "summary_context";
@@ -91,13 +116,17 @@ public:
           generate_response_callback(std::move(response_callback)) {
         summary_slots.reserve(SummarizerConstants::MAX_SUMMARY_SLOTS);
     }
-    
-    // Method to set summary context and callback after creation (for late initialization)
+      // Method to set summary context and callback after creation (for late initialization)
     void set_summary_resources(ModelInfo* summary_mdl, ContextInfo* summary_ctx,
                               std::function<std::string(const std::string&, const std::string&, ContextInfo*)> response_callback) {
         summary_model = summary_mdl;
         summary_context = summary_ctx;
         generate_response_callback = std::move(response_callback);
+    }
+    
+    // Set callback for when summary slots are modified (for message history updates)
+    void set_summary_slots_modified_callback(std::function<void()> callback) {
+        summary_slots_modified_callback = std::move(callback);
     }
     
     // Delete copy constructor and assignment operator
@@ -186,7 +215,124 @@ public:
     void integrate_with_context_size_manager(EnhancedContextSizeManager* context_manager, ContextInfo* context_ref);
     void track_summary_with_context_manager(const std::string& summary, int32_t estimated_tokens = 0);
     bool should_perform_rollover_summarization() const;
-    void sync_slots_with_context_manager();
+    void sync_slots_with_context_manager();    // Remove any existing summary messages from message history
+    // This prevents accumulation of stale summaries when slots are updated
+    void remove_injected_summaries_from_history(std::vector<std::pair<std::string, std::string>>& message_history) {
+        auto it = message_history.begin();
+        size_t removed_count = 0;
+        
+        while (it != message_history.end()) {
+            if (it->first == "system" && it->second.find("[Previous conversation summary]: ") == 0) {
+                it = message_history.erase(it);
+                removed_count++;
+            } else {
+                ++it;
+            }
+        }
+        
+        if (removed_count > 0) {
+            SUMMARIZER_LOG("Removed " + std::to_string(removed_count) + " stale summary messages from history");
+        }
+    }    // Inject summary slots into message history as system messages
+    // Summaries are placed immediately after the original system message (if any)
+    // and maintain chronological order (oldest to newest)
+    void inject_summaries_into_history(std::vector<std::pair<std::string, std::string>>& message_history) {
+        // First, remove any existing injected summaries to prevent duplicates/stale data
+        remove_injected_summaries_from_history(message_history);
+        
+        if (summary_slots.empty()) {
+            SUMMARIZER_LOG("No summaries to inject - summary slots are empty");
+            return;
+        }
+        
+        // Find insertion point: right after the ORIGINAL system message only
+        // The original system message (if present) should be the first message with role "system"
+        // and should NOT be a summary message or other auto-generated system message
+        size_t insert_pos = 0;
+        
+        // Check if first message is the original system message
+        if (!message_history.empty() && 
+            message_history[0].first == "system" &&
+            message_history[0].second.find("[Previous conversation summary]: ") != 0 &&
+            message_history[0].second.find("[Note: ") != 0) {
+            // Original system message found at position 0, insert summaries after it
+            insert_pos = 1;
+            SUMMARIZER_LOG("Found original system message at position 0, inserting summaries after it");
+        } else {
+            // No original system message, insert summaries at the beginning
+            insert_pos = 0;
+            SUMMARIZER_LOG("No original system message found, inserting summaries at beginning");
+        }
+        
+        // Insert summaries in chronological order (oldest to newest)
+        // This maintains the conversation flow: system -> old summaries -> recent summaries -> conversation
+        size_t injected_count = 0;
+        for (const auto& summary : summary_slots) {
+            if (!summary.empty()) {
+                message_history.insert(message_history.begin() + insert_pos, 
+                                     std::make_pair("system", "[Previous conversation summary]: " + summary));
+                insert_pos++; // Move insertion point forward for next summary
+                injected_count++;
+            }
+        }
+        
+        SUMMARIZER_LOG("Injected " + std::to_string(injected_count) + 
+                       " summaries in chronological order (oldest to newest) at position " + 
+                       std::to_string(insert_pos - injected_count));
+    }// Check if summaries exist that should be injected into message history
+    bool has_summaries_to_inject() const {
+        return !summary_slots.empty() && 
+               std::any_of(summary_slots.begin(), summary_slots.end(), 
+                          [](const std::string& s) { return !s.empty(); });
+    }
+
+    // Notify that summary slots have been modified (triggers message history updates)
+    void notify_summary_slots_modified() {
+        if (summary_slots_modified_callback) {
+            SUMMARIZER_LOG("Notifying that summary slots have been modified");
+            summary_slots_modified_callback();
+        }
+    }
+
+    // Update message history with current summary slots (removes stale, adds current)
+    void refresh_summaries_in_history(std::vector<std::pair<std::string, std::string>>& message_history) {
+        SUMMARIZER_LOG("Refreshing summaries in message history after slot modification");
+        inject_summaries_into_history(message_history);
+    }
+
+    // Validate summary slot chronological order (for debugging)
+    bool validate_summary_chronological_order() const {
+        if (summary_slots.size() <= 1) return true;
+        
+        // Summary slots should be in chronological order: oldest (index 0) to newest (last index)
+        // During rollover, slots 0 and 1 are merged, and the merged summary replaces position 0
+        // This maintains the chronological order: [merged_oldest] [slot2] [slot3] [slot4] [new_summary]
+        
+        SUMMARIZER_LOG("Validating chronological order of " + std::to_string(summary_slots.size()) + " summary slots");
+        for (size_t i = 0; i < summary_slots.size(); ++i) {
+            if (summary_slots[i].empty()) {
+                SUMMARIZER_LOG("Warning: Empty summary slot at position " + std::to_string(i));
+                return false;
+            }
+        }
+        
+        SUMMARIZER_LOG("✓ All summary slots contain valid summaries in chronological order");
+        return true;
+    }
+    
+    // Get detailed summary slot information for debugging
+    std::string get_summary_slots_debug_info() const {
+        std::string info = "Summary Slots Debug Info:\n";
+        info += "Total slots: " + std::to_string(summary_slots.size()) + "/" + std::to_string(SummarizerConstants::MAX_SUMMARY_SLOTS) + "\n";
+        
+        for (size_t i = 0; i < summary_slots.size(); ++i) {
+            std::string preview = summary_slots[i].length() > 60 ? 
+                                summary_slots[i].substr(0, 60) + "..." : 
+                                summary_slots[i];
+            info += "Slot " + std::to_string(i) + " (chronological position " + std::to_string(i + 1) + "): " + preview + "\n";
+        }        
+        return info;
+    }
 
 private:
     // Reference to parent context's ContextSizeManager for coordination
@@ -195,7 +341,6 @@ private:
     
     // Helper to estimate tokens in a summary (rough approximation)
     int32_t estimate_summary_tokens(const std::string& summary) const;
-
 };
 
 // Implementation of member functions
@@ -231,8 +376,7 @@ inline void LlamaSummarizer::add_summary_to_slots(const std::string& new_summary
         rollover_messages.emplace_back("system", "Previous summary 2: " + second_oldest_summary);
         
         std::string combined_summary = summarize_messages(rollover_messages);
-        
-        if (!combined_summary.empty()) {
+          if (!combined_summary.empty()) {
             // Execute the merge operation through ContextSizeManager if available
             if (context_size_manager) {
                 int32_t merged_tokens = estimate_summary_tokens(combined_summary);
@@ -243,21 +387,26 @@ inline void LlamaSummarizer::add_summary_to_slots(const std::string& new_summary
                 });
                 
                 if (success) {
-                    // Remove the two oldest summaries and replace with the combined one
+                    // CRITICAL: Maintain chronological order during rollover
+                    // Remove the two oldest summaries (positions 0 and 1)
                     summary_slots.erase(summary_slots.begin(), summary_slots.begin() + 2);
+                    // Insert the combined summary at the beginning (it represents the oldest period)
                     summary_slots.insert(summary_slots.begin(), combined_summary);
-                    SUMMARIZER_LOG("ContextSizeManager-coordinated rollover summarization successful - combined 2 oldest summaries into 1");                } else {
+                    // The new summary will be added at the end after this block
+                    SUMMARIZER_LOG("ContextSizeManager-coordinated rollover: combined 2 oldest summaries, maintaining chronological order");
+                } else {
                     SUMMARIZER_LOG("Warning: ContextSizeManager merge operation failed, falling back to simple removal");
+                    // Just remove the oldest summary to make space
                     summary_slots.erase(summary_slots.begin());
                 }
             } else {
                 // This should not happen if integration is working properly
                 SUMMARIZER_LOG("CRITICAL: No ContextSizeManager available during rollover - this indicates integration failure");
                 
-                // Emergency fallback - but log this as an error
+                // Emergency fallback - maintain chronological order
                 summary_slots.erase(summary_slots.begin(), summary_slots.begin() + 2);
                 summary_slots.insert(summary_slots.begin(), combined_summary);
-                SUMMARIZER_LOG("Emergency fallback: combined 2 oldest summaries into 1 (INTEGRATION PROBLEM)");
+                SUMMARIZER_LOG("Emergency fallback: combined 2 oldest summaries, chronological order maintained (INTEGRATION PROBLEM)");
             }
         } else {
             // Fallback: just remove the oldest if rollover summarization fails
@@ -283,11 +432,21 @@ inline void LlamaSummarizer::add_summary_to_slots(const std::string& new_summary
     // Track the summary creation with ContextSizeManager if not already done in merge case
     if (context_size_manager && !needs_merge) {
         context_size_manager->track_summary_creation(summary_tokens);
-    }
-    
+    }    
     SUMMARIZER_LOG("Added new summary to slot " + std::to_string(summary_slots.size()) + 
                    " of " + std::to_string(SummarizerConstants::MAX_SUMMARY_SLOTS) + 
                    " (" + std::to_string(summary_tokens) + " estimated tokens)");
+    
+    // Validate chronological order after modification
+    if (!validate_summary_chronological_order()) {
+        SUMMARIZER_LOG_ERROR("CRITICAL: Chronological order validation failed after adding summary");
+    }
+    
+    // Log detailed slot information for debugging
+    SUMMARIZER_LOG("Post-addition slot state:\n" + get_summary_slots_debug_info());
+    
+    // Notify that summary slots have been modified so message histories can be updated
+    notify_summary_slots_modified();
 }
 
 inline void LlamaSummarizer::prune_message_history(std::vector<std::pair<std::string, std::string>>& message_history, 
@@ -410,12 +569,10 @@ inline void LlamaSummarizer::prune_message_history(std::vector<std::pair<std::st
         
         // Add a system message explaining what happened
         new_history.emplace_back("system", "[Note: " + std::to_string(summarized_count - fallback_keep) + 
-                                " older messages removed due to context limits]");
-    }
-    
-    // Do NOT add summary slots to message history during regular pruning
-    // Summary slots are maintained separately and only used for rollover summarization
-    // The actual summaries are not part of the conversation context
+                                " older messages removed due to context limits]");    }
+      
+    // NOTE: Do NOT inject summary slots here as they will be injected by the context preparation logic
+    // This prevents duplicate summary injection and ensures proper coordination with slot modifications
     
     // Add the recent messages to keep
     for (size_t i = prune_end_idx; i < message_history.size(); ++i) {

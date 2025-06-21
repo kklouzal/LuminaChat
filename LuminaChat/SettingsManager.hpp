@@ -57,6 +57,7 @@ namespace SettingsUIConstants {
     constexpr int32_t TEMPLATE_MESSAGE_HEIGHT = 200;
     constexpr int32_t SUMMARY_PROMPT_HEIGHT = 120;
     constexpr int32_t CHANNEL_LIST_HEIGHT = 80;
+    constexpr int32_t BLACKLIST_ENTRIES_HEIGHT = 300;
     constexpr int32_t SLIDER_WIDTH = 120;
     constexpr int32_t SETTINGS_DIALOG_WIDTH = 700;
     constexpr int32_t SETTINGS_DIALOG_HEIGHT = 600;
@@ -64,7 +65,8 @@ namespace SettingsUIConstants {
 
 enum class SettingsEventId : int32_t {
     BROWSE_MODEL = 2000,
-    BROWSE_SUMMARIZER_MODEL = 2100
+    BROWSE_SUMMARIZER_MODEL = 2100,
+    SAVE_APPLY_BLACKLIST = 2200
 };
 
 class SettingsManager {
@@ -146,15 +148,15 @@ public:
         SETTINGS_LOG("Settings file path: " + filepath);
         return filepath;
     }
-    
-    static void SaveSettings(const std::string& model_path, int32_t context_size, int32_t gpu_layers, 
+      static void SaveSettings(const std::string& model_path, int32_t context_size, int32_t gpu_layers, 
                            int32_t predict_tokens, const std::string& chat_template, 
                            const std::string& identity_directive, const std::string& other_directives,
                            const std::string& discord_bot_token,
                            const std::string& discord_isolated_channel_ids, const std::string& discord_shared_history_channel_ids,
                            bool discord_allow_dms, bool discord_pull_history, int32_t discord_history_fill_percentage,
                            const std::string& summarizer_model_path, int32_t summarizer_context_size, int32_t summarizer_gpu_layers,
-                           int32_t summarizer_predict_tokens, const std::string& summarizer_system_prompt, const std::string& summarizer_chat_template) {
+                           int32_t summarizer_predict_tokens, const std::string& summarizer_system_prompt, const std::string& summarizer_chat_template,
+                           const std::string& blacklist_entries = "") {
         std::string filepath = GetSettingsFilePath();
         std::ofstream file(filepath);
         
@@ -187,8 +189,7 @@ public:
             file << "PullHistory=" << (discord_pull_history ? "1" : "0") << std::endl;
             file << "HistoryFillPercentage=" << discord_history_fill_percentage << std::endl;
             file << std::endl;
-            
-            // [Summarizer] section
+              // [Summarizer] section
             file << "[Summarizer]" << std::endl;
             file << "ModelPath=" << EscapeString(summarizer_model_path) << std::endl;
             file << "ContextSize=" << summarizer_context_size << std::endl;
@@ -196,6 +197,11 @@ public:
             file << "PredictTokens=" << summarizer_predict_tokens << std::endl;
             file << "SystemPrompt=" << EscapeString(summarizer_system_prompt) << std::endl;
             file << "ChatTemplate=" << EscapeString(summarizer_chat_template) << std::endl;
+            file << std::endl;
+            
+            // [Blacklist] section
+            file << "[Blacklist]" << std::endl;
+            file << "Entries=" << EscapeString(blacklist_entries) << std::endl;
             
             file.close();
             
@@ -204,15 +210,15 @@ public:
             SETTINGS_LOG("Error: Failed to save settings to: " + filepath);
         }
     }
-    
-    static void LoadSettings(std::string& model_path, int32_t& context_size, int32_t& gpu_layers, 
+      static void LoadSettings(std::string& model_path, int32_t& context_size, int32_t& gpu_layers, 
                            int32_t& predict_tokens, std::string& chat_template, 
                            std::string& identity_directive, std::string& other_directives,
                            std::string& discord_bot_token,
                            std::string& discord_isolated_channel_ids, std::string& discord_shared_history_channel_ids,
                            bool& discord_allow_dms, bool& discord_pull_history, int32_t& discord_history_fill_percentage,
                            std::string& summarizer_model_path, int32_t& summarizer_context_size, int32_t& summarizer_gpu_layers,
-                           int32_t& summarizer_predict_tokens, std::string& summarizer_system_prompt, std::string& summarizer_chat_template) {
+                           int32_t& summarizer_predict_tokens, std::string& summarizer_system_prompt, std::string& summarizer_chat_template,
+                           std::string& blacklist_entries) {
         std::string filepath = GetSettingsFilePath();
         std::ifstream file(filepath);
         
@@ -348,11 +354,16 @@ public:
                         } else if (key == "SystemPrompt") {
                             summarizer_system_prompt = UnescapeString(value);
                             loaded_count++;
-                            SETTINGS_LOG("Loaded Summarizer SystemPrompt: " + std::string(summarizer_system_prompt.empty() ? "(empty)" : "configured"));
-                        } else if (key == "ChatTemplate") {
+                            SETTINGS_LOG("Loaded Summarizer SystemPrompt: " + std::string(summarizer_system_prompt.empty() ? "(empty)" : "configured"));                        } else if (key == "ChatTemplate") {
                             summarizer_chat_template = UnescapeString(value);
                             loaded_count++;
                             SETTINGS_LOG("Loaded Summarizer ChatTemplate: " + std::string(summarizer_chat_template.empty() ? "(empty)" : "configured"));
+                        }
+                    } else if (current_section == "Blacklist") {
+                        if (key == "Entries") {
+                            blacklist_entries = UnescapeString(value);
+                            loaded_count++;
+                            SETTINGS_LOG("Loaded Blacklist Entries: " + std::string(blacklist_entries.empty() ? "(empty)" : "configured"));
                         }
                     } else {
                         SETTINGS_LOG("Unknown section/setting: [" + current_section + "] " + key + "=" + value);
@@ -392,14 +403,16 @@ private:
         wxCheckBox* pull_history;
         wxSlider* history_percentage;
         wxStaticText* percentage_label;
-        
-        // Summarizer settings
+          // Summarizer settings
         wxTextCtrl* summarizer_model_path;
         wxTextCtrl* summarizer_context_size;
         wxTextCtrl* summarizer_gpu_layers;
         wxTextCtrl* summarizer_predict_tokens;
         wxTextCtrl* summarizer_system_prompt;
         wxTextCtrl* summarizer_chat_template;
+        
+        // Blacklist settings
+        wxTextCtrl* blacklist_entries;
     } ctrls;
     
     // Configuration references
@@ -419,31 +432,31 @@ private:
         int32_t& discord_history_percentage;
         std::string& summarizer_model_path;
         int32_t& summarizer_context_size;
-        int32_t& summarizer_gpu_layers;
-        int32_t& summarizer_predict_tokens;
+        int32_t& summarizer_gpu_layers;        int32_t& summarizer_predict_tokens;
         std::string& summarizer_system_prompt;
         std::string& summarizer_chat_template;
+        std::string& blacklist_entries;
     } config;
 
     // UI elements
     const wxFont monospace_font{9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL};
     const wxFont help_font{8, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_ITALIC, wxFONTWEIGHT_NORMAL};
 
-public:
-    SettingsDialog(wxWindow* parent, std::string& model_path, int32_t& context_size, int32_t& gpu_layers, 
+public:    SettingsDialog(wxWindow* parent, std::string& model_path, int32_t& context_size, int32_t& gpu_layers, 
                   int32_t& predict_tokens, std::string& chat_template, std::string& identity_directive, 
                   std::string& other_directives, std::string& discord_bot_token,
                   std::string& discord_isolated_channels, std::string& discord_shared_channels,
                   bool& discord_allow_dms, bool& discord_pull_history, int32_t& discord_history_percentage,
                   std::string& summarizer_model_path, int32_t& summarizer_context_size, int32_t& summarizer_gpu_layers,
-                  int32_t& summarizer_predict_tokens, std::string& summarizer_system_prompt, std::string& summarizer_chat_template) 
+                  int32_t& summarizer_predict_tokens, std::string& summarizer_system_prompt, std::string& summarizer_chat_template,
+                  std::string& blacklist_entries) 
         : wxDialog(parent, wxID_ANY, "Settings", wxDefaultPosition, 
                   wxSize(SettingsUIConstants::SETTINGS_DIALOG_WIDTH, SettingsUIConstants::SETTINGS_DIALOG_HEIGHT))
         , config{model_path, context_size, gpu_layers, predict_tokens, chat_template,
                 identity_directive, other_directives, discord_bot_token, discord_isolated_channels,
                 discord_shared_channels, discord_allow_dms, discord_pull_history, discord_history_percentage,
                 summarizer_model_path, summarizer_context_size, summarizer_gpu_layers, summarizer_predict_tokens,
-                summarizer_system_prompt, summarizer_chat_template} {
+                summarizer_system_prompt, summarizer_chat_template, blacklist_entries} {
         
         InitializeUI();
         BindEvents();
@@ -452,12 +465,12 @@ public:
 private:
     void InitializeUI() {
         auto* notebook = new wxNotebook(this, wxID_ANY);
-        
-        CreateModelSettingsTab(notebook);
+          CreateModelSettingsTab(notebook);
         CreateSystemPromptTab(notebook);
         CreateChatTemplateTab(notebook);
         CreateSummarizerTab(notebook);
         CreateDiscordSettingsTab(notebook);
+        CreateBlacklistTab(notebook);
         
         // Dialog layout
         auto* btn_sizer = new wxBoxSizer(wxHORIZONTAL);
@@ -676,18 +689,57 @@ private:
         notebook->AddPage(panel, "Discord Settings");
     }
     
-    // Helper method to reduce code duplication
-    void AddTextSetting(wxWindow* parent, wxBoxSizer* sizer, const wxString& label, 
-                       wxTextCtrl*& control, const std::string& value, long style = 0) {
-        sizer->Add(new wxStaticText(parent, wxID_ANY, label), 0, wxALL, 5);
-        control = new wxTextCtrl(parent, wxID_ANY, wxString::FromUTF8(value), 
-                                wxDefaultPosition, (style & wxTE_MULTILINE) ? wxSize(-1, SettingsUIConstants::CHANNEL_LIST_HEIGHT) : wxDefaultSize, style);
-        if (style & wxTE_MULTILINE) {
-            control->SetFont(monospace_font);
-        }
-        sizer->Add(control, 0, wxEXPAND | wxALL, 5);
+    void CreateBlacklistTab(wxNotebook* notebook) {
+        auto* panel = new wxPanel(notebook);
+        auto* scrolled = new wxScrolledWindow(panel, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxVSCROLL);
+        scrolled->SetScrollRate(0, 20);
+        
+        auto* sizer = new wxBoxSizer(wxVERTICAL);
+        
+        // Help text
+        auto* help_text = new wxStaticText(scrolled, wxID_ANY, 
+            "Add responses that should be excluded from conversation history.\n"
+            "Enter one blacklisted phrase or pattern per line:");
+        help_text->SetFont(help_font);
+        sizer->Add(help_text, 0, wxALL, 5);
+        
+        // Blacklist entries text area
+        ctrls.blacklist_entries = new wxTextCtrl(scrolled, wxID_ANY, 
+                                                wxString::FromUTF8(config.blacklist_entries), 
+                                                wxDefaultPosition, 
+                                                wxSize(-1, SettingsUIConstants::BLACKLIST_ENTRIES_HEIGHT), 
+                                                wxTE_MULTILINE | wxTE_WORDWRAP);
+        ctrls.blacklist_entries->SetFont(monospace_font);
+        sizer->Add(ctrls.blacklist_entries, 1, wxEXPAND | wxALL, 5);
+        
+        // Save and Apply button
+        auto* save_apply_btn = new wxButton(scrolled, static_cast<int>(SettingsEventId::SAVE_APPLY_BLACKLIST), "Save and Apply Blacklist");
+        sizer->Add(save_apply_btn, 0, wxALIGN_RIGHT | wxALL, 5);
+        
+        // Additional help text
+        auto* usage_help = new wxStaticText(scrolled, wxID_ANY, 
+            "Tips:\n"
+            "• Case-insensitive matching\n"
+            "• Partial matches are supported\n"
+            "• Empty lines are ignored\n"
+            "• Changes apply to new responses and existing history");
+        usage_help->SetFont(help_font);
+        sizer->Add(usage_help, 0, wxALL, 5);
+        
+        scrolled->SetSizer(sizer);
+        
+        auto* panel_sizer = new wxBoxSizer(wxVERTICAL);
+        panel_sizer->Add(scrolled, 1, wxEXPAND);
+        panel->SetSizer(panel_sizer);
+        
+        notebook->AddPage(panel, "Blacklist");
+        
+        // Bind save and apply button event
+        save_apply_btn->Bind(wxEVT_COMMAND_BUTTON_CLICKED, [this](wxCommandEvent&) {
+            OnSaveApplyBlacklist();
+        });
     }
-    
+
     void BindEvents() {
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &SettingsDialog::OnBrowseModel, this, static_cast<int>(SettingsEventId::BROWSE_MODEL));
         Bind(wxEVT_COMMAND_BUTTON_CLICKED, &SettingsDialog::OnOK, this, wxID_OK);
@@ -760,8 +812,10 @@ private:
         config.summarizer_model_path = ctrls.summarizer_model_path->GetValue().ToStdString();
         ValidateNumeric(ctrls.summarizer_context_size, config.summarizer_context_size, 1, 32768, 1024, "summarizer context size");
         ValidateNumeric(ctrls.summarizer_gpu_layers, config.summarizer_gpu_layers, 0, 999, 0, "summarizer GPU layers");
-        ValidateNumeric(ctrls.summarizer_predict_tokens, config.summarizer_predict_tokens, 1, 2048, 128, "summarizer prediction tokens");
-        config.summarizer_system_prompt = ctrls.summarizer_system_prompt->GetValue().ToUTF8().data();        config.summarizer_chat_template = ctrls.summarizer_chat_template->GetValue().ToUTF8().data();
+        ValidateNumeric(ctrls.summarizer_predict_tokens, config.summarizer_predict_tokens, 1, 2048, 128, "summarizer prediction tokens");        config.summarizer_system_prompt = ctrls.summarizer_system_prompt->GetValue().ToUTF8().data();        config.summarizer_chat_template = ctrls.summarizer_chat_template->GetValue().ToUTF8().data();
+        
+        // Blacklist settings
+        config.blacklist_entries = ctrls.blacklist_entries->GetValue().ToUTF8().data();
         
         // Save settings with all parameters
         SettingsManager::SaveSettings(config.model_path, config.context_size, config.gpu_layers, 
@@ -772,7 +826,8 @@ private:
                     config.discord_pull_history, config.discord_history_percentage,
                     config.summarizer_model_path, config.summarizer_context_size,
                     config.summarizer_gpu_layers, config.summarizer_predict_tokens,
-                    config.summarizer_system_prompt, config.summarizer_chat_template);
+                    config.summarizer_system_prompt, config.summarizer_chat_template,
+                    config.blacklist_entries);
         
         EndModal(wxID_OK);
     }
@@ -805,6 +860,38 @@ private:
         }
         
         return result;
+    }
+    
+    void OnSaveApplyBlacklist() {
+        // Update the blacklist configuration
+        config.blacklist_entries = ctrls.blacklist_entries->GetValue().ToUTF8().data();
+        
+        // Save settings with current values and updated blacklist
+        SettingsManager::SaveSettings(config.model_path, config.context_size, config.gpu_layers, 
+                    config.predict_tokens, config.chat_template, 
+                    config.identity_directive, config.other_directives,
+                    config.discord_bot_token, config.discord_isolated_channels, 
+                    config.discord_shared_channels, config.discord_allow_dms, 
+                    config.discord_pull_history, config.discord_history_percentage,
+                    config.summarizer_model_path, config.summarizer_context_size,
+                    config.summarizer_gpu_layers, config.summarizer_predict_tokens,
+                    config.summarizer_system_prompt, config.summarizer_chat_template,
+                    config.blacklist_entries);
+        
+        wxMessageBox("Blacklist settings saved and applied successfully!", "Blacklist Updated", 
+                    wxOK | wxICON_INFORMATION);
+    }
+    
+    // Helper method to reduce code duplication
+    void AddTextSetting(wxWindow* parent, wxBoxSizer* sizer, const wxString& label, 
+                       wxTextCtrl*& control, const std::string& value, long style = 0) {
+        sizer->Add(new wxStaticText(parent, wxID_ANY, label), 0, wxALL, 5);
+        control = new wxTextCtrl(parent, wxID_ANY, wxString::FromUTF8(value), 
+                                wxDefaultPosition, (style & wxTE_MULTILINE) ? wxSize(-1, SettingsUIConstants::CHANNEL_LIST_HEIGHT) : wxDefaultSize, style);
+        if (style & wxTE_MULTILINE) {
+            control->SetFont(monospace_font);
+        }
+        sizer->Add(control, 0, wxEXPAND | wxALL, 5);
     }
 };
 

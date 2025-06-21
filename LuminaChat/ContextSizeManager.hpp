@@ -62,11 +62,15 @@ namespace ContextSizeConstants {
     constexpr float HIGH_USAGE_THRESHOLD = 0.85f;             // High context usage threshold
     constexpr float RAPID_GROWTH_THRESHOLD = 0.025f;          // Rapid growth threshold (2.5% per interaction)
     constexpr float HIGH_VOLATILITY_THRESHOLD = 0.15f;        // High volatility threshold
-    
-    // Strategy adaptation thresholds
+      // Strategy adaptation thresholds
     constexpr float LARGE_RESPONSE_THRESHOLD = 500.0f;        
     constexpr float LARGE_SUMMARY_THRESHOLD = 400.0f;         
     constexpr float VARIABILITY_THRESHOLD = 0.6f;             
+    
+    // Context management ratios (moved from SummarizerConstants to avoid circular dependency)
+    constexpr float MAX_CONTEXT_USAGE = 0.90f;
+    constexpr float TARGET_CONTEXT_USAGE = 0.60f;
+    constexpr float AGGRESSIVE_PRUNING_RATIO = 0.30f;
     
     // Mathematical validation: Ensure allocations don't exceed safe limits
     static_assert(GLOBAL_EMERGENCY_BUFFER + MAX_TOTAL_SUMMARY_ALLOCATION + 

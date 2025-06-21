@@ -149,15 +149,17 @@
     <ClCompile Include="LuminaChat.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="Blacklist.hpp" />
     <ClInclude Include="common_utils.hpp" />
+    <ClInclude Include="ContextSizeManager.hpp" />
     <ClInclude Include="DiscordHistoryLoader.hpp" />
     <ClInclude Include="DiscordManager.hpp" />
     <ClInclude Include="LlamaContext.hpp" />
-    <ClInclude Include="LlamaLookahead.hpp" />
     <ClInclude Include="LlamaManager.hpp" />
     <ClInclude Include="LlamaResponse.hpp" />
     <ClInclude Include="LlamaSummarizer.hpp" />
     <ClInclude Include="LogHandler.hpp" />
+    <ClInclude Include="Sanitizer.hpp" />
     <ClInclude Include="SettingsManager.hpp" />
     <ClInclude Include="TokenCache.hpp" />
   </ItemGroup>

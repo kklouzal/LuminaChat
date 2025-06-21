@@ -57,8 +57,13 @@
 #include <thread>
 #include <chrono>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
+#include <algorithm>
+#include <cctype>
+#include <mutex>
 #include "llama-cpp.h"
+#include "Blacklist.hpp"
 
 // llama.cpp backend callbacks for model loading progress etc..
 bool model_loading_progress_callback(float progress, void *user_data);
@@ -111,13 +116,106 @@ private:
     std::unordered_map<std::string, std::unique_ptr<ContextInfo>> contexts;
 
     // Bidirectional cache for token-to-text and text-to-token mappings
-    mutable TokenCache token_cache;
-
-    // Response generation handler
+    mutable TokenCache token_cache;    // Response generation handler
     mutable LlamaResponse response_generator;
-    
-public:
-    LlamaManager() : token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE), response_generator(&token_cache) {
+      // AI Response Blacklist - responses on this list won't be added to message history
+    Blacklist ai_response_blacklist;
+
+private:
+    // Private callback method for retroactive cleanup when patterns are added to blacklist
+    void perform_retroactive_cleanup(const std::string& new_blacklist_pattern) {
+        if (new_blacklist_pattern.empty()) return;
+        
+        int32_t total_contexts_processed = 0;
+        int32_t total_messages_removed = 0;
+        int32_t contexts_requiring_rebuild = 0;
+        
+        LLAMA_LOG("Starting retroactive cleanup for blacklist pattern: '" + 
+                  (new_blacklist_pattern.length() > 50 ? new_blacklist_pattern.substr(0, 50) + "..." : new_blacklist_pattern) + "'");
+        
+        // Process each context
+        for (auto& [context_id, context_info] : contexts) {
+            if (!context_info) continue;
+            
+            total_contexts_processed++;
+            int32_t messages_removed_in_context = 0;
+            bool context_modified = false;
+            
+            // Thread-safe access to message history
+            {
+                std::lock_guard<std::mutex> lock(context_info->context_operations_mutex);
+                
+                // Iterate through message history and remove matching assistant messages
+                auto& message_history = context_info->message_history;
+                auto original_size = message_history.size();
+                
+                // Use erase-remove idiom to remove matching assistant messages
+                message_history.erase(
+                    std::remove_if(message_history.begin(), message_history.end(),
+                        [this, &new_blacklist_pattern, &messages_removed_in_context](const std::pair<std::string, std::string>& message) {
+                            if (message.first == "assistant" && ai_response_blacklist.matches_pattern(message.second, new_blacklist_pattern)) {
+                                messages_removed_in_context++;
+                                LLAMA_LOG("Removing blacklisted assistant message: '" + 
+                                          (message.second.length() > 50 ? message.second.substr(0, 50) + "..." : message.second) + "'");
+                                return true;
+                            }
+                            return false;
+                        }),
+                    message_history.end()
+                );
+                
+                if (message_history.size() != original_size) {
+                    context_modified = true;
+                    total_messages_removed += messages_removed_in_context;
+                    
+                    // Mark conversation state as needing rebuild
+                    context_info->message_cache_dirty = true;
+                    context_info->conversation_state.needs_rebuild = true;
+                    
+                    LLAMA_LOG("Context '" + context_id + "': Removed " + std::to_string(messages_removed_in_context) + 
+                              " messages (from " + std::to_string(original_size) + " to " + std::to_string(message_history.size()) + ")");
+                }
+            }
+            
+            // Perform context rebuild if messages were removed
+            if (context_modified && context_info->is_valid()) {
+                LLAMA_LOG("Performing context rebuild for '" + context_id + "' after retroactive cleanup");
+                
+                try {                    // Create token processor and pruning callback for rebuild
+                    ContextInfo* ctx_ptr = context_info.get();
+                    auto token_processor = [this, ctx_ptr](const std::string& text, bool add_special) {
+                        return process_text_to_tokens(text, ctx_ptr, add_special);
+                    };
+                    auto pruning_callback = [ctx_ptr](float keep_ratio) {
+                        return ctx_ptr->prune_with_summarization(keep_ratio);
+                    };
+                    
+                    // Perform full context rebuild
+                    bool rebuild_success = context_info->update_context_from_history(token_processor, pruning_callback);
+                    
+                    if (rebuild_success) {
+                        contexts_requiring_rebuild++;
+                        LLAMA_LOG("Successfully rebuilt context '" + context_id + "' after retroactive cleanup");
+                    } else {
+                        LLAMA_LOG("WARNING: Failed to rebuild context '" + context_id + "' after retroactive cleanup");
+                    }
+                    
+                } catch (const std::exception& e) {
+                    LLAMA_LOG("ERROR: Exception during context rebuild for '" + context_id + "': " + e.what());
+                } catch (...) {
+                    LLAMA_LOG("ERROR: Unknown exception during context rebuild for '" + context_id + "'");
+                }
+            }
+        }
+        
+        LLAMA_LOG("Retroactive cleanup completed:");
+        LLAMA_LOG("  Contexts processed: " + std::to_string(total_contexts_processed));
+        LLAMA_LOG("  Total messages removed: " + std::to_string(total_messages_removed));
+        LLAMA_LOG("  Contexts rebuilt: " + std::to_string(contexts_requiring_rebuild));
+    }
+
+  public:    LlamaManager() : token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE), response_generator(&token_cache),
+                     ai_response_blacklist([this](const std::string& pattern) { perform_retroactive_cleanup(pattern); }) {
     }
 
     ~LlamaManager() noexcept {
@@ -259,9 +357,7 @@ public:
         }
         
         // Set the reset after generation flag
-        context_info->reset_after_generation = reset_after_generation;
-        
-        // Initialize summarizer for this context with parent context only (summary resources will be set later)
+        context_info->reset_after_generation = reset_after_generation;        // Initialize summarizer for this context with parent context only (summary resources will be set later)
         context_info->summarizer = std::make_unique<LlamaSummarizer>(context_info.get());
         
         // If summary resources are already available, set them up immediately
@@ -277,12 +373,14 @@ public:
           // Initialize ContextSizeManager for adaptive context management
         initialize_context_size_manager(*context_info, *model_info);
         LLAMA_LOG("Initialized ContextSizeManager for context '" + context_id + "' with " + 
-                  std::to_string(model_info->n_ctx) + " token capacity");
-          // Integrate LlamaSummarizer with ContextSizeManager for coordinated summary management
+                  std::to_string(model_info->n_ctx) + " token capacity");          // Integrate LlamaSummarizer with ContextSizeManager for coordinated summary management
         if (context_info->summarizer && context_info->context_size_manager) {
             context_info->summarizer->integrate_with_context_size_manager(context_info->context_size_manager.get(), context_info.get());
             LLAMA_LOG("Integrated LlamaSummarizer with ContextSizeManager and ContextInfo reference for context '" + context_id + "'");
         }
+        
+        // TODO: Setup summarizer callbacks - currently disabled due to context corruption issues
+        // context_info->setup_summarizer_callbacks();
         
         contexts[context_id] = std::move(context_info);
         LLAMA_LOG("Created context '" + context_id + "' with model '" + model_id + "' successfully");
@@ -594,7 +692,6 @@ public:
         }
         
         // STEP 3: Prepare context for generation with enhanced error recovery
-        // ...existing code...
         // Pre-flight validation
         if (!target_context->context || !target_context->model_info || 
             !target_context->model_info->model_loaded || !target_context->model_info->model || 
@@ -656,17 +753,20 @@ public:
         
         // Get AI response size prediction for tracking
         int32_t predicted_tokens = target_context->context_size_manager->get_estimated_ai_response_size();
-        
-        std::string response = response_generator.generate_response("generate", "assistant", target_context, token_adder, context_updater);
-        
-        // STEP 4: Track AI response and update conversation
-        if (!response.empty() && !response.starts_with("Error:")) {
+          std::string response = response_generator.generate_response("generate", "assistant", target_context, token_adder, context_updater);          // STEP 4: Track AI response and update conversation
+        if (!response.empty() && response.substr(0, 6) != "Error:") {
             // Track actual AI response size for learning
             std::vector<llama_token> response_tokens = process_text_to_tokens(response, target_context, false);
             int32_t actual_tokens = static_cast<int32_t>(response_tokens.size());
             track_ai_response(*target_context, *target_context->model_info, actual_tokens, predicted_tokens);
             
-            target_context->add_message("assistant", response);
+            // Check if response is blacklisted before adding to conversation history
+            if (ai_response_blacklist.is_blacklisted(response)) {
+                LLAMA_LOG("AI response is blacklisted, skipping addition to message history: '" + 
+                          (response.length() > 50 ? response.substr(0, 50) + "..." : response) + "'");
+            } else {
+                target_context->add_message("assistant", response);
+            }
             
             // Post-generation analysis and recommendations
             auto post_analysis = analyze_context_usage(*target_context, *target_context->model_info);
@@ -754,17 +854,20 @@ public:
         LLAMA_LOG("Delegating to LlamaResponse for streaming token generation");
           // Get AI response prediction for tracking
         int32_t predicted_tokens = target_context->context_size_manager->get_estimated_ai_response_size();
-        
-        std::string response = response_generator.generate_response("generate", "assistant", target_context, token_adder, context_updater, stream_callback);
-        
-        // STEP 5: Track response and update conversation (if successful)
-        if (!response.empty() && !response.starts_with("Error:")) {
+          std::string response = response_generator.generate_response("generate", "assistant", target_context, token_adder, context_updater, stream_callback);          // STEP 5: Track response and update conversation (if successful)
+        if (!response.empty() && response.substr(0, 6) != "Error:") {
             // Track actual AI response size for learning
             std::vector<llama_token> response_tokens = process_text_to_tokens(response, target_context, false);
             int32_t actual_tokens = static_cast<int32_t>(response_tokens.size());
             track_ai_response(*target_context, *target_context->model_info, actual_tokens, predicted_tokens);
             
-            target_context->add_message("assistant", response);
+            // Check if response is blacklisted before adding to conversation history
+            if (ai_response_blacklist.is_blacklisted(response)) {
+                LLAMA_LOG("AI response is blacklisted, skipping addition to message history: '" + 
+                          (response.length() > 50 ? response.substr(0, 50) + "..." : response) + "'");
+            } else {
+                target_context->add_message("assistant", response);
+            }
             
             // Post-streaming analysis and recommendations
             auto post_analysis = analyze_context_usage(*target_context, *target_context->model_info);
@@ -781,6 +884,48 @@ public:
         }
         
         return response;
+    }
+      // AI Response Blacklist Management
+    // Thread-safe methods for managing responses that should not be added to conversation history
+    
+    // Add a response to the blacklist with automatic retroactive cleanup
+    void add_to_response_blacklist(const std::string& response) {
+        ai_response_blacklist.add_pattern(response);
+    }
+    
+    // Remove a response from the blacklist
+    bool remove_from_response_blacklist(const std::string& response) {
+        return ai_response_blacklist.remove_pattern(response);
+    }
+    
+    // Clear all blacklisted responses
+    void clear_response_blacklist() {
+        ai_response_blacklist.clear_all();
+    }
+    
+    // Get all blacklisted responses (for UI display)
+    std::vector<std::string> get_blacklisted_responses() const {
+        return ai_response_blacklist.get_all_patterns();
+    }
+    
+    // Add multiple responses to blacklist efficiently (single retroactive cleanup)
+    void add_multiple_to_response_blacklist(const std::vector<std::string>& responses) {
+        ai_response_blacklist.add_multiple_patterns(responses);
+    }
+    
+    // Add response to blacklist without retroactive cleanup (for manual cleanup control)
+    bool add_to_response_blacklist_no_cleanup(const std::string& response) {
+        return ai_response_blacklist.add_pattern_no_cleanup(response);
+    }
+    
+    // Manually trigger retroactive cleanup for all current blacklist patterns
+    void trigger_full_retroactive_cleanup() {
+        ai_response_blacklist.trigger_full_cleanup();
+    }
+    
+    // Check if a response is blacklisted (public interface)
+    bool is_blacklisted_response(const std::string& response) const {
+        return ai_response_blacklist.is_blacklisted(response);
     }
     
     // Enhanced cleanup with memory optimization
@@ -857,68 +1002,3 @@ private:
 //
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!
 //
-
-// Implementation of ContextInfo::prune_with_summarization method
-// (moved here because LlamaSummarizer.hpp is included in LlamaManager.hpp)
-inline bool ContextInfo::prune_with_summarization(float keep_ratio) {
-    LLAMA_LOG("Starting conversation pruning with summarization (keep ratio: " + std::to_string(keep_ratio) + ")");
-    
-    if (message_history.empty()) {
-        LLAMA_LOG("No messages to prune - message history is empty");
-        return true;
-    }
-    
-    // Use actual summarization if summarizer is available
-    if (summarizer) {
-        LLAMA_LOG("Using LlamaSummarizer for intelligent conversation pruning");
-        summarizer->prune_message_history(message_history, keep_ratio);
-        
-        // Mark cache as dirty to force rebuild
-        message_cache_dirty = true;
-        conversation_state.invalidate();
-        
-        LLAMA_LOG("Summarization-based pruning completed successfully");
-        return true;
-    }
-    
-    // Fallback: simple pruning without summarization if summarizer is not available
-    LLAMA_LOG("Warning: LlamaSummarizer not available, falling back to simple pruning");
-    size_t total_messages = message_history.size();
-    bool has_system = !message_history.empty() && message_history[0].first == "system";
-    size_t system_offset = has_system ? 1 : 0;
-    size_t non_system_messages = total_messages - system_offset;
-    
-    size_t messages_to_keep = std::max(size_t(2), static_cast<size_t>(non_system_messages * keep_ratio));
-    
-    if (messages_to_keep >= non_system_messages) {
-        LLAMA_LOG("No pruning needed - keeping all messages");
-        return true;
-    }
-    
-    // Build new message history with system message + recent messages
-    std::vector<std::pair<std::string, std::string>> new_history;
-    if (has_system) {
-        new_history.push_back(message_history[0]);
-    }
-    
-    // Add note about removed messages
-    size_t removed_count = non_system_messages - messages_to_keep;
-    new_history.emplace_back("system", "[Note: " + std::to_string(removed_count) + 
-                            " older messages removed due to context limits]");
-    
-    // Keep recent messages
-    size_t start_idx = total_messages - messages_to_keep;
-    for (size_t i = start_idx; i < total_messages; ++i) {
-        new_history.push_back(message_history[i]);
-    }
-    
-    message_history = std::move(new_history);
-    
-    // Mark cache as dirty to force rebuild
-    message_cache_dirty = true;
-    conversation_state.invalidate();
-    
-    LLAMA_LOG("Fallback pruning completed successfully - kept " + std::to_string(messages_to_keep) + 
-              " of " + std::to_string(non_system_messages) + " non-system messages");
-    return true;
-}

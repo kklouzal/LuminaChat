@@ -325,13 +325,13 @@ private:
     std::unique_ptr<wxLogStreamBuffer> cout_buffer, cerr_buffer;
     std::streambuf* original_cout{nullptr};
     std::streambuf* original_cerr{nullptr};
-    
-    // Consolidated configuration structure
+      // Consolidated configuration structure
     struct AppConfig {
         std::string model_path, chat_template;
         std::string identity_directive, other_directives;
         std::string discord_token, discord_isolated_channels, discord_shared_channels;
         std::string summarizer_model_path, summarizer_system_prompt, summarizer_chat_template;
+        std::string blacklist_entries;
         int32_t context_size{2048}, gpu_layers{0}, predict_tokens{256};
         int32_t summarizer_context_size{1024}, summarizer_gpu_layers{0}, summarizer_predict_tokens{128};
         int32_t discord_history_percentage{50};
@@ -447,8 +447,7 @@ public:
     }
 
 private:
-    void LoadConfiguration() {
-        SettingsManager::LoadSettings(config.model_path, config.context_size, config.gpu_layers, 
+    void LoadConfiguration() {        SettingsManager::LoadSettings(config.model_path, config.context_size, config.gpu_layers, 
                                     config.predict_tokens, config.chat_template, 
                                     config.identity_directive, config.other_directives,
                                     config.discord_token, config.discord_isolated_channels, 
@@ -456,7 +455,8 @@ private:
                                     config.discord_pull_history, config.discord_history_percentage,
                                     config.summarizer_model_path, config.summarizer_context_size,
                                     config.summarizer_gpu_layers, config.summarizer_predict_tokens,
-                                    config.summarizer_system_prompt, config.summarizer_chat_template);
+                                    config.summarizer_system_prompt, config.summarizer_chat_template,
+                                    config.blacklist_entries);
     }
     
     void CreateUI() {
@@ -1247,15 +1247,15 @@ private:
         }
     }
 
-    void OnSettings(wxCommandEvent& event) {
-        SettingsDialog dialog(this, config.model_path, config.context_size, config.gpu_layers, config.predict_tokens, 
+    void OnSettings(wxCommandEvent& event) {        SettingsDialog dialog(this, config.model_path, config.context_size, config.gpu_layers, config.predict_tokens, 
                             config.chat_template, config.identity_directive, config.other_directives,
                             config.discord_token, config.discord_isolated_channels, 
                             config.discord_shared_channels, config.discord_allow_dms,
                             config.discord_pull_history, config.discord_history_percentage,
                             config.summarizer_model_path, config.summarizer_context_size,
                             config.summarizer_gpu_layers, config.summarizer_predict_tokens,
-                            config.summarizer_system_prompt, config.summarizer_chat_template);
+                            config.summarizer_system_prompt, config.summarizer_chat_template,
+                            config.blacklist_entries);
         if (dialog.ShowModal() == wxID_OK) {
             UpdateWindowTitle();
             
