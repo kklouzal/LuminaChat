@@ -40,6 +40,7 @@
 #include <shared_mutex>
 #include <atomic>
 #include <chrono>
+#include <numeric>
 #include "llama-cpp.h"
 
 // Enhanced bidirectional token cache - Text↔Tokens with single cache reservoir
@@ -72,8 +73,7 @@ private:
         mutable std::atomic<uint32_t> access_count{1};
         mutable std::chrono::steady_clock::time_point last_access;
         size_t memory_size;
-        
-        CacheEntry(std::string text_, std::vector<llama_token> tokens_) 
+          CacheEntry(std::string text_, std::vector<llama_token> tokens_) noexcept
             : text(std::move(text_)),
               tokens(std::move(tokens_)), 
               last_access(std::chrono::steady_clock::now()),
@@ -85,46 +85,49 @@ private:
     mutable std::unordered_map<std::string, CacheEntry*> token_hash_to_entry;           // token hash -> entry
     mutable std::list<std::string> access_order;  // LRU tracking using text keys
     mutable std::unordered_map<std::string, std::list<std::string>::iterator> access_iterators;
-    
-    // Configuration
-    EvictionPolicy eviction_policy = EvictionPolicy::LRU;
-    bool thread_safe = false;
-    mutable std::shared_mutex cache_mutex;
-    
-    // Memory tracking
-    void update_memory_usage(const int64_t delta) const {
-        memory_usage_bytes.fetch_add(delta, std::memory_order_relaxed);
+      // Configuration - const for better optimization
+    const EvictionPolicy eviction_policy = EvictionPolicy::LRU;
+    const bool thread_safe = false;
+    mutable std::shared_mutex cache_mutex;// Memory tracking - marked static for better optimization
+    static void update_memory_usage_impl(std::atomic<size_t>& memory_bytes, const int64_t delta) noexcept {
+        memory_bytes.fetch_add(delta, std::memory_order_relaxed);
     }
     
-    // Hash function for token vectors
-    [[nodiscard]] std::string hash_tokens(const std::vector<llama_token>& tokens) const {
-        if (tokens.empty()) return "empty_tokens";
+    void update_memory_usage(const int64_t delta) const noexcept {
+        update_memory_usage_impl(memory_usage_bytes, delta);
+    }
+      // Hash function for token vectors
+    [[nodiscard]] std::string hash_tokens(const std::vector<llama_token>& tokens) const noexcept {
+        if (tokens.empty()) [[unlikely]] {
+            return "empty_tokens";
+        }
         
-        std::hash<llama_token> hasher;
+        static const std::hash<llama_token> hasher{};
+        static constexpr size_t HASH_CONSTANT = 0x9e3779b9;
+        
         size_t hash_value = tokens.size();
         
-        for (size_t i = 0; i < tokens.size(); ++i) {
-            hash_value ^= hasher(tokens[i]) + 0x9e3779b9 + (hash_value << 6) + (hash_value >> 2);
-        }
+        // Use STL algorithm for better optimization
+        hash_value = std::accumulate(tokens.begin(), tokens.end(), hash_value,
+            [](size_t acc, llama_token token) noexcept {
+                return acc ^ (hasher(token) + HASH_CONSTANT + (acc << 6) + (acc >> 2));
+            });
         
         return "tokens_" + std::to_string(hash_value);
     }
-    
-    // Update access order for LRU
-    void update_access_order(const std::string& text_key, CacheEntry& entry) const {
+      // Update access order for LRU
+    void update_access_order(const std::string& text_key, CacheEntry& entry) const noexcept {
         entry.last_access = std::chrono::steady_clock::now();
         entry.access_count.fetch_add(1, std::memory_order_relaxed);
         
-        if (eviction_policy == EvictionPolicy::LRU) {
-            if (auto it = access_iterators.find(text_key); it != access_iterators.end()) {
+        if (eviction_policy == EvictionPolicy::LRU) [[likely]] {
+            if (const auto it = access_iterators.find(text_key); it != access_iterators.end()) [[likely]] {
                 access_order.splice(access_order.begin(), access_order, it->second);
             }
         }
-    }
-
-    // Add bidirectional entry to cache
+    }    // Add bidirectional entry to cache
     void add_entry_internal(std::string text_key, std::string text, std::vector<llama_token> tokens) const {
-        if (text_to_entry.size() >= static_cast<size_t>(max_cache_size * CACHE_PREEMPTIVE_THRESHOLD)) {
+        if (text_to_entry.size() >= static_cast<size_t>(max_cache_size * CACHE_PREEMPTIVE_THRESHOLD)) [[unlikely]] {
             trim_cache();
         }
         
@@ -133,10 +136,9 @@ private:
         const std::string token_hash = hash_tokens(entry->tokens);
         
         // Check if text key already exists
-        auto existing_it = text_to_entry.find(text_key);
-        if (existing_it != text_to_entry.end()) {
+        if (const auto existing_it = text_to_entry.find(text_key); existing_it != text_to_entry.end()) [[unlikely]] {
             // Remove old reverse mapping
-            auto old_hash = hash_tokens(existing_it->second->tokens);
+            const auto old_hash = hash_tokens(existing_it->second->tokens);
             token_hash_to_entry.erase(old_hash);
             
             // Update existing entry
@@ -146,10 +148,9 @@ private:
             token_hash_to_entry[token_hash] = existing_it->second.get();
             update_memory_usage(memory_delta);
             update_access_order(existing_it->first, *existing_it->second);
-        } else {
-            // Add new entry
-            auto [inserted_it, was_inserted] = text_to_entry.emplace(std::move(text_key), std::move(entry));
-            if (was_inserted) {
+        } else [[likely]] {
+            // Add new entry - this is the common path
+            if (auto [inserted_it, was_inserted] = text_to_entry.emplace(std::move(text_key), std::move(entry)); was_inserted) [[likely]] {
                 token_hash_to_entry[token_hash] = inserted_it->second.get();
                 update_memory_usage(entry_memory);
                 access_order.push_front(inserted_it->first);
@@ -157,8 +158,7 @@ private:
             }
         }
     }
-    
-    // Enhanced cache trimming
+      // Enhanced cache trimming
     void trim_cache() const {
         const size_t target_size = static_cast<size_t>(max_cache_size * CACHE_TRIM_TARGET_RATIO);
         
@@ -168,111 +168,105 @@ private:
             switch (eviction_policy) {
                 case EvictionPolicy::LRU:
                 case EvictionPolicy::FIFO:
-                    if (!access_order.empty()) {
+                    if (!access_order.empty()) [[likely]] {
                         victim_key = access_order.back();
                         access_order.pop_back();
                     }
                     break;
-                    
-                case EvictionPolicy::LFU: {
-                    auto min_it = std::min_element(text_to_entry.begin(), text_to_entry.end(),
-                        [](const auto& a, const auto& b) {
-                            return a.second->access_count.load() < b.second->access_count.load();
+                      case EvictionPolicy::LFU: {
+                    const auto min_it = std::min_element(text_to_entry.begin(), text_to_entry.end(),
+                        [](const auto& a, const auto& b) noexcept {
+                            return a.second->access_count.load(std::memory_order_relaxed) < 
+                                   b.second->access_count.load(std::memory_order_relaxed);
                         });
-                    if (min_it != text_to_entry.end()) {
+                    if (min_it != text_to_entry.end()) [[likely]] {
                         victim_key = min_it->first;
                     }
                     break;
                 }
             }
-            
-            if (!victim_key.empty()) {
-                if (auto it = text_to_entry.find(victim_key); it != text_to_entry.end()) {
+              if (!victim_key.empty()) [[likely]] {
+                if (const auto it = text_to_entry.find(victim_key); it != text_to_entry.end()) [[likely]] {
                     // Remove reverse mapping
-                    auto token_hash = hash_tokens(it->second->tokens);
+                    const auto token_hash = hash_tokens(it->second->tokens);
                     token_hash_to_entry.erase(token_hash);
                     
                     update_memory_usage(-static_cast<int64_t>(it->second->memory_size));
                     text_to_entry.erase(it);
                     access_iterators.erase(victim_key);
                 }
-            } else {
+            } else [[unlikely]] {
                 break;
             }
         }
     }
-    
-    // Thread-safe wrappers
+      // Thread-safe wrappers
     template<typename Func>
-    auto with_lock(Func&& func) const {
+    auto with_lock(Func&& func) const noexcept(noexcept(func())) {
         if constexpr (std::is_void_v<std::invoke_result_t<Func>>) {
-            if (thread_safe) {
-                std::shared_lock lock(cache_mutex);
+            if (thread_safe) [[unlikely]] {
+                const std::shared_lock lock(cache_mutex);
                 func();
-            } else {
+            } else [[likely]] {
                 func();
             }
         } else {
-            if (thread_safe) {
-                std::shared_lock lock(cache_mutex);
+            if (thread_safe) [[unlikely]] {
+                const std::shared_lock lock(cache_mutex);
                 return func();
-            } else {
+            } else [[likely]] {
                 return func();
             }
         }
     }
     
     template<typename Func>
-    auto with_write_lock(Func&& func) const {
+    auto with_write_lock(Func&& func) const noexcept(noexcept(func())) {
         if constexpr (std::is_void_v<std::invoke_result_t<Func>>) {
-            if (thread_safe) {
-                std::unique_lock lock(cache_mutex);
+            if (thread_safe) [[unlikely]] {
+                const std::unique_lock lock(cache_mutex);
                 func();
-            } else {
+            } else [[likely]] {
                 func();
             }
         } else {
-            if (thread_safe) {
-                std::unique_lock lock(cache_mutex);
+            if (thread_safe) [[unlikely]] {
+                const std::unique_lock lock(cache_mutex);
                 return func();
-            } else {
+            } else [[likely]] {
                 return func();
             }
         }
     }
 
-public:
-    explicit TokenCache(const size_t max_size = DEFAULT_CACHE_SIZE, 
+public:    explicit TokenCache(const size_t max_size = DEFAULT_CACHE_SIZE, 
                        const EvictionPolicy policy = EvictionPolicy::LRU,
-                       const bool enable_thread_safety = false) 
+                       const bool enable_thread_safety = false) noexcept
         : max_cache_size(max_size), eviction_policy(policy), thread_safe(enable_thread_safety) {
         text_to_entry.reserve(INITIAL_RESERVE_SIZE);
+        token_hash_to_entry.reserve(INITIAL_RESERVE_SIZE);
         access_iterators.reserve(INITIAL_RESERVE_SIZE);
+    }// Configure cache settings
+    void configure(const EvictionPolicy policy, const bool enable_thread_safety = false) noexcept {
+        const_cast<EvictionPolicy&>(eviction_policy) = policy;
+        const_cast<bool&>(thread_safe) = enable_thread_safety;
     }
-    
-    // Configure cache settings
-    void configure(const EvictionPolicy policy, const bool enable_thread_safety = false) {
-        eviction_policy = policy;
-        thread_safe = enable_thread_safety;
-    }
-    
-    // Resize cache
+      // Resize cache
     void resize_cache(const size_t new_max_size) {
         return with_write_lock([&]() {
             max_cache_size = new_max_size;
-            if (text_to_entry.size() > max_cache_size) {
+            if (text_to_entry.size() > max_cache_size) [[unlikely]] {
                 trim_cache();
             }
         });
     }
-    
-    // Text -> Tokens lookup
-    [[nodiscard]] std::optional<std::vector<llama_token>> get_tokens(std::string_view text_key) const {
-        return with_lock([&]() -> std::optional<std::vector<llama_token>> {
+      // Text -> Tokens lookup
+    [[nodiscard]] std::optional<std::vector<llama_token>> get_tokens(const std::string_view text_key) const noexcept {
+        return with_lock([&]() noexcept -> std::optional<std::vector<llama_token>> {
             cache_requests.fetch_add(1, std::memory_order_relaxed);
             
             const std::string key_str(text_key);
-            if (auto it = text_to_entry.find(key_str); it != text_to_entry.end()) {
+            if (const auto it = text_to_entry.find(key_str); it != text_to_entry.end()) [[likely]] {
                 cache_hits.fetch_add(1, std::memory_order_relaxed);
                 update_access_order(it->first, *it->second);
                 return it->second->tokens;
@@ -281,27 +275,27 @@ public:
             return std::nullopt;
         });
     }
-    
-    // Tokens -> Text lookup (reverse)
-    [[nodiscard]] std::optional<std::string> get_text(const std::vector<llama_token>& tokens) const {
-        return with_lock([&]() -> std::optional<std::string> {
+      // Tokens -> Text lookup (reverse)
+    [[nodiscard]] std::optional<std::string> get_text(const std::vector<llama_token>& tokens) const noexcept {
+        return with_lock([&]() noexcept -> std::optional<std::string> {
             cache_requests.fetch_add(1, std::memory_order_relaxed);
             
             const std::string token_hash = hash_tokens(tokens);
-            if (auto it = token_hash_to_entry.find(token_hash); it != token_hash_to_entry.end()) {
+            if (const auto it = token_hash_to_entry.find(token_hash); it != token_hash_to_entry.end()) [[likely]] {
                 auto& entry = *(it->second);
                 
                 // Verify exact match (hash collision protection)
-                if (entry.tokens == tokens) {
+                if (entry.tokens == tokens) [[likely]] {
                     cache_hits.fetch_add(1, std::memory_order_relaxed);
                     
-                    // Find text key for LRU update
-                    for (const auto& [text_key, cached_entry] : text_to_entry) {
-                        if (cached_entry.get() == &entry) {
-                            update_access_order(text_key, entry);
-                            return entry.text;
-                        }
+                    // Find text key for LRU update using optimized search
+                    const auto text_it = std::find_if(text_to_entry.begin(), text_to_entry.end(),
+                        [&entry](const auto& pair) noexcept { return pair.second.get() == &entry; });
+                    
+                    if (text_it != text_to_entry.end()) [[likely]] {
+                        update_access_order(text_it->first, entry);
                     }
+                    return entry.text;
                 }
             }
             
@@ -315,27 +309,37 @@ public:
             add_entry_internal(std::move(text_key), std::move(text), std::move(tokens));
         });
     }
-    
-    // Bulk operations
+      // Bulk operations
     void put_batch(std::vector<std::tuple<std::string, std::string, std::vector<llama_token>>> entries) const {
+        if (entries.empty()) [[unlikely]] return;  // Early exit for empty batch
+        
         return with_write_lock([&]() {
-            for (auto& [key, text, tokens] : entries) {
-                add_entry_internal(std::move(key), std::move(text), std::move(tokens));
+            // Reserve space to minimize rehashing during batch insertion
+            const size_t new_capacity = text_to_entry.size() + entries.size();
+            if (new_capacity > text_to_entry.bucket_count()) [[unlikely]] {
+                text_to_entry.reserve(new_capacity);
+                token_hash_to_entry.reserve(new_capacity);
+                access_iterators.reserve(new_capacity);
             }
+            
+            // Use STL for_each for better optimization than range-based for
+            std::for_each(entries.begin(), entries.end(), [this](auto& entry) {
+                auto& [key, text, tokens] = entry;
+                add_entry_internal(std::move(key), std::move(text), std::move(tokens));
+            });
         });
     }
-    
-    // Check existence
-    [[nodiscard]] bool contains_text(std::string_view text_key) const {
-        return with_lock([&]() {
+      // Check existence
+    [[nodiscard]] bool contains_text(const std::string_view text_key) const noexcept {
+        return with_lock([&]() noexcept {
             return text_to_entry.find(std::string(text_key)) != text_to_entry.end();
         });
     }
     
-    [[nodiscard]] bool contains_tokens(const std::vector<llama_token>& tokens) const {
-        return with_lock([&]() {
+    [[nodiscard]] bool contains_tokens(const std::vector<llama_token>& tokens) const noexcept {
+        return with_lock([&]() noexcept {
             const std::string token_hash = hash_tokens(tokens);
-            if (auto it = token_hash_to_entry.find(token_hash); it != token_hash_to_entry.end()) {
+            if (const auto it = token_hash_to_entry.find(token_hash); it != token_hash_to_entry.end()) [[likely]] {
                 return it->second->tokens == tokens;
             }
             return false;
@@ -354,8 +358,7 @@ public:
             memory_usage_bytes.store(0, std::memory_order_relaxed);
         });
     }
-    
-    // Enhanced statistics
+      // Enhanced statistics
     struct CacheStats {
         size_t hits;
         size_t requests;
@@ -366,18 +369,18 @@ public:
         float fill_ratio;
         float memory_efficiency;  // tokens per byte
     };
-    
-    [[nodiscard]] CacheStats get_stats() const {
-        return with_lock([&]() {
+      [[nodiscard]] CacheStats get_stats() const noexcept {
+        return with_lock([&]() noexcept {
             const auto hits = cache_hits.load(std::memory_order_relaxed);
             const auto requests = cache_requests.load(std::memory_order_relaxed);
             const auto memory_bytes = memory_usage_bytes.load(std::memory_order_relaxed);
             const auto entries = text_to_entry.size();
             
-            size_t total_tokens = 0;
-            for (const auto& [key, entry] : text_to_entry) {
-                total_tokens += entry->tokens.size();
-            }
+            // Use STL algorithm for better optimization
+            const size_t total_tokens = std::accumulate(text_to_entry.begin(), text_to_entry.end(), size_t{0},
+                [](size_t sum, const auto& pair) noexcept {
+                    return sum + pair.second->tokens.size();
+                });
             
             return CacheStats{
                 .hits = hits,

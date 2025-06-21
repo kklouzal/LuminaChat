@@ -7,8 +7,8 @@
 class TextSanitizer {
 public:
     // Sanitize text by removing invalid Unicode characters and Discord-specific formatting
-    static std::string sanitize_text(const std::string& text) {
-        if (text.empty()) {
+    [[nodiscard]] static std::string sanitize_text(const std::string& text) {
+        if (text.empty()) [[unlikely]] {
             return text;
         }
 
@@ -27,29 +27,39 @@ public:
     }
 
 private:    // Remove Discord-specific formatting that might cause tokenization issues
-    static std::string clean_discord_formatting(const std::string& text) {
-        if (text.empty()) return text;
+    [[nodiscard]] static std::string clean_discord_formatting(const std::string& text) noexcept {
+        if (text.empty()) [[unlikely]] {
+            return text;
+        }
         
         try {
+            // Pre-compile static regex patterns for better performance
+            static const std::regex user_mention_regex{R"(<@!?\d+>)"};
+            static const std::regex channel_mention_regex{R"(<#\d+>)"};
+            static const std::regex role_mention_regex{R"(<@&\d+>)"};
+            static const std::regex custom_emoji_regex{R"(<:\w+:\d+>)"};
+            static const std::regex animated_emoji_regex{R"(<a:\w+:\d+>)"};
+            static const std::regex timestamp_regex{R"(<t:\d+:[tTdDfFR]>)"};
+            
             std::string cleaned = text;
             
             // Remove user mentions <@!123456789> or <@123456789>
-            cleaned = std::regex_replace(cleaned, std::regex(R"(<@!?\d+>)"), "[User]");
+            cleaned = std::regex_replace(cleaned, user_mention_regex, "[User]");
             
             // Remove channel mentions <#123456789>
-            cleaned = std::regex_replace(cleaned, std::regex(R"(<#\d+>)"), "[Channel]");
+            cleaned = std::regex_replace(cleaned, channel_mention_regex, "[Channel]");
             
             // Remove role mentions <@&123456789>
-            cleaned = std::regex_replace(cleaned, std::regex(R"(<@&\d+>)"), "[Role]");
+            cleaned = std::regex_replace(cleaned, role_mention_regex, "[Role]");
             
             // Remove custom emojis <:emojiname:123456789>
-            cleaned = std::regex_replace(cleaned, std::regex(R"(<:\w+:\d+>)"), "[Emoji]");
+            cleaned = std::regex_replace(cleaned, custom_emoji_regex, "[Emoji]");
             
             // Remove animated emojis <a:emojiname:123456789>
-            cleaned = std::regex_replace(cleaned, std::regex(R"(<a:\w+:\d+>)"), "[AnimatedEmoji]");
+            cleaned = std::regex_replace(cleaned, animated_emoji_regex, "[AnimatedEmoji]");
             
             // Remove timestamp formatting <t:1234567890:F>
-            cleaned = std::regex_replace(cleaned, std::regex(R"(<t:\d+:[tTdDfFR]>)"), "[Timestamp]");
+            cleaned = std::regex_replace(cleaned, timestamp_regex, "[Timestamp]");
             
             return cleaned;
         } catch (const std::exception&) {
@@ -57,52 +67,56 @@ private:    // Remove Discord-specific formatting that might cause tokenization 
             return text;
         }
     }    // Remove invalid Unicode characters that might cause tokenization issues
-    static std::string remove_invalid_unicode(const std::string& text) {
+    [[nodiscard]] static std::string remove_invalid_unicode(const std::string& text) noexcept {
+        if (text.empty()) [[unlikely]] {
+            return text;
+        }
+        
         std::string result;
         result.reserve(text.length());
         
         for (size_t i = 0; i < text.length(); ) {
-            unsigned char c = static_cast<unsigned char>(text[i]);
+            const unsigned char c = static_cast<unsigned char>(text[i]);
             
-            // Handle ASCII characters (0-127)
-            if (c < 128) {
+            // Handle ASCII characters (0-127) - most common case
+            if (c < 128) [[likely]] {
                 // Skip control characters except common whitespace
-                if (c < 32 && c != '\n' && c != '\r' && c != '\t') {
-                    i++;
+                if (c < 32 && c != '\n' && c != '\r' && c != '\t') [[unlikely]] {
+                    ++i;
                     continue;
                 }
                 result += text[i];
-                i++;
+                ++i;
             }
             // Handle UTF-8 sequences
-            else {
-                int utf8_len = get_utf8_sequence_length(c);
-                if (utf8_len == 0 || i + utf8_len > text.length()) {
+            else [[unlikely]] {
+                const int utf8_len = get_utf8_sequence_length(c);
+                if (utf8_len == 0 || i + utf8_len > text.length()) [[unlikely]] {
                     // Invalid UTF-8 sequence, skip this byte
-                    i++;
+                    ++i;
                     continue;
                 }
                 
                 // Validate the complete UTF-8 sequence with bounds checking
                 bool valid_sequence = true;
-                for (int j = 1; j < utf8_len && (i + j) < text.length(); j++) {
-                    unsigned char next_byte = static_cast<unsigned char>(text[i + j]);
-                    if ((next_byte & 0xC0) != 0x80) {
+                for (int j = 1; j < utf8_len && (i + j) < text.length(); ++j) {
+                    const unsigned char next_byte = static_cast<unsigned char>(text[i + j]);
+                    if ((next_byte & 0xC0) != 0x80) [[unlikely]] {
                         valid_sequence = false;
                         break;
                     }
                 }
                 
-                if (valid_sequence && (i + utf8_len <= text.length())) {
+                if (valid_sequence && (i + utf8_len <= text.length())) [[likely]] {
                     // Check for problematic Unicode codepoints
-                    uint32_t codepoint = decode_utf8_codepoint(text.substr(i, utf8_len));
-                    if (is_valid_codepoint(codepoint)) {
+                    const uint32_t codepoint = decode_utf8_codepoint(text.substr(i, utf8_len));
+                    if (is_valid_codepoint(codepoint)) [[likely]] {
                         result += text.substr(i, utf8_len);
                     }
                     i += utf8_len;
-                } else {
+                } else [[unlikely]] {
                     // Invalid sequence, skip this byte
-                    i++;
+                    ++i;
                 }
             }
         }
