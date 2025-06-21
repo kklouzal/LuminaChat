@@ -699,6 +699,8 @@ void setup_event_handlers() {
         
         // Get the main context info to retrieve system prompt
         auto context_info = llama_manager->get_context_info(main_context_id);
+        if (!context_info) return ""; // Check for null pointer
+        
         // get the system message from the main context
         std::string system_prompt = context_info->system_message;
         
