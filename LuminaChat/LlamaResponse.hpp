@@ -278,7 +278,12 @@ private:
             // Use EOS token as dummy for logit generation
             const llama_token dummy_token = llama_vocab_eos(model_info->vocab);
             context_info->batch.token[0] = dummy_token;
-            context_info->batch.pos[0] = context_info->n_past - ResponseConstants::DUMMY_TOKEN_DECODE_POS_OFFSET;
+            
+            // CRITICAL FIX: Ensure position is valid (non-negative and within context)
+            int32_t decode_pos = std::max(0, context_info->n_past - ResponseConstants::DUMMY_TOKEN_DECODE_POS_OFFSET);
+            decode_pos = std::min(decode_pos, model_info->n_ctx - 1);
+            
+            context_info->batch.pos[0] = decode_pos;
             context_info->batch.logits[0] = 1; // Request logits
             context_info->batch.seq_id[0] = 0;
             context_info->batch.n_tokens = 1;
@@ -287,9 +292,11 @@ private:
             if (decode_result == 0) [[likely]] {
                 const float* logits = llama_get_logits(context_info->context);
                 if (logits) [[likely]] {
-                    LLAMA_LOG("Successfully recovered logits with dummy decode");
+                    LLAMA_LOG("Successfully recovered logits with dummy decode at position " + std::to_string(decode_pos));
                     return true;
                 }
+            } else {
+                LLAMA_LOG("Dummy decode failed with error code: " + std::to_string(decode_result));
             }
         }
           LLAMA_LOG("Error: Could not recover logits for generation");

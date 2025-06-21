@@ -427,8 +427,7 @@ public:    // Add message to this context's history
         LLAMA_LOG("Message added for " + role + " - Total messages: " + std::to_string(message_history.size()) + 
                   ". State invalidated - rebuild required.");
     }
-    
-    // Insert historical message right after system messages but before current conversation
+      // Insert historical message right after system messages but before current conversation
     // This maintains chronological order when backfilling Discord history
     void insert_historical_message(const std::string& role, const std::string& content) {
         // CRITICAL: Protect message history modifications to prevent race conditions
@@ -440,10 +439,21 @@ public:    // Add message to this context's history
             message_history.emplace_back("system", system_message);
         }
         
-        // Find insertion point: right after any system messages
+        // Find insertion point: right after system messages BUT respect summary injection order
+        // We need to insert after: original system message + summary system messages
+        // This maintains the proper chronological order: system -> summaries -> historical -> current
         size_t insert_pos = 0;
         while (insert_pos < message_history.size() && message_history[insert_pos].first == "system") {
-            insert_pos++;
+            // Check if this is a summary or note system message - these should stay before historical messages
+            const std::string& content = message_history[insert_pos].second;
+            if (content.find("[Previous conversation summary]: ") == 0 || 
+                content.find("[Note: ") == 0) {
+                // This is an injected summary or note - historical messages should go after it
+                insert_pos++;
+            } else {
+                // This is the original system message - historical messages should go after it
+                insert_pos++;
+            }
         }
         
         // Insert the historical message at the correct position
@@ -583,9 +593,9 @@ public:    // Add message to this context's history
                 LLAMA_LOG("Note: Large incremental update, using incremental batch processing");
                 return process_large_context_incrementally(tokens, n_batch);
             }
-        } else {
-            // Process all tokens in a single batch (normal case)
-            bool output_logits = is_incremental;
+        } else {            // Process all tokens in a single batch (normal case)
+            // CRITICAL FIX: Always generate logits for the final token to enable generation after context rebuilds
+            bool output_logits = true;  // Always true to ensure logits are available for AI generation
             
             if (!add_tokens_to_batch(tokens, n_past, seq_ids, output_logits)) {
                 LLAMA_LOG("Error: Failed to add tokens to batch");
@@ -785,17 +795,45 @@ public:    // Add message to this context's history
                 llama_memory_clear(llama_get_memory(context), true);
             }
             n_past = 0;
-            prev_len = 0;            // Process full content
+            prev_len = 0;            // Process full content - CRITICAL FIX: ensure logits are generated for the final token
             std::vector<llama_token> rebuild_tokens = process_text_to_tokens(formatted_content, true);
             if (!rebuild_tokens.empty() && process_context_tokens(rebuild_tokens, false, prune_conversation_with_summary)) {
                 prev_len = new_len;
                 message_history_token_count = n_past;
                 
-                // Ensure we have valid logits for generation
+                // CRITICAL FIX: Ensure we have valid logits for generation after full rebuild
                 if (n_past > 0) {
                     float* logits = llama_get_logits(context);
                     if (!logits) {
-                        LLAMA_LOG("Warning: No logits available after context rebuild, will need manual decode");
+                        LLAMA_LOG("Warning: No logits available after context rebuild, performing recovery decode");
+                        
+                        // Perform a minimal decode operation to generate logits for the final token
+                        if (batch_initialized && batch.token && batch.pos && batch.logits && batch.seq_id) {
+                            // Clear batch and prepare for logit generation
+                            batch.n_tokens = 0;
+                            
+                            // Use the last token from the rebuild for logit generation
+                            if (!rebuild_tokens.empty()) {
+                                llama_token last_token = rebuild_tokens.back();
+                                batch.token[0] = last_token;
+                                batch.pos[0] = n_past - 1; // Position of the last processed token
+                                batch.logits[0] = 1; // Request logits
+                                batch.seq_id[0] = 0;
+                                batch.n_tokens = 1;
+                                
+                                int decode_result = llama_decode(context, batch);
+                                if (decode_result == 0) {
+                                    logits = llama_get_logits(context);
+                                    if (logits) {
+                                        LLAMA_LOG("Successfully recovered logits after context rebuild");
+                                    } else {
+                                        LLAMA_LOG("Failed to recover logits after context rebuild");
+                                    }
+                                } else {
+                                    LLAMA_LOG("Failed to perform recovery decode, error: " + std::to_string(decode_result));
+                                }
+                            }
+                        }
                     }
                 }
                 
@@ -917,15 +955,17 @@ public:    // Add message to this context's history
             LLAMA_LOG("Updated cached message history token count: " + std::to_string(message_history_token_count));
             
             LLAMA_LOG("Successfully rebuilt context from " + std::to_string(message_history.size()) + 
-                      " messages, using " + std::to_string(n_past) + " tokens");
-        } else {
+                      " messages, using " + std::to_string(n_past) + " tokens");        } else {
             LLAMA_LOG("Failed to update context from history");
         }
-          return success;}    // Debug method to check if summaries are properly accessible in message history
-    void debug_print_message_history_with_summaries() const;
-      // Setup summarizer with proper callbacks for message history management
+        
+        return success;
+    }
+    
+    // Setup summarizer with proper callbacks for message history management
     void setup_summarizer_callbacks();
-      // Manually refresh summaries in message history (useful when slots are externally modified)
+    
+    // Manually refresh summaries in message history (useful when slots are externally modified)
     void refresh_summaries_in_message_history();
 };
 
@@ -1311,102 +1351,6 @@ inline bool ContextInfo::prune_with_summarization(float keep_ratio) {
     
     LLAMA_LOG("Pruning with summarization completed - new message count: " + std::to_string(message_history.size()));
     return true;
-}
-
-inline void ContextInfo::debug_print_message_history_with_summaries() const {
-    LLAMA_LOG("=== DEBUG: Message History Analysis ===");
-    LLAMA_LOG("Total messages in history: " + std::to_string(message_history.size()));
-    
-    size_t system_messages = 0;
-    size_t summary_messages = 0;
-    size_t other_messages = 0;
-    size_t original_system_pos = SIZE_MAX;
-    size_t first_summary_pos = SIZE_MAX;
-    size_t last_summary_pos = SIZE_MAX;
-    
-    for (size_t i = 0; i < message_history.size(); ++i) {
-        const auto& [role, content] = message_history[i];
-        
-        if (role == "system") {
-            system_messages++;
-            if (content.find("[Previous conversation summary]: ") == 0) {
-                summary_messages++;
-                if (first_summary_pos == SIZE_MAX) first_summary_pos = i;
-                last_summary_pos = i;
-                LLAMA_LOG("  [" + std::to_string(i) + "] SUMMARY: " + content.substr(33, 67) + "...");
-            } else if (content.find("[Note: ") != 0 && i == 0) {
-                // Likely the original system message (first message, not a note or summary)
-                original_system_pos = i;
-                LLAMA_LOG("  [" + std::to_string(i) + "] ORIGINAL SYSTEM: " + content.substr(0, 100) + "...");
-            } else {
-                LLAMA_LOG("  [" + std::to_string(i) + "] OTHER SYSTEM: " + content.substr(0, 100) + "...");
-            }
-        } else {
-            other_messages++;
-            LLAMA_LOG("  [" + std::to_string(i) + "] " + role + ": " + content.substr(0, 100) + "...");
-        }
-    }
-    
-    LLAMA_LOG("Summary: " + std::to_string(system_messages) + " system messages (" + 
-              std::to_string(summary_messages) + " summaries), " + 
-              std::to_string(other_messages) + " other messages");
-    
-    // Validate proper ordering
-    if (original_system_pos != SIZE_MAX && first_summary_pos != SIZE_MAX) {
-        if (first_summary_pos == original_system_pos + 1) {
-            LLAMA_LOG("✓ Summaries correctly placed immediately after original system message");
-        } else {
-            LLAMA_LOG("❌ WARNING: Summaries NOT immediately after original system message (gap: " + 
-                     std::to_string(first_summary_pos - original_system_pos - 1) + " messages)");
-        }
-    } else if (first_summary_pos == 0 && original_system_pos == SIZE_MAX) {
-        LLAMA_LOG("✓ Summaries correctly placed at beginning (no original system message)");
-    }
-    
-    // Validate chronological order of summaries
-    if (summary_messages > 1) {
-        bool chronological = true;
-        for (size_t i = first_summary_pos; i <= last_summary_pos; ++i) {
-            if (message_history[i].first == "system" && 
-                message_history[i].second.find("[Previous conversation summary]: ") == 0) {
-                // This is a summary - they should be consecutive
-                continue;
-            } else if (i < last_summary_pos) {
-                chronological = false;
-                break;
-            }
-        }
-        
-        if (chronological) {
-            LLAMA_LOG("✓ Summaries are consecutive and in chronological order");
-        } else {
-            LLAMA_LOG("❌ WARNING: Summaries are NOT consecutive or in wrong order");
-        }
-    }
-    
-    if (summarizer) {
-        auto slot_info = summarizer->get_summary_slot_info();
-        LLAMA_LOG("Summary slots: " + std::to_string(slot_info.used_slots) + "/" + 
-                  std::to_string(slot_info.total_slots) + " used");
-        
-        // Check for synchronization between slots and injected summaries
-        if (slot_info.used_slots != summary_messages) {
-            LLAMA_LOG("❌ WARNING: Mismatch between summary slots (" + std::to_string(slot_info.used_slots) + 
-                      ") and injected summaries (" + std::to_string(summary_messages) + ")");
-        } else {
-            LLAMA_LOG("✓ Summary slots and injected summaries are synchronized");
-        }
-        
-        // Display slot chronological order for verification
-        if (!slot_info.summaries.empty()) {
-            LLAMA_LOG("Summary slot chronological order (oldest to newest):");
-            for (size_t i = 0; i < slot_info.summaries.size(); ++i) {
-                LLAMA_LOG("  Slot " + std::to_string(i) + ": " + slot_info.summaries[i].substr(0, 60) + "...");
-            }
-        }
-    }
-    
-    LLAMA_LOG("=== END DEBUG ===");
 }
 
 inline void ContextInfo::setup_summarizer_callbacks() {

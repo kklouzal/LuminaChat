@@ -348,7 +348,7 @@ private:
     wxTimer* context_monitor_timer;    // UI controls with better organization
 
     struct UIControls {
-        wxButton *start_btn, *stop_btn, *settings_btn, *discord_btn, *prune_btn, *summary_slots_btn;
+        wxButton *start_btn, *stop_btn, *settings_btn, *discord_btn, *prune_btn, *summary_slots_btn, *test_summaries_btn;
         wxGauge* progress_bar;
         
         // Detailed context breakdown UI elements
