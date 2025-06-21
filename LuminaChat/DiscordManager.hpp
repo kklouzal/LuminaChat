@@ -156,30 +156,29 @@ public:
     // Configuration - direct access
     std::string main_context_id;
     std::string model_id = "main_model";
-      
-    BackfillStatus get_backfill_status() const {
+        BackfillStatus get_backfill_status() const {
         std::lock_guard<std::mutex> lock(loaders_mutex);
         
         BackfillStatus status{};
         status.total_channels = static_cast<int32_t>(context_history_loaders.size());
         
-        // Use STL algorithms for efficient aggregation
+        // Use STL algorithms with direct method access per directive #7
         status.completed_channels = std::count_if(context_history_loaders.begin(), context_history_loaders.end(),
             [](const auto& pair) {
-                return pair.second && pair.second->get_status().collection_complete;
+                return pair.second && pair.second->is_collection_complete();
             });
         
         status.in_progress = (status.completed_channels < status.total_channels);
         
-        // Accumulate totals using STL transform_reduce (C++17)
+        // Accumulate totals using direct getter methods
         status.total_messages_fetched = std::accumulate(context_history_loaders.begin(), context_history_loaders.end(), 0,
             [](int32_t sum, const auto& pair) {
-                return sum + (pair.second ? static_cast<int32_t>(pair.second->get_status().messages_collected) : 0);
+                return sum + (pair.second ? static_cast<int32_t>(pair.second->get_messages_collected()) : 0);
             });
         
         status.total_tokens_loaded_this_session = std::accumulate(context_history_loaders.begin(), context_history_loaders.end(), 0,
             [](int32_t sum, const auto& pair) {
-                return sum + (pair.second ? pair.second->get_status().total_tokens_collected : 0);
+                return sum + (pair.second ? pair.second->get_total_tokens_collected() : 0);
             });
         
         return status;
