@@ -1,5 +1,17 @@
 // LlamaContext.hpp - header-only implementation for LLaMA context management
 // 
+// PERFORMANCE OPTIMIZATIONS APPLIED:
+// - Removed unnecessary try-catch blocks around llama_decode() (C functions don't throw C++ exceptions)
+// - Added [[likely]] and [[unlikely]] attributes for branch prediction optimization
+// - Success paths marked as [[likely]], error conditions as [[unlikely]]
+//
+// HISTORICAL MESSAGE LOADING FIX:
+// - Added loading_historical_messages flag to prevent logits corruption during bulk historical loading
+// - Auto-detection of historical loading scenarios when explicit mode isn't set
+// - Use begin_historical_loading()/end_historical_loading() to control logits generation
+// - Call finalize_context_after_historical_loading() after bulk loading to prepare for generation
+// - Auto-detection tracks recent insert_historical_message() calls and context state
+//
 // RESPONSIBILITY: Context state management and operations
 // - Context state tracking and validation
 // - Message history management
@@ -51,6 +63,7 @@
 #include <limits>
 #include <functional>
 #include <type_traits>
+#include <chrono>
 #include "llama-cpp.h"
 #include "LogHandler.hpp"
 #include "ContextSizeManager.hpp"
@@ -213,19 +226,23 @@ struct ContextInfo {
     // NOTE: This field was previously sometimes set to -1 to indicate invalidation,
     // but that pattern is no longer used. The count is now always maintained accurately.
     int32_t message_history_token_count = 0;
-    
-    // Reference to associated model
+      // Reference to associated model
     ModelInfo* model_info;
 
     // Special flag for contexts that should reset before each generation
     // Primarily used for summary models that need a clean slate for each task
-    bool reset_after_generation = false;
+    bool reset_after_generation = false;    // Flag to track if we're currently loading historical messages
+    // This prevents logits generation during bulk historical loading
+    bool loading_historical_messages = false;
+
+    // Counter for recent historical message insertions (for auto-detection)
+    mutable int32_t recent_historical_insertions = 0;
+    mutable std::chrono::steady_clock::time_point last_historical_insertion_time;
 
     // Summarizer for handling conversation summarization per context
-    std::unique_ptr<LlamaSummarizer> summarizer;
-    
-    ContextInfo() : context(nullptr), batch{}, batch_initialized(false), 
-                   n_past(0), prev_len(0), message_history_token_count(0), model_info(nullptr) {
+    std::unique_ptr<LlamaSummarizer> summarizer;    ContextInfo() : context(nullptr), batch{}, batch_initialized(false), 
+                   n_past(0), prev_len(0), message_history_token_count(0), model_info(nullptr),
+                   loading_historical_messages(false), recent_historical_insertions(0) {
     }
     
     // Get current performance statistics
@@ -245,28 +262,26 @@ struct ContextInfo {
     int32_t get_context_size() const noexcept {
         return model_info ? model_info->n_ctx : LlamaConstants::DEFAULT_CONTEXT_SIZE;
     }
-    
-    // Template application specific to this context
+      // Template application specific to this context
     bool apply_template(bool add_generation_prompt, std::string& result) const {
-        if (!model_info) return false;
+        if (!model_info) [[unlikely]] return false;
         
         const char* tmpl = model_info->get_chat_template();
-        if (!tmpl) return false;
+        if (!tmpl) [[unlikely]] return false;
         
         // Update message cache if needed
-        if (message_cache_dirty) {
+        if (message_cache_dirty) [[unlikely]] {
             message_cache = convert_to_llama_messages();
             message_cache_dirty = false;
         }
-        
-        // Apply template with auto-resize
+          // Apply template with auto-resize
         template_buffer.resize(model_info->n_ctx * LlamaConstants::STRING_RESERVE_MULTIPLIER);
         int32_t result_len = llama_chat_apply_template(
             tmpl, message_cache.data(), message_cache.size(),
             add_generation_prompt, template_buffer.data(), template_buffer.size()
         );
         
-        if (result_len < 0) {
+        if (result_len < 0) [[unlikely]] {
             template_buffer.resize(-result_len);
             result_len = llama_chat_apply_template(
                 tmpl, message_cache.data(), message_cache.size(),
@@ -274,26 +289,25 @@ struct ContextInfo {
             );
         }
         
-        if (result_len > 0) {
+        if (result_len > 0) [[likely]] {
             result = std::string(template_buffer.data(), result_len);
             return true;
         }
         return false;
     }
-    
-    // Validate context state
+      // Validate context state
     bool validate_state() const {
-        if (!model_info || !model_info->model || !context) {
+        if (!model_info || !model_info->model || !context) [[unlikely]] {
             return false;
         }
         
         // Check if context position is reasonable
-        if (n_past < 0 || n_past >= model_info->n_ctx) {
+        if (n_past < 0 || n_past >= model_info->n_ctx) [[unlikely]] {
             return false;
         }
         
         // Check for extremely long message history that might cause issues
-        if (message_history.size() > LlamaConstants::MAX_MESSAGE_HISTORY_SIZE) {
+        if (message_history.size() > LlamaConstants::MAX_MESSAGE_HISTORY_SIZE) [[unlikely]] {
             return false;
         }
           return true;
@@ -303,10 +317,9 @@ struct ContextInfo {
     bool is_valid() const {
         return context != nullptr && model_info != nullptr;
     }
-    
-    // Reset context state
+      // Reset context state
     void reset_context_state() {
-        if (context) {
+        if (context) [[likely]] {
             llama_memory_clear(llama_get_memory(context), true);
         }
         n_past = 0;
@@ -318,48 +331,45 @@ struct ContextInfo {
     
     // Batch management methods - context-specific
     void clear_batch() {
-        if (!batch_initialized) return;
+        if (!batch_initialized) [[unlikely]] return;
         batch.n_tokens = 0;
-    }
-
-    // Add tokens from a single input to batch
+    }// Add tokens from a single input to batch
     // NOTE: This is for single-sequence processing, not multi-sequence batching
     bool add_tokens_to_batch(const std::vector<llama_token>& tokens, int32_t start_pos, 
                             const std::vector<llama_seq_id>& seq_ids, bool output_logits = false) {
-        if (!batch_initialized || tokens.empty() || !model_info) return false;
+        if (!batch_initialized || tokens.empty() || !model_info) [[unlikely]] return false;
         
         // Validate start_pos is reasonable
-        if (start_pos < 0 || start_pos >= model_info->n_ctx) {
+        if (start_pos < 0 || start_pos >= model_info->n_ctx) [[unlikely]] {
             return false;
         }        
         
         const int32_t n_batch = llama_n_batch(context);
-        if (n_batch <= 0) {
+        if (n_batch <= 0) [[unlikely]] {
             return false;
         }
         
         clear_batch(); // Clear batch
         
         // Validate sequence IDs
-        if (seq_ids.empty()) {
+        if (seq_ids.empty()) [[unlikely]] {
             return false;
         }
-        
-        // Use n_batch as the capacity limit
+          // Use n_batch as the capacity limit
         for (size_t i = 0; i < tokens.size() && batch.n_tokens < n_batch; ++i) {
             // Check position bounds carefully
             int32_t pos = start_pos + static_cast<int32_t>(i);
-            if (pos >= model_info->n_ctx || pos < 0) {
+            if (pos >= model_info->n_ctx || pos < 0) [[unlikely]] {
                 break;
             }
             
             // Validate token value
-            if (tokens[i] < 0) {
+            if (tokens[i] < 0) [[unlikely]] {
                 return false;
             }
             
             // Ensure we don't exceed batch array bounds
-            if (batch.n_tokens >= n_batch) {
+            if (batch.n_tokens >= n_batch) [[unlikely]] {
                 break;
             }
             
@@ -408,8 +418,11 @@ public:    // Add message to this context's history
         // CRITICAL: Protect message history modifications to prevent race conditions
         std::lock_guard<std::mutex> lock(context_operations_mutex);
         
+        // Clear historical insertion tracking since this is a normal message
+        recent_historical_insertions = 0;
+        
         // Setup conversation - ensure system message is in history if context is empty
-        if (message_history.empty() && !system_message.empty()) {
+        if (message_history.empty() && !system_message.empty()) [[unlikely]] {
             LLAMA_LOG("Adding system message to empty context history prior to adding first message");
             message_history.emplace_back("system", system_message);
         }
@@ -418,7 +431,7 @@ public:    // Add message to this context's history
         conversation_state.needs_rebuild = true;
         
         // Track user messages with ContextSizeManager for pattern analysis
-        if (context_size_manager && role != "system" && role != "assistant") {
+        if (context_size_manager && role != "system" && role != "assistant") [[likely]] {
             context_size_manager->track_user_message();
             LLAMA_LOG("Tracked user message with ContextSizeManager for role: " + role);
         }
@@ -432,9 +445,8 @@ public:    // Add message to this context's history
     void insert_historical_message(const std::string& role, const std::string& content) {
         // CRITICAL: Protect message history modifications to prevent race conditions
         std::lock_guard<std::mutex> lock(context_operations_mutex);
-        
-        // Setup conversation - ensure system message is in history if context is empty
-        if (message_history.empty() && !system_message.empty()) {
+          // Setup conversation - ensure system message is in history if context is empty
+        if (message_history.empty() && !system_message.empty()) [[unlikely]] {
             LLAMA_LOG("Adding system message to empty context history prior to inserting historical message");
             message_history.emplace_back("system", system_message);
         }
@@ -443,11 +455,11 @@ public:    // Add message to this context's history
         // We need to insert after: original system message + summary system messages
         // This maintains the proper chronological order: system -> summaries -> historical -> current
         size_t insert_pos = 0;
-        while (insert_pos < message_history.size() && message_history[insert_pos].first == "system") {
+        while (insert_pos < message_history.size() && message_history[insert_pos].first == "system") [[likely]] {
             // Check if this is a summary or note system message - these should stay before historical messages
             const std::string& content = message_history[insert_pos].second;
             if (content.find("[Previous conversation summary]: ") == 0 || 
-                content.find("[Note: ") == 0) {
+                content.find("[Note: ") == 0) [[unlikely]] {
                 // This is an injected summary or note - historical messages should go after it
                 insert_pos++;
             } else {
@@ -455,14 +467,16 @@ public:    // Add message to this context's history
                 insert_pos++;
             }
         }
-        
-        // Insert the historical message at the correct position
+          // Insert the historical message at the correct position
         message_history.insert(message_history.begin() + insert_pos, std::make_pair(role, content));
         message_cache_dirty = true;
         conversation_state.needs_rebuild = true;
         
-        // Track user messages with ContextSizeManager for pattern analysis
-        if (context_size_manager && role != "system" && role != "assistant") {
+        // Track historical insertion for auto-detection
+        recent_historical_insertions++;
+        last_historical_insertion_time = std::chrono::steady_clock::now();
+          // Track user messages with ContextSizeManager for pattern analysis
+        if (context_size_manager && role != "system" && role != "assistant") [[likely]] {
             context_size_manager->track_user_message();
             LLAMA_LOG("Tracked historical user message with ContextSizeManager for role: " + role);
         }
@@ -471,18 +485,77 @@ public:    // Add message to this context's history
         LLAMA_LOG("Historical message inserted for " + role + " at position " + std::to_string(insert_pos) + 
                   " - Total messages: " + std::to_string(message_history.size()) + 
                   ". State invalidated - rebuild required.");
-    }
-      // Clear conversation for this context (implementation after LlamaSummarizer include)
+    }      // Clear conversation for this context (implementation after LlamaSummarizer include)
     void clear_conversation();    // Prune conversation with summarization for this context
     bool prune_with_summarization(float keep_ratio = 0.6f);
     
-    // Calculate optimal batch size for this context
+    // Historical message loading control
+    void begin_historical_loading() {
+        loading_historical_messages = true;
+        LLAMA_LOG("Started historical message loading mode - logits generation disabled");
+    }    void end_historical_loading() {
+        loading_historical_messages = false;
+        recent_historical_insertions = 0;  // Clear auto-detection tracking
+        // Force a context rebuild to ensure proper state after historical loading
+        conversation_state.needs_rebuild = true;
+        LLAMA_LOG("Ended historical message loading mode - logits generation re-enabled, context rebuild required");
+    }
+    
+    // Clear historical loading detection state (call after successful generation)
+    void clear_historical_loading_state() {
+        recent_historical_insertions = 0;
+        LLAMA_LOG("Cleared historical loading detection state");
+    }
+    
+    // Force a context rebuild with logits generation enabled
+    // Should be called after historical loading is complete to prepare for generation
+    template<typename TokenProcessor, typename PruningCallback>
+    bool finalize_context_after_historical_loading(TokenProcessor&& process_text_to_tokens, 
+                                                   PruningCallback&& prune_conversation_with_summary) {
+        if (loading_historical_messages) {
+            LLAMA_LOG("Warning: Finalizing context while still in historical loading mode");
+            loading_historical_messages = false;
+        }
+        
+        // Force a complete context rebuild with logits generation
+        conversation_state.needs_rebuild = true;
+        return prepare_context_for_generation(std::forward<TokenProcessor>(process_text_to_tokens),
+                                             std::forward<PruningCallback>(prune_conversation_with_summary));
+    }
+      bool is_loading_historical() const {
+        return loading_historical_messages;
+    }
+      // Auto-detection for historical loading based on context state
+    // This provides a fallback when explicit historical loading mode isn't set
+    bool is_likely_historical_loading() const {
+        // Clean up old insertions (older than 5 seconds)
+        auto now = std::chrono::steady_clock::now();
+        auto time_since_last_insertion = std::chrono::duration_cast<std::chrono::seconds>(
+            now - last_historical_insertion_time).count();
+        
+        if (time_since_last_insertion > 5) {
+            recent_historical_insertions = 0;
+        }
+        
+        // If we have multiple recent historical insertions and haven't processed context yet
+        bool has_recent_historical_activity = recent_historical_insertions > 0 && time_since_last_insertion < 2;
+        
+        // If we have message history but no context tokens processed yet, 
+        // and we're about to do a full rebuild, it's likely historical loading
+        bool context_rebuild_scenario = !message_history.empty() && 
+                                       n_past == 0 && 
+                                       conversation_state.needs_rebuild;
+        
+        return !loading_historical_messages && 
+               (has_recent_historical_activity || context_rebuild_scenario);
+    }
+      // Calculate optimal batch size for this context
     int32_t calculate_optimal_batch_size() const {
-        if (!context) {
+        if (!context) [[unlikely]] {
             return LlamaConstants::MAX_BATCH_SIZE;
         }
         
-        if (!model_info) {
+        if (!model_info) [[unlikely]] {
             return LlamaConstants::MAX_BATCH_SIZE;
         }
         
@@ -491,36 +564,35 @@ public:    // Add message to this context's history
         
         return std::max(1, std::min({n_batch, available_ctx, LlamaConstants::MAX_BATCH_SIZE}));
     }
-    
-    // Enhanced context processing - Updated for proper single-input batching
+      // Enhanced context processing - Updated for proper single-input batching
     // NOTE: Batching in llama.cpp is designed for processing multiple separate inputs/sequences 
     // simultaneously, NOT for splitting a single input into chunks. Each batch operation should
     // contain tokens from potentially multiple different inputs, each with their own sequence IDs.
     // For single inputs that exceed batch capacity, we use incremental batch processing for optimal performance.
     template<typename SummarizerCallback>
     bool process_context_tokens(const std::vector<llama_token>& tokens, bool is_incremental, SummarizerCallback&& pruning_callback) {
-        if (!batch_initialized) {
+        if (!batch_initialized) [[unlikely]] {
             LLAMA_LOG("Error: No active context or batch not initialized");
             return false;
         }
         
-        if (tokens.empty()) {
+        if (tokens.empty()) [[unlikely]] {
             return true; // Empty tokens are valid
         }
         
-        if (!model_info) {
+        if (!model_info) [[unlikely]] {
             LLAMA_LOG("Error: No model info available for current context");
             return false;
         }
         
         // Additional validation before processing
-        if (!context) {
+        if (!context) [[unlikely]] {
             LLAMA_LOG("Error: Context is null during token processing");
             return false;
         }
         
         const int32_t n_batch = calculate_optimal_batch_size();
-        if (n_batch <= 0) {
+        if (n_batch <= 0) [[unlikely]] {
             LLAMA_LOG("Error: Invalid batch size calculated: " + std::to_string(n_batch));
             return false;
         }
@@ -529,28 +601,29 @@ public:    // Add message to this context's history
             LLAMA_LOG("Starting context rebuild: FULL (non-incremental) - processing " + std::to_string(tokens.size()) + " tokens");
             n_past = 0; // Reset for full context rebuild
         }
-        
-        // Validate n_past bounds before processing
-        if (n_past < 0) {
+          // Validate n_past bounds before processing
+        if (n_past < 0) [[unlikely]] {
             LLAMA_LOG("Error: Invalid n_past value: " + std::to_string(n_past));
             n_past = 0;
         }
         
-        if (n_past >= model_info->n_ctx) {
+        if (n_past >= model_info->n_ctx) [[unlikely]] {
             LLAMA_LOG("Error: n_past exceeds context size, resetting");
             n_past = 0;
-            if (context) {
+            if (context) [[likely]] {
                 llama_memory_clear(llama_get_memory(context), true); // Ensure kv memory/cache is cleared
             }
         }
         
         // Safer overflow check
         const size_t max_safe_add = static_cast<size_t>(std::numeric_limits<int32_t>::max() - n_past);
-        if (tokens.size() > max_safe_add) {
+        if (tokens.size() > max_safe_add) [[unlikely]] {
             LLAMA_LOG("Error: Token addition would cause overflow");
-            return false;        }        // ContextSizeManager integration - check if we need pruning before processing
-        if (should_trigger_pruning(*this, *model_info, static_cast<int32_t>(tokens.size()))) {
-            if (is_incremental) {
+            return false;        }
+        
+        // ContextSizeManager integration - check if we need pruning before processing
+        if (should_trigger_pruning(*this, *model_info, static_cast<int32_t>(tokens.size()))) [[unlikely]] {
+            if (is_incremental) [[likely]] {
                 LLAMA_LOG("Starting context rebuild: PARTIAL (ContextSizeManager triggered pruning) - context usage analysis recommended action");
                 
                 // Try to call the callback - handle both signatures
@@ -564,7 +637,7 @@ public:    // Add message to this context's history
                     pruning_result = pruning_callback();
                 }
                 
-                if (pruning_result) {
+                if (pruning_result) [[likely]] {
                     // After pruning, the calling method will handle context rebuild
                     return false;
                 } else {
@@ -576,89 +649,93 @@ public:    // Add message to this context's history
                 return false;
             }
         }
-        
-        // Process large token sets using incremental batch processing
+          // Process large token sets using incremental batch processing
         // When tokens exceed batch capacity, use incremental rebuilds instead of sequential processing
-        if (static_cast<int32_t>(tokens.size()) > n_batch) {
+        if (static_cast<int32_t>(tokens.size()) > n_batch) [[unlikely]] {
             LLAMA_LOG("Warning: Input tokens (" + std::to_string(tokens.size()) + 
                      ") exceed batch size (" + std::to_string(n_batch) + "), using incremental batch processing");
               
             // For full rebuilds with large token counts, process in optimal batch-sized chunks
             // This leverages batch efficiency while avoiding sequential token-by-token processing
-            if (!is_incremental) {
+            if (!is_incremental) [[unlikely]] {
                 return process_large_context_incrementally(tokens, n_batch);
             } else {
                 // For incremental updates, also use incremental batch processing
                 // This provides better performance than sequential processing
                 LLAMA_LOG("Note: Large incremental update, using incremental batch processing");
                 return process_large_context_incrementally(tokens, n_batch);
-            }
-        } else {            // Process all tokens in a single batch (normal case)
-            // CRITICAL FIX: Always generate logits for the final token to enable generation after context rebuilds
-            bool output_logits = true;  // Always true to ensure logits are available for AI generation
+            }        } else {            // Process all tokens in a single batch (normal case)
+            // CRITICAL FIX: Generate logits intelligently based on context state
+            // - During historical loading: never generate logits to avoid state corruption
+            // - For incremental updates (user messages): generate logits for immediate generation capability  
+            // - For full rebuilds: only generate logits for the final token if not in historical loading mode
+            bool is_historical_scenario = loading_historical_messages || is_likely_historical_loading();
+            bool output_logits = !is_historical_scenario && 
+                                ((is_incremental) || (!is_incremental && tokens.size() > 0));
             
-            if (!add_tokens_to_batch(tokens, n_past, seq_ids, output_logits)) {
+            if (is_historical_scenario) {
+                LLAMA_LOG("Skipping logits generation during historical loading scenario (explicit=" + 
+                         std::to_string(loading_historical_messages) + ", auto-detected=" + 
+                         std::to_string(is_likely_historical_loading()) + ", incremental=" + 
+                         std::to_string(is_incremental) + ", tokens=" + std::to_string(tokens.size()) + ")");
+            } else {
+                LLAMA_LOG("Generating logits (incremental=" + std::to_string(is_incremental) + 
+                         ", tokens=" + std::to_string(tokens.size()) + ", output_logits=" + std::to_string(output_logits) + ")");
+            }
+            
+            if (!add_tokens_to_batch(tokens, n_past, seq_ids, output_logits)) [[unlikely]] {
                 LLAMA_LOG("Error: Failed to add tokens to batch");
                 return false;
             }
             
             // Validate batch state before decode
-            if (batch.n_tokens <= 0) {
+            if (batch.n_tokens <= 0) [[unlikely]] {
                 LLAMA_LOG("Warning: Empty batch after token addition");
                 return true;
             }
             
             // Additional validation before decode
-            if (!context) {
+            if (!context) [[unlikely]] {
                 LLAMA_LOG("Error: Context became null before decode");
                 return false;
             }
             
-            if (!batch_initialized) {
+            if (!batch_initialized) [[unlikely]] {
                 LLAMA_LOG("Error: Batch became uninitialized before decode");
                 return false;
             }
             
             // Validate batch arrays are not null
             if (!batch.token || !batch.pos || 
-                !batch.logits || !batch.seq_id) {
+                !batch.logits || !batch.seq_id) [[unlikely]] {
                 LLAMA_LOG("Error: Batch arrays are null before decode");
                 return false;
             }
             
             // Use n_batch for validation
             const int32_t context_n_batch = llama_n_batch(context);
-            if (batch.n_tokens > context_n_batch) {
+            if (batch.n_tokens > context_n_batch) [[unlikely]] {
                 LLAMA_LOG("Error: Batch token count exceeds batch size limit");
                 return false;
             }
-            
-            // Add comprehensive error checking for decode operation with try-catch
-            try {
-                int decode_result = llama_decode(context, batch);
-                if (decode_result != 0) {
-                    LLAMA_LOG("Error: Failed to decode batch at position " + std::to_string(n_past) + 
-                               " (error code: " + std::to_string(decode_result) + ")");
-                    
-                    // Don't return false immediately, try to recover
-                    if (decode_result == -1) {
-                        LLAMA_LOG("Decode error -1: Attempting context reset...");
-                        if (context) {
-                            llama_memory_clear(llama_get_memory(context), true); // Ensure kv memory/cache is cleared
-                            n_past = 0;
-                        }
-                        return false; // Let caller handle retry
-                    } else {
-                        LLAMA_LOG("Severe decode error, aborting token processing");
-                        return false;
+              // Decode operation - llama_decode is a C function that returns error codes, no exceptions
+            int decode_result = llama_decode(context, batch);
+            if (decode_result != 0) [[unlikely]] {
+                LLAMA_LOG("Error: Failed to decode batch at position " + std::to_string(n_past) + 
+                           " (error code: " + std::to_string(decode_result) + ")");
+                
+                // Don't return false immediately, try to recover
+                if (decode_result == -1) [[unlikely]] {
+                    LLAMA_LOG("Decode error -1: Attempting context reset...");
+                    if (context) [[likely]] {
+                        llama_memory_clear(llama_get_memory(context), true); // Ensure kv memory/cache is cleared
+                        n_past = 0;
                     }
+                    return false; // Let caller handle retry
+                } else {
+                    LLAMA_LOG("Severe decode error, aborting token processing");
+                    return false;
                 }
-            } catch (const std::exception& e) {
-                LLAMA_LOG("Exception during decode: " + std::string(e.what()));
-                return false;
-            } catch (...) {
-                LLAMA_LOG("Unknown exception during decode");
-                return false;
             }
             
             n_past += static_cast<int32_t>(tokens.size());
@@ -668,9 +745,9 @@ public:    // Add message to this context's history
     }
     
     // Helper function to process large context using incremental batch rebuilds
-    // This allows us to process large token sets efficiently instead of sequentially
+    // This allows us to process large token sets efficiently instead of sequentially    
     bool process_large_context_incrementally(const std::vector<llama_token>& tokens, int32_t n_batch) {
-        if (tokens.empty()) return false;
+        if (tokens.empty()) [[unlikely]] return false;
         
         LLAMA_LOG("Processing " + std::to_string(tokens.size()) + " tokens using incremental batch method (batch size: " + std::to_string(n_batch) + ")");        
         // Clear context for full rebuild using context's reset method
@@ -681,40 +758,31 @@ public:    // Add message to this context's history
         size_t processed = 0;
         std::vector<llama_seq_id> seq_ids = {0};
         
-        while (processed < total_tokens) {
+        while (processed < total_tokens) [[likely]] {
             size_t chunk_size = std::min(static_cast<size_t>(n_batch), total_tokens - processed);
-            std::vector<llama_token> chunk(tokens.begin() + processed, tokens.begin() + processed + chunk_size);
-            
-            // Only output logits on the final chunk
-            bool output_logits = (processed + chunk_size >= total_tokens);
+            std::vector<llama_token> chunk(tokens.begin() + processed, tokens.begin() + processed + chunk_size);            // Only output logits on the final chunk, and only if not loading historical messages
+            bool is_historical_scenario = loading_historical_messages || is_likely_historical_loading();
+            bool output_logits = !is_historical_scenario && (processed + chunk_size >= total_tokens);
             
             LLAMA_LOG("Processing incremental batch " + std::to_string(processed / n_batch + 1) + 
                      " (" + std::to_string(chunk_size) + " tokens, pos: " + std::to_string(n_past) + ")");
             
-            if (!add_tokens_to_batch(chunk, n_past, seq_ids, output_logits)) {
+            if (!add_tokens_to_batch(chunk, n_past, seq_ids, output_logits)) [[unlikely]] {
                 LLAMA_LOG("Error: Failed to add batch chunk starting at token " + std::to_string(processed));
                 return false;
             }
-            
-            // Validate and decode the batch
-            if (batch.n_tokens <= 0) {
+              // Validate and decode the batch
+            if (batch.n_tokens <= 0) [[unlikely]] {
                 LLAMA_LOG("Warning: Empty batch in incremental processing");
                 processed += chunk_size;
                 continue;
             }
             
-            try {
-                int decode_result = llama_decode(context, batch);
-                if (decode_result != 0) {
-                    LLAMA_LOG("Error: Failed to decode incremental batch at position " + 
-                             std::to_string(n_past) + " (error code: " + std::to_string(decode_result) + ")");
-                    return false;
-                }
-            } catch (const std::exception& e) {
-                LLAMA_LOG("Exception during incremental decode: " + std::string(e.what()));
-                return false;
-            } catch (...) {
-                LLAMA_LOG("Unknown exception during incremental decode");
+            // Decode operation - llama_decode is a C function that returns error codes, no exceptions
+            int decode_result = llama_decode(context, batch);
+            if (decode_result != 0) [[unlikely]] {
+                LLAMA_LOG("Error: Failed to decode incremental batch at position " + 
+                         std::to_string(n_past) + " (error code: " + std::to_string(decode_result) + ")");
                 return false;
             }
             
