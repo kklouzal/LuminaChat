@@ -34,34 +34,30 @@ private:
     // Thread-safe container for blacklisted patterns
     std::unordered_set<std::string> blacklisted_patterns;
     mutable std::mutex blacklist_mutex;
-    
-    // Callback for performing retroactive cleanup when new patterns are added
+      // Callback for performing retroactive cleanup when new patterns are added
     RetroactiveCleanupCallback cleanup_callback;
 
+public:
     /**
-     * @brief Helper method to check if a response matches a specific blacklist pattern
+     * @brief Case-insensitive pattern matching using STL algorithms for performance
      * @param response The response text to check
      * @param pattern The blacklist pattern to match against
      * @return true if the response matches the pattern (case-insensitive)
      */
-    bool response_matches_pattern(const std::string& response, const std::string& pattern) const {
-        if (response.empty() || pattern.empty()) return false;
+    static bool matches_pattern(const std::string& response, const std::string& pattern) noexcept {
+        if (response.empty() || pattern.empty()) [[unlikely]] return false;
         
-        // Check for exact match
-        if (response == pattern) {
-            return true;
-        }
+        // Fast exact match check first
+        if (response == pattern) [[unlikely]] return true;
         
-        // Check for partial match (case-insensitive)
-        std::string lower_response = response;
-        std::string lower_pattern = pattern;
-        std::transform(lower_response.begin(), lower_response.end(), lower_response.begin(), ::tolower);
-        std::transform(lower_pattern.begin(), lower_pattern.end(), lower_pattern.begin(), ::tolower);
+        // Use STL search with case-insensitive comparison (Directive #10: Standard Library Preference)
+        auto it = std::search(response.begin(), response.end(), pattern.begin(), pattern.end(),
+            [](char a, char b) noexcept { 
+                return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b)); 
+            });
         
-        return lower_response.find(lower_pattern) != std::string::npos;
+        return it != response.end();
     }
-
-public:
     /**
      * @brief Constructor
      * @param cleanup_callback Optional callback for retroactive cleanup operations
@@ -119,57 +115,32 @@ public:
     void set_cleanup_callback(RetroactiveCleanupCallback callback) {
         std::lock_guard<std::mutex> lock(blacklist_mutex);
         cleanup_callback = std::move(callback);
-    }
-
-    /**
-     * @brief Check if a response is blacklisted
+    }    /**
+     * @brief Check if a response is blacklisted using optimized STL algorithms
      * @param response The response text to check
      * @return true if the response matches any blacklisted pattern
      */
     bool is_blacklisted(const std::string& response) const {
-        if (response.empty()) return false;
+        if (response.empty()) [[unlikely]] return false;
         
         std::lock_guard<std::mutex> lock(blacklist_mutex);
         
-        // Check for exact match
-        if (blacklisted_patterns.find(response) != blacklisted_patterns.end()) {
+        // Fast exact match check first using STL find (Directive #10: Standard Library Preference)
+        if (blacklisted_patterns.find(response) != blacklisted_patterns.end()) [[unlikely]] {
             return true;
         }
-        
-        // Check for partial matches (case-insensitive)
-        std::string lower_response = response;
-        std::transform(lower_response.begin(), lower_response.end(), lower_response.begin(), ::tolower);
-        
-        for (const auto& pattern : blacklisted_patterns) {
-            std::string lower_pattern = pattern;
-            std::transform(lower_pattern.begin(), lower_pattern.end(), lower_pattern.begin(), ::tolower);
-            
-            // Check if blacklisted phrase is contained in the response
-            if (lower_response.find(lower_pattern) != std::string::npos) {
-                return true;
-            }
-        }
-        
-        return false;
-    }
-
-    /**
-     * @brief Check if a response matches a specific pattern (for external use)
-     * @param response The response text to check
-     * @param pattern The pattern to match against
-     * @return true if the response matches the pattern
-     */
-    bool matches_pattern(const std::string& response, const std::string& pattern) const {
-        return response_matches_pattern(response, pattern);
-    }
-
-    /**
+          // Use STL any_of algorithm for pattern matching (Directive #10: Standard Library Preference)
+        return std::any_of(blacklisted_patterns.begin(), blacklisted_patterns.end(),
+            [&response](const std::string& pattern) noexcept {
+                return matches_pattern(response, pattern);
+            });
+    }    /**
      * @brief Add a pattern to the blacklist with automatic retroactive cleanup
      * @param pattern The pattern to add to the blacklist
      * @return true if the pattern was newly added, false if it already existed
      */
     bool add_pattern(const std::string& pattern) {
-        if (pattern.empty()) return false;
+        if (pattern.empty()) [[unlikely]] return false;
         
         // Check if this pattern is already blacklisted to avoid redundant cleanup
         bool pattern_already_exists = false;
@@ -178,7 +149,7 @@ public:
             auto result = blacklisted_patterns.insert(pattern);
             pattern_already_exists = !result.second;
             
-            if (!pattern_already_exists) {
+            if (!pattern_already_exists) [[likely]] {
                 LLAMA_LOG("Added pattern to blacklist: '" + 
                           (pattern.length() > 50 ? pattern.substr(0, 50) + "..." : pattern) + "'");
             } else {
@@ -189,26 +160,24 @@ public:
         }
         
         // Perform retroactive cleanup if callback is available
-        if (cleanup_callback) {
+        if (cleanup_callback) [[likely]] {
             LLAMA_LOG("Performing retroactive cleanup for newly blacklisted pattern");
             cleanup_callback(pattern);
         }
         
         return true;
-    }
-
-    /**
+    }    /**
      * @brief Add a pattern to the blacklist without retroactive cleanup
      * @param pattern The pattern to add to the blacklist
      * @return true if the pattern was newly added, false if it already existed
      */
     bool add_pattern_no_cleanup(const std::string& pattern) {
-        if (pattern.empty()) return false;
+        if (pattern.empty()) [[unlikely]] return false;
         
         std::lock_guard<std::mutex> lock(blacklist_mutex);
         auto result = blacklisted_patterns.insert(pattern);
         
-        if (result.second) {  // Insertion actually happened
+        if (result.second) [[likely]] {  // Insertion actually happened
             LLAMA_LOG("Added pattern to blacklist (no cleanup): '" + 
                       (pattern.length() > 50 ? pattern.substr(0, 50) + "..." : pattern) + "'");
             return true;
@@ -217,88 +186,85 @@ public:
                       (pattern.length() > 50 ? pattern.substr(0, 50) + "..." : pattern) + "'");
             return false;
         }
-    }
-
-    /**
-     * @brief Add multiple patterns to the blacklist efficiently
+    }/**
+     * @brief Add multiple patterns to the blacklist efficiently using STL algorithms
      * @param patterns Vector of patterns to add
      * @return Vector of newly added patterns (excludes duplicates)
      */
     std::vector<std::string> add_multiple_patterns(const std::vector<std::string>& patterns) {
-        if (patterns.empty()) return {};
+        if (patterns.empty()) [[unlikely]] return {};
         
         std::vector<std::string> new_patterns;
+        new_patterns.reserve(patterns.size()); // Reserve space for efficiency
         
-        // Add all patterns to blacklist and collect new ones
+        // Filter out empty patterns and add new ones efficiently
         {
             std::lock_guard<std::mutex> lock(blacklist_mutex);
-            for (const auto& pattern : patterns) {
-                if (!pattern.empty() && blacklisted_patterns.find(pattern) == blacklisted_patterns.end()) {
-                    blacklisted_patterns.insert(pattern);
-                    new_patterns.push_back(pattern);
-                    LLAMA_LOG("Added pattern to blacklist: '" + 
-                              (pattern.length() > 50 ? pattern.substr(0, 50) + "..." : pattern) + "'");
-                }
-            }
+            
+            // Use STL copy_if for filtering and processing (Directive #10: Standard Library Preference)
+            std::copy_if(patterns.begin(), patterns.end(), std::back_inserter(new_patterns),
+                [this](const std::string& pattern) {
+                    if (pattern.empty()) return false;
+                    
+                    auto [_, was_inserted] = blacklisted_patterns.insert(pattern);
+                    if (was_inserted) {
+                        LLAMA_LOG("Added pattern to blacklist: '" + 
+                                  (pattern.length() > 50 ? pattern.substr(0, 50) + "..." : pattern) + "'");
+                        return true;
+                    }
+                    return false;
+                });
         }
         
         // Perform retroactive cleanup for new patterns
-        if (!new_patterns.empty() && cleanup_callback) {
+        if (!new_patterns.empty() && cleanup_callback) [[likely]] {
             LLAMA_LOG("Performing retroactive cleanup for " + std::to_string(new_patterns.size()) + " new blacklist patterns");
             
-            for (const auto& pattern : new_patterns) {
-                cleanup_callback(pattern);
-            }
+            // Use STL for_each for callback invocation (Directive #10: Standard Library Preference)
+            std::for_each(new_patterns.begin(), new_patterns.end(), cleanup_callback);
         } else if (new_patterns.empty()) {
             LLAMA_LOG("All provided patterns were already blacklisted, no cleanup needed");
         }
         
         return new_patterns;
-    }
-
-    /**
+    }    /**
      * @brief Remove a pattern from the blacklist
      * @param pattern The pattern to remove
      * @return true if the pattern was found and removed, false otherwise
      */
     bool remove_pattern(const std::string& pattern) {
-        if (pattern.empty()) return false;
+        if (pattern.empty()) [[unlikely]] return false;
         
         std::lock_guard<std::mutex> lock(blacklist_mutex);
         auto it = blacklisted_patterns.find(pattern);
-        if (it != blacklisted_patterns.end()) {
+        if (it != blacklisted_patterns.end()) [[likely]] {
             blacklisted_patterns.erase(it);
             LLAMA_LOG("Removed pattern from blacklist: '" + 
                       (pattern.length() > 50 ? pattern.substr(0, 50) + "..." : pattern) + "'");
             return true;
         }
         return false;
-    }
-
-    /**
+    }    /**
      * @brief Clear all blacklisted patterns
      * @return Number of patterns that were cleared
      */
     size_t clear_all() {
         std::lock_guard<std::mutex> lock(blacklist_mutex);
         size_t count = blacklisted_patterns.size();
-        blacklisted_patterns.clear();
-        LLAMA_LOG("Cleared " + std::to_string(count) + " blacklisted patterns");
+        if (count > 0) [[likely]] {
+            blacklisted_patterns.clear();
+            LLAMA_LOG("Cleared " + std::to_string(count) + " blacklisted patterns");
+        }
         return count;
-    }
-
-    /**
-     * @brief Get all blacklisted patterns (for UI display or export)
+    }/**
+     * @brief Get all blacklisted patterns using optimized STL algorithms (for UI display or export)
      * @return Vector containing all current blacklist patterns
      */
     std::vector<std::string> get_all_patterns() const {
         std::lock_guard<std::mutex> lock(blacklist_mutex);
-        std::vector<std::string> result;
-        result.reserve(blacklisted_patterns.size());
-        for (const auto& pattern : blacklisted_patterns) {
-            result.push_back(pattern);
-        }
-        return result;
+        
+        // Use STL constructor for efficient copy (Directive #10: Standard Library Preference)
+        return std::vector<std::string>(blacklisted_patterns.begin(), blacklisted_patterns.end());
     }
 
     /**
@@ -317,40 +283,34 @@ public:
     bool empty() const {
         std::lock_guard<std::mutex> lock(blacklist_mutex);
         return blacklisted_patterns.empty();
-    }
-
-    /**
-     * @brief Manually trigger retroactive cleanup for all current patterns
+    }    /**
+     * @brief Manually trigger retroactive cleanup for all current patterns using STL algorithms
      * Useful when cleanup callback is set after patterns are added, or for maintenance
      */
     void trigger_full_cleanup() {
-        std::vector<std::string> all_patterns;
-        
-        // Get all current blacklist patterns
-        {
-            std::lock_guard<std::mutex> lock(blacklist_mutex);
-            all_patterns.reserve(blacklisted_patterns.size());
-            for (const auto& pattern : blacklisted_patterns) {
-                all_patterns.push_back(pattern);
-            }
-        }
-        
-        if (all_patterns.empty()) {
-            LLAMA_LOG("No blacklist patterns to clean up");
-            return;
-        }
-        
-        if (!cleanup_callback) {
+        if (!cleanup_callback) [[unlikely]] {
             LLAMA_LOG("No cleanup callback available for retroactive cleanup");
             return;
         }
         
+        std::vector<std::string> all_patterns;
+        
+        // Get all current blacklist patterns efficiently
+        {
+            std::lock_guard<std::mutex> lock(blacklist_mutex);
+            if (blacklisted_patterns.empty()) {
+                LLAMA_LOG("No blacklist patterns to clean up");
+                return;
+            }
+            
+            // Use STL constructor for efficient copy (Directive #10: Standard Library Preference)
+            all_patterns = std::vector<std::string>(blacklisted_patterns.begin(), blacklisted_patterns.end());
+        }
+        
         LLAMA_LOG("Triggering full retroactive cleanup for " + std::to_string(all_patterns.size()) + " blacklist patterns");
         
-        // Process each pattern
-        for (const auto& pattern : all_patterns) {
-            cleanup_callback(pattern);
-        }
+        // Use STL for_each for callback processing (Directive #10: Standard Library Preference)
+        std::for_each(all_patterns.begin(), all_patterns.end(), cleanup_callback);
         
         LLAMA_LOG("Full retroactive cleanup completed");
     }
