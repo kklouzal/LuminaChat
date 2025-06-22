@@ -3,6 +3,7 @@
 //
 // File Specific Directives:
 // Individual history loaders per context with immediate collection and pre-tokenization.
+// Each loader is tied to exactly one context and one Discord channel.
 // All contexts are isolated and independent, no shared context coordination required.
 //
 // PERFORMANCE OPTIMIZATIONS IMPLEMENTED:
@@ -68,7 +69,9 @@ class LlamaManager;
 // Forward declarations for ContextSizeManager integration
 struct ContextInfo;
 struct ModelInfo;
+struct EnhancedContextAnalysis;
 void initialize_context_size_manager(ContextInfo& context_info, const ModelInfo& model_info);
+EnhancedContextAnalysis analyze_context_usage(ContextInfo& context_info, const ModelInfo& model_info);
 void track_user_message(ContextInfo& context_info, const ModelInfo& model_info, int32_t user_tokens);
 
 // Status structure for DiscordManager compatibility
@@ -101,7 +104,7 @@ class DiscordHistoryLoader;
 // the current conversation, rather than appending them to the end.
 
 // Individual history loader for a specific isolated context
-class DiscordHistoryLoader : public std::enable_shared_from_this<DiscordHistoryLoader> {
+class DiscordHistoryLoader {
 private:
     // Context association - each loader tied to one context
     std::string target_context_id;
@@ -110,9 +113,8 @@ private:
     std::string model_id;
     
     // Thread safety for context access
-    mutable std::mutex context_access_mutex;
-      // Channel assignment and configuration
-    std::vector<uint64_t> assigned_channels;
+    mutable std::mutex context_access_mutex;    // Target channel for this isolated context loader
+    uint64_t target_channel_id;
 
     // NOTE: context_fill_ratio represents the target percentage of context to fill with HISTORICAL MESSAGES ONLY
     // The actual safe threshold must account for emergency buffer and AI response space
@@ -129,11 +131,12 @@ private:
     std::atomic<bool> target_reached{false};
     std::atomic<bool> collection_complete{false};
     std::atomic<bool> messages_applied{false};  // Track if messages have been applied to prevent duplicates
-    mutable std::mutex messages_mutex;
-      // Processing state
+    mutable std::mutex messages_mutex;    // Processing state
     uint64_t last_message_id = 0;
     std::unordered_set<uint64_t> processed_message_ids;
-    mutable std::mutex processed_ids_mutex;// Direct validation without unnecessary wrapper - eliminated redundant method
+    mutable std::mutex processed_ids_mutex;
+    
+    // Direct validation without unnecessary wrapper - eliminated redundant method
     
     // Following directive #7: favor direct access over abstractions
     bool validate_context_safe() const {
@@ -153,18 +156,17 @@ private:
     static constexpr int32_t TIMEOUT_SECONDS = 10;
     static constexpr int32_t RATE_LIMIT_DELAY_MS = 100;
     static constexpr int32_t MAX_MESSAGE_TOKENS = 2048;
-    
-    // Fetch and process a batch of messages from assigned channel
+      // Fetch and process a batch of messages from the target channel
     // Optimized batch processing with STL algorithms and error handling
     // Fixed deadlock by completely avoiding 'this' capture in async callbacks
     bool process_channel_batch() {
-        if (assigned_channels.empty() || target_reached.load()) [[unlikely]] return false;
+        if (target_reached.load()) [[unlikely]] return false;
         
         auto promise = std::make_shared<std::promise<dpp::message_map>>();
         auto future = promise->get_future();
         
         // Capture only essential data, no 'this' pointer to prevent deadlocks
-        uint64_t channel_id = assigned_channels[0];
+        uint64_t channel_id = target_channel_id;
         
         bot->messages_get(channel_id, 0, last_message_id, 0, MESSAGES_PER_FETCH,
             [promise](const dpp::confirmation_callback_t& callback) {
@@ -202,21 +204,20 @@ private:
         
         // STL: Find oldest message ID efficiently
         auto oldest_it = std::min_element(messages.begin(), messages.end(),
-            [](const auto& a, const auto& b) { return a.first < b.first; });
-
-        // Process messages with optimized filtering
+            [](const auto& a, const auto& b) { return a.first < b.first; });        // Process messages with optimized filtering
         for (const auto& [id, msg] : messages) {
             if (auto processed_msg = process_individual_message(msg, channel_id)) {
                 batch_messages.emplace_back(std::move(*processed_msg));
             }
-        }        // Update pagination state - explicit cast to resolve type ambiguity
-        last_message_id = oldest_it != messages.end() ? static_cast<uint64_t>(oldest_it->first) : last_message_id;
+        }
         
-        // Apply batch to context and check fill ratio
+        // Update pagination state - explicit cast to resolve type ambiguity
+        last_message_id = oldest_it != messages.end() ? static_cast<uint64_t>(oldest_it->first) : last_message_id;
+          // Apply batch to context and check fill ratio
         return apply_message_batch(std::move(batch_messages));
     }
-
-private:    // Process individual message - simplified without pre-tokenization
+    
+    // Process individual message - simplified without pre-tokenization
     std::optional<PreTokenizedMessage> process_individual_message(const dpp::message& msg, uint64_t channel_id) {
         uint64_t msg_id = static_cast<uint64_t>(msg.id);
 
@@ -259,10 +260,10 @@ private:    // Process individual message - simplified without pre-tokenization
     }
     
     // Extract content from message (direct access, no unnecessary wrappers)
-    std::string extract_message_content(const dpp::message& msg, bool is_our_bot) const {
-        std::string content = msg.content;
+    std::string extract_message_content(const dpp::message& msg, bool is_our_bot) const {        std::string content = msg.content;
         if (is_our_bot && !msg.embeds.empty() && !msg.embeds[0].description.empty()) {
-            content = msg.embeds[0].description;        }
+            content = msg.embeds[0].description;
+        }
         return safe_trim(TextSanitizer::sanitize_text(content));
     }
     
@@ -274,11 +275,11 @@ private:    // Process individual message - simplified without pre-tokenization
         if (!validate_context_unsafe()) return false;
         
         // Step 2: Loop through batch, add to context 1-by-1
-        for (auto it = batch_messages.rbegin(); it != batch_messages.rend(); ++it) {
-            std::string role = (it->username == "assistant") ? "assistant" : "user";
+        for (auto it = batch_messages.rbegin(); it != batch_messages.rend(); ++it) {            std::string role = (it->username == "assistant") ? "assistant" : "user";
             target_context->insert_historical_message(role, it->content);
         }
-          // Step 3: Trigger FULL context rebuild (NOT incremental)
+        
+        // Step 3: Trigger FULL context rebuild (NOT incremental)
         bool success = llama_manager->update_context_from_history(target_context);
         
         if (!success) {
@@ -290,11 +291,10 @@ private:    // Process individual message - simplified without pre-tokenization
         // This prevents unexpected incremental rebuilds when the user later generates responses
         target_context->conversation_state.needs_rebuild = false;
         target_context->message_cache_dirty = false;
-        
-        // Step 4: Check context usage size
+          // Step 4: Check context usage size
         if (!target_context->context_size_manager) return false;
         
-        auto analysis = target_context->context_size_manager->analyze_context(*target_context);
+        auto analysis = analyze_context_usage(*target_context, *target_context->model_info);
         float current_usage = static_cast<float>(analysis.total_used_tokens) / analysis.context_size;
         
         // Calculate safe target with direct arithmetic
@@ -321,9 +321,10 @@ private:    // Process individual message - simplified without pre-tokenization
         DISCORD_HISTORY_LOG("Batch applied to '" + target_context_id + "': " + 
                           std::to_string(current_usage * 100) + "% usage (target: " +
                           std::to_string(safe_target * 100) + "%)");
-        
-        return true;
-    }// Collection thread main function - simplified
+          return true;
+    }
+    
+    // Collection thread main function - simplified
     void collection_thread() {
         DISCORD_HISTORY_LOG("Starting collection for context '" + target_context_id + "'");
         
@@ -358,19 +359,17 @@ private:    // Process individual message - simplified without pre-tokenization
         while (!target_reached.load() && iterations < MAX_ITERATIONS) {
             if (!process_channel_batch()) {
                 break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(RATE_LIMIT_DELAY_MS));
+            }            std::this_thread::sleep_for(std::chrono::milliseconds(RATE_LIMIT_DELAY_MS));
             iterations++;
         }
-          collection_complete = true;
-        apply_to_isolated_context();
         
-        DISCORD_HISTORY_LOG("Collection complete for context '" + target_context_id + "': " + 
-                   std::to_string(total_tokens_collected.load()) + " tokens collected");
+        collection_complete = true;
+        apply_to_isolated_context();
+          DISCORD_HISTORY_LOG("Collection complete for context '" + target_context_id + "': " + 
+                           std::to_string(total_tokens_collected.load()) + " tokens collected");
     }
 
-public:
-    // Factory method for creating isolated context loaders
+public:    // Factory method for creating isolated context loaders
     static std::shared_ptr<DiscordHistoryLoader> create_for_context(
         const std::string& context_id, uint64_t channel_id, 
         ContextInfo* context, LlamaManager* llama_mgr, const std::string& model_identifier,
@@ -381,18 +380,18 @@ public:
         loader->target_context = context;
         loader->llama_manager = llama_mgr;
         loader->model_id = model_identifier;
-        loader->assigned_channels = {channel_id};
+        loader->target_channel_id = channel_id;
         loader->context_fill_ratio = fill_ratio;
         loader->bot = discord_bot;
         loader->bot_user_id = bot_user_id;
         
         return loader;
-    }
-
-    // Start collection immediately
+    }    // Start collection immediately
     void start_collection() {
         std::thread(&DiscordHistoryLoader::collection_thread, this).detach();
-    }    // Apply messages directly to context
+    }
+    
+    // Apply messages directly to context
     bool apply_to_isolated_context() {
         // Check if already applied to prevent duplicate applications
         if (messages_applied.load()) {
@@ -403,11 +402,11 @@ public:
         // Messages are already applied to context during collection
         // Just mark as applied and log completion
         messages_applied = true;
-        
-        DISCORD_HISTORY_LOG("Messages applied to context '" + target_context_id + "' during collection");
+          DISCORD_HISTORY_LOG("Messages applied to context '" + target_context_id + "' during collection");
         DISCORD_HISTORY_LOG("Final context usage: " + std::to_string(total_tokens_collected.load()) + " tokens");
         return true;
-    }    
+    }
+    
     // Get collected messages for reference
     std::vector<PreTokenizedMessage> get_collected_messages() const {
         std::lock_guard<std::mutex> lock(messages_mutex);

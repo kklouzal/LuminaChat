@@ -846,6 +846,8 @@ public:    // Add message to this context's history
         
         return true;
     }    // Dedicated context rebuilding from formatted content with rollback support
+    // IMPORTANT: PruningCallback parameter is expected to be a no-parameter callable (wrapper lambda)
+    // that already contains the pruning ratio internally. Do NOT call it with arguments.
     template<typename TokenProcessor, typename PruningCallback>
     bool rebuild_context_from_formatted_content(const std::string& formatted_content,
                                                TokenProcessor&& process_text_to_tokens,
@@ -871,8 +873,12 @@ public:    // Add message to this context's history
             }
             n_past = 0;
             prev_len = 0;            // Process full content - CRITICAL FIX: ensure logits are generated for the final token
-            std::vector<llama_token> rebuild_tokens = process_text_to_tokens(formatted_content, true);
-            if (!rebuild_tokens.empty() && process_context_tokens(rebuild_tokens, false, prune_conversation_with_summary)) {
+            std::vector<llama_token> rebuild_tokens = process_text_to_tokens(formatted_content, true);            // CALLBACK SIGNATURE: prune_conversation_with_summary is a no-parameter callable (wrapper lambda)
+            // Do NOT call it with arguments - it contains the ratio internally
+            auto rebuild_pruning_callback = [prune_conversation_with_summary]() { 
+                return prune_conversation_with_summary(); 
+            };
+            if (!rebuild_tokens.empty() && process_context_tokens(rebuild_tokens, false, rebuild_pruning_callback)) {
                 prev_len = new_len;
                 message_history_token_count = n_past;
                 
@@ -930,8 +936,12 @@ public:    // Add message to this context's history
                       std::to_string(new_len - prev_len) + " new characters");
             
             std::string new_content = formatted_content.substr(prev_len);            if (!new_content.empty()) {
-                std::vector<llama_token> new_tokens = process_text_to_tokens(new_content, false);
-                if (!new_tokens.empty() && !process_context_tokens(new_tokens, true, prune_conversation_with_summary)) {
+                std::vector<llama_token> new_tokens = process_text_to_tokens(new_content, false);                // CALLBACK SIGNATURE: prune_conversation_with_summary is a no-parameter callable (wrapper lambda)
+                // Do NOT call it with arguments - it contains the ratio internally
+                auto incremental_pruning_callback = [prune_conversation_with_summary]() { 
+                    return prune_conversation_with_summary(); 
+                };
+                if (!new_tokens.empty() && !process_context_tokens(new_tokens, true, incremental_pruning_callback)) {
                     LLAMA_LOG("Error: Failed to process incremental tokens");
                     return false;
                 }
@@ -951,16 +961,18 @@ public:    // Add message to this context's history
         }
         
         return true;
-    }
-
-    // Pruning and rebuilding logic with clear phases
+    }    // Pruning and rebuilding logic with clear phases
+    // IMPORTANT: PruningCallback parameter is expected to be a no-parameter callable (wrapper lambda)
+    // that already contains the pruning ratio internally. Do NOT call it with arguments.
     template<typename TokenProcessor, typename PruningCallback>
     bool prune_and_rebuild(std::string& formatted_content, std::vector<llama_token>& tokens, int32_t& total_token_count,
                           TokenProcessor&& process_text_to_tokens, PruningCallback&& prune_conversation_with_summary) {
-        LLAMA_LOG("Starting pruning and rebuild process");
-        LLAMA_LOG("Current usage: " + std::to_string(static_cast<float>(total_token_count) / model_info->n_ctx * 100.0f) + 
-                  "% (" + std::to_string(total_token_count) + "/" + std::to_string(model_info->n_ctx) + ")");        // PRUNING PHASE 1: Perform message history pruning with summarization
+        LLAMA_LOG("Starting pruning and rebuild process");        LLAMA_LOG("Current usage: " + std::to_string(static_cast<float>(total_token_count) / model_info->n_ctx * 100.0f) + 
+                  "% (" + std::to_string(total_token_count) + "/" + std::to_string(model_info->n_ctx) + ")");
+          // PRUNING PHASE 1: Perform message history pruning with summarization
         LLAMA_LOG("Pruning Phase 1: Summarizing and pruning message history");
+        // CALLBACK SIGNATURE: prune_conversation_with_summary is already a wrapped no-parameter callable
+        // Do NOT call it with arguments - it contains the ratio internally (see line 1346-1348 in caller)
         if (!prune_conversation_with_summary()) {
             LLAMA_LOG("Error: Failed to prune conversation with summarization");
             return false;
@@ -991,8 +1003,8 @@ public:    // Add message to this context's history
         conversation_state.update(formatted_content, tokens);
         
         LLAMA_LOG("Pruning and rebuild completed successfully");
-        return true;
-    }    // Update context from current message history - context-specific rebuilding
+        return true;    }    // Update context from current message history - context-specific rebuilding
+    // IMPORTANT: PruningCallback parameter expects a float parameter (keep_ratio)
     template<typename TokenProcessor, typename PruningCallback>
     bool update_context_from_history(TokenProcessor&& process_text_to_tokens, 
                                      PruningCallback&& prune_conversation_with_summary) {
@@ -1020,7 +1032,11 @@ public:    // Add message to this context's history
             return false;
         }
           // Delegate to the context's rebuild method
-        bool success = rebuild_context_from_formatted_content(formatted_content, process_text_to_tokens, prune_conversation_with_summary, true);
+        // Create a wrapper lambda since rebuild_context_from_formatted_content expects no-parameter callable
+        auto pruning_wrapper = [&prune_conversation_with_summary]() {
+            return prune_conversation_with_summary(ContextSizeConstants::TARGET_CONTEXT_USAGE);
+        };
+        bool success = rebuild_context_from_formatted_content(formatted_content, process_text_to_tokens, pruning_wrapper, true);
         
         if (success) {
             // Update the cached message history token count since we just rebuilt the context
@@ -1196,14 +1212,13 @@ inline EnhancedContextAnalysis EnhancedContextSizeManager::analyze_context(const
     // Calculate allocations based on current strategy and usage patterns
     auto ai_stats = ai_response_tracker_.get_statistics();
     auto summary_stats = summary_tracker_.get_statistics();
-    
-    // Dynamic space requirements with strategy-based multipliers
+      // Dynamic space requirements with strategy-based multipliers
     analysis.required_ai_space = static_cast<int32_t>(ai_stats.estimated_size * ContextSizeConstants::DYNAMIC_BUFFER_MULTIPLIER);
     analysis.required_summary_space = static_cast<int32_t>(summary_stats.estimated_size * ContextSizeConstants::DYNAMIC_BUFFER_MULTIPLIER);
-    analysis.emergency_buffer_space = static_cast<int32_t>(analysis.context_size * ContextSizeConstants::GLOBAL_EMERGENCY_BUFFER);
+    analysis.emergency_buffer_space = static_cast<int32_t>(analysis.context_size * ContextSizeConstants::EMERGENCY_BUFFER);
     
-    // Calculate dynamic allocation percentages
-    analysis.emergency_buffer_percentage = ContextSizeConstants::GLOBAL_EMERGENCY_BUFFER;
+    // Calculate dynamic allocation percentages for this context
+    analysis.emergency_buffer_percentage = ContextSizeConstants::EMERGENCY_BUFFER;
     analysis.summary_allocation_percentage = static_cast<float>(analysis.summary_tokens) / analysis.context_size;
     analysis.ai_allocation_percentage = static_cast<float>(analysis.required_ai_space) / analysis.context_size;
     analysis.active_content_percentage = static_cast<float>(analysis.active_history_tokens) / analysis.context_size;
@@ -1344,7 +1359,11 @@ inline bool ContextInfo::prepare_context_for_generation(TokenProcessor&& process
         }
     } else {
         LLAMA_LOG("Phase 3: No pruning needed - ContextSizeManager analysis indicates sufficient space");        // PHASE 4: Rebuild context with current tokens
-        if (!rebuild_context_from_formatted_content(formatted_content, process_text_to_tokens, prune_conversation_with_summary, false)) {
+        // Create wrapper lambda since rebuild_context_from_formatted_content expects no-parameter callable
+        auto rebuild_wrapper = [&prune_conversation_with_summary]() {
+            return prune_conversation_with_summary(ContextSizeConstants::TARGET_CONTEXT_USAGE);
+        };
+        if (!rebuild_context_from_formatted_content(formatted_content, process_text_to_tokens, rebuild_wrapper, false)) {
             LLAMA_LOG("Error: Failed to rebuild context from formatted content");
             return false;
         }

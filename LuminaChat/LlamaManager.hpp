@@ -2,7 +2,7 @@
 // 
 // RESPONSIBILITY: Core management and infrastructure
 // - Model loading, management, and lifecycle
-// - Context creation, switching, and management  
+// - Context creation and individual context management  
 // - Batch operations and token processing
 // - Template application and conversation state
 // - Text-to-token conversion (input processing)
@@ -109,7 +109,7 @@ namespace LlamaConstants {
 // - All public methods must be called from a single thread or protected by external mutexes
 // - The llama.cpp backend itself has thread-safety limitations that require careful handling
 // - Model loading/unloading operations are particularly sensitive to race conditions
-// - Context switching operations modify shared state and must be serialized
+// - Individual context operations require proper synchronization within each context
 //
 // INTEGRATION WITH LlamaResponse:
 // - LlamaManager handles setup, context management, and provides callback functions
@@ -119,12 +119,13 @@ class LlamaManager {
 private:
     
     std::unordered_map<std::string, std::unique_ptr<ModelInfo>> models;
-    std::unordered_map<std::string, std::unique_ptr<ContextInfo>> contexts;
-
-    // Bidirectional cache for token-to-text and text-to-token mappings
-    mutable TokenCache token_cache;    // Response generation handler
+    std::unordered_map<std::string, std::unique_ptr<ContextInfo>> contexts;    // Bidirectional cache for token-to-text and text-to-token mappings
+    mutable TokenCache token_cache;
+    
+    // Response generation handler
     mutable LlamaResponse response_generator;
-      // AI Response Blacklist - responses on this list won't be added to message history
+    
+    // AI Response Blacklist - responses on this list won't be added to message history
     Blacklist ai_response_blacklist;
 
 private:
@@ -226,28 +227,31 @@ private:
         LLAMA_LOG("Retroactive cleanup completed:");
         LLAMA_LOG("  Contexts processed: " + std::to_string(total_contexts_processed));
         LLAMA_LOG("  Total messages removed: " + std::to_string(total_messages_removed));
-        LLAMA_LOG("  Contexts rebuilt: " + std::to_string(contexts_requiring_rebuild));
-    }
+        LLAMA_LOG("  Contexts rebuilt: " + std::to_string(contexts_requiring_rebuild));    }
 
-  public:    LlamaManager() : token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE), response_generator(&token_cache),
+public:
+    LlamaManager() : token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE), response_generator(&token_cache),
                      ai_response_blacklist([this](const std::string& pattern) { perform_retroactive_cleanup(pattern); }) {
     }
 
     ~LlamaManager() noexcept {
         cleanup();
     }
-    
-    // Initialize llama.cpp backend
+      // Initialize llama.cpp backend
     bool initialize() {
         ggml_backend_load_all();
-        return true;    }    // Load .gguf model file and create ModelInfo with specific parameters
+        return true;
+    }
+    
+    // Load .gguf model file and create ModelInfo with specific parameters
     bool load_model(const std::string& model_path, const std::string& model_id = "", 
                    int32_t context_size = LlamaConstants::DEFAULT_CONTEXT_SIZE, int32_t gpu_layers = LlamaConstants::DEFAULT_GPU_LAYERS, int32_t predict_tokens = LlamaConstants::DEFAULT_PREDICT_TOKENS,
                    void* progress_callback_user_data = nullptr, const std::string& chat_template = "") {
-        if (!std::filesystem::exists(model_path)) [[unlikely]] {
-            LLAMA_LOG("Error: Model file does not exist: " + model_path);
+        if (!std::filesystem::exists(model_path)) [[unlikely]] {            LLAMA_LOG("Error: Model file does not exist: " + model_path);
             return false;
-        }        std::string actual_model_id = model_id.empty() ? std::filesystem::path(model_path).stem().string() : model_id;
+        }
+        
+        std::string actual_model_id = model_id.empty() ? std::filesystem::path(model_path).stem().string() : model_id;
         
         if (models.find(actual_model_id) != models.end()) [[unlikely]] {
             LLAMA_LOG("Model '" + actual_model_id + "' already loaded, using existing model");
@@ -268,10 +272,11 @@ private:
 
         // Load the model
         model_info->model = llama_model_load_from_file(model_path.c_str(), model_params);
-        if (!model_info->model) [[unlikely]] {
-            LLAMA_LOG("Error: Failed to load model from " + model_path);
+        if (!model_info->model) [[unlikely]] {            LLAMA_LOG("Error: Failed to load model from " + model_path);
             return false;
-        }model_info->vocab = llama_model_get_vocab(model_info->model);
+        }
+        
+        model_info->vocab = llama_model_get_vocab(model_info->model);
         model_info->model_path = model_path;
         model_info->model_name = actual_model_id;
         model_info->n_ctx = context_size;
@@ -291,10 +296,10 @@ private:
         clear_caches();
         
         LLAMA_LOG("Model loaded successfully: " + model_path + " as '" + actual_model_id + 
-                  "' (ctx:" + std::to_string(context_size) + ", gpu:" + std::to_string(gpu_layers) + ")");
-        return true;
+                  "' (ctx:" + std::to_string(context_size) + ", gpu:" + std::to_string(gpu_layers) + ")");        return true;
     }
-      // Context creation with consistent system prompt usage
+    
+    // Context creation with consistent system prompt usage
     bool create_context(const std::string& context_id, const std::string& model_id, const std::string& system_prompt = "", bool reset_after_generation = false) {
         auto model_it = models.find(model_id);
         if (model_it == models.end()) [[unlikely]] {
@@ -342,14 +347,8 @@ private:
             LLAMA_LOG("Error: Failed to initialize batch for context '" + context_id + "'");
             llama_free(context_info->context);
             return false;
-        }
-        context_info->batch_initialized = true;
-          // Always use provided system prompt, or copy from main context if empty
+        }        context_info->batch_initialized = true;        // Use provided system prompt directly - each context is independent
         std::string prompt_to_use = system_prompt;
-		auto main_context = get_context_info("main_context");
-        if (prompt_to_use.empty() && main_context && !main_context->system_message.empty()) [[unlikely]] {
-            prompt_to_use = main_context->system_message;
-        }
           // Set system message if we have one
         if (!prompt_to_use.empty()) [[likely]] {
             context_info->system_message = prompt_to_use;
@@ -1155,22 +1154,20 @@ private:
     void clear_caches() const {
         token_cache.clear();
     }
-      // Helper method for summarizer callback - generates response on a specific context without context switching
+
+    // Helper method for summarizer callback - generates response on a specific context directly
     std::string generate_response_on_context(const std::string& input, const std::string& username, ContextInfo* target_context) {
-        // Generate response directly on the target context without switching
-        LLAMA_LOG("Generating response directly on target context without switching");
+        // Generate response directly on the target context
+        LLAMA_LOG("Generating response directly on target context");
         
         // Pre-flight validation instead of broad try-catch
         if (!target_context) [[unlikely]] {
             LLAMA_LOG("Error: Null target context provided");
-            return "Error: Invalid context";
-        }
+            return "Error: Invalid context";        }
         
         // Use the overloaded method that accepts a specific context
         return generate_response(input, target_context, username);
     }
-
-private:
 };
 
 //

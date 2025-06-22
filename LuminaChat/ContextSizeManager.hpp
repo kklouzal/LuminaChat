@@ -1,13 +1,17 @@
 // ContextSizeManager.hpp - Production-ready adaptive context size management for LLaMA contexts
 //
-// COMPREHENSIVE STRATEGY:
-// - Dynamic tracking of AI response sizes with 1.5x buffer
-// - Dynamic tracking of summary sizes with 1.5x buffer  
-// - Hard 30% cap for summary allocation with dynamic threshold management
-// - 10% global emergency buffer for prediction overruns
-// - Minimum 3 summary slots with intelligent merging
-// - Truly adaptive space allocation based on rolling averages
-// - Mathematical validation of all allocation constraints
+// ISOLATED CONTEXT STRATEGY:
+// - Each ContextInfo has its own EnhancedContextSizeManager instance
+// - Dynamic tracking of AI response sizes with 1.5x buffer per context
+// - Dynamic tracking of summary sizes with 1.5x buffer per context
+// - Hard 30% cap for summary allocation with dynamic threshold management per context
+// - 10% emergency buffer for prediction overruns per context
+// - Minimum 3 summary slots with intelligent merging per context
+// - Truly adaptive space allocation based on rolling averages per context
+// - Mathematical validation of all allocation constraints per context
+//
+// INTEGRATION: Functions implemented in LlamaContext.hpp to avoid circular dependencies
+// Usage: initialize_context_size_manager(), analyze_context_usage(), track_user_message(), track_ai_response()
 
 #pragma once
 
@@ -20,6 +24,8 @@
 #include <memory>
 #include <cmath>
 #include <mutex>
+#include <optional>
+#include <unordered_set>
 #include "LogHandler.hpp"
 
 // Forward declarations - actual definitions in LlamaContext.hpp
@@ -33,14 +39,14 @@ enum class ContextStrategy : uint8_t {
     SUMMARY_HEAVY = 2  // Prioritize summary space for detailed summarization
 };
 
-// Mathematically validated context size management configuration
+// Mathematically validated context size management configuration for isolated contexts
 namespace ContextSizeConstants {
-    // Core allocation constraints (mathematically validated)
-    static constexpr float MAX_TOTAL_SUMMARY_ALLOCATION = 0.30f;     // Hard 30% cap for all summaries
-    static constexpr float GLOBAL_EMERGENCY_BUFFER = 0.10f;          // 10% global safety buffer  
-    static constexpr float MIN_AI_ALLOCATION = 0.15f;                // Minimum 15% for AI responses
-    static constexpr float MIN_ACTIVE_CONTENT = 0.25f;               // Minimum 25% for active conversation
-    static constexpr float DYNAMIC_BUFFER_MULTIPLIER = 1.5f;         // 1.5x multiplier for predictions
+    // Core allocation constraints per context (mathematically validated)
+    static constexpr float MAX_TOTAL_SUMMARY_ALLOCATION = 0.30f;     // Hard 30% cap for all summaries per context
+    static constexpr float EMERGENCY_BUFFER = 0.10f;                 // 10% emergency buffer per context
+    static constexpr float MIN_AI_ALLOCATION = 0.15f;                // Minimum 15% for AI responses per context
+    static constexpr float MIN_ACTIVE_CONTENT = 0.25f;               // Minimum 25% for active conversation per context
+    static constexpr float DYNAMIC_BUFFER_MULTIPLIER = 1.5f;         // 1.5x multiplier for predictions per context
     
     // Summary management
     static constexpr size_t MIN_SUMMARY_SLOTS = 3;                   // Minimum slots before merging
@@ -70,14 +76,13 @@ namespace ContextSizeConstants {
     static constexpr float MAX_CONTEXT_USAGE = 0.90f;
     static constexpr float TARGET_CONTEXT_USAGE = 0.60f;
     static constexpr float AGGRESSIVE_PRUNING_RATIO = 0.30f;
-    
-    // Mathematical validation: Ensure allocations don't exceed safe limits
-    static_assert(GLOBAL_EMERGENCY_BUFFER + MAX_TOTAL_SUMMARY_ALLOCATION + 
+      // Mathematical validation: Ensure allocations don't exceed safe limits per context
+    static_assert(EMERGENCY_BUFFER + MAX_TOTAL_SUMMARY_ALLOCATION + 
                   MIN_AI_ALLOCATION + MIN_ACTIVE_CONTENT <= 0.85f, 
-                  "Allocation constraints exceed safe limits - total must be <= 85%");
+                  "Allocation constraints exceed safe limits - total must be <= 85% per context");
 }
 
-// Thread-safe adaptive size tracker with prediction accuracy monitoring
+// Thread-safe adaptive size tracker with prediction accuracy monitoring for isolated contexts
 template<typename T>
 class AdaptiveSizeTracker {
 private:
@@ -87,15 +92,15 @@ private:
     T default_size_;
     std::string tracker_name_;
     
-    // Enhanced statistics
+    // Enhanced statistics for this context's tracker
     float average_size_ = 0.0f;
     float standard_deviation_ = 0.0f;
     T max_size_ = 0;
     T min_size_ = std::numeric_limits<T>::max();
     
-    // Prediction accuracy tracking
+    // Prediction accuracy tracking for this context
     std::vector<float> prediction_errors_;
-    float average_prediction_error_ = 0.0f;    
+    float average_prediction_error_ = 0.0f;
 public:
     explicit AdaptiveSizeTracker(T default_size, const std::string& name) noexcept
         : estimated_size_(default_size), default_size_(default_size), tracker_name_(name) {
@@ -126,24 +131,27 @@ public:
         
         // Maintain rolling window
         if (size_samples_.size() > ContextSizeConstants::MAX_SAMPLES_TO_TRACK) [[unlikely]] {
-            size_samples_.erase(size_samples_.begin());
-        }
+            size_samples_.erase(size_samples_.begin());        }
         
         update_statistics();
-          LLAMA_LOG(tracker_name_ + " tracked: " + std::to_string(actual_size) + 
+        
+        LLAMA_LOG(tracker_name_ + " tracked: " + std::to_string(actual_size) + 
                   " tokens (avg: " + std::to_string(average_size_) + 
                   ", estimated: " + std::to_string(estimated_size_) + ")");
-    }    // Get estimated size with dynamic buffer
+    }
+    
+    // Get estimated size with dynamic buffer
     [[nodiscard]] inline T get_estimated_size() const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
-        return estimated_size_;
-    }
-      // Get required space with safety margin and prediction error compensation
+        return estimated_size_;    }
+    
+    // Get required space with safety margin and prediction error compensation
     [[nodiscard]] inline T get_required_space() const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         return get_required_space_unsafe();
     }
-      // Get comprehensive statistics
+    
+    // Get comprehensive statistics
     struct SizeStats {
         float average;
         float std_deviation;
@@ -153,9 +161,9 @@ public:
         bool has_reliable_data;
         float prediction_accuracy;
         T estimated_size;
-        T required_space;
-    };
-      [[nodiscard]] SizeStats get_statistics() const noexcept {
+        T required_space;    };
+    
+    [[nodiscard]] SizeStats get_statistics() const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         return {
             average_size_,
@@ -169,7 +177,8 @@ public:
             get_required_space_unsafe()
         };
     }
-      // Check if patterns suggest heavy allocation
+    
+    // Check if patterns suggest heavy allocation
     [[nodiscard]] bool suggests_heavy_allocation() const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         
@@ -182,9 +191,9 @@ public:
                                                ContextSizeConstants::LARGE_SUMMARY_THRESHOLD);
         
         const bool has_high_variability = standard_deviation_ > (average_size_ * ContextSizeConstants::VARIABILITY_THRESHOLD);
-        
-        return has_large_sizes || has_high_variability;
-    }    
+          return has_large_sizes || has_high_variability;
+    }
+    
 private:
     // Internal helper for get_required_space (assumes lock is held)
     [[nodiscard]] inline T get_required_space_unsafe() const noexcept {
@@ -198,10 +207,10 @@ private:
         if (!prediction_errors_.empty() && average_prediction_error_ > 0.1f) [[unlikely]] {
             safe_estimate *= (1.0f + average_prediction_error_);
         }
-        
-        return static_cast<T>(safe_estimate);
+          return static_cast<T>(safe_estimate);
     }
-      void update_statistics() noexcept {
+    
+    void update_statistics() noexcept {
         if (size_samples_.empty()) [[unlikely]] return;
         
         // Calculate average using STL algorithm (optimized)
@@ -304,9 +313,9 @@ public:
         const float dynamic_threshold = base_threshold + adjustment;
         return std::clamp(dynamic_threshold, 
                          ContextSizeConstants::MIN_SUMMARY_MERGE_THRESHOLD,
-                         ContextSizeConstants::MAX_SUMMARY_MERGE_THRESHOLD);
-    }
-      // Get usage pattern statistics
+                         ContextSizeConstants::MAX_SUMMARY_MERGE_THRESHOLD);    }
+    
+    // Get usage pattern statistics
     struct UsagePatternStats {
         float average_context_growth_per_interaction;
         float peak_usage_in_window;
@@ -315,7 +324,8 @@ public:
         size_t sample_count;
         bool has_reliable_patterns;
     };
-      [[nodiscard]] UsagePatternStats get_statistics() const noexcept {
+    
+    [[nodiscard]] UsagePatternStats get_statistics() const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         return {
             average_context_growth_per_interaction_,
@@ -323,8 +333,8 @@ public:
             usage_volatility_,
             calculate_dynamic_threshold_unsafe(),
             recent_context_usage_.size(),
-            recent_context_usage_.size() >= ContextSizeConstants::MIN_SAMPLES_FOR_RELIABILITY
-        };    }
+            recent_context_usage_.size() >= ContextSizeConstants::MIN_SAMPLES_FOR_RELIABILITY        };
+    }
     
 private:
     [[nodiscard]] inline float calculate_dynamic_threshold_unsafe() const noexcept {
@@ -358,9 +368,9 @@ private:
         const float dynamic_threshold = base_threshold + adjustment;
         return std::clamp(dynamic_threshold, 
                          ContextSizeConstants::MIN_SUMMARY_MERGE_THRESHOLD,
-                         ContextSizeConstants::MAX_SUMMARY_MERGE_THRESHOLD);
-    }
-      void update_pattern_analysis() noexcept {
+                         ContextSizeConstants::MAX_SUMMARY_MERGE_THRESHOLD);    }
+    
+    void update_pattern_analysis() noexcept {
         if (recent_context_usage_.size() < 2) [[unlikely]] return;
         
         // Calculate average context growth per interaction using STL algorithms (optimized)
@@ -413,7 +423,7 @@ private:
     size_t merge_operations_count_ = 0;
     mutable UsagePatternTracker usage_tracker_;
     
-public:    
+public:
     void set_context_size(int32_t size) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         context_size_ = size;
@@ -485,9 +495,9 @@ public:
         bool exceeds_hard_cap;
         bool at_minimum_slots;
         bool needs_merge;
-        UsagePatternTracker::UsagePatternStats usage_patterns;
-    };
-      [[nodiscard]] SummarySlotStats get_statistics() const noexcept {
+        UsagePatternTracker::UsagePatternStats usage_patterns;    };
+    
+    [[nodiscard]] SummarySlotStats get_statistics() const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         
         const float usage = get_usage_percentage_unsafe();
@@ -527,9 +537,9 @@ public:
     }
     
     [[nodiscard]] int32_t get_total_tokens() const noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return total_summary_tokens_;
-    }    
+        std::lock_guard<std::mutex> lock(mutex_);        return total_summary_tokens_;
+    }
+    
 private:
     [[nodiscard]] inline float get_usage_percentage_unsafe() const noexcept {
         return context_size_ > 0 ? static_cast<float>(total_summary_tokens_) / static_cast<float>(context_size_) : 0.0f;
@@ -616,7 +626,9 @@ public:
         float average_context_pressure;
         std::chrono::minutes conversation_duration;
         float pruning_frequency;
-    };    [[nodiscard]] ConversationMetrics get_metrics() const noexcept {
+    };
+    
+    [[nodiscard]] ConversationMetrics get_metrics() const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         
         const auto duration = std::chrono::duration_cast<std::chrono::minutes>(
@@ -699,13 +711,14 @@ public:
     explicit EnhancedContextSizeManager() noexcept
         : current_strategy_(ContextStrategy::BALANCED),
           ai_response_tracker_(ContextSizeConstants::DEFAULT_AI_RESPONSE_SIZE, "AI Response"),
-          summary_tracker_(ContextSizeConstants::DEFAULT_SUMMARY_SIZE, "Summary"),
-          last_strategy_review_(std::chrono::steady_clock::now()) {}
-      // Set context size for all calculations
+          summary_tracker_(ContextSizeConstants::DEFAULT_SUMMARY_SIZE, "Summary"), last_strategy_review_(std::chrono::steady_clock::now()) {}
+    
+    // Set context size for all calculations
     void set_context_size(const int32_t context_size) noexcept {
         summary_slot_manager_.set_context_size(context_size);
     }
-      // Track AI response with optional prediction for accuracy monitoring
+    
+    // Track AI response with optional prediction for accuracy monitoring
     void track_ai_response(const int32_t actual_tokens, const int32_t predicted_tokens = 0) noexcept {
         ai_response_tracker_.add_sample(actual_tokens, predicted_tokens);
         conversation_analyzer_.track_message();
@@ -739,17 +752,19 @@ public:
         return summary_tracker_.get_estimated_size();
     }
     
-    // Comprehensive context analysis with all dynamic features
+    // Comprehensive context analysis with all dynamic features    
+    
     EnhancedContextAnalysis analyze_context(const ContextInfo& context) const;
-      // Summary management workflow
+    
+    // Summary management workflow
     struct SummaryManagementPlan {
         bool can_add_directly;
         bool needs_merge_first;
         size_t merge_cycles_needed;
         std::string action_plan;
-        float estimated_final_usage_percentage;
-    };
-      [[nodiscard]] SummaryManagementPlan plan_summary_addition(const int32_t estimated_summary_size) const noexcept {
+        float estimated_final_usage_percentage;    };
+    
+    [[nodiscard]] SummaryManagementPlan plan_summary_addition(const int32_t estimated_summary_size) const noexcept {
         SummaryManagementPlan plan{};
         
         plan.needs_merge_first = summary_slot_manager_.needs_merge_before_adding(estimated_summary_size);
@@ -770,9 +785,9 @@ public:
                 static_cast<float>(estimated_after_merge + estimated_summary_size) / static_cast<float>(4096);
         }
         
-        return plan;
-    }
-      // Execute summary addition with automatic merge management
+        return plan;    }
+    
+    // Execute summary addition with automatic merge management
     template<typename MergeCallback>
     [[nodiscard]] bool execute_summary_addition(const int32_t actual_summary_size, MergeCallback&& merge_callback) noexcept {
         const auto plan = plan_summary_addition(actual_summary_size);
@@ -849,9 +864,9 @@ public:
         
         // Performance insights
         if (analysis.prediction_accuracy_score < 0.7f) [[unlikely]] {
-            recommendations.emplace_back("Low prediction accuracy - consider larger safety margins");
-        }
-          if (analysis.context_utilization_efficiency > 0.9f) [[likely]] {
+            recommendations.emplace_back("Low prediction accuracy - consider larger safety margins");        }
+        
+        if (analysis.context_utilization_efficiency > 0.9f) [[likely]] {
             const std::string efficiency_message = "Excellent context utilization - " + 
                 std::to_string(analysis.context_utilization_efficiency * 100) + "% efficiency";
             recommendations.emplace_back(efficiency_message);
@@ -873,8 +888,8 @@ public:
     
     // Reset all summary slots
     void reset_summary_slots() noexcept {
-        summary_slot_manager_.clear_all_slots();
-    }    
+        summary_slot_manager_.clear_all_slots();    }
+    
 private:
     void review_strategy() noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -884,7 +899,9 @@ private:
             return;  // Review every 3 minutes max
         }
         
-        const ContextStrategy suggested = conversation_analyzer_.suggest_optimal_strategy(ai_response_tracker_, summary_tracker_);        if (suggested != current_strategy_) [[unlikely]] {
+        const ContextStrategy suggested = conversation_analyzer_.suggest_optimal_strategy(ai_response_tracker_, summary_tracker_);
+        
+        if (suggested != current_strategy_) [[unlikely]] {
             const std::string log_message = std::string("Auto-strategy adaptation: ") + 
                                           strategy_to_string(current_strategy_) + 
                                           " -> " + strategy_to_string(suggested);
@@ -892,8 +909,9 @@ private:
             current_strategy_ = suggested;
         }
         
-        last_strategy_review_ = now;
-    }      [[nodiscard]] static constexpr const char* strategy_to_string(const ContextStrategy strategy) noexcept {
+        last_strategy_review_ = now;    }
+    
+    [[nodiscard]] static constexpr const char* strategy_to_string(const ContextStrategy strategy) noexcept {
         switch (strategy) {
             case ContextStrategy::BALANCED: return "BALANCED";
             case ContextStrategy::AI_HEAVY: return "AI_HEAVY";
@@ -903,8 +921,14 @@ private:
     }
 };
 
-// Implementation note: EnhancedContextSizeManager::analyze_context method 
-// implementation is moved to LlamaContext.hpp to avoid circular dependencies
+// INTEGRATION NOTES:
+// - Each ContextInfo instance has its own EnhancedContextSizeManager via std::unique_ptr
+// - No shared/global context management - all operations are isolated per context
+// - EnhancedContextSizeManager::analyze_context() implementation is in LlamaContext.hpp to avoid circular dependencies
+// - Integration functions (initialize_context_size_manager, analyze_context_usage, track_user_message, track_ai_response) 
+//   are implemented as inline functions in LlamaContext.hpp and called by other components
+// - Thread safety: Each context's ContextSizeManager is protected by its own mutexes
+// - Memory management: RAII through std::unique_ptr ownership in ContextInfo
 
 //
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!
