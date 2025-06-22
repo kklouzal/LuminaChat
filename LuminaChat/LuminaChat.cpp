@@ -361,7 +361,7 @@ private:
         wxStaticBoxSizer* context_buffer_box;
         wxRichTextCtrl* chat_history;
         wxTextCtrl *input_text, *logs_text, *summaries_text;
-        wxListBox* message_history_list;
+        wxTextCtrl* message_history_list;
         wxChoice* context_selector;
         wxNotebook* notebook;
         wxPanel* main_panel;
@@ -619,10 +619,9 @@ private:
         controls_sizer->AddStretchSpacer();
         
         sizer->Add(controls_sizer, 0, wxEXPAND | wxALL, 5);
-        
-        // Create the listbox for message history
-        ui.message_history_list = new wxListBox(panel, wxID_ANY, wxDefaultPosition, wxDefaultSize,
-                                              0, nullptr, wxLB_SINGLE | wxLB_HSCROLL);
+          // Create the text control for message history (multi-line display)
+        ui.message_history_list = new wxTextCtrl(panel, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
+                                                wxTE_MULTILINE | wxTE_READONLY | wxTE_WORDWRAP);
         ui.message_history_list->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
         
         sizer->Add(ui.message_history_list, 1, wxEXPAND | wxALL, 5);
@@ -1154,8 +1153,7 @@ private:
         LLAMA_LOG("LuminaChat stopped.");
         ui.gen_stats_label->SetLabel("Ready\nTokens: 0\nSpeed: 0.0 tok/s\nTime: 0.0s");        // Clear message history display when model is stopped
         if (ui.message_history_list) {
-            ui.message_history_list->Clear();
-            ui.message_history_list->Append("Model stopped - no message history available");
+            ui.message_history_list->SetValue("Model stopped - no message history available");
         }
     }
     
@@ -1557,11 +1555,9 @@ private:
             ui.ai_space_progress_bar->SetValue(0);
             ui.buffer_progress_bar->SetValue(0);
         }
-    }
-      void RefreshMessageHistory() {        if (!ui.message_history_list || !is_started || !llama_manager) {
+    }      void RefreshMessageHistory() {        if (!ui.message_history_list || !is_started || !llama_manager) {
             if (ui.message_history_list) {
-                ui.message_history_list->Clear();
-                ui.message_history_list->Append("Model not started - no message history available");
+                ui.message_history_list->SetValue("Model not started - no message history available");
             }
             if (ui.context_selector) {
                 ui.context_selector->Clear();
@@ -1575,8 +1571,8 @@ private:
         // First, update the context selector dropdown with all available contexts
         UpdateContextSelector();
         
-        // Clear existing items
-        ui.message_history_list->Clear();
+        // Clear existing content
+        ui.message_history_list->SetValue("");
           // Get selected context from dropdown
         wxString selected_context = "main_chat"; // Default
         if (ui.context_selector && ui.context_selector->GetSelection() != wxNOT_FOUND) {
@@ -1586,39 +1582,33 @@ private:
         // Get the selected context
         auto context_info = llama_manager->get_context_info(selected_context.ToStdString());
         if (!context_info) {
-            ui.message_history_list->Append(wxString::Format("Context '%s' not found or not available", selected_context));
+            ui.message_history_list->SetValue(wxString::Format("Context '%s' not found or not available", selected_context));
             return;
         }
         
-        // Add each message to the listbox
+        // Add each message to the text control with full content
         if (context_info->message_history.empty()) {
-            ui.message_history_list->Append("No messages in history");        } else {
+            ui.message_history_list->SetValue("No messages in history");        } else {
+            wxString full_history;
             for (size_t i = 0; i < context_info->message_history.size(); ++i) {
                 const auto& msg = context_info->message_history[i];
                 
-                // Format: [index] role: content (truncated if too long)
+                // Format: [index] role: content (full content, no truncation)
                 std::string content = msg.second;  // content is the second element of the pair
-                if (content.length() > 100) {
-                    content = content.substr(0, 97) + "...";
-                }
                 
-                // Replace newlines with spaces for better display
-                std::replace(content.begin(), content.end(), '\n', ' ');
-                std::replace(content.begin(), content.end(), '\r', ' ');
-                
-                wxString formatted = wxString::Format("[%zu] %s: %s", 
+                // Keep newlines intact for proper multi-line display
+                wxString formatted = wxString::Format("[%zu] %s:\n%s\n\n", 
                                                     i, 
                                                     wxString::FromUTF8(msg.first),   // role is the first element of the pair
                                                     wxString::FromUTF8(content));
-                ui.message_history_list->Append(formatted);
+                full_history += formatted;
             }
+            ui.message_history_list->SetValue(full_history);
         }
         
         // Scroll to the bottom to show most recent messages
-        if (ui.message_history_list->GetCount() > 0) {
-            ui.message_history_list->SetSelection(ui.message_history_list->GetCount() - 1);
-        }
-    }    void UpdateContextSelector() {
+        ui.message_history_list->SetInsertionPointEnd();
+    }void UpdateContextSelector() {
         if (!ui.context_selector || !llama_manager) return;
         
         // Store current selection

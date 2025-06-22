@@ -95,8 +95,7 @@ private:
     
     void update_memory_usage(const int64_t delta) const noexcept {
         update_memory_usage_impl(memory_usage_bytes, delta);
-    }
-      // Hash function for token vectors
+    }    // Hash function for token vectors
     [[nodiscard]] std::string hash_tokens(const std::vector<llama_token>& tokens) const noexcept {
         if (tokens.empty()) [[unlikely]] {
             return "empty_tokens";
@@ -109,7 +108,7 @@ private:
         
         // Use STL algorithm for better optimization
         hash_value = std::accumulate(tokens.begin(), tokens.end(), hash_value,
-            [](size_t acc, llama_token token) noexcept {
+            [](const size_t acc, const llama_token token) noexcept {
                 return acc ^ (hasher(token) + HASH_CONSTANT + (acc << 6) + (acc >> 2));
             });
         
@@ -246,7 +245,7 @@ public:    explicit TokenCache(const size_t max_size = DEFAULT_CACHE_SIZE,
         text_to_entry.reserve(INITIAL_RESERVE_SIZE);
         token_hash_to_entry.reserve(INITIAL_RESERVE_SIZE);
         access_iterators.reserve(INITIAL_RESERVE_SIZE);
-    }// Configure cache settings
+    }    // Configure cache settings
     void configure(const EvictionPolicy policy, const bool enable_thread_safety = false) noexcept {
         const_cast<EvictionPolicy&>(eviction_policy) = policy;
         const_cast<bool&>(thread_safe) = enable_thread_safety;
@@ -302,8 +301,7 @@ public:    explicit TokenCache(const size_t max_size = DEFAULT_CACHE_SIZE,
             return std::nullopt;
         });
     }
-    
-    // Store bidirectional mapping: Text ↔ Tokens
+      // Store bidirectional mapping: Text ↔ Tokens
     void put(std::string text_key, std::string text, std::vector<llama_token> tokens) const {
         return with_write_lock([&]() {
             add_entry_internal(std::move(text_key), std::move(text), std::move(tokens));
@@ -321,8 +319,7 @@ public:    explicit TokenCache(const size_t max_size = DEFAULT_CACHE_SIZE,
                 token_hash_to_entry.reserve(new_capacity);
                 access_iterators.reserve(new_capacity);
             }
-            
-            // Use STL for_each for better optimization than range-based for
+              // Use STL for_each for better optimization than range-based for
             std::for_each(entries.begin(), entries.end(), [this](auto& entry) {
                 auto& [key, text, tokens] = entry;
                 add_entry_internal(std::move(key), std::move(text), std::move(tokens));

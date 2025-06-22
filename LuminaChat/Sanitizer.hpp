@@ -5,9 +5,8 @@
 #include <algorithm>
 
 class TextSanitizer {
-public:
-    // Sanitize text by removing invalid Unicode characters and Discord-specific formatting
-    [[nodiscard]] static std::string sanitize_text(const std::string& text) {
+public:    // Sanitize text by removing invalid Unicode characters and Discord-specific formatting
+    [[nodiscard]] static std::string sanitize_text(const std::string& text) noexcept {
         if (text.empty()) [[unlikely]] {
             return text;
         }
@@ -66,9 +65,9 @@ private:    // Remove Discord-specific formatting that might cause tokenization 
             // If regex fails, return original text rather than empty string
             return text;
         }
-    }    // Remove invalid Unicode characters that might cause tokenization issues
+    }// Remove invalid Unicode characters that might cause tokenization issues
     [[nodiscard]] static std::string remove_invalid_unicode(const std::string& text) noexcept {
-        if (text.empty()) [[unlikely]] {
+        if (text.empty()) {
             return text;
         }
         
@@ -122,39 +121,35 @@ private:    // Remove Discord-specific formatting that might cause tokenization 
         }
         
         return result;
-    }
-
-    // Get the expected length of a UTF-8 sequence based on the first byte
-    static int get_utf8_sequence_length(unsigned char first_byte) {
-        if ((first_byte & 0x80) == 0) return 1;      // 0xxxxxxx
-        if ((first_byte & 0xE0) == 0xC0) return 2;   // 110xxxxx
-        if ((first_byte & 0xF0) == 0xE0) return 3;   // 1110xxxx
-        if ((first_byte & 0xF8) == 0xF0) return 4;   // 11110xxx
+    }    // Get the expected length of a UTF-8 sequence based on the first byte
+    [[nodiscard]] static constexpr int get_utf8_sequence_length(const unsigned char first_byte) noexcept {
+        if ((first_byte & 0x80) == 0) [[likely]] return 1;      // 0xxxxxxx
+        if ((first_byte & 0xE0) == 0xC0) [[unlikely]] return 2;   // 110xxxxx
+        if ((first_byte & 0xF0) == 0xE0) [[unlikely]] return 3;   // 1110xxxx
+        if ((first_byte & 0xF8) == 0xF0) [[unlikely]] return 4;   // 11110xxx
         return 0; // Invalid UTF-8 start byte
-    }
-
-    // Decode a UTF-8 sequence to a Unicode codepoint
-    static uint32_t decode_utf8_codepoint(const std::string& utf8_sequence) {
-        if (utf8_sequence.empty()) return 0;
+    }    // Decode a UTF-8 sequence to a Unicode codepoint
+    [[nodiscard]] static constexpr uint32_t decode_utf8_codepoint(const std::string& utf8_sequence) noexcept {
+        if (utf8_sequence.empty()) [[unlikely]] return 0;
         
-        unsigned char first = static_cast<unsigned char>(utf8_sequence[0]);
+        const unsigned char first = static_cast<unsigned char>(utf8_sequence[0]);
         
-        if (utf8_sequence.length() == 1) {
+        if (utf8_sequence.length() == 1) [[likely]] {
             return first; // ASCII
         }
         
         uint32_t codepoint = 0;
         
-        if (utf8_sequence.length() == 2) {
+        if (utf8_sequence.length() == 2) [[unlikely]] {
             codepoint = (first & 0x1F) << 6;
             codepoint |= (static_cast<unsigned char>(utf8_sequence[1]) & 0x3F);
         }
-        else if (utf8_sequence.length() == 3) {
+        else if (utf8_sequence.length() == 3) [[unlikely]] {
             codepoint = (first & 0x0F) << 12;
             codepoint |= (static_cast<unsigned char>(utf8_sequence[1]) & 0x3F) << 6;
             codepoint |= (static_cast<unsigned char>(utf8_sequence[2]) & 0x3F);
         }
-        else if (utf8_sequence.length() == 4) {
+        else if (utf8_sequence.length() == 4) [[unlikely]] {
             codepoint = (first & 0x07) << 18;
             codepoint |= (static_cast<unsigned char>(utf8_sequence[1]) & 0x3F) << 12;
             codepoint |= (static_cast<unsigned char>(utf8_sequence[2]) & 0x3F) << 6;
@@ -162,24 +157,24 @@ private:    // Remove Discord-specific formatting that might cause tokenization 
         }
         
         return codepoint;
-    }    // Check if a Unicode codepoint is valid and safe for tokenization
-    static bool is_valid_codepoint(uint32_t codepoint) {
+    }// Check if a Unicode codepoint is valid and safe for tokenization
+    [[nodiscard]] static constexpr bool is_valid_codepoint(const uint32_t codepoint) noexcept {
         // Skip null character
-        if (codepoint == 0) return false;
+        if (codepoint == 0) [[unlikely]] return false;
         
         // Only skip the most problematic ranges, be less aggressive
         // Skip surrogates (should not appear in UTF-8)
-        if (codepoint >= 0xD800 && codepoint <= 0xDFFF) {
+        if (codepoint >= 0xD800 && codepoint <= 0xDFFF) [[unlikely]] {
             return false;
         }
         
         // Skip non-characters (U+FFFE and U+FFFF in any plane)
-        if ((codepoint & 0xFFFE) == 0xFFFE) {
+        if ((codepoint & 0xFFFE) == 0xFFFE) [[unlikely]] {
             return false;
         }
         
         // Skip specific problematic non-character range
-        if (codepoint >= 0xFDD0 && codepoint <= 0xFDEF) {
+        if (codepoint >= 0xFDD0 && codepoint <= 0xFDEF) [[unlikely]] {
             return false;
         }
         
@@ -187,8 +182,8 @@ private:    // Remove Discord-specific formatting that might cause tokenization 
         // Modern LLMs can handle these without issues
         return true;
     }    // Normalize whitespace to prevent tokenization issues while preserving structure
-    static std::string normalize_whitespace(const std::string& text) {
-        if (text.empty()) return text;
+    [[nodiscard]] static std::string normalize_whitespace(const std::string& text) noexcept {
+        if (text.empty()) [[unlikely]] return text;
         
         try {
             std::string normalized = text;
@@ -210,9 +205,9 @@ private:    // Remove Discord-specific formatting that might cause tokenization 
             // If regex fails, do basic whitespace cleanup
             std::string result = text;
             // Just trim leading/trailing whitespace as fallback
-            size_t start = result.find_first_not_of(" \t\n\r");
-            if (start == std::string::npos) return "";
-            size_t end = result.find_last_not_of(" \t\n\r");
+            const size_t start = result.find_first_not_of(" \t\n\r");
+            if (start == std::string::npos) [[unlikely]] return "";
+            const size_t end = result.find_last_not_of(" \t\n\r");
             return result.substr(start, end - start + 1);
         }
     }

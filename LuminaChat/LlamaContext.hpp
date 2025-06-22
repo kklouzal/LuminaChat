@@ -227,11 +227,15 @@ struct ContextInfo {
     // but that pattern is no longer used. The count is now always maintained accurately.
     int32_t message_history_token_count = 0;
       // Reference to associated model
-    ModelInfo* model_info;
-
-    // Special flag for contexts that should reset before each generation
+    ModelInfo* model_info;    // Special flag for contexts that should reset before each generation
     // Primarily used for summary models that need a clean slate for each task
-    bool reset_after_generation = false;    // Flag to track if we're currently loading historical messages
+    bool reset_after_generation = false;
+    
+    // CRITICAL: Flag to track if context is properly initialized and ready for operations
+    // This prevents race conditions where external components access partially-initialized contexts
+    std::atomic<bool> fully_initialized{false};
+    
+    // Flag to track if we're currently loading historical messages
     // This prevents logits generation during bulk historical loading
     bool loading_historical_messages = false;
 
@@ -312,10 +316,14 @@ struct ContextInfo {
         }
           return true;
     }
-    
-    // Check if context is valid for operations
+      // Check if context is valid for operations
     bool is_valid() const {
-        return context != nullptr && model_info != nullptr;
+        return context != nullptr && model_info != nullptr && fully_initialized.load();
+    }
+    
+    // Check if context is valid and ready for external operations (more strict)
+    bool is_ready_for_external_access() const {
+        return is_valid() && !loading_historical_messages;
     }
       // Reset context state
     void reset_context_state() {

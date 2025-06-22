@@ -89,10 +89,9 @@ private:
     static constexpr int32_t MIN_HISTORY_PERCENTAGE = 10;
     static constexpr int32_t MAX_HISTORY_PERCENTAGE = 80;
     static constexpr int32_t MAX_SUMMARIZER_CONTEXT = 32768;
-    static constexpr int32_t MAX_SUMMARIZER_PREDICT = 2048;
-
-    static std::string EscapeString(const std::string& input) {
+    static constexpr int32_t MAX_SUMMARIZER_PREDICT = 2048;    static std::string EscapeString(const std::string& input) noexcept {
         std::string result;
+        result.reserve(input.length() + input.length() / 4); // Reserve extra space for escapes
         for (const char c : input) {
             switch (c) {
                 case '\n': result += "\\n"; break;
@@ -105,11 +104,11 @@ private:
         }
         return result;
     }
-    
-    static std::string UnescapeString(const std::string& input) {
+      static std::string UnescapeString(const std::string& input) noexcept {
         std::string result;
+        result.reserve(input.length()); // Reserve space for efficiency
         for (size_t i = 0; i < input.size(); ++i) {
-            if (input[i] == '\\' && i + 1 < input.size()) {
+            if (input[i] == '\\' && i + 1 < input.size()) [[unlikely]] {
                 switch (input[i + 1]) {
                     case 'n': result += '\n'; i++; break;
                     case 'r': result += '\r'; i++; break;
@@ -118,14 +117,13 @@ private:
                     case '=': result += '='; i++; break;
                     default: result += input[i]; break;
                 }
-            } else {
+            } else [[likely]] {
                 result += input[i];
             }
         }
         return result;
-    }
-      // Validate and clamp integer values
-    static int32_t ValidateInt32(const std::string& value, const int32_t default_val, const int32_t min_val, const int32_t max_val) {
+    }    // Validate and clamp integer values
+    static int32_t ValidateInt32(const std::string& value, const int32_t default_val, const int32_t min_val, const int32_t max_val) noexcept {
         try {
             const int32_t result = std::stoi(value);
             return std::clamp(result, min_val, max_val);
@@ -134,8 +132,7 @@ private:
         }
     }
 
-public:
-    static std::string GetSettingsFilePath() {
+public:    static std::string GetSettingsFilePath() noexcept {
         // Get the directory where the executable is located
         wxString exeDir = wxStandardPaths::Get().GetExecutablePath();
         wxFileName exePath(exeDir);

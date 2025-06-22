@@ -187,8 +187,7 @@ public:
 private:
 
 void setup_event_handlers() {
-        if (!bot) [[unlikely]] return;
-          bot->on_ready([this](const dpp::ready_t& event) {
+        if (!bot) [[unlikely]] return;        bot->on_ready([this](const dpp::ready_t& event) {
             is_connected = true;
             DISCORD_LOG("Discord bot ready! Logged in as: " + bot->me.username);
             
@@ -199,6 +198,10 @@ void setup_event_handlers() {
             if (!shared_history_channels.empty()) {
                 create_shared_context_history_system();
             }
+              // CRITICAL: Add delay to ensure all contexts are fully initialized
+            // before any Discord message processing begins - increased for better reliability
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            LLAMA_LOG("Discord bot initialization completed - contexts ready for message processing");
         });
         
         bot->on_message_create([this](const dpp::message_create_t& event) {
@@ -311,13 +314,24 @@ void setup_event_handlers() {
         PendingMessage new_message{
             sanitized_message, username, user_id, channel_id, guild_id,
             std::chrono::system_clock::now()
-        };
-          // Add message to history immediately using direct context access
+        };        // Add message to history immediately using direct context access - retry initialization if needed
         ContextInfo* target_context = llama_manager ? llama_manager->get_context_info(context_id) : nullptr;
-        if (target_context) [[likely]] {
+        if (target_context && target_context->fully_initialized.load()) [[likely]] {
             target_context->add_message("user", username + ": " + sanitized_message);
             ++total_messages_processed;
             last_activity = std::chrono::system_clock::now();
+        } else if (target_context) [[unlikely]] {
+            // Context exists but not fully initialized - attempt retry
+            LLAMA_LOG("WARNING: Context '" + context_id + "' not initialized for message queue - attempting retry");
+            
+            if (llama_manager->retry_context_initialization(context_id)) {
+                LLAMA_LOG("SUCCESS: Context '" + context_id + "' initialized successfully for message queue");
+                target_context->add_message("user", username + ": " + sanitized_message);
+                ++total_messages_processed;
+                last_activity = std::chrono::system_clock::now();
+            } else {
+                LLAMA_LOG("ERROR: Context '" + context_id + "' retry initialization failed - message not added to queue history");
+            }
         }
         
         {
@@ -474,8 +488,7 @@ void setup_event_handlers() {
                 context_processing_flags[context_id] = false;
             }
         }).detach();
-    }
-      std::string process_user_message_direct(const std::string& message, const std::string& username, 
+    }      std::string process_user_message_direct(const std::string& message, const std::string& username, 
                                            uint64_t user_id, uint64_t channel_id, uint64_t guild_id) {
         if (!llama_manager) [[unlikely]] return "Error: AI backend not available";        
         
@@ -485,6 +498,18 @@ void setup_event_handlers() {
         ContextInfo* target_context = llama_manager ? llama_manager->get_context_info(context_id) : nullptr;
         if (!target_context) [[unlikely]] {
             return "Error: Failed to access your chat context";
+        }
+          // CRITICAL: Verify context is ready for generation before proceeding, retry if needed
+        if (!target_context->fully_initialized.load()) [[unlikely]] {
+            LLAMA_LOG("WARNING: Discord attempting to use uninitialized context '" + context_id + "' - attempting retry initialization");
+            
+            // Attempt retry initialization
+            if (llama_manager->retry_context_initialization(context_id)) {
+                LLAMA_LOG("SUCCESS: Context '" + context_id + "' initialized successfully for Discord generation");
+            } else {
+                LLAMA_LOG("ERROR: Context '" + context_id + "' retry initialization failed - deferring message");
+                return "The AI is still initializing for this channel. Please try again in a moment.";
+            }
         }
         
         std::string response = llama_manager->generate_response(message, target_context, username);
@@ -500,17 +525,29 @@ void setup_event_handlers() {
         if (sanitized_message.empty()) [[unlikely]] return;
         
         std::string context_id = get_or_create_user_context(user_id, username, channel_id, guild_id);
-        if (context_id.empty()) [[unlikely]] return;
-          // Use direct context access to add message to history
+        if (context_id.empty()) [[unlikely]] return;        // Use direct context access to add message to history - retry initialization if needed
         ContextInfo* target_context = llama_manager ? llama_manager->get_context_info(context_id) : nullptr;
-        if (target_context) [[likely]] {
+        if (target_context && target_context->fully_initialized.load()) [[likely]] {
             target_context->add_message("user", username + ": " + sanitized_message);
             ++total_messages_processed;
             last_activity = std::chrono::system_clock::now();
-            DISCORD_LOG("Added message to history (listening mode) for context '" + context_id + "'");
+            DISCORD_LOG("Added message to history (listening mode) for context '" + context_id + "'");        } else if (target_context) [[unlikely]] {
+            // Context exists but not fully initialized - attempt retry
+            LLAMA_LOG("WARNING: Context '" + context_id + "' not initialized for history-only mode - attempting retry");
+            
+            if (llama_manager->retry_context_initialization(context_id)) {
+                LLAMA_LOG("SUCCESS: Context '" + context_id + "' initialized successfully for history-only mode");
+                target_context->add_message("user", username + ": " + sanitized_message);
+                ++total_messages_processed;
+                last_activity = std::chrono::system_clock::now();
+                DISCORD_LOG("Added message to history (listening mode) for context '" + context_id + "' after retry");
+            } else {
+                LLAMA_LOG("ERROR: Context '" + context_id + "' retry initialization failed - message not added to history");
+            }
         }
     }
-      std::vector<std::string> split_message(const std::string& message, size_t max_length = MAX_MESSAGE_LENGTH) const {
+      
+    std::vector<std::string> split_message(const std::string& message, size_t max_length = MAX_MESSAGE_LENGTH) const {
         if (message.length() <= max_length) [[likely]] {
             return {message};
         }
@@ -590,8 +627,7 @@ void setup_event_handlers() {
         
         last_time = now;
         return false;
-    }
-      // Create contexts for all isolated channels that the bot can access
+    }      // Create contexts for all isolated channels that the bot can access
     void create_isolated_channel_contexts() {
         if (!llama_manager || model_id.empty()) [[unlikely]] return;
         
@@ -606,11 +642,24 @@ void setup_event_handlers() {
                 channel_contexts[channel_id] = context_id;
                 DISCORD_LOG("Using existing context for isolated channel: " + std::to_string(channel_id));
             } else {
-                // Create new context
+                // Create new context with mandatory warmup
+                DISCORD_LOG("Creating new context for isolated channel: " + std::to_string(channel_id));
                 if (llama_manager->create_context(context_id, model_id, system_prompt)) {
                     std::lock_guard<std::mutex> data_lock(data_mutex);
                     channel_contexts[channel_id] = context_id;
                     DISCORD_LOG("Created context '" + context_id + "' for isolated channel: " + std::to_string(channel_id));
+                      // CRITICAL: Verify context is actually ready before proceeding, retry if needed
+                    auto context_info = llama_manager->get_context_info(context_id);
+                    if (context_info && !context_info->fully_initialized.load()) {
+                        DISCORD_LOG("WARNING: Context '" + context_id + "' not fully initialized after creation - attempting retry");
+                        
+                        // Attempt retry initialization
+                        if (llama_manager->retry_context_initialization(context_id)) {
+                            DISCORD_LOG("SUCCESS: Context '" + context_id + "' initialized successfully on retry");
+                        } else {
+                            DISCORD_LOG("ERROR: Context '" + context_id + "' failed retry initialization - will require manual recovery");
+                        }
+                    }
                 } else {
                     DISCORD_LOG("Warning: Failed to create context for isolated channel: " + std::to_string(channel_id));
                     continue;
@@ -711,11 +760,23 @@ void setup_event_handlers() {
                 user_contexts[user_id] = context_id;
                 return context_id;
             }
-            
-            // Use new API with model_id parameter and proper system prompt
+              // Use new API with model_id parameter and proper system prompt
             std::string system_prompt = get_system_prompt_for_new_context();
             if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, system_prompt)) {
                 user_contexts[user_id] = context_id;
+                  // CRITICAL: Verify context is ready for use, retry if needed
+                auto created_context = llama_manager->get_context_info(context_id);
+                if (created_context && !created_context->fully_initialized.load()) {
+                    LLAMA_LOG("WARNING: Created Discord context '" + context_id + "' not fully initialized - attempting retry");
+                    
+                    // Attempt retry initialization
+                    if (llama_manager->retry_context_initialization(context_id)) {
+                        LLAMA_LOG("SUCCESS: Discord context '" + context_id + "' initialized successfully on retry");
+                    } else {
+                        LLAMA_LOG("ERROR: Discord context '" + context_id + "' failed retry initialization");
+                    }
+                }
+                
                 return context_id;
             }
         } else if (is_isolated_chan) {
@@ -731,11 +792,23 @@ void setup_event_handlers() {
                 channel_contexts[channel_id] = context_id;
                 return context_id;
             }
-            
-            DISCORD_LOG("Warning: Creating missing context for isolated channel: " + std::to_string(channel_id));
+              DISCORD_LOG("Warning: Creating missing context for isolated channel: " + std::to_string(channel_id));
             std::string system_prompt = get_system_prompt_for_new_context();
             if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, system_prompt)) {
                 channel_contexts[channel_id] = context_id;
+                  // CRITICAL: Verify context is ready for use, retry if needed
+                auto created_context = llama_manager->get_context_info(context_id);
+                if (created_context && !created_context->fully_initialized.load()) {
+                    LLAMA_LOG("WARNING: Created fallback Discord context '" + context_id + "' not fully initialized - attempting retry");
+                    
+                    // Attempt retry initialization
+                    if (llama_manager->retry_context_initialization(context_id)) {
+                        LLAMA_LOG("SUCCESS: Fallback Discord context '" + context_id + "' initialized successfully on retry");
+                    } else {
+                        LLAMA_LOG("ERROR: Fallback Discord context '" + context_id + "' failed retry initialization");
+                    }
+                }
+                
                 return context_id;
             }
         }

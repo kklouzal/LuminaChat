@@ -432,8 +432,7 @@ private:
                           std::to_string(current_usage * 100) + "% usage");
         return true;
     }
-    
-    // Collection thread main function
+      // Collection thread main function
     // Fixed deadlock by avoiding mutex holds across async operations
     void collection_thread() {
         DISCORD_HISTORY_LOG("Starting collection for context '" + target_context_id + "'");
@@ -442,6 +441,33 @@ private:
             DISCORD_HISTORY_LOG("ERROR: Context validation failed at start for '" + target_context_id + "' - aborting collection");
             collection_complete = true;
             return;
+        }
+        
+        // CRITICAL: Wait for context to be fully initialized before proceeding
+        int32_t initialization_checks = 0;
+        const int32_t MAX_INIT_CHECKS = 10;
+        while (initialization_checks < MAX_INIT_CHECKS) {
+            {
+                std::lock_guard<std::mutex> lock(context_access_mutex);
+                if (target_context && target_context->fully_initialized.load()) {
+                    break;
+                }
+            }
+            DISCORD_HISTORY_LOG("Waiting for context '" + target_context_id + "' to be fully initialized...");
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            initialization_checks++;
+        }
+          if (initialization_checks >= MAX_INIT_CHECKS) {
+            DISCORD_HISTORY_LOG("ERROR: Context '" + target_context_id + "' failed to initialize within timeout - attempting manual retry");
+            
+            // Attempt one manual retry of context initialization
+            if (llama_manager && llama_manager->retry_context_initialization(target_context_id)) {
+                DISCORD_HISTORY_LOG("SUCCESS: Context '" + target_context_id + "' initialized successfully on manual retry");
+            } else {
+                DISCORD_HISTORY_LOG("CRITICAL: Context '" + target_context_id + "' manual retry failed - aborting collection");
+                collection_complete = true;
+                return;
+            }
         }
         
         try {
