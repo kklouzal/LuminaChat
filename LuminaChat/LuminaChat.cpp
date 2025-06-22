@@ -325,11 +325,11 @@ private:
     std::unique_ptr<wxLogStreamBuffer> cout_buffer, cerr_buffer;
     std::streambuf* original_cout{nullptr};
     std::streambuf* original_cerr{nullptr};
-      // Consolidated configuration structure
+      // Consolidated configuration structure    
     struct AppConfig {
         std::string model_path, chat_template;
         std::string identity_directive, other_directives;
-        std::string discord_token, discord_isolated_channels, discord_shared_channels;
+        std::string discord_token, discord_isolated_channels;
         std::string summarizer_model_path, summarizer_system_prompt, summarizer_chat_template;
         std::string blacklist_entries;
         int32_t context_size{2048}, gpu_layers{0}, predict_tokens{256};
@@ -437,8 +437,7 @@ public:
         const wxString timestamp = wxDateTime::Now().Format("%H:%M:%S");
         const wxString formatted = wxString::Format("[%s] INPUT:\n%s\n\n", timestamp, input);
         AppendToSummariesThreadSafe(formatted);
-    }
-    
+    }    
     void AppendSummaryOutput(const wxString& output) {
         const wxString timestamp = wxDateTime::Now().Format("%H:%M:%S");
         const wxString formatted = wxString::Format("[%s] OUTPUT:\n%s\n\n%s\n\n", 
@@ -447,11 +446,12 @@ public:
     }
 
 private:
-    void LoadConfiguration() {        SettingsManager::LoadSettings(config.model_path, config.context_size, config.gpu_layers, 
+    void LoadConfiguration() {
+        SettingsManager::LoadSettings(config.model_path, config.context_size, config.gpu_layers, 
                                     config.predict_tokens, config.chat_template, 
                                     config.identity_directive, config.other_directives,
                                     config.discord_token, config.discord_isolated_channels, 
-                                    config.discord_shared_channels, config.discord_allow_dms,
+                                    config.discord_allow_dms,
                                     config.discord_pull_history, config.discord_history_percentage,
                                     config.summarizer_model_path, config.summarizer_context_size,
                                     config.summarizer_gpu_layers, config.summarizer_predict_tokens,
@@ -957,12 +957,11 @@ private:
         if (config.identity_directive.empty() && config.other_directives.empty()) {
             config.identity_directive = "You are a helpful AI assistant named Lumina.";
             config.other_directives = "Answer each user request thoughtfully and to the best of your ability.";
-            
-            SettingsManager::SaveSettings(config.model_path, config.context_size, config.gpu_layers, 
+              SettingsManager::SaveSettings(config.model_path, config.context_size, config.gpu_layers, 
                                         config.predict_tokens, config.chat_template, 
                                         config.identity_directive, config.other_directives,
                                         config.discord_token, config.discord_isolated_channels, 
-                                        config.discord_shared_channels, config.discord_allow_dms,
+                                        config.discord_allow_dms,
                                         config.discord_pull_history, config.discord_history_percentage,
                                         config.summarizer_model_path, config.summarizer_context_size,
                                         config.summarizer_gpu_layers, config.summarizer_predict_tokens,
@@ -1027,12 +1026,11 @@ private:
                 auto model_info = llama_manager->get_model_info("main_model");
                 std::string model_template = model_info->get_chat_template();
                 if (!model_template.empty()) {
-                    config.chat_template = model_template;
-                    SettingsManager::SaveSettings(config.model_path, config.context_size, config.gpu_layers, config.predict_tokens, 
+                    config.chat_template = model_template;                    SettingsManager::SaveSettings(config.model_path, config.context_size, config.gpu_layers, config.predict_tokens, 
                                                 config.chat_template, 
                                                 config.identity_directive, config.other_directives,
                                                 config.discord_token, config.discord_isolated_channels, 
-                                                config.discord_shared_channels, config.discord_allow_dms,
+                                                config.discord_allow_dms,
                                                 config.discord_pull_history, config.discord_history_percentage,
                                                 config.summarizer_model_path, config.summarizer_context_size,
                                                 config.summarizer_gpu_layers, config.summarizer_predict_tokens,
@@ -1156,8 +1154,7 @@ private:
             ui.message_history_list->SetValue("Model stopped - no message history available");
         }
     }
-    
-    void OnConnectDiscord(wxCommandEvent& event) {
+      void OnConnectDiscord(wxCommandEvent& event) {
         if (!discord_manager) {
             AddSystemMessage("Error: Discord manager not available");
             return;
@@ -1169,28 +1166,45 @@ private:
             ui.discord_btn->SetLabel("Connect Discord");
             AddSystemMessage("Discord bot disconnected");
         } else {
+            // Validate prerequisites before attempting connection
+            if (!is_started || !llama_manager || !context_created) {
+                AddSystemMessage("Error: Please start the AI model first before connecting Discord");
+                return;
+            }
+            
+            if (!llama_manager->has_context("main_chat")) {
+                AddSystemMessage("Error: Main chat context not available. Please restart the model.");
+                return;
+            }
+            
             // Configure and start Discord bot
             if (config.discord_token.empty()) {
                 AddSystemMessage("Discord bot token not configured. Please check Settings.");
                 return;
             }
             
+            AddSystemMessage("Validating Discord configuration...");
+            
             // Configure bot
             DiscordBotConfig bot_config;
             bot_config.bot_token = config.discord_token;
             
             if (!discord_manager->configure(bot_config)) {
-                AddSystemMessage("Failed to configure Discord bot");
+                AddSystemMessage("Failed to configure Discord bot - check token format");
                 return;
             }
-              // Set up integration with LlamaManager
+            
+            AddSystemMessage("Setting up Discord integration...");
+            
+            // Set up integration with LlamaManager BEFORE starting
             discord_manager->set_llama_manager(llama_manager.get());
             discord_manager->main_context_id = "main_chat";
             discord_manager->model_id = "main_model";
             discord_manager->set_isolated_channels(config.discord_isolated_channels);
-            discord_manager->set_shared_history_channels(config.discord_shared_channels);
             discord_manager->set_allow_dms(config.discord_allow_dms);
             discord_manager->set_history_settings(config.discord_pull_history, config.discord_history_percentage);
+            
+            AddSystemMessage("Starting Discord bot...");
             
             // Start bot
             if (discord_manager->start()) {
@@ -1240,7 +1254,7 @@ private:
                     }
                 }).detach();
             } else {
-                AddSystemMessage("Failed to start Discord bot");
+                AddSystemMessage("Failed to start Discord bot - check logs for details");
             }
         }
     }
@@ -1248,7 +1262,7 @@ private:
     void OnSettings(wxCommandEvent& event) {        SettingsDialog dialog(this, config.model_path, config.context_size, config.gpu_layers, config.predict_tokens, 
                             config.chat_template, config.identity_directive, config.other_directives,
                             config.discord_token, config.discord_isolated_channels, 
-                            config.discord_shared_channels, config.discord_allow_dms,
+                            config.discord_allow_dms,
                             config.discord_pull_history, config.discord_history_percentage,
                             config.summarizer_model_path, config.summarizer_context_size,
                             config.summarizer_gpu_layers, config.summarizer_predict_tokens,

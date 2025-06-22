@@ -144,12 +144,11 @@ public:    static std::string GetSettingsFilePath() noexcept {
         
         SETTINGS_LOG("Settings file path: " + filepath);
         return filepath;
-    }
-      static void SaveSettings(const std::string& model_path, int32_t context_size, int32_t gpu_layers, 
+    }    static void SaveSettings(const std::string& model_path, int32_t context_size, int32_t gpu_layers, 
                            int32_t predict_tokens, const std::string& chat_template, 
                            const std::string& identity_directive, const std::string& other_directives,
                            const std::string& discord_bot_token,
-                           const std::string& discord_isolated_channel_ids, const std::string& discord_shared_history_channel_ids,
+                           const std::string& discord_isolated_channel_ids,
                            bool discord_allow_dms, bool discord_pull_history, int32_t discord_history_fill_percentage,
                            const std::string& summarizer_model_path, int32_t summarizer_context_size, int32_t summarizer_gpu_layers,
                            int32_t summarizer_predict_tokens, const std::string& summarizer_system_prompt, const std::string& summarizer_chat_template,
@@ -177,11 +176,9 @@ public:    static std::string GetSettingsFilePath() noexcept {
             file << "OtherDirectives=" << EscapeString(other_directives) << std::endl;
             file << std::endl;
             
-            // [Discord] section
-            file << "[Discord]" << std::endl;
+            // [Discord] section            file << "[Discord]" << std::endl;
             file << "BotToken=" << EscapeString(discord_bot_token) << std::endl;
             file << "IsolatedChannelIds=" << EscapeString(discord_isolated_channel_ids) << std::endl;
-            file << "SharedHistoryChannelIds=" << EscapeString(discord_shared_history_channel_ids) << std::endl;
             file << "AllowDMs=" << (discord_allow_dms ? "1" : "0") << std::endl;
             file << "PullHistory=" << (discord_pull_history ? "1" : "0") << std::endl;
             file << "HistoryFillPercentage=" << discord_history_fill_percentage << std::endl;
@@ -206,12 +203,11 @@ public:    static std::string GetSettingsFilePath() noexcept {
         } else {
             SETTINGS_LOG("Error: Failed to save settings to: " + filepath);
         }
-    }
-      static void LoadSettings(std::string& model_path, int32_t& context_size, int32_t& gpu_layers, 
+    }    static void LoadSettings(std::string& model_path, int32_t& context_size, int32_t& gpu_layers, 
                            int32_t& predict_tokens, std::string& chat_template, 
                            std::string& identity_directive, std::string& other_directives,
                            std::string& discord_bot_token,
-                           std::string& discord_isolated_channel_ids, std::string& discord_shared_history_channel_ids,
+                           std::string& discord_isolated_channel_ids,
                            bool& discord_allow_dms, bool& discord_pull_history, int32_t& discord_history_fill_percentage,
                            std::string& summarizer_model_path, int32_t& summarizer_context_size, int32_t& summarizer_gpu_layers,
                            int32_t& summarizer_predict_tokens, std::string& summarizer_system_prompt, std::string& summarizer_chat_template,
@@ -310,15 +306,10 @@ public:    static std::string GetSettingsFilePath() noexcept {
                         if (key == "BotToken") {
                             discord_bot_token = UnescapeString(value);
                             loaded_count++;
-                            SETTINGS_LOG("Loaded BotToken: " + std::string(discord_bot_token.empty() ? "(empty)" : "configured"));
-                        } else if (key == "IsolatedChannelIds") {
+                            SETTINGS_LOG("Loaded BotToken: " + std::string(discord_bot_token.empty() ? "(empty)" : "configured"));                        } else if (key == "IsolatedChannelIds") {
                             discord_isolated_channel_ids = UnescapeString(value);
                             loaded_count++;
                             SETTINGS_LOG("Loaded IsolatedChannelIds: " + discord_isolated_channel_ids);
-                        } else if (key == "SharedHistoryChannelIds") {
-                            discord_shared_history_channel_ids = UnescapeString(value);
-                            loaded_count++;
-                            SETTINGS_LOG("Loaded SharedHistoryChannelIds: " + discord_shared_history_channel_ids);
                         } else if (key == "AllowDMs") {
                             discord_allow_dms = (value == "1" || value == "true" || value == "True" || value == "TRUE");
                             loaded_count++;
@@ -391,11 +382,9 @@ private:
         // System prompt
         wxTextCtrl* identity_directive;
         wxTextCtrl* other_directives;
-        
-        // Discord settings
+          // Discord settings
         wxTextCtrl* bot_token;
         wxTextCtrl* isolated_channels;
-        wxTextCtrl* shared_channels;
         wxCheckBox* allow_dms;
         wxCheckBox* pull_history;
         wxSlider* history_percentage;
@@ -420,10 +409,8 @@ private:
         int32_t& predict_tokens;
         std::string& chat_template;
         std::string& identity_directive;
-        std::string& other_directives;
-        std::string& discord_bot_token;
+        std::string& other_directives;        std::string& discord_bot_token;
         std::string& discord_isolated_channels;
-        std::string& discord_shared_channels;
         bool& discord_allow_dms;
         bool& discord_pull_history;
         int32_t& discord_history_percentage;
@@ -442,7 +429,7 @@ private:
 public:    SettingsDialog(wxWindow* parent, std::string& model_path, int32_t& context_size, int32_t& gpu_layers, 
                   int32_t& predict_tokens, std::string& chat_template, std::string& identity_directive, 
                   std::string& other_directives, std::string& discord_bot_token,
-                  std::string& discord_isolated_channels, std::string& discord_shared_channels,
+                  std::string& discord_isolated_channels,
                   bool& discord_allow_dms, bool& discord_pull_history, int32_t& discord_history_percentage,
                   std::string& summarizer_model_path, int32_t& summarizer_context_size, int32_t& summarizer_gpu_layers,
                   int32_t& summarizer_predict_tokens, std::string& summarizer_system_prompt, std::string& summarizer_chat_template,
@@ -451,7 +438,7 @@ public:    SettingsDialog(wxWindow* parent, std::string& model_path, int32_t& co
                   wxSize(SettingsUIConstants::SETTINGS_DIALOG_WIDTH, SettingsUIConstants::SETTINGS_DIALOG_HEIGHT))
         , config{model_path, context_size, gpu_layers, predict_tokens, chat_template,
                 identity_directive, other_directives, discord_bot_token, discord_isolated_channels,
-                discord_shared_channels, discord_allow_dms, discord_pull_history, discord_history_percentage,
+                discord_allow_dms, discord_pull_history, discord_history_percentage,
                 summarizer_model_path, summarizer_context_size, summarizer_gpu_layers, summarizer_predict_tokens,
                 summarizer_system_prompt, summarizer_chat_template, blacklist_entries} {
         
@@ -671,11 +658,8 @@ private:
         history_sizer->Add(ctrls.history_percentage, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
         history_sizer->Add(ctrls.percentage_label, 0, wxALIGN_CENTER_VERTICAL);
         sizer->Add(history_sizer, 0, wxALL, 5);
-        
-        AddTextSetting(scrolled, sizer, "Isolated Context Channels:", ctrls.isolated_channels, 
+          AddTextSetting(scrolled, sizer, "Isolated Context Channels:", ctrls.isolated_channels, 
                       config.discord_isolated_channels, wxTE_MULTILINE);
-        AddTextSetting(scrolled, sizer, "Shared Context Channels:", ctrls.shared_channels, 
-                      config.discord_shared_channels, wxTE_MULTILINE);
         
         scrolled->SetSizer(sizer);
         
@@ -797,10 +781,8 @@ private:
         
         config.chat_template = ctrls.chat_template->GetValue().ToUTF8().data();
         config.identity_directive = ctrls.identity_directive->GetValue().ToUTF8().data();
-        config.other_directives = ctrls.other_directives->GetValue().ToUTF8().data();
-        config.discord_bot_token = ctrls.bot_token->GetValue().ToUTF8().data();
+        config.other_directives = ctrls.other_directives->GetValue().ToUTF8().data();        config.discord_bot_token = ctrls.bot_token->GetValue().ToUTF8().data();
         config.discord_isolated_channels = ValidateChannelIds(ctrls.isolated_channels->GetValue().ToUTF8().data());
-        config.discord_shared_channels = ValidateChannelIds(ctrls.shared_channels->GetValue().ToUTF8().data());
         config.discord_allow_dms = ctrls.allow_dms->GetValue();
         config.discord_pull_history = ctrls.pull_history->GetValue();
         config.discord_history_percentage = ctrls.history_percentage->GetValue();
@@ -813,13 +795,12 @@ private:
         
         // Blacklist settings
         config.blacklist_entries = ctrls.blacklist_entries->GetValue().ToUTF8().data();
-        
-        // Save settings with all parameters
+          // Save settings with all parameters
         SettingsManager::SaveSettings(config.model_path, config.context_size, config.gpu_layers, 
                     config.predict_tokens, config.chat_template, 
                     config.identity_directive, config.other_directives,
                     config.discord_bot_token, config.discord_isolated_channels, 
-                    config.discord_shared_channels, config.discord_allow_dms, 
+                    config.discord_allow_dms, 
                     config.discord_pull_history, config.discord_history_percentage,
                     config.summarizer_model_path, config.summarizer_context_size,
                     config.summarizer_gpu_layers, config.summarizer_predict_tokens,
@@ -862,20 +843,19 @@ private:
     void OnSaveApplyBlacklist() {
         // Update the blacklist configuration
         config.blacklist_entries = ctrls.blacklist_entries->GetValue().ToUTF8().data();
-        
-        // Save settings with current values and updated blacklist
+          // Save settings with current values and updated blacklist
         SettingsManager::SaveSettings(config.model_path, config.context_size, config.gpu_layers, 
                     config.predict_tokens, config.chat_template, 
                     config.identity_directive, config.other_directives,
                     config.discord_bot_token, config.discord_isolated_channels, 
-                    config.discord_shared_channels, config.discord_allow_dms, 
+                    config.discord_allow_dms, 
                     config.discord_pull_history, config.discord_history_percentage,
                     config.summarizer_model_path, config.summarizer_context_size,
                     config.summarizer_gpu_layers, config.summarizer_predict_tokens,
                     config.summarizer_system_prompt, config.summarizer_chat_template,
                     config.blacklist_entries);
         
-        wxMessageBox("Blacklist settings saved and applied successfully!", "Blacklist Updated", 
+        wxMessageBox("Blacklist settings saved and applied successfully!", "Blacklist Updated",
                     wxOK | wxICON_INFORMATION);
     }
     

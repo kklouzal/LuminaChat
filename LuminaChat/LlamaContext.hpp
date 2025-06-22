@@ -845,21 +845,20 @@ public:    // Add message to this context's history
         }
         
         return true;
-    }
-
-    // Dedicated context rebuilding from formatted content with rollback support
+    }    // Dedicated context rebuilding from formatted content with rollback support
     template<typename TokenProcessor, typename PruningCallback>
     bool rebuild_context_from_formatted_content(const std::string& formatted_content,
                                                TokenProcessor&& process_text_to_tokens,
-                                               PruningCallback&& prune_conversation_with_summary) {
+                                               PruningCallback&& prune_conversation_with_summary,
+                                               bool force_full_rebuild = false) {
         int32_t new_len = static_cast<int32_t>(formatted_content.length());
         
         // Store original state for potential rollback
         int32_t original_n_past = n_past;
         int32_t original_prev_len = prev_len;
-        
-        // Check if we need a full rebuild or can do incremental update
-        bool needs_full_rebuild = (prev_len > new_len || 
+          // Check if we need a full rebuild or can do incremental update
+        bool needs_full_rebuild = force_full_rebuild || 
+                                  (prev_len > new_len || 
                                   (prev_len == 0 && !message_history.empty()));
         
         if (needs_full_rebuild) {
@@ -981,10 +980,9 @@ public:    // Add message to this context's history
         
         LLAMA_LOG("After pruning: " + std::to_string(static_cast<float>(total_token_count) / model_info->n_ctx * 100.0f) + 
                   "% (" + std::to_string(total_token_count) + "/" + std::to_string(model_info->n_ctx) + ")");
-        
-        // PRUNING PHASE 4: Rebuild context with pruned content
+          // PRUNING PHASE 4: Rebuild context with pruned content
         LLAMA_LOG("Pruning Phase 4: Rebuilding context with pruned content");
-        if (!rebuild_context_from_formatted_content(formatted_content, process_text_to_tokens, prune_conversation_with_summary)) {
+        if (!rebuild_context_from_formatted_content(formatted_content, process_text_to_tokens, prune_conversation_with_summary, false)) {
             LLAMA_LOG("Error: Failed to rebuild context after pruning");
             return false;
         }
@@ -1021,9 +1019,8 @@ public:    // Add message to this context's history
             LLAMA_LOG("Error: Failed to apply chat template");
             return false;
         }
-        
-        // Delegate to the context's rebuild method
-        bool success = rebuild_context_from_formatted_content(formatted_content, process_text_to_tokens, prune_conversation_with_summary);
+          // Delegate to the context's rebuild method
+        bool success = rebuild_context_from_formatted_content(formatted_content, process_text_to_tokens, prune_conversation_with_summary, true);
         
         if (success) {
             // Update the cached message history token count since we just rebuilt the context
@@ -1346,9 +1343,8 @@ inline bool ContextInfo::prepare_context_for_generation(TokenProcessor&& process
             return false;
         }
     } else {
-        LLAMA_LOG("Phase 3: No pruning needed - ContextSizeManager analysis indicates sufficient space");
-        // PHASE 4: Rebuild context with current tokens
-        if (!rebuild_context_from_formatted_content(formatted_content, process_text_to_tokens, prune_conversation_with_summary)) {
+        LLAMA_LOG("Phase 3: No pruning needed - ContextSizeManager analysis indicates sufficient space");        // PHASE 4: Rebuild context with current tokens
+        if (!rebuild_context_from_formatted_content(formatted_content, process_text_to_tokens, prune_conversation_with_summary, false)) {
             LLAMA_LOG("Error: Failed to rebuild context from formatted content");
             return false;
         }
