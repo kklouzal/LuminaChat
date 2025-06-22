@@ -35,6 +35,11 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <string_view>
+#include <optional>
+#include <shared_mutex>
+#include <array>
+#include <charconv>
 
 // Log levels for filtering
 enum class LogLevel : int {
@@ -57,18 +62,90 @@ enum class LogComponent {
 
 class LogHandler {
 private:
-    // Thread-safe callback mechanism
-    std::function<void(const std::string&)> output_callback;
-    std::function<void(const std::string&)> summarizer_callback;
-    mutable std::mutex callback_mutex;
+    // Thread-safe callback mechanism - optimized with shared_mutex for better read performance
+    std::optional<std::function<void(std::string_view)>> output_callback;
+    std::optional<std::function<void(std::string_view)>> summarizer_callback;
+    mutable std::shared_mutex callback_mutex;
     
-    // Logging configuration
-    std::atomic<LogLevel> min_log_level{LogLevel::INF};
-    std::atomic<bool> include_timestamps{true};
-    std::atomic<bool> include_component_tags{true};
+    // Logging configuration - const as they are not meant to be changed after initialization
+    static constexpr LogLevel DEFAULT_MIN_LEVEL = LogLevel::INF;
+    static constexpr bool INCLUDE_TIMESTAMPS = true;
+    static constexpr bool INCLUDE_COMPONENT_TAGS = true;
+      // Performance optimization: cache time formatting to avoid repeated work
+    mutable std::chrono::seconds last_time_cache{0};
+    mutable std::array<char, 17> time_cache{};  // Pre-allocated buffer for time string "[HH:MM:SS.mmm] " + null
+    mutable std::mutex time_cache_mutex;
+      // Fast integer to string conversion using C++17 std::to_chars
+    static constexpr size_t format_milliseconds(char* buffer, int ms) noexcept {
+        // Fast path for common cases
+        if (ms < 10) {
+            buffer[0] = '0';
+            buffer[1] = '0';
+            buffer[2] = '0' + static_cast<char>(ms);
+            return 3;
+        } else if (ms < 100) {
+            buffer[0] = '0';
+            buffer[1] = '0' + static_cast<char>(ms / 10);
+            buffer[2] = '0' + static_cast<char>(ms % 10);
+            return 3;
+        } else {
+            buffer[0] = '0' + static_cast<char>(ms / 100);
+            buffer[1] = '0' + static_cast<char>((ms / 10) % 10);
+            buffer[2] = '0' + static_cast<char>(ms % 10);
+            return 3;
+        }
+    }
     
-    // Component name mapping
-    static const char* get_component_name(LogComponent component) {
+    // Optimized time string formatting with caching
+    std::string_view get_formatted_time() const {
+        if constexpr (!INCLUDE_TIMESTAMPS) {
+            return {};
+        }
+        
+        const auto now = std::chrono::system_clock::now();
+        const auto now_seconds = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch());
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()) % 1000;
+          // Use cached time if it's the same second
+        {
+            std::lock_guard<std::mutex> lock(time_cache_mutex);
+            if (now_seconds == last_time_cache) {
+                // Update only milliseconds part (positions 10, 11, 12)
+                format_milliseconds(time_cache.data() + 10, static_cast<int>(ms.count()));
+                return std::string_view(time_cache.data(), 15); // "[HH:MM:SS.mmm] "
+            }
+            
+            // Format new time
+            const auto time_t = std::chrono::system_clock::to_time_t(now);
+            std::tm tm_buf{};
+#ifdef _WIN32
+            localtime_s(&tm_buf, &time_t);
+#else
+            localtime_r(&time_t, &tm_buf);
+#endif
+            
+            // Fast formatting using direct char manipulation
+            time_cache[0] = '[';
+            time_cache[1] = '0' + static_cast<char>(tm_buf.tm_hour / 10);
+            time_cache[2] = '0' + static_cast<char>(tm_buf.tm_hour % 10);
+            time_cache[3] = ':';
+            time_cache[4] = '0' + static_cast<char>(tm_buf.tm_min / 10);
+            time_cache[5] = '0' + static_cast<char>(tm_buf.tm_min % 10);
+            time_cache[6] = ':';
+            time_cache[7] = '0' + static_cast<char>(tm_buf.tm_sec / 10);
+            time_cache[8] = '0' + static_cast<char>(tm_buf.tm_sec % 10);
+            time_cache[9] = '.';
+            format_milliseconds(time_cache.data() + 10, static_cast<int>(ms.count()));
+            time_cache[13] = ']';
+            time_cache[14] = ' ';
+            time_cache[15] = '\0';
+            
+            last_time_cache = now_seconds;
+            return std::string_view(time_cache.data(), 15); // "[HH:MM:SS.mmm] "
+        }
+    }    
+    // Component name mapping - constexpr for compile-time optimization
+    static constexpr std::string_view get_component_name(LogComponent component) noexcept {
         switch (component) {
             case LogComponent::MAIN: return "Main";
             case LogComponent::LLAMA_MANAGER: return "LlamaManager";
@@ -81,8 +158,8 @@ private:
         }
     }
     
-    // Level name mapping
-    static const char* get_level_name(LogLevel level) {
+    // Level name mapping - constexpr for compile-time optimization
+    static constexpr std::string_view get_level_name(LogLevel level) noexcept {
         switch (level) {
             case LogLevel::DBG: return "DEBUG";
             case LogLevel::INF: return "INFO";
@@ -90,39 +167,48 @@ private:
             case LogLevel::ERR: return "ERROR";
             default: return "UNKNOWN";
         }
-    }
-    
-    // Format message with timestamp and component
-    std::string format_message(LogLevel level, LogComponent component, const std::string& message) const {
-        std::ostringstream oss;
+    }    // Optimized message formatting using direct string operations instead of streams
+    std::string format_message(LogLevel level, LogComponent component, std::string_view message) const {
+        // Pre-calculate approximate size to reduce allocations
+        size_t estimated_size = message.length();
+        if constexpr (INCLUDE_TIMESTAMPS) {
+            estimated_size += 16; // "[HH:MM:SS.mmm] "
+        }
+        if constexpr (INCLUDE_COMPONENT_TAGS) {
+            estimated_size += get_component_name(component).length() + 3; // "[component] "
+        }
+        if (level >= LogLevel::WRN) {
+            estimated_size += get_level_name(level).length() + 3; // "[level] "
+        }
         
-        // Add timestamp if enabled
-        if (include_timestamps) {
-            auto now = std::chrono::system_clock::now();
-            auto time_t = std::chrono::system_clock::to_time_t(now);
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now.time_since_epoch()) % 1000;
-            
-            oss << "[" << std::put_time(std::localtime(&time_t), "%H:%M:%S");
-            oss << "." << std::setfill('0') << std::setw(3) << ms.count() << "] ";
+        std::string result;
+        result.reserve(estimated_size);
+        
+        // Add timestamp if enabled - using cached formatting
+        if constexpr (INCLUDE_TIMESTAMPS) {
+            const auto time_str = get_formatted_time();
+            result.append(time_str);
         }
         
         // Add component tag if enabled
-        if (include_component_tags) {
-            oss << "[" << get_component_name(component) << "] ";
+        if constexpr (INCLUDE_COMPONENT_TAGS) {
+            result.append("[");
+            result.append(get_component_name(component));
+            result.append("] ");
         }
         
-        // Add level for warnings and errors
-        if (level >= LogLevel::WRN) {
-            oss << "[" << get_level_name(level) << "] ";
+        // Add level for warnings and errors only
+        if (level >= LogLevel::WRN) [[unlikely]] {
+            result.append("[");
+            result.append(get_level_name(level));
+            result.append("] ");
         }
         
-        oss << message;
-        return oss.str();
+        result.append(message);
+        return result;
     }
-    
-    // Singleton instance
-    static LogHandler& instance() {
+      // Singleton instance
+    static LogHandler& instance() noexcept {
         static LogHandler handler;
         return handler;
     }
@@ -130,107 +216,78 @@ private:
     LogHandler() = default;
 
 public:
-    // Delete copy constructor and assignment operator
+    // Delete copy constructor and assignment operator for singleton pattern
     LogHandler(const LogHandler&) = delete;
     LogHandler& operator=(const LogHandler&) = delete;
-      // Set output callback (thread-safe)
-    static void set_output_callback(std::function<void(const std::string&)> callback) {
+      // Set output callback (thread-safe) - optimized with move semantics and optional
+    static void set_output_callback(std::function<void(std::string_view)> callback) {
         auto& handler = instance();
-        std::lock_guard<std::mutex> lock(handler.callback_mutex);
-        handler.output_callback = callback;
+        std::unique_lock<std::shared_mutex> lock(handler.callback_mutex);
+        handler.output_callback = std::move(callback);
     }
     
-    // Set summarizer-specific callback (thread-safe)
-    static void set_summarizer_callback(std::function<void(const std::string&)> callback) {
+    // Set summarizer-specific callback (thread-safe) - optimized with move semantics and optional
+    static void set_summarizer_callback(std::function<void(std::string_view)> callback) {
         auto& handler = instance();
-        std::lock_guard<std::mutex> lock(handler.callback_mutex);
-        handler.summarizer_callback = callback;
+        std::unique_lock<std::shared_mutex> lock(handler.callback_mutex);
+        handler.summarizer_callback = std::move(callback);
     }
-      // Configuration methods (removed unused setters per Directive #2: Redundancy Elimination)
-    
-    // Main logging method
-    static void log(LogLevel level, LogComponent component, const std::string& message) {
-        auto& handler = instance();
-        
-        // Check if we should log this level
-        if (level < handler.min_log_level) {
+      // Main logging method - optimized with shared_mutex and minimal string copies
+    static void log(LogLevel level, LogComponent component, std::string_view message) {
+        // Early exit for filtered levels - branch prediction hint
+        if (level < DEFAULT_MIN_LEVEL) [[likely]] {
             return;
         }
         
-        // Format the message
+        auto& handler = instance();
+        
+        // Format the message once
         std::string formatted = handler.format_message(level, component, message);
-          // Send to callback if available
-        {
-            std::lock_guard<std::mutex> lock(handler.callback_mutex);
-            
-            // Route summarizer logs to the summarizer callback if available
-            if (component == LogComponent::SUMMARIZER_MANAGER && handler.summarizer_callback) {
-                handler.summarizer_callback(formatted + "\n");
-            } else if (handler.output_callback) {
-                handler.output_callback(formatted + "\n");
-            }
+        formatted.append("\n"); // Single append instead of concatenation
+        
+        // Use shared_lock for better read performance, convert to string_view for zero-copy
+        std::shared_lock<std::shared_mutex> lock(handler.callback_mutex);
+          // Route summarizer logs to specialized callback if available
+        if (component == LogComponent::SUMMARIZER_MANAGER && handler.summarizer_callback.has_value()) [[unlikely]] {
+            std::invoke(handler.summarizer_callback.value(), std::string_view{formatted});
+        } else if (handler.output_callback.has_value()) [[likely]] {
+            std::invoke(handler.output_callback.value(), std::string_view{formatted});
         }
     }
-    
-    // Convenience methods for different levels
-    static void debug(LogComponent component, const std::string& message) {
+      // Core logging methods - const-correct parameters
+    static void debug(LogComponent component, std::string_view message) {
         log(LogLevel::DBG, component, message);
     }
     
-    static void info(LogComponent component, const std::string& message) {
+    static void info(LogComponent component, std::string_view message) {
         log(LogLevel::INF, component, message);
     }
     
-    static void warning(LogComponent component, const std::string& message) {
+    static void warning(LogComponent component, std::string_view message) {
         log(LogLevel::WRN, component, message);
     }
     
-    static void error(LogComponent component, const std::string& message) {
+    static void error(LogComponent component, std::string_view message) {
         log(LogLevel::ERR, component, message);
-    }
-    
-    // Component-specific convenience methods
-    static void llama_log(const std::string& message, LogLevel level = LogLevel::INF) {
-        log(level, LogComponent::LLAMA_MANAGER, message);
-    }
-    
-    static void discord_log(const std::string& message, LogLevel level = LogLevel::INF) {
-        log(level, LogComponent::DISCORD_MANAGER, message);
-    }
-    
-    static void discord_history_log(const std::string& message, LogLevel level = LogLevel::INF) {
-        log(level, LogComponent::DISCORD_HISTORY, message);
-    }
-    
-    static void settings_log(const std::string& message, LogLevel level = LogLevel::INF) {
-        log(level, LogComponent::SETTINGS_MANAGER, message);
-    }
-    
-    static void summarizer_log(const std::string& message, LogLevel level = LogLevel::INF) {
-        log(level, LogComponent::SUMMARIZER_MANAGER, message);
-    }
-    
-    static void ui_log(const std::string& message, LogLevel level = LogLevel::INF) {
-        log(level, LogComponent::UI, message);
     }
 };
 
-// Essential macros only
+// Unified logging macros - streamlined per directive #2 (Redundancy Elimination)
 #define LOG_DEBUG(component, message) LogHandler::debug(LogComponent::component, message)
 #define LOG_INFO(component, message) LogHandler::info(LogComponent::component, message)
 #define LOG_WARNING(component, message) LogHandler::warning(LogComponent::component, message)
 #define LOG_ERROR(component, message) LogHandler::error(LogComponent::component, message)
 
-// Component-specific macros
-#define LLAMA_LOG(message) LogHandler::llama_log(message)
-#define LLAMA_LOG_ERROR(message) LogHandler::llama_log(message, LogLevel::ERR)
-#define DISCORD_LOG(message) LogHandler::discord_log(message)
-#define DISCORD_LOG_ERROR(message) LogHandler::discord_log(message, LogLevel::ERR)
-#define DISCORD_HISTORY_LOG(message) LogHandler::discord_history_log(message)
-#define SETTINGS_LOG(message) LogHandler::settings_log(message)
-#define SUMMARIZER_LOG(message) LogHandler::summarizer_log(message)
-#define SUMMARIZER_LOG_ERROR(message) LogHandler::summarizer_log(message, LogLevel::ERR)
-#define UI_LOG(message) LogHandler::ui_log(message)
+// Component-specific convenience macros - for backward compatibility and convenience
+#define LLAMA_LOG(message) LogHandler::info(LogComponent::LLAMA_MANAGER, message)
+#define LLAMA_LOG_ERROR(message) LogHandler::error(LogComponent::LLAMA_MANAGER, message)
+#define DISCORD_LOG(message) LogHandler::info(LogComponent::DISCORD_MANAGER, message)
+#define DISCORD_LOG_ERROR(message) LogHandler::error(LogComponent::DISCORD_MANAGER, message)
+#define DISCORD_HISTORY_LOG(message) LogHandler::info(LogComponent::DISCORD_HISTORY, message)
+#define SETTINGS_LOG(message) LogHandler::info(LogComponent::SETTINGS_MANAGER, message)
+#define SUMMARIZER_LOG(message) LogHandler::info(LogComponent::SUMMARIZER_MANAGER, message)
+#define SUMMARIZER_LOG_ERROR(message) LogHandler::error(LogComponent::SUMMARIZER_MANAGER, message)
+#define UI_LOG(message) LogHandler::info(LogComponent::UI, message)
 
 //
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!

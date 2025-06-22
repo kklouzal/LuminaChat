@@ -2,7 +2,7 @@
 // 
 // RESPONSIBILITY: Core management and infrastructure
 // - Model loading, management, and lifecycle
-// - Context creation, switching, and management  
+// - Context creation and individual context management  
 // - Batch operations and token processing
 // - Template application and conversation state
 // - Text-to-token conversion (input processing)
@@ -11,6 +11,12 @@
 // DELEGATION: Response generation is delegated to LlamaResponse class
 // 
 // Handles core classs pertaining to llama.cpp backend usage.
+//
+// PERFORMANCE OPTIMIZATIONS:
+// - Uses [[likely]]/[[unlikely]] attributes for branch prediction optimization
+// - Minimized try-catch blocks to avoid unnecessary exception handling overhead
+// - Optimized error path predictions (errors are [[unlikely]], success paths are [[likely]])
+// - Cache hits are marked as [[likely]], cache misses as [[unlikely]]
 //
 // BATCHING APPROACH:
 // Batching in llama.cpp is designed for processing multiple separate inputs/sequences 
@@ -57,17 +63,19 @@
 #include <thread>
 #include <chrono>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
+#include <algorithm>
+#include <cctype>
+#include <mutex>
 #include "llama-cpp.h"
-#include "LogHandler.hpp"
-#include "TokenCache.hpp"
-#include "LlamaContext.hpp"
+#include "Blacklist.hpp"
 
-// Forward declarations
-class LlamaSummarizer;
+// llama.cpp backend callbacks for model loading progress etc..
 bool model_loading_progress_callback(float progress, void *user_data);
 
-// Constants for configuration and performance (Directive #13: Zero Magic & Strong Typing)
+// Constants for configuration and performance
+// We place these just before the application includes so all constants can be grouped in one place for all files
 namespace LlamaConstants {
     // Additional constants specific to LlamaManager (core constants are in LlamaContext.hpp)
     constexpr int32_t DEFAULT_TOKEN_CACHE_SIZE = 1024;
@@ -81,23 +89,27 @@ namespace LlamaConstants {
     constexpr float DEFAULT_TEMPERATURE = 0.8f;
     constexpr float DEFAULT_MIN_P = 0.05f;
     constexpr float DEFAULT_TOP_P = 0.9f;
-    constexpr int32_t DEFAULT_TOP_K = 40;
-    // String processing constants
+    constexpr int32_t DEFAULT_TOP_K = 40;    // String processing constants
     constexpr size_t MAX_TEXT_PREVIEW_LENGTH = 50;
     constexpr int32_t MAX_RETRY_ATTEMPTS = 2;
     // Timing and sleep constants
     constexpr int32_t RETRY_BACKOFF_MS = 50;
-    constexpr float MS_TO_MICROSECONDS = 1000.0f;
 }
 
+// Application includes
+// We place these just after the LlamaConstants so all constants can be grouped in one place for all files
+#include "LogHandler.hpp"
+#include "TokenCache.hpp"
+#include "LlamaContext.hpp"
 #include "LlamaResponse.hpp"
+#include "LlamaSummarizer.hpp"
 
 // Thread Safety Contract (Directive #12):
 // This class is NOT thread-safe. External synchronization is required for concurrent access.
 // - All public methods must be called from a single thread or protected by external mutexes
 // - The llama.cpp backend itself has thread-safety limitations that require careful handling
 // - Model loading/unloading operations are particularly sensitive to race conditions
-// - Context switching operations modify shared state and must be serialized
+// - Individual context operations require proper synchronization within each context
 //
 // INTEGRATION WITH LlamaResponse:
 // - LlamaManager handles setup, context management, and provides callback functions
@@ -107,38 +119,141 @@ class LlamaManager {
 private:
     
     std::unordered_map<std::string, std::unique_ptr<ModelInfo>> models;
-    std::unordered_map<std::string, std::unique_ptr<ContextInfo>> contexts;
-    //std::string active_context_id;    ContextInfo* current_context;
-      // Working buffers
+    std::unordered_map<std::string, std::unique_ptr<ContextInfo>> contexts;    // Bidirectional cache for token-to-text and text-to-token mappings
     mutable TokenCache token_cache;
-    mutable std::string temp_string_buffer;// Working buffers
-
+    
     // Response generation handler
     mutable LlamaResponse response_generator;
     
+    // AI Response Blacklist - responses on this list won't be added to message history
+    Blacklist ai_response_blacklist;
+
+private:
+    // Private callback method for retroactive cleanup when patterns are added to blacklist
+    void perform_retroactive_cleanup(const std::string& new_blacklist_pattern) {
+        if (new_blacklist_pattern.empty()) return;
+        
+        int32_t total_contexts_processed = 0;
+        int32_t total_messages_removed = 0;
+        int32_t contexts_requiring_rebuild = 0;
+        
+        LLAMA_LOG("Starting retroactive cleanup for blacklist pattern: '" + 
+                  (new_blacklist_pattern.length() > 50 ? new_blacklist_pattern.substr(0, 50) + "..." : new_blacklist_pattern) + "'");
+          // Process each context
+        for (auto& [context_id, context_info] : contexts) {
+            if (!context_info) continue;
+            
+            // CRITICAL FIX: Only process fully initialized contexts to prevent race conditions
+            if (!context_info->fully_initialized.load()) [[unlikely]] {
+                LLAMA_LOG("Skipping context '" + context_id + "' - not fully initialized yet");
+                continue;
+            }
+            
+            total_contexts_processed++;
+            int32_t messages_removed_in_context = 0;
+            bool context_modified = false;
+            
+            // Thread-safe access to message history
+            {
+                std::lock_guard<std::mutex> lock(context_info->context_operations_mutex);
+                
+                // Iterate through message history and remove matching assistant messages
+                auto& message_history = context_info->message_history;
+                auto original_size = message_history.size();
+                
+                // Use erase-remove idiom to remove matching assistant messages
+                message_history.erase(
+                    std::remove_if(message_history.begin(), message_history.end(),
+                        [this, &new_blacklist_pattern, &messages_removed_in_context](const std::pair<std::string, std::string>& message) {
+                            if (message.first == "assistant" && ai_response_blacklist.matches_pattern(message.second, new_blacklist_pattern)) {
+                                messages_removed_in_context++;
+                                LLAMA_LOG("Removing blacklisted assistant message: '" + 
+                                          (message.second.length() > 50 ? message.second.substr(0, 50) + "..." : message.second) + "'");
+                                return true;
+                            }
+                            return false;
+                        }),
+                    message_history.end()
+                );
+                
+                if (message_history.size() != original_size) {
+                    context_modified = true;
+                    total_messages_removed += messages_removed_in_context;
+                    
+                    // Mark conversation state as needing rebuild
+                    context_info->message_cache_dirty = true;
+                    context_info->conversation_state.needs_rebuild = true;
+                    
+                    LLAMA_LOG("Context '" + context_id + "': Removed " + std::to_string(messages_removed_in_context) + 
+                              " messages (from " + std::to_string(original_size) + " to " + std::to_string(message_history.size()) + ")");
+                }
+            }              // Perform context rebuild if messages were removed
+            if (context_modified && context_info->is_ready_for_external_access()) [[likely]] {
+                LLAMA_LOG("Performing context rebuild for '" + context_id + "' after retroactive cleanup");
+                
+                try {
+                    // Create token processor and pruning callback for rebuild
+                    ContextInfo* ctx_ptr = context_info.get();
+                    auto token_processor = [this, ctx_ptr](const std::string& text, bool add_special) {
+                        return process_text_to_tokens(text, ctx_ptr, add_special);
+                    };
+                    auto pruning_callback = [ctx_ptr](float keep_ratio) {
+                        return ctx_ptr->prune_with_summarization(keep_ratio);
+                    };
+                    
+                    // Perform full context rebuild - this can throw if tokenization fails
+                    bool rebuild_success = context_info->update_context_from_history(token_processor, pruning_callback);
+                    
+                    if (rebuild_success) [[likely]] {
+                        contexts_requiring_rebuild++;
+                        LLAMA_LOG("Successfully rebuilt context '" + context_id + "' after retroactive cleanup");
+                    } else {
+                        LLAMA_LOG("WARNING: Failed to rebuild context '" + context_id + "' after retroactive cleanup");
+                    }
+                    
+                } catch (const std::bad_alloc& e) {
+                    // Handle memory allocation failures specifically  
+                    LLAMA_LOG("ERROR: Memory allocation failed during context rebuild for '" + context_id + "': " + e.what());
+                } catch (const std::exception& e) {
+                    // Handle other standard exceptions
+                    LLAMA_LOG("ERROR: Exception during context rebuild for '" + context_id + "': " + e.what());
+                } catch (...) {
+                    // Last resort for unknown exceptions
+                    LLAMA_LOG("ERROR: Unknown exception during context rebuild for '" + context_id + "'");
+                }
+            }
+        }
+        
+        LLAMA_LOG("Retroactive cleanup completed:");
+        LLAMA_LOG("  Contexts processed: " + std::to_string(total_contexts_processed));
+        LLAMA_LOG("  Total messages removed: " + std::to_string(total_messages_removed));
+        LLAMA_LOG("  Contexts rebuilt: " + std::to_string(contexts_requiring_rebuild));    }
+
 public:
-    LlamaManager() : token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE) {
+    LlamaManager() : token_cache(LlamaConstants::DEFAULT_TOKEN_CACHE_SIZE), response_generator(&token_cache),
+                     ai_response_blacklist([this](const std::string& pattern) { perform_retroactive_cleanup(pattern); }) {
     }
 
     ~LlamaManager() noexcept {
         cleanup();
     }
-    
-    // Initialize llama.cpp backend
+      // Initialize llama.cpp backend
     bool initialize() {
         ggml_backend_load_all();
-        return true;    }
-
+        return true;
+    }
+    
     // Load .gguf model file and create ModelInfo with specific parameters
     bool load_model(const std::string& model_path, const std::string& model_id = "", 
                    int32_t context_size = LlamaConstants::DEFAULT_CONTEXT_SIZE, int32_t gpu_layers = LlamaConstants::DEFAULT_GPU_LAYERS, int32_t predict_tokens = LlamaConstants::DEFAULT_PREDICT_TOKENS,
                    void* progress_callback_user_data = nullptr, const std::string& chat_template = "") {
-        if (!std::filesystem::exists(model_path)) {
-            LLAMA_LOG("Error: Model file does not exist: " + model_path);
+        if (!std::filesystem::exists(model_path)) [[unlikely]] {            LLAMA_LOG("Error: Model file does not exist: " + model_path);
             return false;
-        }        std::string actual_model_id = model_id.empty() ? std::filesystem::path(model_path).stem().string() : model_id;
+        }
         
-        if (models.find(actual_model_id) != models.end()) {
+        std::string actual_model_id = model_id.empty() ? std::filesystem::path(model_path).stem().string() : model_id;
+        
+        if (models.find(actual_model_id) != models.end()) [[unlikely]] {
             LLAMA_LOG("Model '" + actual_model_id + "' already loaded, using existing model");
             return true;
         }
@@ -149,29 +264,28 @@ public:
         llama_model_params model_params = llama_model_default_params();
         model_params.n_gpu_layers = gpu_layers;
         model_params.use_mmap = true; // Enable memory-mapped file support
-        
-        // Set progress callback if user data is provided
-        if (progress_callback_user_data) {
+          // Set progress callback if user data is provided
+        if (progress_callback_user_data) [[unlikely]] {
             model_params.progress_callback = model_loading_progress_callback;
             model_params.progress_callback_user_data = progress_callback_user_data;
         }
 
         // Load the model
         model_info->model = llama_model_load_from_file(model_path.c_str(), model_params);
-        if (!model_info->model) {
-            LLAMA_LOG("Error: Failed to load model from " + model_path);
+        if (!model_info->model) [[unlikely]] {            LLAMA_LOG("Error: Failed to load model from " + model_path);
             return false;
         }
-
+        
         model_info->vocab = llama_model_get_vocab(model_info->model);
         model_info->model_path = model_path;
+        model_info->model_name = actual_model_id;
         model_info->n_ctx = context_size;
         model_info->n_gpu_layers = gpu_layers;
         model_info->n_predict = predict_tokens; // Store predict tokens in model info
+        model_info->n_batch = std::min(LlamaConstants::MAX_BATCH_SIZE, context_size / LlamaConstants::BATCH_DIVISOR);
         model_info->model_loaded = true;
-        
-        // Store custom chat template if provided
-        if (!chat_template.empty()) {
+          // Store custom chat template if provided
+        if (!chat_template.empty()) [[unlikely]] {
             model_info->custom_chat_template = chat_template;
             LLAMA_LOG("Custom chat template stored for model '" + actual_model_id + "'");
         }
@@ -182,25 +296,24 @@ public:
         clear_caches();
         
         LLAMA_LOG("Model loaded successfully: " + model_path + " as '" + actual_model_id + 
-                  "' (ctx:" + std::to_string(context_size) + ", gpu:" + std::to_string(gpu_layers) + ")");
-        return true;
+                  "' (ctx:" + std::to_string(context_size) + ", gpu:" + std::to_string(gpu_layers) + ")");        return true;
     }
     
     // Context creation with consistent system prompt usage
     bool create_context(const std::string& context_id, const std::string& model_id, const std::string& system_prompt = "", bool reset_after_generation = false) {
         auto model_it = models.find(model_id);
-        if (model_it == models.end()) {
+        if (model_it == models.end()) [[unlikely]] {
             LLAMA_LOG("Error: Model '" + model_id + "' not found");
             return false;
         }
         
         ModelInfo* model_info = model_it->second.get();
-        if (!model_info->model_loaded || !model_info->model) {
+        if (!model_info->model_loaded || !model_info->model) [[unlikely]] {
             LLAMA_LOG("Error: Model '" + model_id + "' not properly loaded");
             return false;
         }
         
-        if (contexts.find(context_id) != contexts.end()) {
+        if (contexts.find(context_id) != contexts.end()) [[unlikely]] {
             LLAMA_LOG("Error: Context '" + context_id + "' already exists");
             return false;
         }
@@ -219,10 +332,10 @@ public:
         ctx_params.flash_attn = true;
         ctx_params.op_offload = true;
         ctx_params.offload_kqv = true;
-        
-        // Create context
+        ctx_params.defrag_thold = 0.33f; // auto-defrag KV cache if holes > 33% of size
+          // Create context
         context_info->context = llama_init_from_model(model_info->model, ctx_params);
-        if (!context_info->context) {
+        if (!context_info->context) [[unlikely]] {
             LLAMA_LOG("Error: Failed to create context '" + context_id + "'");
             return false;
         }
@@ -230,22 +343,14 @@ public:
         // Initialize batch
         int32_t batch_size = std::min(LlamaConstants::MAX_BATCH_SIZE, model_info->n_ctx / LlamaConstants::BATCH_DIVISOR);
         context_info->batch = llama_batch_init(batch_size, 0, 1);
-        if (context_info->batch.token == nullptr) {
+        if (context_info->batch.token == nullptr) [[unlikely]] {
             LLAMA_LOG("Error: Failed to initialize batch for context '" + context_id + "'");
             llama_free(context_info->context);
             return false;
-        }
-        context_info->batch_initialized = true;
-        
-        // Always use provided system prompt, or copy from main context if empty
+        }        context_info->batch_initialized = true;        // Use provided system prompt directly - each context is independent
         std::string prompt_to_use = system_prompt;
-		auto main_context = get_context_info("main_context");
-        if (prompt_to_use.empty() && main_context && !main_context->system_message.empty()) {
-            prompt_to_use = main_context->system_message;
-        }
-        
-        // Set system message if we have one
-        if (!prompt_to_use.empty()) {
+          // Set system message if we have one
+        if (!prompt_to_use.empty()) [[likely]] {
             context_info->system_message = prompt_to_use;
             context_info->message_history.emplace_back("system", prompt_to_use);
             context_info->message_cache_dirty = true;
@@ -253,7 +358,7 @@ public:
         }
         
         // Ensure token count is properly initialized (safety check)
-        if (context_info->message_history_token_count < 0) {
+        if (context_info->message_history_token_count < 0) [[unlikely]] {
             context_info->message_history_token_count = 0;
         }
         
@@ -262,25 +367,108 @@ public:
         
         // Initialize summarizer for this context with parent context only (summary resources will be set later)
         context_info->summarizer = std::make_unique<LlamaSummarizer>(context_info.get());
+          // If summary resources are already available, set them up immediately
+        ContextInfo* summary_ctx = get_context_info("summary_context");
+        ModelInfo* summary_mdl = get_model_info("summary_model");
+        if (summary_ctx && summary_mdl) [[unlikely]] {
+            auto response_callback = [this](const std::string& input, const std::string& username, ContextInfo* target_context) -> std::string {
+                return generate_response_on_context(input, username, target_context);
+            };
+            context_info->summarizer->set_summary_resources(summary_mdl, summary_ctx, response_callback);
+            LLAMA_LOG("Set summarizer resources for new context '" + context_id + "'");
+        }
+          // Initialize ContextSizeManager for adaptive context management
+        initialize_context_size_manager(*context_info, *model_info);
+        LLAMA_LOG("Initialized ContextSizeManager for context '" + context_id + "' with " + 
+                  std::to_string(model_info->n_ctx) + " token capacity");          // Integrate LlamaSummarizer with ContextSizeManager for coordinated summary management
+        if (context_info->summarizer && context_info->context_size_manager) [[likely]] {
+            context_info->summarizer->integrate_with_context_size_manager(context_info->context_size_manager.get(), context_info.get());
+            LLAMA_LOG("Integrated LlamaSummarizer with ContextSizeManager and ContextInfo reference for context '" + context_id + "'");
+        }        context_info->setup_summarizer_callbacks();
+          // CRITICAL FIX: Perform MANDATORY context warmup for ALL contexts
+        // This ensures proper tokenizer/vocabulary initialization and generation readiness
+        LLAMA_LOG("Performing mandatory context warmup for '" + context_id + "'");
+        
+        // Create token processor and pruning callback for warmup
+        ContextInfo* ctx_ptr = context_info.get();
+        auto token_processor = [this, ctx_ptr](const std::string& text, bool add_special) {
+            return process_text_to_tokens(text, ctx_ptr, add_special);
+        };
+        auto pruning_callback = [ctx_ptr](float keep_ratio) {
+            return ctx_ptr->prune_with_summarization(keep_ratio);
+        };
+        
+        bool warmup_success = false;
+        
+        if (!context_info->message_history.empty()) [[likely]] {
+            // Context with system message - rebuild to establish proper state
+            LLAMA_LOG("Warming up context with system message - performing full rebuild");
+            warmup_success = context_info->update_context_from_history(token_processor, pruning_callback);
+            
+            if (warmup_success) [[likely]] {
+                // Mark conversation state as properly initialized and up-to-date
+                context_info->conversation_state.needs_rebuild = false;
+                context_info->message_cache_dirty = false;
+                LLAMA_LOG("Successfully warmed up context '" + context_id + "' with " + 
+                          std::to_string(context_info->n_past) + " tokens");
+            }
+        } else {
+            // Empty context - perform minimal warmup to initialize tokenizer state
+            LLAMA_LOG("Warming up empty context - performing minimal tokenizer initialization");
+            
+            // Use a minimal prompt to warm up the tokenizer and establish generation state
+            std::string warmup_prompt = "<|im_start|>system\nReady<|im_end|>\n<|im_start|>assistant\n";
+            std::vector<llama_token> warmup_tokens = process_text_to_tokens(warmup_prompt, context_info.get(), true);
+            
+            if (!warmup_tokens.empty()) {
+                // Process warmup tokens to establish context state
+                std::vector<llama_seq_id> seq_ids = {0};
+                if (context_info->add_tokens_to_batch(warmup_tokens, 0, seq_ids, true)) {
+                    int decode_result = llama_decode(context_info->context, context_info->batch);
+                    if (decode_result == 0) {
+                        context_info->n_past = static_cast<int32_t>(warmup_tokens.size());
+                        warmup_success = true;
+                        LLAMA_LOG("Successfully warmed up empty context '" + context_id + "' with " + 
+                                  std::to_string(warmup_tokens.size()) + " warmup tokens");
+                        
+                        // Reset context for normal use but keep the initialized state
+                        llama_memory_clear(llama_get_memory(context_info->context), true);
+                        context_info->n_past = 0;
+                        context_info->prev_len = 0;
+                        context_info->conversation_state.invalidate();
+                        context_info->message_cache_dirty = true;
+                    }
+                }
+            }
+        }
+          // CRITICAL: Only mark as fully initialized AFTER successful warmup
+        // NEVER mark as initialized if warmup fails - this prevents garbage output
+        if (warmup_success) [[likely]] {
+            context_info->fully_initialized.store(true);
+            LLAMA_LOG("Context '" + context_id + "' marked as fully initialized after successful warmup");
+        } else {
+            context_info->fully_initialized.store(false);
+            LLAMA_LOG("CRITICAL: Context warmup failed for '" + context_id + "' - context NOT marked as initialized to prevent garbage output");
+            LLAMA_LOG("Context '" + context_id + "' will require manual initialization before use");
+        }
         
         contexts[context_id] = std::move(context_info);
         LLAMA_LOG("Created context '" + context_id + "' with model '" + model_id + "' successfully");
         
         return true;
     }
-    
-    bool remove_context(const std::string& context_id) {
+      bool remove_context(const std::string& context_id) {
         auto it = contexts.find(context_id);
-        if (it == contexts.end()) {
+        if (it == contexts.end()) [[unlikely]] {
             LLAMA_LOG("Error: Context '" + context_id + "' not found");
             return false;
         }
         
         // Clean up the context
-        if (it->second->batch_initialized) {
+        if (it->second->batch_initialized) [[likely]] {
             llama_batch_free(it->second->batch);
         }
-        if (it->second->context) {
+        if (it->second->context) [[likely]] {
             llama_free(it->second->context);
         }
         
@@ -293,52 +481,56 @@ public:
     // Critical Needed for context validation in various operations
     bool has_context(const std::string& context_id) const noexcept {
         return contexts.find(context_id) != contexts.end();
-    }
-    
-    // Retrieve a ContextInfo object by its ID
+    }    // Retrieve a ContextInfo object by its ID
     // Critical Needed for context access in various operations
     ContextInfo* get_context_info(const std::string& context_id) const {
         auto it = contexts.find(context_id);
-        if (it == contexts.end()) {
+        if (it == contexts.end()) [[unlikely]] {
             return nullptr;
         }
         return it->second.get();
     }
 
-    // Retrieve a ModelInfo object by its ID
+    // Get all available context IDs
+    // Needed for UI dropdown population
+    std::vector<std::string> get_context_ids() const {
+        std::vector<std::string> context_ids;
+        context_ids.reserve(contexts.size());
+        for (const auto& pair : contexts) {
+            context_ids.push_back(pair.first);
+        }
+        return context_ids;
+    }    // Retrieve a ModelInfo object by its ID
     // Critical Needed for model access in various operations
     ModelInfo* get_model_info(const std::string& model_id) const {
         auto it = models.find(model_id);
-        if (it == models.end()) {
+        if (it == models.end()) [[unlikely]] {
             return nullptr;
         }
         return it->second.get();
-    }
-    
-    // Context-specific tokenization with caching
+    }    // Context-specific tokenization with bidirectional caching
     std::vector<llama_token> process_text_to_tokens(const std::string& text, ContextInfo* target_context, bool add_special = true) const {
-        if (text.empty()) return {};
+        if (text.empty()) [[unlikely]] return {};
         
         // Get vocab from specified context's model
-        if (!target_context->model_info || !target_context->model_info->vocab) {
+        if (!target_context->model_info || !target_context->model_info->vocab) [[unlikely]] {
             LLAMA_LOG("Error: No vocabulary available from specified context's model");
             return {};
         }
         
         std::string cache_key = text + (add_special ? ":s" : ":n");
         
-        // Check cache first
-        std::vector<llama_token> cached_tokens = token_cache.get(cache_key);
-        if (!cached_tokens.empty()) {
-            return cached_tokens;
-        }        
-        // Get required buffer size for tokenization
+        // Check cache first - bidirectional lookup
+        if (auto cached_tokens = token_cache.get_tokens(cache_key)) [[likely]] {
+            return *cached_tokens;
+        }
+          // Get required buffer size for tokenization
         const int32_t n_tokens_required = -llama_tokenize(target_context->model_info->vocab, text.c_str(), text.size(), nullptr, 0, add_special, true);
-        if (n_tokens_required <= 0) {
+        if (n_tokens_required <= 0) [[unlikely]] {
             // Don't treat empty tokenization as warning for whitespace-only text
-            if (std::all_of(text.begin(), text.end(), [](char c) { return std::isspace(c); })) {
+            if (std::all_of(text.begin(), text.end(), [](char c) { return std::isspace(c); })) [[likely]] {
                 // Cache empty result for whitespace-only strings
-                token_cache.put(cache_key, {});
+                token_cache.put(cache_key, text, {});
                 return {};
             }
             
@@ -348,76 +540,142 @@ public:
         }
         
         // Add bounds checking for extremely large token counts
-        if (n_tokens_required > target_context->model_info->n_ctx) {
+        if (n_tokens_required > target_context->model_info->n_ctx) [[unlikely]] {
             LLAMA_LOG("Error: Text would produce " + std::to_string(n_tokens_required) + 
                        " tokens, exceeding context limit of " + std::to_string(target_context->model_info->n_ctx));
             return {};
         }
-        
-        // Allocate buffer and tokenize
+          // Allocate buffer and tokenize
         std::vector<llama_token> tokens(n_tokens_required);
         const int32_t n_tokens_actual = llama_tokenize(target_context->model_info->vocab, text.c_str(), text.size(), 
                                                        tokens.data(), tokens.size(), add_special, true);
         
-        if (n_tokens_actual < 0) {
+        if (n_tokens_actual < 0) [[unlikely]] {
             LLAMA_LOG("Error: Tokenization failed with error code: " + std::to_string(n_tokens_actual));
             return {};
         }
         
         // Handle case where actual tokens is 0 but expected was > 0
-        if (n_tokens_actual == 0 && n_tokens_required > 0) {
+        if (n_tokens_actual == 0 && n_tokens_required > 0) [[unlikely]] {
             LLAMA_LOG("Warning: Expected " + std::to_string(n_tokens_required) + " tokens but got 0");
             tokens.clear();
-        } else if (n_tokens_actual != n_tokens_required) {
+        } else if (n_tokens_actual != n_tokens_required) [[unlikely]] {
             LLAMA_LOG("Warning: Token count mismatch - expected " + std::to_string(n_tokens_required) + 
                        ", got " + std::to_string(n_tokens_actual));
             tokens.resize(std::max(0, n_tokens_actual)); // Ensure non-negative size
         }
         
-        // Cache the result
-        token_cache.put(cache_key, tokens);
+        // Cache the result with bidirectional mapping for detokenization
+        token_cache.put(cache_key, text, tokens);
         
         return tokens;
     }
+      
+    // Context-specific detokenization with bidirectional caching (reverse lookup)
+    std::string process_tokens_to_text(const std::vector<llama_token>& tokens, ContextInfo* target_context) const {
+        if (tokens.empty()) return {};
         
-    // Clear conversation history
-    void clear_conversation(ContextInfo* target_context) {        
-        LLAMA_LOG("Clearing conversation for specified context");
-        target_context->clear_conversation();
-    }
-
-    // Prune message history with summarization
-    // Context-specific conversation pruning with summarization
-    bool prune_conversation_with_summary(ContextInfo* target_context, float keep_ratio = 0.6f) {
-        // Don't prune summary contexts
-        if (target_context == get_context_info("summary_context")) {
-            LLAMA_LOG("Skipping pruning for summary context");
-            return true;
+        // Get vocab from specified context's model
+        if (!target_context->model_info || !target_context->model_info->vocab) {
+            LLAMA_LOG("Error: No vocabulary available from specified context's model for detokenization");
+            return {};
         }
         
-        LLAMA_LOG("Pruning context with " + std::to_string(target_context->message_history.size()) + 
-                  " messages, keep_ratio=" + std::to_string(keep_ratio));
+        // Check reverse cache first - bidirectional lookup
+        if (auto cached_text = token_cache.get_text(tokens)) {
+            return *cached_text;
+        }
         
-        return target_context->prune_with_summarization(keep_ratio);
+        // Fallback to llama.cpp detokenization
+        std::string result;
+        result.reserve(tokens.size() * 4); // Rough estimate for token-to-text expansion
+        
+        for (const auto& token : tokens) {
+            std::vector<char> buffer(32); // Start with reasonable buffer size
+            
+            int32_t result_length = llama_token_to_piece(
+                target_context->model_info->vocab, 
+                token, 
+                buffer.data(), 
+                buffer.size(), 
+                0, 
+                true
+            );
+            
+            if (result_length < 0) {
+                // Buffer too small, resize and retry
+                buffer.resize(-result_length);
+                result_length = llama_token_to_piece(
+                    target_context->model_info->vocab, 
+                    token, 
+                    buffer.data(), 
+                    buffer.size(), 
+                    0, 
+                    true
+                );
+            }
+            
+            if (result_length > 0) {
+                result.append(buffer.data(), result_length);
+            }
+        }
+        
+        // Cache the result bidirectionally for future lookups
+        std::string cache_key = "detok:" + std::to_string(std::hash<std::string>{}(result));
+        token_cache.put(cache_key, result, tokens);
+        
+        return result;
     }
     
-    // Context-specific message addition to history
-    void add_message_to_history(ContextInfo* target_context, const std::string& role, const std::string& content) {
-        LLAMA_LOG("Adding message from " + role + " to specified context");
-        target_context->add_message(role, content);
+    // Cache-aware token-to-text conversion with bidirectional caching
+    std::string convert_token_to_text_cached(llama_token token, ContextInfo* target_context) const {
+        if (!target_context->model_info || !target_context->model_info->vocab) {
+            LLAMA_LOG("Error: No vocabulary available for token conversion");
+            return {};
+        }
+        
+        // Try reverse cache lookup first for single token
+        std::vector<llama_token> single_token = {token};
+        if (auto cached_text = token_cache.get_text(single_token)) {
+            return *cached_text;
+        }
+        
+        // Fallback to direct llama.cpp conversion
+        std::vector<char> buffer(32); // Start with reasonable buffer size
+        
+        int32_t result_length = llama_token_to_piece(
+            target_context->model_info->vocab, 
+            token, 
+            buffer.data(), 
+            buffer.size(), 
+            0, 
+            true
+        );
+        
+        if (result_length < 0) {
+            // Buffer too small, resize and retry
+            buffer.resize(-result_length);
+            result_length = llama_token_to_piece(
+                target_context->model_info->vocab, 
+                token, 
+                buffer.data(), 
+                buffer.size(), 
+                0, 
+                true
+            );
+        }
+        
+        std::string result;
+        if (result_length > 0) {
+            result.assign(buffer.data(), result_length);
+            
+            // Cache the result bidirectionally
+            std::string cache_key = "tok:" + std::to_string(token);
+            token_cache.put(cache_key, result, single_token);
+        }
+        
+        return result;
     }
-    
-    // Forward declaration for summary slot info - implementation after LlamaSummarizer include
-    // TODO: Move this into LlamaSummarizer and access it through the parent ContextInfo
-    struct SummarySlotInfo {
-        size_t total_slots;
-        size_t used_slots;
-        std::vector<std::string> summaries;
-    };
-
-    // Context-specific summary slot information
-    // TODO: Move this into LlamaSummarizer and access it through the parent ContextInfo
-    SummarySlotInfo get_summary_slot_info(ContextInfo* target_context) const;
     
     // Initialize summarizer resources for all contexts when summary context becomes available
     void initialize_summarizer_resources() {
@@ -425,7 +683,7 @@ public:
         ContextInfo* summary_ctx = get_context_info("summary_context");
         ModelInfo* summary_mdl = get_model_info("summary_model");
         
-        if (!summary_ctx || !summary_mdl) {
+        if (!summary_ctx || !summary_mdl) [[unlikely]] {
             LLAMA_LOG("Warning: Summary context or model not available for summarizer initialization");
             return;
         }
@@ -434,86 +692,24 @@ public:
         auto response_callback = [this](const std::string& input, const std::string& username, ContextInfo* target_context) -> std::string {
             return generate_response_on_context(input, username, target_context);
         };
-        
-        // Update summarizer ContextInfo (will only ever be one summarizer context)
-        summary_ctx->summarizer->set_summary_resources(summary_mdl, summary_ctx, response_callback);
-        LLAMA_LOG("Successfully initialized summarizer resources");
-    }
-        
-private:
-    // Improved logic flow helper methods
-    // Add message and mark conversation state as needing rebuild
-    void add_message_and_invalidate(ContextInfo* target_context, const std::string& role, const std::string& content) {
-        LLAMA_LOG("Adding " + role + " message and invalidating conversation state for specified context");
-        
-        // Setup conversation - ensure system message is in history if context is empty
-        if (target_context->message_history.empty() && !target_context->system_message.empty()) {
-            target_context->add_message("system", target_context->system_message);
-        }
-        
-        target_context->add_message(role, content);
-        
-        LLAMA_LOG("Message added. Total messages: " + std::to_string(target_context->message_history.size()) + 
-                  ". State invalidated - rebuild required.");
-    }
-    
-    // Generate response tokens using LlamaResponse
-    std::string generate_response_tokens(ContextInfo* target_context) {
-        // Validate that context is properly prepared for generation
-        if (!target_context->context || !target_context->model_info || !target_context->model_info->vocab) {
-            return "Error: Context not properly initialized for generation";
-        }
-          
-        // Check that we have valid context position
-        if (target_context->n_past < 0) {
-            return "Error: Context position is negative (n_past=" + std::to_string(target_context->n_past) + ")";
-        }
-        
-        // For very first generation, n_past could be 0, which is acceptable
-        // But we need to ensure the context has been properly prepared
-        if (target_context->n_past == 0 && target_context->message_history.empty()) {
-            return "Error: Context is completely empty - no messages and n_past=0";
-        }
-          
-        // Ensure we have logits available for generation (if context has been built)
-        if (target_context->n_past > 0) {
-            float* logits = llama_get_logits(target_context->context);
-            if (!logits) {
-                LLAMA_LOG("Warning: No logits available after context rebuild, but proceeding with generation");
-                // Don't fail here - let LlamaResponse handle this case
+          // Initialize summarizer resources for ALL contexts that have summarizers
+        int32_t initialized_count = 0;
+        for (auto& [context_id, context_info] : contexts) {
+            if (context_info->summarizer) [[likely]] {
+                context_info->summarizer->set_summary_resources(summary_mdl, summary_ctx, response_callback);
+                  // Ensure ContextSizeManager integration if both are available
+                if (context_info->context_size_manager) [[likely]] {
+                    context_info->summarizer->integrate_with_context_size_manager(context_info->context_size_manager.get(), context_info.get());
+                    LLAMA_LOG("Integrated LlamaSummarizer with ContextSizeManager and ContextInfo reference for context: " + context_id);
+                }
+                
+                initialized_count++;
+                LLAMA_LOG("Initialized summarizer resources for context: " + context_id);
             }
         }
         
-        LLAMA_LOG("Pre-generation validation passed - context ready for generation");
-        
-        // Setup callback functions for LlamaResponse
-        auto token_adder = [this, target_context](llama_token token, int32_t pos, const std::vector<llama_seq_id>& seq_ids, bool output_logits) -> bool {
-            return target_context->add_tokens_to_batch({token}, pos, seq_ids, output_logits);
-        };
-          auto context_updater = [target_context]() -> void {
-            // Update context length tracking after generation
-            std::string updated_content;
-            if (target_context->apply_template(false, updated_content)) {
-                target_context->prev_len = static_cast<int32_t>(updated_content.length());
-            }
-        };
-          
-        // Single attempt at generation
-        // Context should already be properly prepared by prepare_context_for_generation()
-        LLAMA_LOG("Delegating to LlamaResponse for token generation");
-        std::string response = response_generator.generate_response("generate", "assistant", target_context, token_adder, context_updater);
-        
-        if (!response.empty() && !response.starts_with("Error:")) {
-            LLAMA_LOG("Response generation completed successfully: " + std::to_string(response.length()) + " characters");
-            return response;
-        }
-        
-        // If generation failed, log the error but don't attempt aggressive recovery
-        LLAMA_LOG("Response generation failed: " + response);
-        return response.empty() ? "Error: Failed to generate response - empty result" : response;
+        LLAMA_LOG("Successfully initialized summarizer resources for " + std::to_string(initialized_count) + " contexts");
     }
-
-public:
 
 /* 
      * IMPROVED LINEAR LOGIC FLOW FOR RESPONSE GENERATION
@@ -540,32 +736,179 @@ public:
      * - Linear, predictable flow (no jumping between methods)
      * - Comprehensive logging for debugging
      */
-    
-     // Context-specific response generation
+      // Context-specific response generation
      std::string generate_response(const std::string& input, ContextInfo* target_context, const std::string& username = "Schwi") {
-        // Pre-flight validation
+        if (!target_context) [[unlikely]] return "Error: Invalid context";        // CRITICAL: Enhanced pre-flight validation to prevent garbage generation
+        if (!target_context->fully_initialized.load()) [[unlikely]] {
+            LLAMA_LOG("ERROR: Attempted to generate on uninitialized context - attempting retry initialization");
+            
+            // Find context ID for the target context
+            std::string context_id = "unknown";
+            for (const auto& [id, ctx] : contexts) {
+                if (ctx.get() == target_context) {
+                    context_id = id;
+                    break;
+                }
+            }
+            
+            if (context_id != "unknown" && retry_context_initialization(context_id)) {
+                LLAMA_LOG("SUCCESS: Context '" + context_id + "' initialized successfully for generation");
+            } else {
+                LLAMA_LOG("ERROR: Context '" + context_id + "' retry initialization failed - blocking generation");
+                return "Error: Context not ready for generation - please try again in a moment";
+            }
+        }
+        
+        // Validate context has proper generation state
         if (!target_context->context || !target_context->model_info || 
             !target_context->model_info->model_loaded || !target_context->model_info->model || 
-            !target_context->model_info->vocab || !target_context->batch_initialized) {
+            !target_context->model_info->vocab || !target_context->batch_initialized) [[unlikely]] {
+            LLAMA_LOG("ERROR: Context components not properly initialized for generation");
             return "Error: Model components not properly initialized for generation";
         }
+
+        // Additional validation: Check if context has been through at least one tokenization cycle
+        // This catches contexts that are marked as initialized but haven't established proper state
+        if (target_context->n_past == 0 && !target_context->message_history.empty()) [[unlikely]] {
+            LLAMA_LOG("WARNING: Context has message history but n_past=0 - forcing rebuild before generation");
+            
+            // Force a rebuild to establish proper state
+            auto token_processor = [this, target_context](const std::string& text, bool add_special) {
+                return process_text_to_tokens(text, target_context, add_special);
+            };
+            auto pruning_callback = [this, target_context](float keep_ratio) {
+                return target_context->prune_with_summarization(keep_ratio);
+            };
+            
+            if (!target_context->update_context_from_history(token_processor, pruning_callback)) {
+                LLAMA_LOG("ERROR: Failed to rebuild context before generation - blocking to prevent garbage");
+                return "Error: Failed to initialize context for generation";
+            }
+        }
+
+        if (input.empty()) [[unlikely]] {
+            return "Error: Empty input";
+        }
+
+        LLAMA_LOG("Starting improved linear generation flow for input: " + 
+                  (input.length() > 50 ? input.substr(0, 50) + "..." : input));        // STEP 1: Track user message and get context analysis
+        std::vector<llama_token> input_tokens = process_text_to_tokens(input, target_context, false);
+        track_user_message(*target_context, *target_context->model_info, static_cast<int32_t>(input_tokens.size()));
+        
+        auto pre_analysis = analyze_context_usage(*target_context, *target_context->model_info);
+        auto recommendations = target_context->context_size_manager->get_optimization_recommendations(pre_analysis);
+        for (const auto& rec : recommendations) {
+            LLAMA_LOG("Pre-generation recommendation: " + rec);
+        }
+
+        // STEP 2: Update conversation with new input
+        target_context->add_message(username, input);        
+        // STEP 3: Prepare context for generation (handles template, tokenization, pruning, rebuild)
+        auto token_processor = [this, target_context](const std::string& text, bool add_special) {
+            return process_text_to_tokens(text, target_context, add_special);
+        };        auto pruning_callback = [this, target_context](float keep_ratio) {
+            return target_context->prune_with_summarization(keep_ratio);
+        };
+        
+        if (!target_context->prepare_context_for_generation(token_processor, pruning_callback)) [[unlikely]] {
+            LLAMA_LOG("Context preparation failed, attempting one recovery");
+            
+            // Single recovery attempt - clear context state and try again
+            if (target_context->context) [[likely]] {
+                llama_memory_clear(llama_get_memory(target_context->context), true);
+                target_context->n_past = 0;
+                target_context->prev_len = 0;
+                target_context->message_cache_dirty = true;
+                target_context->conversation_state.invalidate();
+                  if (!target_context->prepare_context_for_generation(token_processor, pruning_callback)) [[unlikely]] {
+                    return "Error: Failed to prepare context for generation after recovery attempt";
+                }
+                LLAMA_LOG("Context preparation recovered successfully");
+            } else {
+                return "Error: Failed to prepare context for generation";
+            }
+        }        
+        // STEP 4: Generate response tokens
+        // Setup callback functions for LlamaResponse
+        auto token_adder = [this, target_context](llama_token token, int32_t pos, const std::vector<llama_seq_id>& seq_ids, bool output_logits) -> bool {
+            return target_context->add_tokens_to_batch({token}, pos, seq_ids, output_logits);
+        };
+        auto context_updater = [target_context]() -> void {
+            // Update context length tracking after generation
+            std::string updated_content;
+            if (target_context->apply_template(false, updated_content)) {
+                target_context->prev_len = static_cast<int32_t>(updated_content.length());
+            }
+        };
+        
+        LLAMA_LOG("Delegating to LlamaResponse for token generation");
+        
+        // Get AI response size prediction for tracking
+        int32_t predicted_tokens = target_context->context_size_manager->get_estimated_ai_response_size();
+          std::string response = response_generator.generate_response("generate", "assistant", target_context, token_adder, context_updater);        // STEP 5: Track AI response and update conversation
+        if (!response.empty() && response.substr(0, 6) != "Error:") [[likely]] {
+            // Track actual AI response size for learning
+            std::vector<llama_token> response_tokens = process_text_to_tokens(response, target_context, false);
+            int32_t actual_tokens = static_cast<int32_t>(response_tokens.size());
+            track_ai_response(*target_context, *target_context->model_info, actual_tokens, predicted_tokens);
+            
+            // Check if response is blacklisted before adding to conversation history
+            if (ai_response_blacklist.is_blacklisted(response)) [[unlikely]] {
+                LLAMA_LOG("AI response is blacklisted, skipping addition to message history: '" + 
+                          (response.length() > 50 ? response.substr(0, 50) + "..." : response) + "'");
+            } else [[likely]] {
+                target_context->add_message("assistant", response);
+            }
+            
+            // Post-generation analysis and recommendations
+            auto post_analysis = analyze_context_usage(*target_context, *target_context->model_info);
+            auto post_recommendations = target_context->context_size_manager->get_optimization_recommendations(post_analysis);
+            for (const auto& rec : post_recommendations) {
+                LLAMA_LOG("Post-generation recommendation: " + rec);
+            }
+            
+            LLAMA_LOG("Linear generation flow completed successfully - tracked " + 
+                      std::to_string(actual_tokens) + " response tokens (predicted: " + 
+                      std::to_string(predicted_tokens) + ")");
+        } else [[unlikely]] {
+            LLAMA_LOG("Linear generation flow failed: " + response);
+        }
+        
+        return response;
+    }
+    
+    // Context-specific response generation with streaming support
+     // StreamCallback signature: void(std::string_view token_text)
+     template<typename StreamCallback>
+     std::string generate_response_streaming(const std::string& input, ContextInfo* target_context, const std::string& username, StreamCallback stream_callback) {
+        if (!target_context) return "Error: Invalid context";
 
         if (input.empty()) {
             return "Error: Empty input";
         }
 
-        LLAMA_LOG("Starting improved linear generation flow for input: " + 
+        LLAMA_LOG("Starting streaming generation flow for input: " + 
                   (input.length() > 50 ? input.substr(0, 50) + "..." : input));
 
-        // STEP 1: Update conversation with new input
-        add_message_and_invalidate(target_context, username, input);
+        // STEP 1: Track user message and get context analysis
+        std::vector<llama_token> input_tokens = process_text_to_tokens(input, target_context, false);
+        track_user_message(*target_context, *target_context->model_info, static_cast<int32_t>(input_tokens.size()));
         
-        // STEP 2: Prepare context for generation (handles template, tokenization, pruning, rebuild)
+        auto pre_analysis = analyze_context_usage(*target_context, *target_context->model_info);
+        auto recommendations = target_context->context_size_manager->get_optimization_recommendations(pre_analysis);
+        for (const auto& rec : recommendations) {
+            LLAMA_LOG("Pre-streaming recommendation: " + rec);
+        }
+
+        // STEP 2: Update conversation with new input
+        target_context->add_message(username, input);
+        
+        // STEP 3: Prepare context for generation with enhanced monitoring
         auto token_processor = [this, target_context](const std::string& text, bool add_special) {
             return process_text_to_tokens(text, target_context, add_special);
         };
         auto pruning_callback = [this, target_context](float keep_ratio) {
-            return prune_conversation_with_summary(target_context, keep_ratio);
+            return target_context->prune_with_summarization(keep_ratio);
         };
         
         if (!target_context->prepare_context_for_generation(token_processor, pruning_callback)) {
@@ -586,59 +929,95 @@ public:
                 return "Error: Failed to prepare context for generation";
             }
         }
+          
+        // STEP 4: Generate response tokens with streaming
+        // Setup callback functions for LlamaResponse
+        auto token_adder = [this, target_context](llama_token token, int32_t pos, const std::vector<llama_seq_id>& seq_ids, bool output_logits) -> bool {
+            return target_context->add_tokens_to_batch({token}, pos, seq_ids, output_logits);
+        };
+        auto context_updater = [target_context]() -> void {
+            // Update context length tracking after generation
+            std::string updated_content;
+            if (target_context->apply_template(false, updated_content)) {
+                target_context->prev_len = static_cast<int32_t>(updated_content.length());
+            }
+        };
         
-        // STEP 3: Generate response tokens
-        std::string response = generate_response_tokens(target_context);
-        
-        // STEP 4: Update conversation with response (if successful)
-        if (!response.empty() && !response.starts_with("Error:")) {
-            add_message_and_invalidate(target_context, "assistant", response);
-            LLAMA_LOG("Linear generation flow completed successfully");
+        LLAMA_LOG("Delegating to LlamaResponse for streaming token generation");
+          // Get AI response prediction for tracking
+        int32_t predicted_tokens = target_context->context_size_manager->get_estimated_ai_response_size();
+          std::string response = response_generator.generate_response("generate", "assistant", target_context, token_adder, context_updater, stream_callback);          // STEP 5: Track response and update conversation (if successful)
+        if (!response.empty() && response.substr(0, 6) != "Error:") {
+            // Track actual AI response size for learning
+            std::vector<llama_token> response_tokens = process_text_to_tokens(response, target_context, false);
+            int32_t actual_tokens = static_cast<int32_t>(response_tokens.size());
+            track_ai_response(*target_context, *target_context->model_info, actual_tokens, predicted_tokens);
+            
+            // Check if response is blacklisted before adding to conversation history
+            if (ai_response_blacklist.is_blacklisted(response)) {
+                LLAMA_LOG("AI response is blacklisted, skipping addition to message history: '" + 
+                          (response.length() > 50 ? response.substr(0, 50) + "..." : response) + "'");
+            } else {
+                target_context->add_message("assistant", response);
+            }
+            
+            // Post-streaming analysis and recommendations
+            auto post_analysis = analyze_context_usage(*target_context, *target_context->model_info);
+            auto post_recommendations = target_context->context_size_manager->get_optimization_recommendations(post_analysis);
+            for (const auto& rec : post_recommendations) {
+                LLAMA_LOG("Post-streaming recommendation: " + rec);
+            }
+            
+            LLAMA_LOG("Streaming generation flow completed successfully - tracked " + 
+                      std::to_string(actual_tokens) + " response tokens (predicted: " + 
+                      std::to_string(predicted_tokens) + ")");
         } else {
-            LLAMA_LOG("Linear generation flow failed: " + response);
+            LLAMA_LOG("Streaming generation flow failed: " + response);
         }
         
         return response;
     }
+      // AI Response Blacklist Management
+    // Thread-safe methods for managing responses that should not be added to conversation history
     
-    // Get performance statistics - overloaded for specific context
-    // TODO: PerformanceStats should probably integrate Timings and be moved into ContextInfo
-    struct PerformanceStats {
-        int64_t total_generation_tokens;
-        int64_t last_decode_time_us;
-        float average_tokens_per_second;
-    };
-    
-    PerformanceStats get_performance_stats(ContextInfo* target_context) const {
-        float avg_tps = 0.0f;
-        if (target_context->last_decode_time_us > 0 && target_context->total_generation_tokens > 0) {
-            avg_tps = static_cast<float>(target_context->total_generation_tokens) / (static_cast<float>(target_context->last_decode_time_us) / 1000000.0f);
-        }
-        
-        return {
-            target_context->total_generation_tokens,
-            target_context->last_decode_time_us,
-            avg_tps
-        };
+    // Add a response to the blacklist with automatic retroactive cleanup
+    void add_to_response_blacklist(const std::string& response) {
+        ai_response_blacklist.add_pattern(response);
     }
     
-    // Timing API methods for compatibility with UI - overloaded for specific context
-    // TODO: Should probably integrate into PerformanceStats and be moved into ContextInfo
-    struct Timings {
-        int32_t n_eval = 0;
-        float t_eval_ms = 0.0f;
-    };
-    
-    void reset_timings(ContextInfo* target_context) {
-        target_context->total_generation_tokens = 0;
-        target_context->last_decode_time_us = 0;
+    // Remove a response from the blacklist
+    bool remove_from_response_blacklist(const std::string& response) {
+        return ai_response_blacklist.remove_pattern(response);
     }
     
-    Timings get_timings(ContextInfo* target_context) const {
-        Timings timings;
-        timings.n_eval = static_cast<int32_t>(target_context->total_generation_tokens);
-        timings.t_eval_ms = static_cast<float>(target_context->last_decode_time_us) / LlamaConstants::MS_TO_MICROSECONDS;
-        return timings;
+    // Clear all blacklisted responses
+    void clear_response_blacklist() {
+        ai_response_blacklist.clear_all();
+    }
+    
+    // Get all blacklisted responses (for UI display)
+    std::vector<std::string> get_blacklisted_responses() const {
+        return ai_response_blacklist.get_all_patterns();
+    }
+    
+    // Add multiple responses to blacklist efficiently (single retroactive cleanup)
+    void add_multiple_to_response_blacklist(const std::vector<std::string>& responses) {
+        ai_response_blacklist.add_multiple_patterns(responses);
+    }
+    
+    // Add response to blacklist without retroactive cleanup (for manual cleanup control)
+    bool add_to_response_blacklist_no_cleanup(const std::string& response) {
+        return ai_response_blacklist.add_pattern_no_cleanup(response);
+    }
+    
+    // Manually trigger retroactive cleanup for all current blacklist patterns
+    void trigger_full_retroactive_cleanup() {
+        ai_response_blacklist.trigger_full_cleanup();
+    }
+    
+    // Check if a response is blacklisted (public interface)
+    bool is_blacklisted_response(const std::string& response) const {
+        return ai_response_blacklist.is_blacklisted(response);
     }
     
     // Enhanced cleanup with memory optimization
@@ -666,12 +1045,7 @@ public:
         models.clear();        
         LLAMA_LOG("Cleanup completed");
     }
-    
-    // Get context size for capacity calculations
-    // TODO: This function should be removed and callers directly access ContextInfo::get_context_size()
-    int32_t get_context_size(ContextInfo* target_context) const noexcept {
-        return target_context->get_context_size();
-    }
+  
     
     bool update_context_from_history(ContextInfo* target_context) {
         // Delegate to the context's rebuild method
@@ -679,43 +1053,122 @@ public:
             return process_text_to_tokens(text, target_context, add_special);
         };
         auto pruning_callback = [this, target_context](float keep_ratio) {
-            return prune_conversation_with_summary(target_context, keep_ratio);
-        };
-        
-        return target_context->update_context_from_history(token_processor, pruning_callback);
+            return target_context->prune_with_summarization(keep_ratio);        };
+          return target_context->update_context_from_history(token_processor, pruning_callback);
     }
     
-private:
+    // TokenCache management and statistics
+    // Get token cache performance statistics for monitoring and optimization
+    TokenCache::CacheStats get_token_cache_stats() const {
+        return token_cache.get_stats();
+    }
+    
+    // Configure token cache settings
+    void configure_token_cache(TokenCache::EvictionPolicy policy = TokenCache::EvictionPolicy::LRU, 
+                              bool enable_thread_safety = false) {        token_cache.configure(policy, enable_thread_safety);
+        LLAMA_LOG("Token cache configured - Policy: " + std::to_string(static_cast<int>(policy)) + 
+                  ", Thread Safety: " + (enable_thread_safety ? "enabled" : "disabled"));
+    }
 
+    // Retry initialization for a context that failed warmup during creation
+    // This allows recovery of contexts that weren't properly initialized
+    bool retry_context_initialization(const std::string& context_id) {
+        auto it = contexts.find(context_id);
+        if (it == contexts.end()) [[unlikely]] {
+            LLAMA_LOG("Error: Context '" + context_id + "' not found for retry initialization");
+            return false;
+        }
+        
+        ContextInfo* context_info = it->second.get();
+        if (context_info->fully_initialized.load()) [[likely]] {
+            LLAMA_LOG("Context '" + context_id + "' is already fully initialized");
+            return true;
+        }
+        
+        LLAMA_LOG("Retrying initialization for context '" + context_id + "'");
+        
+        // Create token processor and pruning callback for retry
+        auto token_processor = [this, context_info](const std::string& text, bool add_special) {
+            return process_text_to_tokens(text, context_info, add_special);
+        };
+        auto pruning_callback = [context_info](float keep_ratio) {
+            return context_info->prune_with_summarization(keep_ratio);
+        };
+        
+        bool retry_success = false;
+        
+        if (!context_info->message_history.empty()) [[likely]] {
+            // Context with system message - rebuild to establish proper state
+            LLAMA_LOG("Retry: Warming up context with system message - performing full rebuild");
+            retry_success = context_info->update_context_from_history(token_processor, pruning_callback);
+            
+            if (retry_success) [[likely]] {
+                // Mark conversation state as properly initialized and up-to-date
+                context_info->conversation_state.needs_rebuild = false;
+                context_info->message_cache_dirty = false;
+                LLAMA_LOG("Retry: Successfully warmed up context '" + context_id + "' with " + 
+                          std::to_string(context_info->n_past) + " tokens");
+            }
+        } else {
+            // Empty context - perform minimal warmup to initialize tokenizer state
+            LLAMA_LOG("Retry: Warming up empty context - performing minimal tokenizer initialization");
+            
+            // Use a minimal prompt to warm up the tokenizer and establish generation state
+            std::string warmup_prompt = "<|im_start|>system\nReady<|im_end|>\n<|im_start|>assistant\n";
+            std::vector<llama_token> warmup_tokens = process_text_to_tokens(warmup_prompt, context_info, true);
+            
+            if (!warmup_tokens.empty()) {
+                // Process warmup tokens to establish context state
+                std::vector<llama_seq_id> seq_ids = {0};
+                if (context_info->add_tokens_to_batch(warmup_tokens, 0, seq_ids, true)) {
+                    int decode_result = llama_decode(context_info->context, context_info->batch);
+                    if (decode_result == 0) {
+                        context_info->n_past = static_cast<int32_t>(warmup_tokens.size());
+                        retry_success = true;
+                        LLAMA_LOG("Retry: Successfully warmed up empty context '" + context_id + "' with " + 
+                                  std::to_string(warmup_tokens.size()) + " warmup tokens");
+                        
+                        // Reset context for normal use but keep the initialized state
+                        llama_memory_clear(llama_get_memory(context_info->context), true);
+                        context_info->n_past = 0;
+                        context_info->prev_len = 0;
+                        context_info->conversation_state.invalidate();
+                        context_info->message_cache_dirty = true;
+                    }
+                }
+            }
+        }
+        
+        // Only mark as fully initialized if retry was successful
+        if (retry_success) [[likely]] {
+            context_info->fully_initialized.store(true);
+            LLAMA_LOG("Context '" + context_id + "' successfully initialized on retry");
+            return true;
+        } else {
+            LLAMA_LOG("ERROR: Context '" + context_id + "' retry initialization failed");
+            return false;
+        }
+    }
+
+private:
     void clear_caches() const {
         token_cache.clear();
     }
-      // Helper method for summarizer callback - generates response on a specific context without context switching
+
+    // Helper method for summarizer callback - generates response on a specific context directly
     std::string generate_response_on_context(const std::string& input, const std::string& username, ContextInfo* target_context) {
-        // Generate response directly on the target context without switching
-        LLAMA_LOG("Generating response directly on target context without switching");
+        // Generate response directly on the target context
+        LLAMA_LOG("Generating response directly on target context");
         
-        try {
-            // Use the overloaded method that accepts a specific context
-            return generate_response(input, target_context, username);
-        } catch (...) {
-            LLAMA_LOG("Exception occurred during context-specific response generation");
-            return "Error: Exception during response generation";
-        }
+        // Pre-flight validation instead of broad try-catch
+        if (!target_context) [[unlikely]] {
+            LLAMA_LOG("Error: Null target context provided");
+            return "Error: Invalid context";        }
+        
+        // Use the overloaded method that accepts a specific context
+        return generate_response(input, target_context, username);
     }
 };
-
-// Include LlamaSummarizer implementation after class declaration to avoid circular dependency
-#include "LlamaSummarizer.hpp"
-
-// Implementation of LlamaManager methods that depend on LlamaSummarizer
-inline LlamaManager::SummarySlotInfo LlamaManager::get_summary_slot_info(ContextInfo* target_context) const {
-    if (!target_context->summarizer) {
-        return {SummarizerConstants::MAX_SUMMARY_SLOTS, 0, {}};
-    }
-    auto summarizer_info = target_context->summarizer->get_summary_slot_info();
-    return {summarizer_info.total_slots, summarizer_info.used_slots, summarizer_info.summaries};
-}
 
 //
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!

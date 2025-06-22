@@ -1,0 +1,19 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build LuminaChat",
+			"type": "shell",
+			"command": "msbuild",
+			"args": [
+				"LuminaChat.vcxproj",
+				"/p:Configuration=Debug",
+				"/p:Platform=x64"
+			],
+			"group": "build",
+			"problemMatcher": [
+				"$msCompile"
+			]
+		}
+	]
+}
