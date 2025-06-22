@@ -1,14 +1,14 @@
 // ContextSizeManager.hpp - Production-ready adaptive context size management for LLaMA contexts
 //
-// ISOLATED CONTEXT STRATEGY:
-// - Each ContextInfo has its own EnhancedContextSizeManager instance
-// - Dynamic tracking of AI response sizes with 1.5x buffer per context
-// - Dynamic tracking of summary sizes with 1.5x buffer per context
-// - Hard 30% cap for summary allocation with dynamic threshold management per context
-// - 10% emergency buffer for prediction overruns per context
-// - Minimum 3 summary slots with intelligent merging per context
-// - Truly adaptive space allocation based on rolling averages per context
-// - Mathematical validation of all allocation constraints per context
+// OPTIMIZED CONTEXT STRATEGY (v2.0):
+// - Maximum context utilization (up to 95%) while maintaining safety
+// - Balanced allocation: 20% summaries, 35% active content, 15% AI responses, 3% emergency buffer
+// - Message-aware summarization: ensures ~12 messages can fit between summarizations
+// - Reduced summary merge frequency through optimized thresholds (15-20% range)
+// - Enhanced yo-yo effect prevention with 75% target usage after pruning
+// - Each ContextInfo has its own EnhancedContextSizeManager instance for isolation
+// - Dynamic tracking with conservative 1.5x buffers and prediction accuracy monitoring
+// - Mathematical validation ensures total allocations ≤ 73% with remaining space for messages
 //
 // INTEGRATION: Functions implemented in LlamaContext.hpp to avoid circular dependencies
 // Usage: initialize_context_size_manager(), analyze_context_usage(), track_user_message(), track_ai_response()
@@ -41,22 +41,26 @@ enum class ContextStrategy : uint8_t {
 
 // Mathematically validated context size management configuration for isolated contexts
 namespace ContextSizeConstants {
-    // Core allocation constraints per context (mathematically validated)
-    static constexpr float MAX_TOTAL_SUMMARY_ALLOCATION = 0.30f;     // Hard 30% cap for all summaries per context
-    static constexpr float EMERGENCY_BUFFER = 0.10f;                 // 10% emergency buffer per context
+    // Core allocation constraints per context (optimized for maximum utilization)
+    static constexpr float MAX_TOTAL_SUMMARY_ALLOCATION = 0.20f;     // Hard 20% cap for all summaries per context (reduced for better balance)
+    static constexpr float EMERGENCY_BUFFER = 0.03f;                 // 3% emergency buffer per context (reduced for higher utilization)    
     static constexpr float MIN_AI_ALLOCATION = 0.15f;                // Minimum 15% for AI responses per context
-    static constexpr float MIN_ACTIVE_CONTENT = 0.25f;               // Minimum 25% for active conversation per context
+    static constexpr float MIN_ACTIVE_CONTENT = 0.35f;               // Minimum 35% for active conversation per context (increased for more messages)
     static constexpr float DYNAMIC_BUFFER_MULTIPLIER = 1.5f;         // 1.5x multiplier for predictions per context
-    
+    static constexpr float CONSERVATIVE_BUFFER_MULTIPLIER = 1.2f;    // More conservative 1.2x multiplier for AI space estimation    
     // Summary management
     static constexpr size_t MIN_SUMMARY_SLOTS = 3;                   // Minimum slots before merging
-    static constexpr float MAX_HISTORY_PER_SUMMARY = 0.10f;          // Max 10% of context per summary creation
-      // Dynamic threshold calculation (mathematically bounded)
-    static constexpr float BASE_SUMMARY_MERGE_THRESHOLD = 0.25f;     // Base threshold (25%)
-    static constexpr float MIN_SUMMARY_MERGE_THRESHOLD = 0.22f;      // Minimum threshold (22%)
-    static constexpr float MAX_SUMMARY_MERGE_THRESHOLD = 0.30f;      // Maximum threshold (30% - full utilization)
-    static constexpr float THRESHOLD_ADJUSTMENT_SENSITIVITY = 1.5f;  // Sensitivity to usage patterns
-      // Rolling average tracking
+    static constexpr float MAX_HISTORY_PER_SUMMARY = 0.08f;          // Max 8% of context per summary creation (reduced for more frequent summaries)
+    static constexpr size_t MIN_MESSAGES_BEFORE_SUMMARY = 10;        // Minimum messages that should fit before next summary
+    static constexpr size_t TARGET_MESSAGES_BETWEEN_SUMMARIES = 12;  // Target number of messages between summarizations
+    
+    // Dynamic threshold calculation (optimized for balanced summarization)
+    static constexpr float BASE_SUMMARY_MERGE_THRESHOLD = 0.18f;     // Base threshold (18% - reduced for less frequent merging)
+    static constexpr float MIN_SUMMARY_MERGE_THRESHOLD = 0.15f;      // Minimum threshold (15%)
+    static constexpr float MAX_SUMMARY_MERGE_THRESHOLD = 0.20f;      // Maximum threshold (20% - aligned with hard cap)
+    static constexpr float THRESHOLD_ADJUSTMENT_SENSITIVITY = 1.2f;  // Sensitivity to usage patterns (reduced for stability)
+    
+    // Rolling average tracking
     static constexpr size_t MIN_SAMPLES_FOR_RELIABILITY = 5;         
     static constexpr size_t MAX_SAMPLES_TO_TRACK = 50;               
     static constexpr int32_t DEFAULT_AI_RESPONSE_SIZE = 150;         
@@ -67,19 +71,23 @@ namespace ContextSizeConstants {
     static constexpr float HIGH_USAGE_THRESHOLD = 0.85f;             // High context usage threshold
     static constexpr float RAPID_GROWTH_THRESHOLD = 0.025f;          // Rapid growth threshold (2.5% per interaction)
     static constexpr float HIGH_VOLATILITY_THRESHOLD = 0.15f;        // High volatility threshold
-      // Strategy adaptation thresholds
+    
+    // Strategy adaptation thresholds
     static constexpr float LARGE_RESPONSE_THRESHOLD = 500.0f;        
     static constexpr float LARGE_SUMMARY_THRESHOLD = 400.0f;         
-    static constexpr float VARIABILITY_THRESHOLD = 0.6f;             
+    static constexpr float VARIABILITY_THRESHOLD = 0.6f;       // Context management ratios (optimized for maximum utilization and balanced operations)
+    static constexpr float MAX_CONTEXT_USAGE = 0.95f;              // Only trigger pruning at 95% usage (increased for better utilization)
+    static constexpr float TARGET_CONTEXT_USAGE = 0.75f;           // Target usage after pruning (increased to reduce yo-yo effect)
+    static constexpr float AGGRESSIVE_PRUNING_RATIO = 0.25f;       // Emergency pruning ratio (reduced for gentler pruning)
     
-    // Context management ratios (moved from SummarizerConstants to avoid circular dependency)
-    static constexpr float MAX_CONTEXT_USAGE = 0.90f;
-    static constexpr float TARGET_CONTEXT_USAGE = 0.60f;
-    static constexpr float AGGRESSIVE_PRUNING_RATIO = 0.30f;
-      // Mathematical validation: Ensure allocations don't exceed safe limits per context
+    // Message-based thresholds for balanced summarization
+    static constexpr float ESTIMATED_TOKENS_PER_MESSAGE = 75.0f;    // Estimated tokens per user+AI message exchange
+    static constexpr float MESSAGE_BUFFER_MULTIPLIER = 1.3f;        // Safety multiplier for message estimation
+    
+    // Mathematical validation: Ensure allocations don't exceed safe limits per context (updated for higher utilization)
     static_assert(EMERGENCY_BUFFER + MAX_TOTAL_SUMMARY_ALLOCATION + 
-                  MIN_AI_ALLOCATION + MIN_ACTIVE_CONTENT <= 0.85f, 
-                  "Allocation constraints exceed safe limits - total must be <= 85% per context");
+                  MIN_AI_ALLOCATION + MIN_ACTIVE_CONTENT <= 0.73f, 
+                  "Allocation constraints exceed safe limits - total must be <= 73% per context");
 }
 
 // Thread-safe adaptive size tracker with prediction accuracy monitoring for isolated contexts
@@ -284,26 +292,25 @@ public:
         
         constexpr float base_threshold = ContextSizeConstants::BASE_SUMMARY_MERGE_THRESHOLD;
         float adjustment = 0.0f;
-        
-        // Factor 1: Context growth rate
+          // Factor 1: Context growth rate (adjusted for less frequent summarization)
         if (average_context_growth_per_interaction_ > ContextSizeConstants::RAPID_GROWTH_THRESHOLD) [[unlikely]] {
-            adjustment -= 0.02f;  // Lower threshold (trigger earlier)
+            adjustment -= 0.015f;  // Lower threshold (trigger earlier) - reduced from 0.02f
         } else if (average_context_growth_per_interaction_ < 0.01f) [[likely]] {
-            adjustment += 0.01f;  // Higher threshold (trigger later)
+            adjustment += 0.015f;  // Higher threshold (trigger later) - increased from 0.01f
         }
         
-        // Factor 2: Usage volatility
+        // Factor 2: Usage volatility (adjusted for stability)
         if (usage_volatility_ > ContextSizeConstants::HIGH_VOLATILITY_THRESHOLD) [[unlikely]] {
-            adjustment -= 0.015f;  // Lower threshold for safety
+            adjustment -= 0.01f;  // Lower threshold for safety - reduced from 0.015f
         } else if (usage_volatility_ < 0.05f) [[likely]] {
-            adjustment += 0.01f;   // Higher threshold, more predictable
+            adjustment += 0.015f;   // Higher threshold, more predictable - increased from 0.01f
         }
         
-        // Factor 3: Peak usage in recent window
+        // Factor 3: Peak usage in recent window (adjusted for higher utilization targets)
         if (peak_usage_in_window_ > ContextSizeConstants::HIGH_USAGE_THRESHOLD) [[unlikely]] {
-            adjustment -= 0.025f;  // Much lower threshold
-        } else if (peak_usage_in_window_ < 0.65f) [[likely]] {
-            adjustment += 0.015f;  // Higher threshold
+            adjustment -= 0.02f;  // Much lower threshold - reduced from 0.025f
+        } else if (peak_usage_in_window_ < 0.70f) [[likely]] {  // Increased from 0.65f
+            adjustment += 0.02f;  // Higher threshold - increased from 0.015f
         }
         
         // Apply sensitivity multiplier
@@ -344,23 +351,22 @@ private:
         
         constexpr float base_threshold = ContextSizeConstants::BASE_SUMMARY_MERGE_THRESHOLD;
         float adjustment = 0.0f;
-        
-        if (average_context_growth_per_interaction_ > ContextSizeConstants::RAPID_GROWTH_THRESHOLD) [[unlikely]] {
-            adjustment -= 0.02f;
+          if (average_context_growth_per_interaction_ > ContextSizeConstants::RAPID_GROWTH_THRESHOLD) [[unlikely]] {
+            adjustment -= 0.015f;  // Lower threshold (trigger earlier) - reduced from 0.02f
         } else if (average_context_growth_per_interaction_ < 0.01f) [[likely]] {
-            adjustment += 0.01f;
+            adjustment += 0.015f;  // Higher threshold (trigger later) - increased from 0.01f
         }
         
         if (usage_volatility_ > ContextSizeConstants::HIGH_VOLATILITY_THRESHOLD) [[unlikely]] {
-            adjustment -= 0.015f;
+            adjustment -= 0.01f;  // Lower threshold for safety - reduced from 0.015f
         } else if (usage_volatility_ < 0.05f) [[likely]] {
-            adjustment += 0.01f;
+            adjustment += 0.015f;   // Higher threshold, more predictable - increased from 0.01f
         }
         
         if (peak_usage_in_window_ > ContextSizeConstants::HIGH_USAGE_THRESHOLD) [[unlikely]] {
-            adjustment -= 0.025f;
-        } else if (peak_usage_in_window_ < 0.65f) [[likely]] {
-            adjustment += 0.015f;
+            adjustment -= 0.02f;  // Much lower threshold - reduced from 0.025f
+        } else if (peak_usage_in_window_ < 0.70f) [[likely]] {  // Increased from 0.65f
+            adjustment += 0.02f;  // Higher threshold - increased from 0.015f
         }
         
         adjustment *= ContextSizeConstants::THRESHOLD_ADJUSTMENT_SENSITIVITY;
@@ -433,8 +439,7 @@ public:
     void track_usage_pattern(float context_usage, int32_t ai_tokens = 0, int32_t user_tokens = 0) const noexcept {
         usage_tracker_.track_interaction(context_usage, ai_tokens, user_tokens);
     }
-    
-    // Check if we need to merge before adding a new summary
+      // Check if we need to merge before adding a new summary (enhanced with message-based logic)
     [[nodiscard]] bool needs_merge_before_adding(int32_t new_summary_size) const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         
@@ -442,14 +447,23 @@ public:
             return false;
         }
         
-        // Check against hard 30% cap first (critical safety check)
+        // Check against hard 20% cap first (critical safety check)
         const int32_t projected_total = total_summary_tokens_ + new_summary_size;
         const float projected_usage = static_cast<float>(projected_total) / context_size_;
         if (projected_usage > ContextSizeConstants::MAX_TOTAL_SUMMARY_ALLOCATION) [[unlikely]] {
             return true;
         }
         
-        // Check against dynamic threshold
+        // Enhanced check: Ensure we have room for target number of messages before next summary
+        const float remaining_context = 1.0f - projected_usage;
+        const float estimated_space_for_messages = remaining_context - ContextSizeConstants::MIN_AI_ALLOCATION - ContextSizeConstants::EMERGENCY_BUFFER;
+        const float messages_that_fit = (estimated_space_for_messages * context_size_) / ContextSizeConstants::ESTIMATED_TOKENS_PER_MESSAGE;
+        
+        if (messages_that_fit < ContextSizeConstants::MIN_MESSAGES_BEFORE_SUMMARY) [[unlikely]] {
+            return true; // Need to merge to make room for adequate message exchanges
+        }
+        
+        // Check against dynamic threshold (secondary check)
         const float dynamic_threshold = usage_tracker_.calculate_dynamic_threshold();
         const float current_usage = get_usage_percentage_unsafe();
         return current_usage > dynamic_threshold;
@@ -885,10 +899,55 @@ public:
     [[nodiscard]] DynamicSummarySlotManager::SummarySlotStats get_summary_statistics() const noexcept {
         return summary_slot_manager_.get_statistics();
     }
-    
-    // Reset all summary slots
+      // Reset all summary slots
     void reset_summary_slots() noexcept {
-        summary_slot_manager_.clear_all_slots();    }
+        summary_slot_manager_.clear_all_slots();
+    }
+    
+    // Clear all summary slots (alias for reset_summary_slots)
+    void clear_summary_slots() noexcept {
+        summary_slot_manager_.clear_all_slots();
+    }
+    
+    // Add a summary slot directly (for synchronization)
+    void add_summary_slot_direct(int32_t tokens) noexcept {
+        summary_slot_manager_.add_summary_slot(tokens);
+    }
+    
+    // Atomic synchronization with LlamaSummarizer - rebuilds tracking from authoritative source
+    template<typename SlotContainer>
+    void sync_with_authoritative_slots(const SlotContainer& authoritative_slots) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        // Store current state for comparison
+        auto old_stats = summary_slot_manager_.get_statistics();
+        
+        // Clear and rebuild from authoritative source atomically
+        summary_slot_manager_.clear_all_slots();
+        
+        size_t synced_count = 0;
+        for (const auto& slot : authoritative_slots) {
+            if (!slot.empty()) {
+                // Estimate tokens for this slot (using same logic as LlamaSummarizer)
+                constexpr float CHARS_PER_TOKEN = 4.0f;
+                int32_t estimated = static_cast<int32_t>(slot.length() / CHARS_PER_TOKEN);
+                estimated = static_cast<int32_t>(estimated * 1.1f); // 10% buffer
+                estimated = std::clamp(estimated, 10, 1000); // Same bounds as LlamaSummarizer
+                
+                summary_slot_manager_.add_summary_slot(estimated);
+                synced_count++;
+            }
+        }
+        
+        auto new_stats = summary_slot_manager_.get_statistics();
+        
+        LLAMA_LOG("Atomic slot synchronization completed:");
+        LLAMA_LOG("  Previous: " + std::to_string(old_stats.slot_count) + " slots, " + 
+                  std::to_string(old_stats.total_tokens) + " tokens");
+        LLAMA_LOG("  Current: " + std::to_string(new_stats.slot_count) + " slots, " + 
+                  std::to_string(new_stats.total_tokens) + " tokens");
+        LLAMA_LOG("  Synced: " + std::to_string(synced_count) + " non-empty slots");
+    }
     
 private:
     void review_strategy() noexcept {
@@ -932,6 +991,5 @@ private:
 
 //
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!
-//
 
 
