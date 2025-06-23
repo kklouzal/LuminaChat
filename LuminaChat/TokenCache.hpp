@@ -168,10 +168,9 @@ private:
     void trim_cache() const {
         const size_t target_size = static_cast<size_t>(max_cache_size * CACHE_TRIM_TARGET_RATIO);
         size_t initial_size = text_to_entry.size();
-        size_t total_reclaimed = 0;
-          // Debug logging for cache pressure
+        size_t total_reclaimed = 0;        // Debug logging for cache pressure
         if (initial_size > max_cache_size * 0.8f) {
-            LOG_DEBUG(LLAMA_MANAGER, "TokenCache trim triggered - pressure at " + 
+            TOKEN_CACHE_LOG_DEBUG("Cache trim triggered - pressure at " + 
                      std::to_string(static_cast<float>(initial_size) / max_cache_size * 100.0f) + 
                      "% (" + std::to_string(initial_size) + "/" + std::to_string(max_cache_size) + ")");
         }
@@ -214,13 +213,12 @@ private:
                     evictions.fetch_add(1, std::memory_order_relaxed);
                     memory_reclaimed_bytes.fetch_add(reclaimed_memory, std::memory_order_relaxed);
                 }            } else [[unlikely]] {
-                LOG_DEBUG(LLAMA_MANAGER, "TokenCache trim: No victim found, breaking");
+                TOKEN_CACHE_LOG_DEBUG("Cache trim: No victim found, breaking");
                 break;
             }
-        }
-          // Debug logging for trim results
+        }        // Debug logging for trim results
         if (initial_size != text_to_entry.size()) {
-            LOG_DEBUG(LLAMA_MANAGER, "TokenCache trim completed: " + 
+            TOKEN_CACHE_LOG_DEBUG("Cache trim completed: " + 
                      std::to_string(initial_size - text_to_entry.size()) + " entries removed, " +
                      std::to_string(total_reclaimed) + " bytes reclaimed");
         }
@@ -271,14 +269,19 @@ public:    explicit TokenCache(const size_t max_size = DEFAULT_CACHE_SIZE,
         text_to_entry.reserve(INITIAL_RESERVE_SIZE);
         token_hash_to_entry.reserve(INITIAL_RESERVE_SIZE);
         access_iterators.reserve(INITIAL_RESERVE_SIZE);
-    }    // Configure cache settings
+        
+        TOKEN_CACHE_LOG_DEBUG("TokenCache initialized: max_size=" + std::to_string(max_size) + 
+                             ", policy=" + std::to_string(static_cast<int>(policy)) + 
+                             ", thread_safe=" + (enable_thread_safety ? "true" : "false"));
+    }// Configure cache settings
     void configure(const EvictionPolicy policy, const bool enable_thread_safety = false) noexcept {
         const_cast<EvictionPolicy&>(eviction_policy) = policy;
         const_cast<bool&>(thread_safe) = enable_thread_safety;
-    }
-      // Resize cache
+    }    // Resize cache
     void resize_cache(const size_t new_max_size) {
         return with_write_lock([&]() {
+            TOKEN_CACHE_LOG_DEBUG("Resizing cache from " + std::to_string(max_cache_size) + 
+                                 " to " + std::to_string(new_max_size) + " entries");
             max_cache_size = new_max_size;
             if (text_to_entry.size() > max_cache_size) [[unlikely]] {
                 trim_cache();
@@ -296,12 +299,11 @@ public:    explicit TokenCache(const size_t max_size = DEFAULT_CACHE_SIZE,
                 cache_hits.fetch_add(1, std::memory_order_relaxed);
                 update_access_order(it->first, *it->second);
                 return it->second->tokens;
-            }
-              // Debug logging for frequent cache misses (potential performance issue)
+            }            // Debug logging for frequent cache misses (potential performance issue)
             if (cache_requests.load() % 100 == 0) {
                 float hit_ratio = static_cast<float>(cache_hits.load()) / cache_requests.load();
                 if (hit_ratio < 0.5f) {
-                    LOG_DEBUG(LLAMA_MANAGER, "TokenCache: Low hit ratio detected: " + 
+                    TOKEN_CACHE_LOG_DEBUG("Low hit ratio detected: " + 
                              std::to_string(hit_ratio * 100.0f) + "% (requests: " + 
                              std::to_string(cache_requests.load()) + ")");
                 }
@@ -333,7 +335,7 @@ public:    explicit TokenCache(const size_t max_size = DEFAULT_CACHE_SIZE,
                     }
                     return entry.text;                } else {
                     // Hash collision detected - this is rare but important to log
-                    LOG_DEBUG(LLAMA_MANAGER, "TokenCache: Hash collision detected for token sequence");
+                    TOKEN_CACHE_LOG_DEBUG("Hash collision detected for token sequence");
                 }
             }
             
@@ -395,7 +397,7 @@ public:    explicit TokenCache(const size_t max_size = DEFAULT_CACHE_SIZE,
             cache_requests.store(0, std::memory_order_relaxed);
             memory_usage_bytes.store(0, std::memory_order_relaxed);
             
-            LOG_DEBUG(LLAMA_MANAGER, "TokenCache cleared: " + 
+            TOKEN_CACHE_LOG_DEBUG("Cache cleared: " + 
                      std::to_string(entries_cleared) + " entries, " + 
                      std::to_string(memory_cleared) + " bytes freed");
         });

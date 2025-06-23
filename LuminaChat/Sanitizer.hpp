@@ -3,6 +3,7 @@
 #include <sstream>
 #include <regex>
 #include <algorithm>
+#include "LogHandler.hpp"
 
 class TextSanitizer {
 public:    // Sanitize text by removing invalid Unicode characters and Discord-specific formatting
@@ -30,8 +31,7 @@ private:    // Remove Discord-specific formatting that might cause tokenization 
         if (text.empty()) [[unlikely]] {
             return text;
         }
-        
-        try {
+          try {
             // Pre-compile static regex patterns for better performance
             static const std::regex user_mention_regex{R"(<@!?\d+>)"};
             static const std::regex channel_mention_regex{R"(<#\d+>)"};
@@ -61,11 +61,13 @@ private:    // Remove Discord-specific formatting that might cause tokenization 
             cleaned = std::regex_replace(cleaned, timestamp_regex, "[Timestamp]");
             
             return cleaned;
-        } catch (const std::exception&) {
+        } catch (const std::exception& e) {
             // If regex fails, return original text rather than empty string
+            SANITIZER_LOG_DEBUG("Discord formatting cleanup failed: " + std::string(e.what()) + 
+                               " - returning original text");
             return text;
         }
-    }// Remove invalid Unicode characters that might cause tokenization issues
+    }    // Remove invalid Unicode characters that might cause tokenization issues
     [[nodiscard]] static std::string remove_invalid_unicode(const std::string& text) noexcept {
         if (text.empty()) {
             return text;
@@ -73,6 +75,9 @@ private:    // Remove Discord-specific formatting that might cause tokenization 
         
         std::string result;
         result.reserve(text.length());
+        
+        size_t invalid_sequences = 0;
+        size_t invalid_codepoints = 0;
         
         for (size_t i = 0; i < text.length(); ) {
             const unsigned char c = static_cast<unsigned char>(text[i]);
@@ -92,6 +97,7 @@ private:    // Remove Discord-specific formatting that might cause tokenization 
                 const int utf8_len = get_utf8_sequence_length(c);
                 if (utf8_len == 0 || i + utf8_len > text.length()) [[unlikely]] {
                     // Invalid UTF-8 sequence, skip this byte
+                    invalid_sequences++;
                     ++i;
                     continue;
                 }
@@ -105,19 +111,28 @@ private:    // Remove Discord-specific formatting that might cause tokenization 
                         break;
                     }
                 }
-                
-                if (valid_sequence && (i + utf8_len <= text.length())) [[likely]] {
+                  if (valid_sequence && (i + utf8_len <= text.length())) [[likely]] {
                     // Check for problematic Unicode codepoints
                     const uint32_t codepoint = decode_utf8_codepoint(text.substr(i, utf8_len));
                     if (is_valid_codepoint(codepoint)) [[likely]] {
                         result += text.substr(i, utf8_len);
+                    } else {
+                        invalid_codepoints++;
                     }
                     i += utf8_len;
                 } else [[unlikely]] {
                     // Invalid sequence, skip this byte
+                    invalid_sequences++;
                     ++i;
                 }
             }
+        }
+        
+        // Debug logging for significant Unicode cleanup
+        if (invalid_sequences > 0 || invalid_codepoints > 0) {
+            SANITIZER_LOG_DEBUG("Unicode cleanup removed " + std::to_string(invalid_sequences) + 
+                               " invalid sequences and " + std::to_string(invalid_codepoints) + 
+                               " invalid codepoints from text");
         }
         
         return result;
@@ -199,10 +214,11 @@ private:    // Remove Discord-specific formatting that might cause tokenization 
             
             // Trim leading and trailing whitespace from entire string
             normalized = std::regex_replace(normalized, std::regex(R"(^\s+|\s+$)"), "");
-            
-            return normalized;
-        } catch (const std::exception&) {
+              return normalized;
+        } catch (const std::exception& e) {
             // If regex fails, do basic whitespace cleanup
+            SANITIZER_LOG_DEBUG("Whitespace normalization regex failed: " + std::string(e.what()) + 
+                               " - falling back to basic cleanup");
             std::string result = text;
             // Just trim leading/trailing whitespace as fallback
             const size_t start = result.find_first_not_of(" \t\n\r");

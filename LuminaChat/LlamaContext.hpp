@@ -572,8 +572,7 @@ public:    // Add message to this context's history
         int32_t available_ctx = model_info->n_ctx - n_past;
         
         return std::max(1, std::min({n_batch, available_ctx, LlamaConstants::MAX_BATCH_SIZE}));
-    }
-      // Enhanced context processing - Updated for proper single-input batching
+    }    // Enhanced context processing - Updated for proper single-input batching
     // NOTE: Batching in llama.cpp is designed for processing multiple separate inputs/sequences 
     // simultaneously, NOT for splitting a single input into chunks. Each batch operation should
     // contain tokens from potentially multiple different inputs, each with their own sequence IDs.
@@ -581,43 +580,52 @@ public:    // Add message to this context's history
     template<typename SummarizerCallback>
     bool process_context_tokens(const std::vector<llama_token>& tokens, bool is_incremental, SummarizerCallback&& pruning_callback) {
         if (!batch_initialized) [[unlikely]] {
-            LLAMA_LOG("Error: No active context or batch not initialized");
+            LLAMA_CONTEXT_LOG_ERROR("No active context or batch not initialized");
             return false;
         }
         
         if (tokens.empty()) [[unlikely]] {
+            LLAMA_CONTEXT_LOG_DEBUG("Empty token vector provided to process_context_tokens");
             return true; // Empty tokens are valid
         }
         
+        LLAMA_CONTEXT_LOG_DEBUG("Processing " + std::to_string(tokens.size()) + " tokens (incremental=" + 
+                               (is_incremental ? "true" : "false") + ", n_past=" + std::to_string(n_past) + ")");
+        
         if (!model_info) [[unlikely]] {
-            LLAMA_LOG("Error: No model info available for current context");
+            LLAMA_CONTEXT_LOG_ERROR("No model info available for current context");
             return false;
         }
         
         // Additional validation before processing
         if (!context) [[unlikely]] {
-            LLAMA_LOG("Error: Context is null during token processing");
+            LLAMA_CONTEXT_LOG_ERROR("Context is null during token processing");
             return false;
         }
         
+        PERF_TRACE(LLAMA_CONTEXT, "Starting token processing");
+        
         const int32_t n_batch = calculate_optimal_batch_size();
         if (n_batch <= 0) [[unlikely]] {
-            LLAMA_LOG("Error: Invalid batch size calculated: " + std::to_string(n_batch));
+            LLAMA_CONTEXT_LOG_ERROR("Invalid batch size calculated: " + std::to_string(n_batch));
             return false;
         }
+        
+        LLAMA_CONTEXT_LOG_DEBUG("Using batch size: " + std::to_string(n_batch));
+        
           std::vector<llama_seq_id> seq_ids = {0};
         if (!is_incremental) {
-            LLAMA_LOG("Starting context rebuild: FULL (non-incremental) - processing " + std::to_string(tokens.size()) + " tokens");
+            LLAMA_CONTEXT_LOG("Starting context rebuild: FULL (non-incremental) - processing " + std::to_string(tokens.size()) + " tokens");
             n_past = 0; // Reset for full context rebuild
-        }
-          // Validate n_past bounds before processing
+        }          // Validate n_past bounds before processing
         if (n_past < 0) [[unlikely]] {
-            LLAMA_LOG("Error: Invalid n_past value: " + std::to_string(n_past));
+            LLAMA_CONTEXT_LOG_ERROR("Invalid n_past value: " + std::to_string(n_past));
             n_past = 0;
         }
         
         if (n_past >= model_info->n_ctx) [[unlikely]] {
-            LLAMA_LOG("Error: n_past exceeds context size, resetting");
+            LLAMA_CONTEXT_LOG_ERROR("n_past exceeds context size, resetting (n_past=" + std::to_string(n_past) + 
+                                   ", n_ctx=" + std::to_string(model_info->n_ctx) + ")");
             n_past = 0;
             if (context) [[likely]] {
                 llama_memory_clear(llama_get_memory(context), true); // Ensure kv memory/cache is cleared
@@ -627,55 +635,62 @@ public:    // Add message to this context's history
         // Safer overflow check
         const size_t max_safe_add = static_cast<size_t>(std::numeric_limits<int32_t>::max() - n_past);
         if (tokens.size() > max_safe_add) [[unlikely]] {
-            LLAMA_LOG("Error: Token addition would cause overflow");
+            LLAMA_CONTEXT_LOG_ERROR("Token addition would cause overflow");
             return false;        }        // ContextSizeManager integration - check if we need pruning before processing
         // CRITICAL FIX: Only trigger pruning if we haven't already pruned recently
         // During post-pruning rebuilds, we should proceed even if usage appears high,
         // since the message history has already been reduced
         bool recently_pruned = conversation_state.needs_rebuild && message_cache_dirty;
         bool should_prune = should_trigger_pruning(*this, *model_info, static_cast<int32_t>(tokens.size()));
+          LLAMA_CONTEXT_LOG_DEBUG("Pruning analysis: recently_pruned=" + std::string(recently_pruned ? "true" : "false") + 
+                               ", should_prune=" + std::string(should_prune ? "true" : "false"));
         
         // ADDITIONAL FIX: If we're in a post-pruning rebuild and the analysis thinks we need pruning,
         // this might be due to stale ContextSizeManager state. Force a refresh of the analysis.
         if (recently_pruned && should_prune && context_size_manager) {
-            LLAMA_LOG("Post-pruning rebuild detected with high usage - refreshing ContextSizeManager state");
+            LLAMA_CONTEXT_LOG_DEBUG("Post-pruning rebuild detected with high usage - refreshing ContextSizeManager state");
             // Clear any stale state and force re-analysis with current message count
             context_size_manager->clear_summary_slots();
             should_prune = should_trigger_pruning(*this, *model_info, static_cast<int32_t>(tokens.size()));
             if (should_prune) {
-                LLAMA_LOG("WARNING: ContextSizeManager still reports pruning needed after state refresh - proceeding with rebuild anyway (post-pruning scenario)");
+                LLAMA_CONTEXT_LOG_DEBUG("ContextSizeManager still reports pruning needed after state refresh - proceeding with rebuild anyway (post-pruning scenario)");
                 should_prune = false; // Override the decision for post-pruning rebuilds
             }
         }
         
         if (should_prune && !recently_pruned) [[unlikely]] {
             if (is_incremental) [[likely]] {
-                LLAMA_LOG("Starting context rebuild: PARTIAL (ContextSizeManager triggered pruning) - context usage analysis recommended action");
+                LLAMA_CONTEXT_LOG("Starting context rebuild: PARTIAL (ContextSizeManager triggered pruning) - context usage analysis recommended action");
+                
+                PERF_TRACE(LLAMA_CONTEXT, "Executing pruning callback");
                 
                 // Try to call the callback - handle both signatures
                 bool pruning_result = false;
                 if constexpr (std::is_invocable_v<SummarizerCallback, float>) {
                     // Callback expects a float parameter (optimal ratio)
                     float optimal_ratio = get_optimal_pruning_ratio(*this, *model_info);
+                    LLAMA_CONTEXT_LOG_DEBUG("Calling pruning callback with optimal ratio: " + std::to_string(optimal_ratio));
                     pruning_result = pruning_callback(optimal_ratio);
                 } else {
                     // Callback expects no parameters (wrapper lambda)
+                    LLAMA_CONTEXT_LOG_DEBUG("Calling pruning callback (no parameters)");
                     pruning_result = pruning_callback();
                 }
                 
                 if (pruning_result) [[likely]] {
+                    LLAMA_CONTEXT_LOG_DEBUG("Pruning completed successfully, returning for context rebuild");
                     // After pruning, the calling method will handle context rebuild
                     return false;
                 } else {
-                    LLAMA_LOG("Error: Pruning failed during token processing");
+                    LLAMA_CONTEXT_LOG_ERROR("Pruning failed during token processing");
                     return false;
                 }
             } else {
-                LLAMA_LOG("Error: Full context rebuild would exceed context limit");
+                LLAMA_CONTEXT_LOG_ERROR("Full context rebuild would exceed context limit");
                 return false;
             }
         } else if (should_prune && recently_pruned) {
-            LLAMA_LOG("Skipping pruning check during post-pruning rebuild (usage analysis may show high usage due to tokenization overhead)");
+            LLAMA_CONTEXT_LOG_DEBUG("Skipping pruning check during post-pruning rebuild (usage analysis may show high usage due to tokenization overhead)");
         }
           // Process large token sets using incremental batch processing
         // When tokens exceed batch capacity, use incremental rebuilds instead of sequential processing

@@ -117,9 +117,8 @@ public:
     }
       // Thread-safe sample addition with prediction accuracy tracking and enhanced logging
     void add_sample(T actual_size, T predicted_size = 0) noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-          if (actual_size <= 0) [[unlikely]] {
-            LLAMA_LOG("DEBUG: " + tracker_name_ + ": Invalid sample size ignored: " + std::to_string(actual_size));
+        std::lock_guard<std::mutex> lock(mutex_);        if (actual_size <= 0) [[unlikely]] {
+            CONTEXT_SIZE_LOG_DEBUG(tracker_name_ + ": Invalid sample size ignored: " + std::to_string(actual_size));
             return;
         }
         
@@ -136,10 +135,9 @@ public:
             
             // Update average prediction error using STL algorithm (optimized)
             const float sum = std::accumulate(prediction_errors_.cbegin(), prediction_errors_.cend(), 0.0f);
-            average_prediction_error_ = sum / static_cast<float>(prediction_errors_.size());
-              // Log significant prediction errors for model tuning
+            average_prediction_error_ = sum / static_cast<float>(prediction_errors_.size());            // Log significant prediction errors for model tuning
             if (error > 0.5f) {
-                LLAMA_LOG("DEBUG: " + tracker_name_ + ": Large prediction error: " + 
+                CONTEXT_SIZE_LOG_DEBUG(tracker_name_ + ": Large prediction error: " + 
                          std::to_string(error * 100.0f) + "% (predicted: " + std::to_string(predicted_size) + 
                          ", actual: " + std::to_string(actual_size) + ")");
             }
@@ -150,18 +148,17 @@ public:
             size_samples_.erase(size_samples_.begin());        }
         
         T old_estimate = estimated_size_;
-        update_statistics();
-          // Log significant estimate changes
+        update_statistics();        // Log significant estimate changes
         if (size_samples_.size() >= ContextSizeConstants::MIN_SAMPLES_FOR_RELIABILITY) {
             float estimate_change = std::abs(static_cast<float>(estimated_size_ - old_estimate)) / static_cast<float>(old_estimate);
             if (estimate_change > 0.2f) {
-                LLAMA_LOG("DEBUG: " + tracker_name_ + ": Estimate adjusted by " + 
+                CONTEXT_SIZE_LOG_DEBUG(tracker_name_ + ": Estimate adjusted by " + 
                          std::to_string(estimate_change * 100.0f) + "% (" + std::to_string(old_estimate) + 
                          " -> " + std::to_string(estimated_size_) + ")");
             }
         }
         
-        LLAMA_LOG(tracker_name_ + " tracked: " + std::to_string(actual_size) + 
+        CONTEXT_SIZE_LOG_DEBUG(tracker_name_ + " tracked: " + std::to_string(actual_size) + 
                   " tokens (avg: " + std::to_string(average_size_) + 
                   ", estimated: " + std::to_string(estimated_size_) + ")");
     }
@@ -447,11 +444,10 @@ private:
     size_t merge_operations_count_ = 0;
     mutable UsagePatternTracker usage_tracker_;
     
-public:
-    void set_context_size(int32_t size) noexcept {
+public:    void set_context_size(int32_t size) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         context_size_ = size;
-        LLAMA_LOG("DynamicSummarySlotManager: Set context size to " + std::to_string(size));
+        CONTEXT_SIZE_LOG("DynamicSummarySlotManager: Set context size to " + std::to_string(size));
     }
     
     void track_usage_pattern(float context_usage, int32_t ai_tokens = 0, int32_t user_tokens = 0) const noexcept {
@@ -486,22 +482,20 @@ public:
         const float current_usage = get_usage_percentage_unsafe();
         return current_usage > dynamic_threshold;
     }
-    
-    void add_summary_slot(int32_t tokens) noexcept {
+      void add_summary_slot(int32_t tokens) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         slot_sizes_.push_back(tokens);
         total_summary_tokens_ += tokens;
         
-        LLAMA_LOG("Added summary slot: " + std::to_string(tokens) + " tokens (total: " + 
+        CONTEXT_SIZE_LOG_DEBUG("Added summary slot: " + std::to_string(tokens) + " tokens (total: " + 
                   std::to_string(total_summary_tokens_) + ", usage: " + 
                   std::to_string(get_usage_percentage_unsafe() * 100) + "%)");
     }
     
     [[nodiscard]] bool merge_oldest_slots(int32_t merged_size) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
-        
-        if (slot_sizes_.size() < 2) [[unlikely]] {
-            LLAMA_LOG("Warning: Cannot merge - insufficient slots");
+          if (slot_sizes_.size() < 2) [[unlikely]] {
+            CONTEXT_SIZE_LOG("Warning: Cannot merge - insufficient slots");
             return false;
         }
         
@@ -511,8 +505,7 @@ public:
         
         total_summary_tokens_ = total_summary_tokens_ - removed_tokens + merged_size;
         merge_operations_count_++;
-        
-        LLAMA_LOG("Merged oldest slots: " + std::to_string(removed_tokens) + 
+          CONTEXT_SIZE_LOG("Merged oldest slots: " + std::to_string(removed_tokens) + 
                   " -> " + std::to_string(merged_size) + " tokens (usage: " + 
                   std::to_string(get_usage_percentage_unsafe() * 100) + "%)");
         return true;
@@ -553,9 +546,8 @@ public:
     void clear_all_slots() noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         slot_sizes_.clear();
-        total_summary_tokens_ = 0;
-        merge_operations_count_ = 0;
-        LLAMA_LOG("All summary slots cleared");
+        total_summary_tokens_ = 0;        merge_operations_count_ = 0;
+        CONTEXT_SIZE_LOG("All summary slots cleared");
     }
     
     [[nodiscard]] float get_usage_percentage() const noexcept {
@@ -823,25 +815,24 @@ public:
     template<typename MergeCallback>
     [[nodiscard]] bool execute_summary_addition(const int32_t actual_summary_size, MergeCallback&& merge_callback) noexcept {
         const auto plan = plan_summary_addition(actual_summary_size);
-        
-        LLAMA_LOG("Executing summary addition: " + plan.action_plan);
+          CONTEXT_SIZE_LOG("Executing summary addition: " + plan.action_plan);
         
         // Perform merge if needed
         if (plan.needs_merge_first) [[unlikely]] {
             if (summary_slot_manager_.get_slot_count() <= ContextSizeConstants::MIN_SUMMARY_SLOTS) [[unlikely]] {
-                LLAMA_LOG("Warning: Cannot merge - at minimum slot count");
+                CONTEXT_SIZE_LOG("Warning: Cannot merge - at minimum slot count");
                 return false;
             }
             
             // Call the merge callback to get merged summary size
             const int32_t merged_size = merge_callback();
             if (merged_size <= 0) [[unlikely]] {
-                LLAMA_LOG("Error: Merge operation failed");
+                CONTEXT_SIZE_LOG_ERROR("Error: Merge operation failed");
                 return false;
             }
             
             if (!summary_slot_manager_.merge_oldest_slots(merged_size)) [[unlikely]] {
-                LLAMA_LOG("Error: Failed to merge summary slots");
+                CONTEXT_SIZE_LOG_ERROR("Error: Failed to merge summary slots");
                 return false;
             }
         }
@@ -851,16 +842,15 @@ public:
         
         // Track for learning
         track_summary_creation(actual_summary_size, summary_tracker_.get_estimated_size());
-        
-        // Verify we're still within hard cap
+          // Verify we're still within hard cap
         const auto stats = summary_slot_manager_.get_statistics();
         if (stats.exceeds_hard_cap) [[unlikely]] {
-            LLAMA_LOG("Critical: Still exceeding hard cap after operations - " +
+            CONTEXT_SIZE_LOG_ERROR("Critical: Still exceeding hard cap after operations - " +
                       std::to_string(stats.usage_percentage * 100) + "% usage");
             return false;
         }
         
-        LLAMA_LOG("Summary addition successful - " +
+        CONTEXT_SIZE_LOG("Summary addition successful - " +
                   std::to_string(stats.usage_percentage * 100) + "% usage (" +
                   std::to_string(stats.slot_count) + " slots)");
           return true;

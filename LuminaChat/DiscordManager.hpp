@@ -176,43 +176,52 @@ private:
 
 void setup_event_handlers() {
         if (!bot) [[unlikely]] return;
-        
-        bot->on_ready([this](const dpp::ready_t& event) {
+          bot->on_ready([this](const dpp::ready_t& event) {
             try {
                 is_connected = true;
                 DISCORD_LOG("Discord bot ready! Logged in as: " + bot->me.username);
+                
+                DISCORD_LOG_DEBUG("Bot ready event triggered, validating prerequisites");
+                
                   // Verify LlamaManager is available before proceeding
                 if (!llama_manager) {
-                    DISCORD_LOG("ERROR: LlamaManager not available during bot ready event");
+                    DISCORD_LOG_ERROR("LlamaManager not available during bot ready event");
                     return;
                 }
                 
                 if (model_id.empty()) {
-                    DISCORD_LOG("ERROR: model_id not set during bot ready event");
+                    DISCORD_LOG_ERROR("model_id not set during bot ready event");
                     return;
                 }
                 
-                DISCORD_LOG("Prerequisites verified - creating individual channel contexts");                  // Create individual contexts for configured channels
+                DISCORD_LOG("Prerequisites verified - creating individual channel contexts");
+                
+                DISCORD_LOG_DEBUG("Creating contexts for " + std::to_string(isolated_channels.size()) + " configured channels");
+                
+                  // Create individual contexts for configured channels
                 create_channel_contexts();
                 
                 // CRITICAL: Add delay to ensure all contexts are fully initialized
                 // before any Discord message processing begins - increased for better reliability
+                DISCORD_LOG_DEBUG("Waiting for context initialization to complete");
                 std::this_thread::sleep_for(std::chrono::milliseconds(1000));
                 LLAMA_LOG("Discord bot initialization completed - contexts ready for message processing");
             } catch (const std::exception& e) {
-                DISCORD_LOG("CRITICAL ERROR in on_ready handler: " + std::string(e.what()));
+                DISCORD_LOG_ERROR("CRITICAL ERROR in on_ready handler: " + std::string(e.what()));
             } catch (...) {
-                DISCORD_LOG("CRITICAL ERROR: Unknown exception in on_ready handler");
+                DISCORD_LOG_ERROR("CRITICAL ERROR: Unknown exception in on_ready handler");
             }
         });
-        
-        bot->on_message_create([this](const dpp::message_create_t& event) {
+          bot->on_message_create([this](const dpp::message_create_t& event) {
             try {
+                DISCORD_LOG_DEBUG("Message received from user " + std::to_string(event.msg.author.id) + 
+                                 " in channel " + std::to_string(event.msg.channel_id) + 
+                                 " (length: " + std::to_string(event.msg.content.length()) + ")");
                 handle_message(event);
             } catch (const std::exception& e) {
-                DISCORD_LOG("ERROR in message handler: " + std::string(e.what()));
+                DISCORD_LOG_ERROR("ERROR in message handler: " + std::string(e.what()));
             } catch (...) {
-                DISCORD_LOG("ERROR: Unknown exception in message handler");
+                DISCORD_LOG_ERROR("ERROR: Unknown exception in message handler");
             }
         });
         
@@ -228,12 +237,21 @@ void setup_event_handlers() {
                 DISCORD_LOG("Discord bot connected to guild: " + event.created.name);
             }
         });
-    }
-      void handle_message(const dpp::message_create_t& event) {
-        if (event.msg.author.is_bot() || event.msg.content.empty()) [[unlikely]] return;
+    }      void handle_message(const dpp::message_create_t& event) {
+        if (event.msg.author.is_bot() || event.msg.content.empty()) [[unlikely]] {
+            DISCORD_LOG_DEBUG("Ignoring message: is_bot=" + std::to_string(event.msg.author.is_bot()) + 
+                             ", content_empty=" + std::to_string(event.msg.content.empty()));
+            return;
+        }
         
-        const bool is_dm = (event.msg.guild_id == 0);        // Early exit for disabled DMs
+        const bool is_dm = (event.msg.guild_id == 0);
+        
+        DISCORD_LOG_DEBUG("Processing message from user " + event.msg.author.username + 
+                         " (ID: " + std::to_string(event.msg.author.id) + "), is_dm=" + (is_dm ? "true" : "false"));
+        
+        // Early exit for disabled DMs
         if (is_dm && !allow_dms.load()) [[unlikely]] {
+            DISCORD_LOG_DEBUG("Rejecting DM - DMs are disabled");
             send_message(event.msg.channel_id, 
                 "Sorry, Direct Messages are currently disabled. Please use the appropriate server channels.");
             return;
@@ -241,7 +259,7 @@ void setup_event_handlers() {
         
         // Early exit if LlamaManager is not available
         if (!llama_manager) [[unlikely]] {
-            DISCORD_LOG("Blocking message - LlamaManager not available");
+            DISCORD_LOG_ERROR("Blocking message - LlamaManager not available");
             return;
         }
         
