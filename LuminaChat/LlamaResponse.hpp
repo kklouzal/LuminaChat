@@ -256,8 +256,7 @@ private:
             result = llama_token_to_piece(model_info->vocab, token, temp_string_buffer.data(), 
                                          temp_string_buffer.size(), 0, true);
         }
-        
-        std::string token_text = (result > 0) ? std::string(temp_string_buffer.data(), static_cast<size_t>(result)) : std::string{};
+          std::string token_text = (result > 0) ? std::string(temp_string_buffer.data(), static_cast<size_t>(result)) : std::string{};
         
         // Cache the result if TokenCache is available and conversion was successful
         if (token_cache_ref && !token_text.empty()) [[likely]] {
@@ -266,7 +265,7 @@ private:
             token_cache_ref->put(cache_key, token_text, single_token);
         }
         
-        return token_text;
+        return std::move(token_text);
     }
 
     // Attempt to recover logits by performing a minimal decode operation - C++17 optimized

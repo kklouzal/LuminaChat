@@ -180,9 +180,10 @@ public:
                 messages_to_summarize.begin() + i, 
                 messages_to_summarize.begin() + end_idx
             );
-              std::string chunk_summary = summarize_messages(chunk);
+            
+            std::string chunk_summary = summarize_messages(chunk);
             if (!chunk_summary.empty()) [[likely]] {
-                chunk_summaries.push_back(chunk_summary);
+                chunk_summaries.push_back(std::move(chunk_summary));
                 SUMMARIZER_LOG("Successfully summarized chunk " + std::to_string(i/CHUNK_SIZE + 1) + 
                                " (" + std::to_string(chunk.size()) + " messages)");
             }
@@ -190,12 +191,13 @@ public:
         
         // If we have multiple chunk summaries, combine them into a final summary
         if (chunk_summaries.size() > 1) [[likely]] {
+            
             std::vector<std::pair<std::string, std::string>> final_summary_input;
+            final_summary_input.reserve(chunk_summaries.size());
             for (size_t i = 0; i < chunk_summaries.size(); ++i) {
                 final_summary_input.emplace_back("system", 
-                    "Summary part " + std::to_string(i + 1) + ": " + chunk_summaries[i]);
-            }
-              std::string final_summary = summarize_messages(final_summary_input);
+                    "Summary part " + std::to_string(i + 1) + ": " + std::move(chunk_summaries[i]));
+            }              std::string final_summary = summarize_messages(final_summary_input);
             if (!final_summary.empty()) [[likely]] {
                 SUMMARIZER_LOG("Successfully created final summary from " + std::to_string(chunk_summaries.size()) + " chunks");
                 return final_summary;
@@ -203,7 +205,7 @@ public:
         }
         
         // Fallback: return the first chunk summary if final combination failed
-        return chunk_summaries.empty() ? "" : chunk_summaries[0];    }
+        return chunk_summaries.empty() ? "" : std::move(chunk_summaries[0]);}
     
     // Direct summary generation using stored context pointers (eliminates LlamaManager dependency)
     std::string generate_summary_directly(const std::string& summarization_request);
