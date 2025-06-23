@@ -464,17 +464,11 @@ public:    // Add message to this context's history
         // We need to insert after: original system message + summary system messages
         // This maintains the proper chronological order: system -> summaries -> historical -> current
         size_t insert_pos = 0;
+        
         while (insert_pos < message_history.size() && message_history[insert_pos].first == "system") [[likely]] {
-            // Check if this is a summary or note system message - these should stay before historical messages
-            const std::string& content = message_history[insert_pos].second;
-            if (content.find("[Previous conversation summary]: ") == 0 || 
-                content.find("[Note: ") == 0) [[unlikely]] {
-                // This is an injected summary or note - historical messages should go after it
-                insert_pos++;
-            } else {
-                // This is the original system message - historical messages should go after it
-                insert_pos++;
-            }
+            // All system messages (original system message, summaries, and notes) should stay before historical messages
+            // Historical messages should go after all system messages regardless of their content
+            insert_pos++;
         }
           // Insert the historical message at the correct position
         message_history.insert(message_history.begin() + insert_pos, std::make_pair(role, content));
