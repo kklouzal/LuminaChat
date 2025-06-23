@@ -75,7 +75,7 @@ namespace ContextSizeConstants {
     // Strategy adaptation thresholds
     static constexpr float LARGE_RESPONSE_THRESHOLD = 500.0f;        
     static constexpr float LARGE_SUMMARY_THRESHOLD = 400.0f;         
-    static constexpr float VARIABILITY_THRESHOLD = 0.6f;       // Context management ratios (optimized for maximum utilization and balanced operations)
+    static constexpr float VARIABILITY_THRESHOLD = 0.6f;           // Context management ratios (optimized for maximum utilization and balanced operations)
     static constexpr float MAX_CONTEXT_USAGE = 0.95f;              // Only trigger pruning at 95% usage (increased for better utilization)
     static constexpr float TARGET_CONTEXT_USAGE = 0.75f;           // Target usage after pruning (increased to reduce yo-yo effect)
     static constexpr float AGGRESSIVE_PRUNING_RATIO = 0.25f;       // Emergency pruning ratio (reduced for gentler pruning)
@@ -112,55 +112,86 @@ private:
 public:
     explicit AdaptiveSizeTracker(T default_size, const std::string& name) noexcept
         : estimated_size_(default_size), default_size_(default_size), tracker_name_(name) {
-        size_samples_.reserve(ContextSizeConstants::MAX_SAMPLES_TO_TRACK);
-        prediction_errors_.reserve(ContextSizeConstants::MAX_SAMPLES_TO_TRACK);
+        // Reserve capacity to prevent reallocations and potential exceptions
+        size_samples_.reserve(ContextSizeConstants::MAX_SAMPLES_TO_TRACK + 5); // Small buffer
+        prediction_errors_.reserve(ContextSizeConstants::MAX_SAMPLES_TO_TRACK + 5);
     }
-      // Thread-safe sample addition with prediction accuracy tracking and enhanced logging
+    
+    // Thread-safe sample addition with prediction accuracy tracking and enhanced logging
     void add_sample(T actual_size, T predicted_size = 0) noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);        if (actual_size <= 0) [[unlikely]] {
-            CONTEXT_SIZE_LOG_DEBUG(tracker_name_ + ": Invalid sample size ignored: " + std::to_string(actual_size));
-            return;
+        // Fast path: early validation without exceptions
+        if (actual_size <= 0) [[unlikely]] {
+            DEBUG_IF_ENABLED(CONTEXT_SIZE_MANAGER, {
+                CONTEXT_SIZE_LOG_DEBUG(tracker_name_ + ": Invalid sample size ignored: " + std::to_string(actual_size));
+            });
+            return; // Skip invalid samples silently
         }
         
-        size_samples_.push_back(actual_size);
+        std::lock_guard<std::mutex> lock(mutex_);
         
-        // Track prediction accuracy if we had a prediction
-        if (predicted_size > 0) [[likely]] {
+        // Pre-check capacity to avoid potential reallocation exceptions
+        if (size_samples_.size() < size_samples_.capacity()) [[likely]] {
+            size_samples_.push_back(actual_size);
+        } else {
+            // Manual rotation to avoid erase() exceptions
+            if (!size_samples_.empty()) {
+                std::rotate(size_samples_.begin(), size_samples_.begin() + 1, size_samples_.end());
+                size_samples_.back() = actual_size;
+            }
+        }
+        
+        // Track prediction accuracy with capacity check
+        if (predicted_size > 0 && actual_size > 0) [[likely]] {
             const float error = std::abs(static_cast<float>(actual_size - predicted_size)) / static_cast<float>(actual_size);
-            prediction_errors_.push_back(error);
             
-            if (prediction_errors_.size() > ContextSizeConstants::MAX_SAMPLES_TO_TRACK) [[unlikely]] {
-                prediction_errors_.erase(prediction_errors_.begin());
+            if (prediction_errors_.size() < prediction_errors_.capacity()) [[likely]] {
+                prediction_errors_.push_back(error);
+            } else if (!prediction_errors_.empty()) {
+                // Manual rotation instead of erase()
+                std::rotate(prediction_errors_.begin(), prediction_errors_.begin() + 1, prediction_errors_.end());
+                prediction_errors_.back() = error;
             }
             
-            // Update average prediction error using STL algorithm (optimized)
-            const float sum = std::accumulate(prediction_errors_.cbegin(), prediction_errors_.cend(), 0.0f);
-            average_prediction_error_ = sum / static_cast<float>(prediction_errors_.size());            // Log significant prediction errors for model tuning
-            if (error > 0.5f) {
-                CONTEXT_SIZE_LOG_DEBUG(tracker_name_ + ": Large prediction error: " + 
-                         std::to_string(error * 100.0f) + "% (predicted: " + std::to_string(predicted_size) + 
-                         ", actual: " + std::to_string(actual_size) + ")");
+            // Update average prediction error safely
+            if (!prediction_errors_.empty()) {
+                const float sum = std::accumulate(prediction_errors_.cbegin(), prediction_errors_.cend(), 0.0f);
+                average_prediction_error_ = sum / static_cast<float>(prediction_errors_.size());
+            }
+            
+            // Log significant prediction errors for model tuning
+            if (error > 0.5f) [[unlikely]] {
+                DEBUG_IF_ENABLED(CONTEXT_SIZE_MANAGER, {
+                    CONTEXT_SIZE_LOG_DEBUG(tracker_name_ + ": Large prediction error: " + 
+                             std::to_string(static_cast<int>(error * 100.0f)) + "% (predicted: " + 
+                             std::to_string(predicted_size) + ", actual: " + std::to_string(actual_size) + ")");
+                });
             }
         }
         
-        // Maintain rolling window
-        if (size_samples_.size() > ContextSizeConstants::MAX_SAMPLES_TO_TRACK) [[unlikely]] {
-            size_samples_.erase(size_samples_.begin());        }
+        const T old_estimate = estimated_size_;
+        update_statistics();
         
-        T old_estimate = estimated_size_;
-        update_statistics();        // Log significant estimate changes
-        if (size_samples_.size() >= ContextSizeConstants::MIN_SAMPLES_FOR_RELIABILITY) {
-            float estimate_change = std::abs(static_cast<float>(estimated_size_ - old_estimate)) / static_cast<float>(old_estimate);
-            if (estimate_change > 0.2f) {
-                CONTEXT_SIZE_LOG_DEBUG(tracker_name_ + ": Estimate adjusted by " + 
-                         std::to_string(estimate_change * 100.0f) + "% (" + std::to_string(old_estimate) + 
-                         " -> " + std::to_string(estimated_size_) + ")");
+        // Log significant estimate changes for debugging
+        if (size_samples_.size() >= ContextSizeConstants::MIN_SAMPLES_FOR_RELIABILITY && old_estimate > 0) [[likely]] {
+            const float estimate_change = std::abs(static_cast<float>(estimated_size_ - old_estimate)) / static_cast<float>(old_estimate);
+            if (estimate_change > 0.2f) [[unlikely]] {
+                DEBUG_IF_ENABLED(CONTEXT_SIZE_MANAGER, {
+                    CONTEXT_SIZE_LOG_DEBUG(tracker_name_ + ": Estimate adjusted by " + 
+                             std::to_string(static_cast<int>(estimate_change * 100.0f)) + "% (" + 
+                             std::to_string(old_estimate) + " -> " + std::to_string(estimated_size_) + ")");
+                });
             }
         }
         
-        CONTEXT_SIZE_LOG_DEBUG(tracker_name_ + " tracked: " + std::to_string(actual_size) + 
-                  " tokens (avg: " + std::to_string(average_size_) + 
-                  ", estimated: " + std::to_string(estimated_size_) + ")");
+        // Periodic detailed logging for debugging sessions
+        DEBUG_IF_ENABLED(CONTEXT_SIZE_MANAGER, {
+            if (size_samples_.size() % 10 == 0) { // Log every 10th sample to avoid spam
+                CONTEXT_SIZE_LOG_DEBUG(tracker_name_ + " sample #" + std::to_string(size_samples_.size()) + 
+                          ": " + std::to_string(actual_size) + " tokens (avg: " + 
+                          std::to_string(static_cast<int>(average_size_)) + ", est: " + 
+                          std::to_string(estimated_size_) + ")");
+            }
+        });
     }
     
     // Get estimated size with dynamic buffer
@@ -236,11 +267,11 @@ private:
     void update_statistics() noexcept {
         if (size_samples_.empty()) [[unlikely]] return;
         
-        // Calculate average using STL algorithm (optimized)
+        // All operations here are noexcept with proper containers
         const auto sum = std::accumulate(size_samples_.cbegin(), size_samples_.cend(), T(0));
         average_size_ = static_cast<float>(sum) / static_cast<float>(size_samples_.size());
         
-        // Calculate standard deviation using STL algorithm (optimized)
+        // Calculate standard deviation - this is noexcept since we're using floats
         const float variance = std::transform_reduce(
             size_samples_.cbegin(), size_samples_.cend(),
             0.0f,
@@ -252,7 +283,7 @@ private:
         ) / static_cast<float>(size_samples_.size());
         standard_deviation_ = std::sqrt(variance);
         
-        // Update min/max using STL algorithm
+        // Update min/max - noexcept with iterators
         const auto [min_it, max_it] = std::minmax_element(size_samples_.cbegin(), size_samples_.cend());
         min_size_ = *min_it;
         max_size_ = *max_it;
@@ -276,22 +307,42 @@ private:
     float usage_volatility_ = 0.0f;
     
 public:
+    UsagePatternTracker() noexcept {
+        // Pre-reserve capacity to prevent reallocations
+        recent_context_usage_.reserve(ContextSizeConstants::USAGE_PATTERN_WINDOW + 2);
+        recent_ai_responses_.reserve(ContextSizeConstants::USAGE_PATTERN_WINDOW + 2);
+        recent_user_inputs_.reserve(ContextSizeConstants::USAGE_PATTERN_WINDOW + 2);
+    }
+    
     void track_interaction(float context_usage, int32_t ai_tokens = 0, int32_t user_tokens = 0) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         
-        // Add to rolling windows
-        recent_context_usage_.push_back(context_usage);
-        if (ai_tokens > 0) [[likely]] recent_ai_responses_.push_back(ai_tokens);
-        if (user_tokens > 0) [[likely]] recent_user_inputs_.push_back(user_tokens);
-      // Maintain window size using efficient erase
-        if (recent_context_usage_.size() > ContextSizeConstants::USAGE_PATTERN_WINDOW) [[unlikely]] {
-            recent_context_usage_.erase(recent_context_usage_.begin());
+        // Pre-check capacity to avoid reallocation exceptions
+        if (recent_context_usage_.size() < ContextSizeConstants::USAGE_PATTERN_WINDOW) [[likely]] {
+            recent_context_usage_.push_back(context_usage);
+        } else if (!recent_context_usage_.empty()) {
+            // Manual rotation instead of erase() to avoid exceptions
+            std::rotate(recent_context_usage_.begin(), recent_context_usage_.begin() + 1, recent_context_usage_.end());
+            recent_context_usage_.back() = context_usage;
         }
-        if (recent_ai_responses_.size() > ContextSizeConstants::USAGE_PATTERN_WINDOW) [[unlikely]] {
-            recent_ai_responses_.erase(recent_ai_responses_.begin());
+        
+        // Same approach for other vectors
+        if (ai_tokens > 0) [[likely]] {
+            if (recent_ai_responses_.size() < ContextSizeConstants::USAGE_PATTERN_WINDOW) {
+                recent_ai_responses_.push_back(ai_tokens);
+            } else if (!recent_ai_responses_.empty()) {
+                std::rotate(recent_ai_responses_.begin(), recent_ai_responses_.begin() + 1, recent_ai_responses_.end());
+                recent_ai_responses_.back() = ai_tokens;
+            }
         }
-        if (recent_user_inputs_.size() > ContextSizeConstants::USAGE_PATTERN_WINDOW) [[unlikely]] {
-            recent_user_inputs_.erase(recent_user_inputs_.begin());
+        
+        if (user_tokens > 0) [[likely]] {
+            if (recent_user_inputs_.size() < ContextSizeConstants::USAGE_PATTERN_WINDOW) {
+                recent_user_inputs_.push_back(user_tokens);
+            } else if (!recent_user_inputs_.empty()) {
+                std::rotate(recent_user_inputs_.begin(), recent_user_inputs_.begin() + 1, recent_user_inputs_.end());
+                recent_user_inputs_.back() = user_tokens;
+            }
         }
         
         update_pattern_analysis();
@@ -307,7 +358,8 @@ public:
         
         constexpr float base_threshold = ContextSizeConstants::BASE_SUMMARY_MERGE_THRESHOLD;
         float adjustment = 0.0f;
-          // Factor 1: Context growth rate (adjusted for less frequent summarization)
+        
+        // Factor 1: Context growth rate (adjusted for less frequent summarization)
         if (average_context_growth_per_interaction_ > ContextSizeConstants::RAPID_GROWTH_THRESHOLD) [[unlikely]] {
             adjustment -= 0.015f;  // Lower threshold (trigger earlier) - reduced from 0.02f
         } else if (average_context_growth_per_interaction_ < 0.01f) [[likely]] {
@@ -389,33 +441,35 @@ private:
         const float dynamic_threshold = base_threshold + adjustment;
         return std::clamp(dynamic_threshold, 
                          ContextSizeConstants::MIN_SUMMARY_MERGE_THRESHOLD,
-                         ContextSizeConstants::MAX_SUMMARY_MERGE_THRESHOLD);    }
+                         ContextSizeConstants::MAX_SUMMARY_MERGE_THRESHOLD);    
+    }
     
     void update_pattern_analysis() noexcept {
         if (recent_context_usage_.size() < 2) [[unlikely]] return;
         
-        // Calculate average context growth per interaction using STL algorithms (optimized)
+        // Reserve capacity for growth_rates to prevent allocations
         std::vector<float> growth_rates;
-        growth_rates.reserve(recent_context_usage_.size() - 1);
+        growth_rates.reserve(recent_context_usage_.size());
         
-        std::transform(
-            recent_context_usage_.cbegin() + 1, recent_context_usage_.cend(),
-            recent_context_usage_.cbegin(),
-            std::back_inserter(growth_rates),
-            [](const float current, const float previous) noexcept {
-                return std::max(0.0f, current - previous);  // Only positive growth
+        // Calculate growth rates without exceptions
+        for (size_t i = 1; i < recent_context_usage_.size(); ++i) {
+            const float growth = std::max(0.0f, recent_context_usage_[i] - recent_context_usage_[i-1]);
+            if (growth_rates.size() < growth_rates.capacity()) {
+                growth_rates.push_back(growth);
             }
-        );
+        }
         
         if (!growth_rates.empty()) [[likely]] {
             const float sum = std::accumulate(growth_rates.cbegin(), growth_rates.cend(), 0.0f);
             average_context_growth_per_interaction_ = sum / static_cast<float>(growth_rates.size());
         }
         
-        // Calculate peak usage in current window using STL algorithm
-        peak_usage_in_window_ = *std::max_element(recent_context_usage_.cbegin(), recent_context_usage_.cend());
+        // Calculate peak usage - noexcept operation
+        if (!recent_context_usage_.empty()) {
+            peak_usage_in_window_ = *std::max_element(recent_context_usage_.cbegin(), recent_context_usage_.cend());
+        }
         
-        // Calculate usage volatility (standard deviation) - optimized
+        // Calculate usage volatility (standard deviation) - all noexcept operations
         if (recent_context_usage_.size() >= 3) [[likely]] {
             const float mean = std::accumulate(recent_context_usage_.cbegin(), recent_context_usage_.cend(), 0.0f) / 
                               static_cast<float>(recent_context_usage_.size());
@@ -444,16 +498,36 @@ private:
     size_t merge_operations_count_ = 0;
     mutable UsagePatternTracker usage_tracker_;
     
-public:    void set_context_size(int32_t size) noexcept {
+public:
+    DynamicSummarySlotManager() noexcept {
+        // Pre-reserve capacity to prevent reallocations and exceptions
+        slot_sizes_.reserve(10); // Reasonable initial capacity
+    }
+    
+    void set_context_size(int32_t size) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
+        const int32_t old_size = context_size_;
         context_size_ = size;
-        CONTEXT_SIZE_LOG("DynamicSummarySlotManager: Set context size to " + std::to_string(size));
+        
+        // Always log context size changes as they're critical for debugging
+        if (old_size != size) {
+            CONTEXT_SIZE_LOG("DynamicSummarySlotManager: Context size changed from " + 
+                           std::to_string(old_size) + " to " + std::to_string(size) + " tokens");
+        }
+        
+        // Log current state for debugging
+        DEBUG_IF_ENABLED(CONTEXT_SIZE_MANAGER, {
+            const float usage = get_usage_percentage_unsafe();
+            CONTEXT_SIZE_LOG_DEBUG("Context size set: " + std::to_string(size) + 
+                                 " tokens, current usage: " + std::to_string(static_cast<int>(usage * 100)) + "%");
+        });
     }
     
     void track_usage_pattern(float context_usage, int32_t ai_tokens = 0, int32_t user_tokens = 0) const noexcept {
         usage_tracker_.track_interaction(context_usage, ai_tokens, user_tokens);
     }
-      // Check if we need to merge before adding a new summary (enhanced with message-based logic)
+    
+    // Check if we need to merge before adding a new summary (enhanced with message-based logic)
     [[nodiscard]] bool needs_merge_before_adding(int32_t new_summary_size) const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         
@@ -465,6 +539,10 @@ public:    void set_context_size(int32_t size) noexcept {
         const int32_t projected_total = total_summary_tokens_ + new_summary_size;
         const float projected_usage = static_cast<float>(projected_total) / context_size_;
         if (projected_usage > ContextSizeConstants::MAX_TOTAL_SUMMARY_ALLOCATION) [[unlikely]] {
+            CONTEXT_SIZE_LOG("Merge required: projected usage " + 
+                           std::to_string(static_cast<int>(projected_usage * 100)) + 
+                           "% exceeds hard cap " + 
+                           std::to_string(static_cast<int>(ContextSizeConstants::MAX_TOTAL_SUMMARY_ALLOCATION * 100)) + "%");
             return true;
         }
         
@@ -474,40 +552,97 @@ public:    void set_context_size(int32_t size) noexcept {
         const float messages_that_fit = (estimated_space_for_messages * context_size_) / ContextSizeConstants::ESTIMATED_TOKENS_PER_MESSAGE;
         
         if (messages_that_fit < ContextSizeConstants::MIN_MESSAGES_BEFORE_SUMMARY) [[unlikely]] {
+            DEBUG_IF_ENABLED(CONTEXT_SIZE_MANAGER, {
+                CONTEXT_SIZE_LOG_DEBUG("Merge required: insufficient message space - " + 
+                                      std::to_string(static_cast<int>(messages_that_fit)) + 
+                                      " messages fit (min: " + 
+                                      std::to_string(ContextSizeConstants::MIN_MESSAGES_BEFORE_SUMMARY) + ")");
+            });
             return true; // Need to merge to make room for adequate message exchanges
         }
         
         // Check against dynamic threshold (secondary check)
         const float dynamic_threshold = usage_tracker_.calculate_dynamic_threshold();
         const float current_usage = get_usage_percentage_unsafe();
-        return current_usage > dynamic_threshold;
-    }
-      void add_summary_slot(int32_t tokens) noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        slot_sizes_.push_back(tokens);
-        total_summary_tokens_ += tokens;
+        const bool threshold_exceeded = current_usage > dynamic_threshold;
         
-        CONTEXT_SIZE_LOG_DEBUG("Added summary slot: " + std::to_string(tokens) + " tokens (total: " + 
-                  std::to_string(total_summary_tokens_) + ", usage: " + 
-                  std::to_string(get_usage_percentage_unsafe() * 100) + "%)");
+        if (threshold_exceeded) {
+            DEBUG_IF_ENABLED(CONTEXT_SIZE_MANAGER, {
+                CONTEXT_SIZE_LOG_DEBUG("Merge required: usage " + 
+                                      std::to_string(static_cast<int>(current_usage * 100)) + 
+                                      "% exceeds dynamic threshold " + 
+                                      std::to_string(static_cast<int>(dynamic_threshold * 100)) + "%");
+            });
+        }
+        
+        return threshold_exceeded;
+    }
+    
+    void add_summary_slot(int32_t tokens) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        // Pre-check capacity to avoid reallocation
+        if (slot_sizes_.size() < slot_sizes_.capacity()) [[likely]] {
+            slot_sizes_.push_back(tokens);
+            total_summary_tokens_ += tokens;
+        } else {
+            // Fallback: still add but may allocate
+            slot_sizes_.push_back(tokens);
+            total_summary_tokens_ += tokens;
+        }
+        
+        // Always log summary slot additions as they're important for debugging
+        const float usage = get_usage_percentage_unsafe();
+        CONTEXT_SIZE_LOG_DEBUG("Added summary slot: " + std::to_string(tokens) + 
+                              " tokens (total: " + std::to_string(total_summary_tokens_) + 
+                              ", usage: " + std::to_string(static_cast<int>(usage * 100)) + "%, " +
+                              std::to_string(slot_sizes_.size()) + " slots)");
+        
+        // Warn if approaching hard cap
+        if (usage > ContextSizeConstants::MAX_TOTAL_SUMMARY_ALLOCATION * 0.85f) [[unlikely]] {
+            CONTEXT_SIZE_LOG("Warning: Summary usage approaching hard cap: " + 
+                           std::to_string(static_cast<int>(usage * 100)) + "% of context");
+        }
     }
     
     [[nodiscard]] bool merge_oldest_slots(int32_t merged_size) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
-          if (slot_sizes_.size() < 2) [[unlikely]] {
-            CONTEXT_SIZE_LOG("Warning: Cannot merge - insufficient slots");
+        
+        if (slot_sizes_.size() < 2) [[unlikely]] {
+            CONTEXT_SIZE_LOG_ERROR("Cannot merge summary slots - insufficient slots (count: " + 
+                                  std::to_string(slot_sizes_.size()) + ")");
             return false;
         }
         
         const int32_t removed_tokens = slot_sizes_[0] + slot_sizes_[1];
-        slot_sizes_.erase(slot_sizes_.begin(), slot_sizes_.begin() + 2);
-        slot_sizes_.insert(slot_sizes_.begin(), merged_size);
+        const float old_usage = get_usage_percentage_unsafe();
+        
+        // More efficient: modify in place rather than erase+insert
+        slot_sizes_[0] = merged_size;
+        if (slot_sizes_.size() > 1) {
+            slot_sizes_.erase(slot_sizes_.begin() + 1);
+        }
         
         total_summary_tokens_ = total_summary_tokens_ - removed_tokens + merged_size;
         merge_operations_count_++;
-          CONTEXT_SIZE_LOG("Merged oldest slots: " + std::to_string(removed_tokens) + 
-                  " -> " + std::to_string(merged_size) + " tokens (usage: " + 
-                  std::to_string(get_usage_percentage_unsafe() * 100) + "%)");
+        
+        const float new_usage = get_usage_percentage_unsafe();
+        
+        // Always log merge operations as they're critical for debugging
+        CONTEXT_SIZE_LOG("Merged oldest summary slots: " + std::to_string(removed_tokens) + 
+                        " -> " + std::to_string(merged_size) + " tokens " +
+                        "(usage: " + std::to_string(static_cast<int>(old_usage * 100)) + "% -> " +
+                        std::to_string(static_cast<int>(new_usage * 100)) + "%, " +
+                        std::to_string(slot_sizes_.size()) + " slots remaining)");
+        
+        // Log performance metrics for merge operations
+        DEBUG_IF_ENABLED(CONTEXT_SIZE_MANAGER, {
+            const int compression_ratio = removed_tokens > 0 ? 
+                static_cast<int>((static_cast<float>(merged_size) / removed_tokens) * 100) : 100;
+            CONTEXT_SIZE_LOG_DEBUG("Merge efficiency: " + std::to_string(compression_ratio) + 
+                                  "% compression, operation #" + std::to_string(merge_operations_count_));
+        });
+        
         return true;
     }
     
@@ -520,7 +655,8 @@ public:    void set_context_size(int32_t size) noexcept {
         bool exceeds_hard_cap;
         bool at_minimum_slots;
         bool needs_merge;
-        UsagePatternTracker::UsagePatternStats usage_patterns;    };
+        UsagePatternTracker::UsagePatternStats usage_patterns;
+    };
     
     [[nodiscard]] SummarySlotStats get_statistics() const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -545,9 +681,16 @@ public:    void set_context_size(int32_t size) noexcept {
     
     void clear_all_slots() noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
+        const size_t cleared_slots = slot_sizes_.size();
+        const int32_t cleared_tokens = total_summary_tokens_;
+        
         slot_sizes_.clear();
-        total_summary_tokens_ = 0;        merge_operations_count_ = 0;
-        CONTEXT_SIZE_LOG("All summary slots cleared");
+        total_summary_tokens_ = 0;
+        merge_operations_count_ = 0;
+        
+        // Always log clearing operations as they're significant events
+        CONTEXT_SIZE_LOG("Cleared all summary slots: " + std::to_string(cleared_slots) + 
+                        " slots, " + std::to_string(cleared_tokens) + " tokens freed");
     }
     
     [[nodiscard]] float get_usage_percentage() const noexcept {
@@ -561,7 +704,8 @@ public:    void set_context_size(int32_t size) noexcept {
     }
     
     [[nodiscard]] int32_t get_total_tokens() const noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);        return total_summary_tokens_;
+        std::lock_guard<std::mutex> lock(mutex_);
+        return total_summary_tokens_;
     }
     
 private:
@@ -585,9 +729,9 @@ private:
     mutable float average_context_pressure_ = 0.0f;
     
 public:
-    EnhancedConversationAnalyzer() noexcept : conversation_start_(std::chrono::steady_clock::now()),
+EnhancedConversationAnalyzer() noexcept : conversation_start_(std::chrono::steady_clock::now()),
                                     last_activity_(std::chrono::steady_clock::now()) {
-        context_usage_history_.reserve(100);  // Pre-allocate for performance
+        context_usage_history_.reserve(100);  // Pre-allocate to prevent exceptions
     }
     
     void track_message() noexcept {
@@ -610,13 +754,21 @@ public:
     
     void track_context_usage(float usage_percentage) const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
-        context_usage_history_.push_back(usage_percentage);
-        if (context_usage_history_.size() > 100) [[unlikely]] {  // Keep last 100 measurements
-            context_usage_history_.erase(context_usage_history_.begin());
+        
+        // Use capacity check to avoid reallocation
+        if (context_usage_history_.size() < context_usage_history_.capacity()) [[likely]] {
+            context_usage_history_.push_back(usage_percentage);
+        } else {
+            // Manual rotation instead of erase() to avoid exceptions
+            std::rotate(context_usage_history_.begin(), context_usage_history_.begin() + 1, context_usage_history_.end());
+            context_usage_history_.back() = usage_percentage;
         }
-      // Update average context pressure using STL algorithm (optimized)
-        const float sum = std::accumulate(context_usage_history_.cbegin(), context_usage_history_.cend(), 0.0f);
-        average_context_pressure_ = sum / static_cast<float>(context_usage_history_.size());
+        
+        // Update average context pressure - noexcept operation
+        if (!context_usage_history_.empty()) {
+            const float sum = std::accumulate(context_usage_history_.cbegin(), context_usage_history_.cend(), 0.0f);
+            average_context_pressure_ = sum / static_cast<float>(context_usage_history_.size());
+        }
     }
     
     [[nodiscard]] ContextStrategy suggest_optimal_strategy(const AdaptiveSizeTracker<int32_t>& ai_tracker,
@@ -746,6 +898,15 @@ public:
     void track_ai_response(const int32_t actual_tokens, const int32_t predicted_tokens = 0) noexcept {
         ai_response_tracker_.add_sample(actual_tokens, predicted_tokens);
         conversation_analyzer_.track_message();
+        
+        // Log significant AI responses for debugging
+        DEBUG_IF_ENABLED(CONTEXT_SIZE_MANAGER, {
+            if (actual_tokens > ContextSizeConstants::LARGE_RESPONSE_THRESHOLD) {
+                CONTEXT_SIZE_LOG_DEBUG("Large AI response tracked: " + std::to_string(actual_tokens) + 
+                                      " tokens (threshold: " + std::to_string(static_cast<int>(ContextSizeConstants::LARGE_RESPONSE_THRESHOLD)) + ")");
+            }
+        });
+        
         review_strategy();
     }
     
@@ -753,6 +914,13 @@ public:
     void track_summary_creation(const int32_t actual_tokens, const int32_t predicted_tokens = 0) noexcept {
         summary_tracker_.add_sample(actual_tokens, predicted_tokens);
         conversation_analyzer_.track_summary_event();
+        
+        // Log summary creation for debugging
+        DEBUG_IF_ENABLED(CONTEXT_SIZE_MANAGER, {
+            CONTEXT_SIZE_LOG_DEBUG("Summary creation tracked: " + std::to_string(actual_tokens) + " tokens" +
+                                  (predicted_tokens > 0 ? " (predicted: " + std::to_string(predicted_tokens) + ")" : ""));
+        });
+        
         review_strategy();
     }
     
@@ -776,8 +944,7 @@ public:
         return summary_tracker_.get_estimated_size();
     }
     
-    // Comprehensive context analysis with all dynamic features    
-    
+    // Comprehensive context analysis with all dynamic features
     EnhancedContextAnalysis analyze_context(const ContextInfo& context) const;
     
     // Summary management workflow
@@ -786,7 +953,8 @@ public:
         bool needs_merge_first;
         size_t merge_cycles_needed;
         std::string action_plan;
-        float estimated_final_usage_percentage;    };
+        float estimated_final_usage_percentage;
+    };
     
     [[nodiscard]] SummaryManagementPlan plan_summary_addition(const int32_t estimated_summary_size) const noexcept {
         SummaryManagementPlan plan{};
@@ -809,30 +977,36 @@ public:
                 static_cast<float>(estimated_after_merge + estimated_summary_size) / static_cast<float>(4096);
         }
         
-        return plan;    }
+        return plan;
+    }
     
     // Execute summary addition with automatic merge management
     template<typename MergeCallback>
     [[nodiscard]] bool execute_summary_addition(const int32_t actual_summary_size, MergeCallback&& merge_callback) noexcept {
         const auto plan = plan_summary_addition(actual_summary_size);
-          CONTEXT_SIZE_LOG("Executing summary addition: " + plan.action_plan);
+        
+        // Log the execution plan for debugging
+        CONTEXT_SIZE_LOG("Executing summary addition: " + plan.action_plan + 
+                        " (size: " + std::to_string(actual_summary_size) + " tokens)");
         
         // Perform merge if needed
         if (plan.needs_merge_first) [[unlikely]] {
             if (summary_slot_manager_.get_slot_count() <= ContextSizeConstants::MIN_SUMMARY_SLOTS) [[unlikely]] {
-                CONTEXT_SIZE_LOG("Warning: Cannot merge - at minimum slot count");
+                CONTEXT_SIZE_LOG_ERROR("Cannot merge - at minimum slot count (" + 
+                                      std::to_string(ContextSizeConstants::MIN_SUMMARY_SLOTS) + ")");
                 return false;
             }
             
             // Call the merge callback to get merged summary size
             const int32_t merged_size = merge_callback();
             if (merged_size <= 0) [[unlikely]] {
-                CONTEXT_SIZE_LOG_ERROR("Error: Merge operation failed");
+                CONTEXT_SIZE_LOG_ERROR("Merge operation failed - invalid merged size: " + 
+                                      std::to_string(merged_size));
                 return false;
             }
             
             if (!summary_slot_manager_.merge_oldest_slots(merged_size)) [[unlikely]] {
-                CONTEXT_SIZE_LOG_ERROR("Error: Failed to merge summary slots");
+                CONTEXT_SIZE_LOG_ERROR("Failed to merge summary slots");
                 return false;
             }
         }
@@ -842,18 +1016,24 @@ public:
         
         // Track for learning
         track_summary_creation(actual_summary_size, summary_tracker_.get_estimated_size());
-          // Verify we're still within hard cap
+        
+        // Verify we're still within hard cap
         const auto stats = summary_slot_manager_.get_statistics();
         if (stats.exceeds_hard_cap) [[unlikely]] {
-            CONTEXT_SIZE_LOG_ERROR("Critical: Still exceeding hard cap after operations - " +
-                      std::to_string(stats.usage_percentage * 100) + "% usage");
+            CONTEXT_SIZE_LOG_ERROR("CRITICAL: Still exceeding hard cap after operations - " +
+                      std::to_string(static_cast<int>(stats.usage_percentage * 100)) + "% usage " +
+                      "(" + std::to_string(stats.total_tokens) + "/" + 
+                      std::to_string(static_cast<int>(stats.total_tokens / stats.usage_percentage)) + " tokens)");
             return false;
         }
         
+        // Log successful completion with metrics
         CONTEXT_SIZE_LOG("Summary addition successful - " +
-                  std::to_string(stats.usage_percentage * 100) + "% usage (" +
-                  std::to_string(stats.slot_count) + " slots)");
-          return true;
+                  std::to_string(static_cast<int>(stats.usage_percentage * 100)) + "% usage (" +
+                  std::to_string(stats.slot_count) + " slots, " + 
+                  std::to_string(stats.total_tokens) + " tokens)");
+        
+        return true;
     }
     
     // Get optimization recommendations
@@ -862,36 +1042,63 @@ public:
         recommendations.reserve(8);  // Pre-allocate for common case
         
         if (analysis.summary_hard_cap_exceeded) [[unlikely]] {
-            recommendations.emplace_back("CRITICAL: Summary usage exceeds 30% hard cap - immediate merge required");
+            const std::string critical_msg = "CRITICAL: Summary usage exceeds hard cap - immediate merge required";
+            recommendations.emplace_back(critical_msg);
+            CONTEXT_SIZE_LOG_ERROR(critical_msg);
         }
         
         if (analysis.emergency_buffer_violated) [[unlikely]] {
-            recommendations.emplace_back("CRITICAL: Emergency buffer violated - immediate pruning required");        }
+            const std::string critical_msg = "CRITICAL: Emergency buffer violated - immediate pruning required";
+            recommendations.emplace_back(critical_msg);
+            CONTEXT_SIZE_LOG_ERROR(critical_msg);
+        }
         
         if (analysis.summary_slot_stats.needs_merge) [[likely]] {
             const std::string merge_message = "Summary merge recommended based on dynamic threshold (" + 
-                std::to_string(analysis.summary_slot_stats.current_dynamic_threshold * 100) + "%)";
+                std::to_string(static_cast<int>(analysis.summary_slot_stats.current_dynamic_threshold * 100)) + "%)";
             recommendations.emplace_back(merge_message);
+            DEBUG_IF_ENABLED(CONTEXT_SIZE_MANAGER, {
+                CONTEXT_SIZE_LOG_DEBUG(merge_message);
+            });
         }
         
         if (analysis.needs_pruning) [[unlikely]] {
-            recommendations.emplace_back("Context pruning recommended - insufficient space for AI responses");
+            const std::string pruning_msg = "Context pruning recommended - insufficient space for AI responses";
+            recommendations.emplace_back(pruning_msg);
+            CONTEXT_SIZE_LOG(pruning_msg);
         }
         
         if (analysis.strategy_change_recommended) [[unlikely]] {
             const std::string strategy_message = std::string("Strategy change recommended: ") + 
                                                 strategy_to_string(analysis.recommended_strategy);
             recommendations.emplace_back(strategy_message);
+            CONTEXT_SIZE_LOG(strategy_message);
         }
         
         // Performance insights
         if (analysis.prediction_accuracy_score < 0.7f) [[unlikely]] {
-            recommendations.emplace_back("Low prediction accuracy - consider larger safety margins");        }
+            const std::string accuracy_msg = "Low prediction accuracy (" + 
+                std::to_string(static_cast<int>(analysis.prediction_accuracy_score * 100)) + 
+                "%) - consider larger safety margins";
+            recommendations.emplace_back(accuracy_msg);
+            CONTEXT_SIZE_LOG(accuracy_msg);
+        }
         
         if (analysis.context_utilization_efficiency > 0.9f) [[likely]] {
             const std::string efficiency_message = "Excellent context utilization - " + 
-                std::to_string(analysis.context_utilization_efficiency * 100) + "% efficiency";
+                std::to_string(static_cast<int>(analysis.context_utilization_efficiency * 100)) + "% efficiency";
             recommendations.emplace_back(efficiency_message);
+            DEBUG_IF_ENABLED(CONTEXT_SIZE_MANAGER, {
+                CONTEXT_SIZE_LOG_DEBUG(efficiency_message);
+            });
+        }
+        
+        // Log summary of recommendations for debugging
+        if (!recommendations.empty()) {
+            DEBUG_IF_ENABLED(CONTEXT_SIZE_MANAGER, {
+                CONTEXT_SIZE_LOG_DEBUG("Generated " + std::to_string(recommendations.size()) + 
+                                      " optimization recommendations");
+            });
         }
         
         return recommendations;
@@ -907,7 +1114,8 @@ public:
     [[nodiscard]] DynamicSummarySlotManager::SummarySlotStats get_summary_statistics() const noexcept {
         return summary_slot_manager_.get_statistics();
     }
-      // Reset all summary slots
+    
+    // Reset all summary slots
     void reset_summary_slots() noexcept {
         summary_slot_manager_.clear_all_slots();
     }
@@ -922,6 +1130,42 @@ public:
         summary_slot_manager_.add_summary_slot(tokens);
     }
     
+    // Periodic health check and diagnostics logging
+    void log_health_check() const noexcept {
+        const auto stats = summary_slot_manager_.get_statistics();
+        const auto ai_stats = ai_response_tracker_.get_statistics();
+        const auto summary_stats = summary_tracker_.get_statistics();
+        const auto conv_metrics = conversation_analyzer_.get_metrics();
+        
+        CONTEXT_SIZE_LOG("=== Context Size Manager Health Check ===");
+        CONTEXT_SIZE_LOG("Strategy: " + std::string(strategy_to_string(current_strategy_)));
+        CONTEXT_SIZE_LOG("Summary usage: " + std::to_string(static_cast<int>(stats.usage_percentage * 100)) + 
+                        "% (" + std::to_string(stats.slot_count) + " slots, " + 
+                        std::to_string(stats.total_tokens) + " tokens)");
+        CONTEXT_SIZE_LOG("AI responses: avg=" + std::to_string(static_cast<int>(ai_stats.average)) + 
+                        " tokens, samples=" + std::to_string(ai_stats.sample_count));
+        CONTEXT_SIZE_LOG("Summaries: avg=" + std::to_string(static_cast<int>(summary_stats.average)) + 
+                        " tokens, samples=" + std::to_string(summary_stats.sample_count));
+        CONTEXT_SIZE_LOG("Conversation: " + std::to_string(conv_metrics.total_messages) + 
+                        " messages, " + std::to_string(conv_metrics.pruning_events) + 
+                        " pruning events, " + std::to_string(conv_metrics.summary_events) + " summaries");
+        
+        // Warn about potential issues
+        if (stats.usage_percentage > 0.15f) {
+            CONTEXT_SIZE_LOG("Info: Summary usage above 15% - monitoring for merge needs");
+        }
+        if (ai_stats.prediction_accuracy < 0.8f && ai_stats.sample_count > 5) {
+            CONTEXT_SIZE_LOG("Warning: AI response prediction accuracy low (" + 
+                           std::to_string(static_cast<int>(ai_stats.prediction_accuracy * 100)) + "%)");
+        }
+        if (conv_metrics.pruning_frequency > 0.1f) {
+            CONTEXT_SIZE_LOG("Info: High pruning frequency (" + 
+                           std::to_string(static_cast<int>(conv_metrics.pruning_frequency * 100)) + "%)");
+        }
+        
+        CONTEXT_SIZE_LOG("========================================");
+    }
+    
     // Atomic synchronization with LlamaSummarizer - rebuilds tracking from authoritative source
     template<typename SlotContainer>
     void sync_with_authoritative_slots(const SlotContainer& authoritative_slots) noexcept {
@@ -934,31 +1178,54 @@ public:
         summary_slot_manager_.clear_all_slots();
         
         size_t synced_count = 0;
+        int32_t total_estimated_tokens = 0;
+        
         for (const auto& slot : authoritative_slots) {
             if (!slot.empty()) {
                 // Estimate tokens for this slot (using same logic as LlamaSummarizer)
                 constexpr float CHARS_PER_TOKEN = 4.0f;
-                int32_t estimated = static_cast<int32_t>(slot.length() / CHARS_PER_TOKEN);
+                const size_t slot_length = slot.length();
+                int32_t estimated = static_cast<int32_t>(slot_length / CHARS_PER_TOKEN);
                 estimated = static_cast<int32_t>(estimated * 1.1f); // 10% buffer
                 estimated = std::clamp(estimated, 10, 1000); // Same bounds as LlamaSummarizer
                 
                 summary_slot_manager_.add_summary_slot(estimated);
+                total_estimated_tokens += estimated;
                 synced_count++;
             }
         }
         
         auto new_stats = summary_slot_manager_.get_statistics();
         
-        LLAMA_LOG("Atomic slot synchronization completed:");
-        LLAMA_LOG("  Previous: " + std::to_string(old_stats.slot_count) + " slots, " + 
+        // Always log synchronization operations as they're critical for state consistency
+        CONTEXT_SIZE_LOG("Atomic slot synchronization completed:");
+        CONTEXT_SIZE_LOG("  Previous: " + std::to_string(old_stats.slot_count) + " slots, " + 
                   std::to_string(old_stats.total_tokens) + " tokens");
-        LLAMA_LOG("  Current: " + std::to_string(new_stats.slot_count) + " slots, " + 
+        CONTEXT_SIZE_LOG("  Current: " + std::to_string(new_stats.slot_count) + " slots, " + 
                   std::to_string(new_stats.total_tokens) + " tokens");
-        LLAMA_LOG("  Synced: " + std::to_string(synced_count) + " non-empty slots");
+        CONTEXT_SIZE_LOG("  Synced: " + std::to_string(synced_count) + " non-empty slots");
+        
+        // Warn about significant changes
+        const int32_t token_diff = new_stats.total_tokens - old_stats.total_tokens;
+        if (std::abs(token_diff) > 100) [[unlikely]] {
+            const std::string sign = (token_diff > 0) ? "+" : "";
+            CONTEXT_SIZE_LOG("Significant token count change during sync: " + 
+                           sign + std::to_string(token_diff) + " tokens");
+        }
+        
+        // Debug information about sync accuracy
+        DEBUG_IF_ENABLED(CONTEXT_SIZE_MANAGER, {
+            if (synced_count > 0) {
+                const int avg_tokens_per_slot = total_estimated_tokens / static_cast<int>(synced_count);
+                CONTEXT_SIZE_LOG_DEBUG("Sync details: avg " + std::to_string(avg_tokens_per_slot) + 
+                                      " tokens/slot, usage: " + 
+                                      std::to_string(static_cast<int>(new_stats.usage_percentage * 100)) + "%");
+            }
+        });
     }
     
 private:
-    void review_strategy() noexcept {
+void review_strategy() noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         
         const auto now = std::chrono::steady_clock::now();
@@ -966,17 +1233,34 @@ private:
             return;  // Review every 3 minutes max
         }
         
+        const ContextStrategy old_strategy = current_strategy_;
         const ContextStrategy suggested = conversation_analyzer_.suggest_optimal_strategy(ai_response_tracker_, summary_tracker_);
         
         if (suggested != current_strategy_) [[unlikely]] {
-            const std::string log_message = std::string("Auto-strategy adaptation: ") + 
-                                          strategy_to_string(current_strategy_) + 
-                                          " -> " + strategy_to_string(suggested);
-            LLAMA_LOG(log_message);
             current_strategy_ = suggested;
+            
+            // Always log strategy changes as they're important for debugging behavior
+            CONTEXT_SIZE_LOG("Auto-strategy adaptation: " + 
+                           std::string(strategy_to_string(old_strategy)) + " -> " + 
+                           std::string(strategy_to_string(suggested)));
+            
+            // Log the reasoning behind the strategy change
+            DEBUG_IF_ENABLED(CONTEXT_SIZE_MANAGER, {
+                const auto ai_stats = ai_response_tracker_.get_statistics();
+                const auto summary_stats = summary_tracker_.get_statistics();
+                const auto conv_metrics = conversation_analyzer_.get_metrics();
+                
+                CONTEXT_SIZE_LOG_DEBUG("Strategy change reasoning:");
+                CONTEXT_SIZE_LOG_DEBUG("  AI responses: avg=" + std::to_string(static_cast<int>(ai_stats.average)) + 
+                                      ", heavy_alloc=" + (ai_stats.average > ContextSizeConstants::LARGE_RESPONSE_THRESHOLD ? "yes" : "no"));
+                CONTEXT_SIZE_LOG_DEBUG("  Summaries: avg=" + std::to_string(static_cast<int>(summary_stats.average)) + 
+                                      ", heavy_alloc=" + (summary_stats.average > ContextSizeConstants::LARGE_SUMMARY_THRESHOLD ? "yes" : "no"));
+                CONTEXT_SIZE_LOG_DEBUG("  Context pressure: " + std::to_string(static_cast<int>(conv_metrics.average_context_pressure * 100)) + "%");
+            });
         }
         
-        last_strategy_review_ = now;    }
+        last_strategy_review_ = now;
+    }
     
     [[nodiscard]] static constexpr const char* strategy_to_string(const ContextStrategy strategy) noexcept {
         switch (strategy) {
@@ -999,5 +1283,3 @@ private:
 
 //
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!
-
-
