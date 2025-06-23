@@ -26,8 +26,10 @@
 // context state management.
 //
 // File Specific Directives:
-// Only keep a maximum of 90% maximum token usage in the context.
-// Use a maximum of 90% context usage, prune older messages to bring us down to 60% usage.
+// Maximum context usage: 90% (enforced via ContextSizeConstants::MAX_CONTEXT_USAGE)
+// Target usage after pruning: 60% (enforced via ContextSizeConstants::TARGET_CONTEXT_USAGE)
+// Conservative pruning ratios: 60-90% retention (never prune more than 40% of messages)
+// Improved prediction accuracy: Enhanced buffer multipliers and conservative estimates
 //
 // Project Settings:
 // C++ Language Standard: ISO C++20 Standard (/std:c++20)

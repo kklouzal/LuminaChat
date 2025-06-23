@@ -1,13 +1,12 @@
 // ContextSizeManager.hpp - Production-ready adaptive context size management for LLaMA contexts
 //
-// OPTIMIZED CONTEXT STRATEGY (v2.0):
-// - Maximum context utilization (up to 95%) while maintaining safety
+// OPTIMIZED CONTEXT STRATEGY (v2.1 - Stability & Consistency Focus):
+// - Consistent thresholds aligned with LlamaManager: 90% max usage, 60% target after pruning
+// - Conservative pruning: 60-90% retention ratios to prevent excessive message loss
+// - Enhanced prediction accuracy: Increased buffer multipliers (2.0x dynamic, 1.5x conservative)
+// - Improved decision logic consistency: Analysis recommendations align with actual decisions
 // - Balanced allocation: 20% summaries, 35% active content, 15% AI responses, 3% emergency buffer
-// - Message-aware summarization: ensures ~12 messages can fit between summarizations
-// - Reduced summary merge frequency through optimized thresholds (15-20% range)
-// - Enhanced yo-yo effect prevention with 75% target usage after pruning
 // - Each ContextInfo has its own EnhancedContextSizeManager instance for isolation
-// - Dynamic tracking with conservative 1.5x buffers and prediction accuracy monitoring
 // - Mathematical validation ensures total allocations ≤ 73% with remaining space for messages
 //
 // INTEGRATION: Functions implemented in LlamaContext.hpp to avoid circular dependencies
@@ -45,9 +44,9 @@ namespace ContextSizeConstants {
     static constexpr float MAX_TOTAL_SUMMARY_ALLOCATION = 0.20f;     // Hard 20% cap for all summaries per context (reduced for better balance)
     static constexpr float EMERGENCY_BUFFER = 0.03f;                 // 3% emergency buffer per context (reduced for higher utilization)    
     static constexpr float MIN_AI_ALLOCATION = 0.15f;                // Minimum 15% for AI responses per context
-    static constexpr float MIN_ACTIVE_CONTENT = 0.35f;               // Minimum 35% for active conversation per context (increased for more messages)
-    static constexpr float DYNAMIC_BUFFER_MULTIPLIER = 1.5f;         // 1.5x multiplier for predictions per context
-    static constexpr float CONSERVATIVE_BUFFER_MULTIPLIER = 1.2f;    // More conservative 1.2x multiplier for AI space estimation    
+    static constexpr float MIN_ACTIVE_CONTENT = 0.35f;               // Minimum 35% for active conversation per context (increased for more messages)    // Enhanced buffer multipliers for more accurate predictions
+    static constexpr float DYNAMIC_BUFFER_MULTIPLIER = 2.0f;         // Increased from 1.5x to 2.0x for better safety margins 
+    static constexpr float CONSERVATIVE_BUFFER_MULTIPLIER = 1.5f;    // Increased from 1.2x to 1.5x for better prediction accuracy
     // Summary management
     static constexpr size_t MIN_SUMMARY_SLOTS = 3;                   // Minimum slots before merging
     static constexpr float MAX_HISTORY_PER_SUMMARY = 0.08f;          // Max 8% of context per summary creation (reduced for more frequent summaries)
@@ -62,9 +61,9 @@ namespace ContextSizeConstants {
     
     // Rolling average tracking
     static constexpr size_t MIN_SAMPLES_FOR_RELIABILITY = 5;         
-    static constexpr size_t MAX_SAMPLES_TO_TRACK = 50;               
-    static constexpr int32_t DEFAULT_AI_RESPONSE_SIZE = 150;         
-    static constexpr int32_t DEFAULT_SUMMARY_SIZE = 200;             
+    static constexpr size_t MAX_SAMPLES_TO_TRACK = 50;                 // Default sizes with more conservative estimates to improve prediction accuracy
+    static constexpr int32_t DEFAULT_AI_RESPONSE_SIZE = 200;         // Increased from 150 for better prediction accuracy
+    static constexpr int32_t DEFAULT_SUMMARY_SIZE = 250;             // Increased from 200 for better prediction accuracy
     
     // Usage pattern analysis
     static constexpr size_t USAGE_PATTERN_WINDOW = 15;               // Track last 15 interactions
@@ -75,10 +74,10 @@ namespace ContextSizeConstants {
     // Strategy adaptation thresholds
     static constexpr float LARGE_RESPONSE_THRESHOLD = 500.0f;        
     static constexpr float LARGE_SUMMARY_THRESHOLD = 400.0f;         
-    static constexpr float VARIABILITY_THRESHOLD = 0.6f;           // Context management ratios (optimized for maximum utilization and balanced operations)
-    static constexpr float MAX_CONTEXT_USAGE = 0.95f;              // Only trigger pruning at 95% usage (increased for better utilization)
-    static constexpr float TARGET_CONTEXT_USAGE = 0.75f;           // Target usage after pruning (increased to reduce yo-yo effect)
-    static constexpr float AGGRESSIVE_PRUNING_RATIO = 0.25f;       // Emergency pruning ratio (reduced for gentler pruning)
+    static constexpr float VARIABILITY_THRESHOLD = 0.6f;       // Context management ratios (aligned with LlamaManager directives: 90% max, 60% target)
+    static constexpr float MAX_CONTEXT_USAGE = 0.90f;              // Maximum 90% usage as specified in LlamaManager directives
+    static constexpr float TARGET_CONTEXT_USAGE = 0.60f;           // Target 60% usage after pruning as specified in LlamaManager directives  
+    static constexpr float AGGRESSIVE_PRUNING_RATIO = 0.30f;       // Emergency pruning ratio (keep 30% for emergency scenarios)
     
     // Message-based thresholds for balanced summarization
     static constexpr float ESTIMATED_TOKENS_PER_MESSAGE = 75.0f;    // Estimated tokens per user+AI message exchange
