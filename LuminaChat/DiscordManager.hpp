@@ -93,7 +93,7 @@ private:
     std::unordered_map<uint64_t, std::string> user_contexts;
     std::unordered_map<uint64_t, std::string> channel_contexts;
     std::unordered_map<uint64_t, std::chrono::system_clock::time_point> last_response_time;
-
+    
     mutable std::mutex data_mutex;
 
     // Message queue system to prevent concurrent context access
@@ -104,7 +104,18 @@ private:
         uint64_t channel_id = 0;
         uint64_t guild_id = 0;
         std::chrono::system_clock::time_point timestamp;
-    };    // Multi-message collection system for handling rapid successive messages
+        
+        // Default constructor
+        PendingMessage() = default;
+        
+        // Move constructor
+        PendingMessage(std::string content, std::string username, uint64_t user_id, 
+                      uint64_t channel_id, uint64_t guild_id, std::chrono::system_clock::time_point timestamp)
+            : content(std::move(content)), username(std::move(username)), user_id(user_id),
+              channel_id(channel_id), guild_id(guild_id), timestamp(timestamp) {}
+    };
+    
+    // Multi-message collection system for handling rapid successive messages
     struct MessageCollector {
         std::vector<PendingMessage> messages;
         std::chrono::system_clock::time_point last_message_time;
@@ -119,7 +130,8 @@ private:
     std::unordered_map<std::string, std::unique_ptr<MessageCollector>> pending_collectors;
     mutable std::mutex message_queue_mutex;
     mutable std::mutex collectors_mutex;
-      // Individual history loaders per context
+    
+    // Individual history loaders per context
     std::unordered_map<std::string, std::shared_ptr<DiscordHistoryLoader>> context_history_loaders;
     mutable std::mutex loaders_mutex;
     
@@ -144,7 +156,9 @@ public:
     std::atomic<bool> pull_message_history{true};
     std::atomic<int32_t> history_fill_percentage{50};    // Configuration - direct access
     std::string main_context_id; // Used only for system prompt template retrieval
-    std::string model_id = "main_model";        BackfillStatus get_backfill_status() const {
+    std::string model_id = "main_model";
+    
+    BackfillStatus get_backfill_status() const {
         std::lock_guard<std::mutex> lock(loaders_mutex);
         
         BackfillStatus status{};
@@ -212,7 +226,8 @@ void setup_event_handlers() {
                 DISCORD_LOG_ERROR("CRITICAL ERROR: Unknown exception in on_ready handler");
             }
         });
-          bot->on_message_create([this](const dpp::message_create_t& event) {
+        
+        bot->on_message_create([this](const dpp::message_create_t& event) {
             try {
                 DISCORD_LOG_DEBUG("Message received from user " + std::to_string(event.msg.author.id) + 
                                  " in channel " + std::to_string(event.msg.channel_id) + 
@@ -237,7 +252,9 @@ void setup_event_handlers() {
                 DISCORD_LOG("Discord bot connected to guild: " + event.created.name);
             }
         });
-    }      void handle_message(const dpp::message_create_t& event) {
+    }
+    
+    void handle_message(const dpp::message_create_t& event) {
         if (event.msg.author.is_bot() || event.msg.content.empty()) [[unlikely]] {
             DISCORD_LOG_DEBUG("Ignoring message: is_bot=" + std::to_string(event.msg.author.is_bot()) + 
                              ", content_empty=" + std::to_string(event.msg.content.empty()));
@@ -321,9 +338,9 @@ void setup_event_handlers() {
     // Queue a message for processing with message collection delay
     void queue_user_message(const std::string& message, const std::string& username, 
                            uint64_t user_id, uint64_t channel_id, uint64_t guild_id) {
+                            
         // Sanitize the incoming message to prevent tokenization issues
-        std::string sanitized_message = TextSanitizer::sanitize_text(message);
-        if (sanitized_message.empty()) [[unlikely]] {
+        std::string sanitized_message = TextSanitizer::sanitize_text(message);        if (sanitized_message.empty()) [[unlikely]] {
             send_message(channel_id, "I'm sorry, but your message couldn't be processed. Please try rephrasing your message.");
             return;
         }
@@ -337,12 +354,13 @@ void setup_event_handlers() {
         // Create unique key for this user in this context
         std::string collector_key;
         collector_key.reserve(context_id.length() + 20); // Reserve space for efficiency
-        collector_key.append(context_id).append("_").append(std::to_string(user_id));
-        
+        collector_key.append(context_id).append("_").append(std::to_string(user_id));        
         PendingMessage new_message{
-            sanitized_message, username, user_id, channel_id, guild_id,
+            std::move(sanitized_message), std::string{username}, user_id, channel_id, guild_id,
             std::chrono::system_clock::now()
-        };        // Add message to history immediately using direct context access - retry initialization if needed
+        };
+        
+        // Add message to history immediately using direct context access - retry initialization if needed
         ContextInfo* target_context = llama_manager ? llama_manager->get_context_info(context_id) : nullptr;
         if (target_context && target_context->fully_initialized.load()) [[likely]] {
             target_context->add_message("user", username + ": " + sanitized_message);
@@ -364,7 +382,8 @@ void setup_event_handlers() {
         
         {
             std::lock_guard<std::mutex> lock(collectors_mutex);
-              // Get or create collector for this user/context combination
+            
+            // Get or create collector for this user/context combination
             auto& collector = pending_collectors[collector_key];
             if (!collector) [[unlikely]] {
                 collector = std::make_unique<MessageCollector>();
@@ -402,7 +421,8 @@ void setup_event_handlers() {
             }
             
             auto& collector = it->second;
-              // Check if we should wait longer (if a very recent message was added)
+            
+            // Check if we should wait longer (if a very recent message was added)
             auto now = std::chrono::system_clock::now();
             auto time_since_last = std::chrono::duration_cast<std::chrono::milliseconds>(now - collector->last_message_time);
             
@@ -445,12 +465,11 @@ void setup_event_handlers() {
         
         DISCORD_LOG("Processing " + std::to_string(messages_to_process.size()) + 
                    " collected messages for context '" + context_id + "'");
-        
-        // Add combined message to processing queue
+          // Add combined message to processing queue
         {
             std::lock_guard<std::mutex> lock(message_queue_mutex);
             auto& queue = context_message_queues[context_id];
-            queue.emplace(combined_message, username, messages_to_process.front().user_id, 
+            queue.emplace(std::move(combined_message), std::string{username}, messages_to_process.front().user_id, 
                          channel_id, messages_to_process.front().guild_id,
                          std::chrono::system_clock::now());
             
@@ -463,14 +482,17 @@ void setup_event_handlers() {
     }
     
     // Process queued messages for a specific context (one at a time)
-    void process_context_queue(const std::string& context_id) {        // Check if already processing this context
+    void process_context_queue(const std::string& context_id) {
+        // Check if already processing this context
         {
             std::lock_guard<std::mutex> lock(message_queue_mutex);
             if (context_processing_flags[context_id].exchange(true)) [[unlikely]] {
                 DISCORD_LOG("Context '" + context_id + "' already processing - message queued");
                 return; // Already processing this context
             }
-        }        // Process messages in queue sequentially
+        }
+        
+        // Process messages in queue sequentially
         std::thread([this, context_id]() {
             try {
                 while (true) {
@@ -516,18 +538,23 @@ void setup_event_handlers() {
                 context_processing_flags[context_id] = false;
             }
         }).detach();
-    }      std::string process_user_message_direct(const std::string& message, const std::string& username, 
+    }
+    
+    std::string process_user_message_direct(const std::string& message, const std::string& username, 
                                            uint64_t user_id, uint64_t channel_id, uint64_t guild_id) {
+        
         if (!llama_manager) [[unlikely]] return "Error: AI backend not available";        
         
-        std::string context_id = get_or_create_user_context(user_id, username, channel_id, guild_id);
+        const std::string context_id = get_or_create_user_context(user_id, username, channel_id, guild_id);
         if (context_id.empty()) [[unlikely]] return "Error: Failed to access chat context";
-          // Use direct context access for better performance
+        
+        // Use direct context access for better performance
         ContextInfo* target_context = llama_manager ? llama_manager->get_context_info(context_id) : nullptr;
         if (!target_context) [[unlikely]] {
             return "Error: Failed to access your chat context";
         }
-          // CRITICAL: Verify context is ready for generation before proceeding, retry if needed
+        
+        // CRITICAL: Verify context is ready for generation before proceeding, retry if needed
         if (!target_context->fully_initialized.load()) [[unlikely]] {
             LLAMA_LOG("WARNING: Discord attempting to use uninitialized context '" + context_id + "' - attempting retry initialization");
             
@@ -543,23 +570,26 @@ void setup_event_handlers() {
         std::string response = llama_manager->generate_response(message, target_context, username);
         return response.empty() ? "I'm not sure how to respond to that. Could you try rephrasing?" : response;
     }
-      // Add message to history without generating a response (for listening mode)
+    
+    // Add message to history without generating a response (for listening mode)
     void add_message_to_history_only(const std::string& message, const std::string& username,
                                     uint64_t user_id, uint64_t channel_id, uint64_t guild_id) {
         if (!llama_manager) [[unlikely]] return;
-        
-        // Sanitize the incoming message to prevent tokenization issues
-        std::string sanitized_message = TextSanitizer::sanitize_text(message);
+          // Sanitize the incoming message to prevent tokenization issues
+        const std::string sanitized_message = TextSanitizer::sanitize_text(message);
         if (sanitized_message.empty()) [[unlikely]] return;
         
-        std::string context_id = get_or_create_user_context(user_id, username, channel_id, guild_id);
-        if (context_id.empty()) [[unlikely]] return;        // Use direct context access to add message to history - retry initialization if needed
+        const std::string context_id = get_or_create_user_context(user_id, username, channel_id, guild_id);
+        if (context_id.empty()) [[unlikely]] return;
+        
+        // Use direct context access to add message to history - retry initialization if needed
         ContextInfo* target_context = llama_manager ? llama_manager->get_context_info(context_id) : nullptr;
         if (target_context && target_context->fully_initialized.load()) [[likely]] {
             target_context->add_message("user", username + ": " + sanitized_message);
             ++total_messages_processed;
             last_activity = std::chrono::system_clock::now();
-            DISCORD_LOG("Added message to history (listening mode) for context '" + context_id + "'");        } else if (target_context) [[unlikely]] {
+            DISCORD_LOG("Added message to history (listening mode) for context '" + context_id + "'");
+        } else if (target_context) [[unlikely]] {
             // Context exists but not fully initialized - attempt retry
             LLAMA_LOG("WARNING: Context '" + context_id + "' not initialized for history-only mode - attempting retry");
             
@@ -602,7 +632,8 @@ void setup_event_handlers() {
         }
         return parts;
     }
-      void parse_channel_ids(const std::string& channel_ids_str, std::unordered_set<uint64_t>& target_set) {
+    
+    void parse_channel_ids(const std::string& channel_ids_str, std::unordered_set<uint64_t>& target_set) {
         std::lock_guard<std::mutex> lock(channel_config_mutex);
         target_set.clear();
         
@@ -623,7 +654,9 @@ void setup_event_handlers() {
                                            [](char c) { return std::isspace(static_cast<unsigned char>(c)); });
             auto id_end = std::find_if_not(std::reverse_iterator(channel_ids_str.begin() + end_pos),
                                          std::reverse_iterator(channel_ids_str.begin() + start),
-                                         [](char c) { return std::isspace(static_cast<unsigned char>(c)); }).base();            if (id_start < id_end) [[likely]] {
+                                         [](char c) { return std::isspace(static_cast<unsigned char>(c)); }).base();
+                                         
+                if (id_start < id_end) [[likely]] {
                 try {
                     target_set.emplace(std::stoull(std::string(id_start, id_end)));
                 } catch (const std::exception&) {
@@ -633,7 +666,9 @@ void setup_event_handlers() {
             
             start = (comma_pos == channel_ids_str.end()) ? channel_ids_str.length() : end_pos + 1;
         }
-    }    bool is_isolated_channel(uint64_t channel_id) const {
+    }
+    
+    bool is_isolated_channel(uint64_t channel_id) const {
         std::lock_guard<std::mutex> lock(channel_config_mutex);
         return isolated_channels.contains(channel_id);
     }
@@ -648,17 +683,20 @@ void setup_event_handlers() {
         
         last_time = now;
         return false;
-    }    // Create contexts for configured channels that the bot can access
+    }
+    
+    // Create contexts for configured channels that the bot can access
     void create_channel_contexts() {
         if (!llama_manager || model_id.empty()) [[unlikely]] return;
         
         std::lock_guard<std::mutex> channel_lock(channel_config_mutex);
-        std::string system_prompt = get_system_prompt_for_new_context();
+        const std::string system_prompt = get_system_prompt_for_new_context();
         
         // Note: isolated_channels now contains all configured channels (no longer distinguishing isolated vs shared)
         for (uint64_t channel_id : isolated_channels) {
-            std::string context_id = "discord_channel_" + std::to_string(channel_id);
-              // Check if context already exists
+            const std::string context_id = "discord_channel_" + std::to_string(channel_id);
+            
+            // Check if context already exists
             if (llama_manager->has_context(context_id)) [[likely]] {
                 std::lock_guard<std::mutex> data_lock(data_mutex);
                 channel_contexts[channel_id] = context_id;
@@ -670,7 +708,8 @@ void setup_event_handlers() {
                     std::lock_guard<std::mutex> data_lock(data_mutex);
                     channel_contexts[channel_id] = context_id;
                     DISCORD_LOG("Created context '" + context_id + "' for channel: " + std::to_string(channel_id));
-                      // CRITICAL: Verify context is actually ready before proceeding, retry if needed
+                    
+                    // CRITICAL: Verify context is actually ready before proceeding, retry if needed
                     auto context_info = llama_manager->get_context_info(context_id);
                     if (context_info && !context_info->fully_initialized.load()) {
                         DISCORD_LOG("WARNING: Context '" + context_id + "' not fully initialized after creation - attempting retry");
@@ -691,7 +730,9 @@ void setup_event_handlers() {
             if (pull_message_history.load() && bot) {
                 auto context_info = llama_manager->get_context_info(context_id);
                 if (context_info) {
-                    const float fill_ratio = static_cast<float>(history_fill_percentage.load()) / 100.0f;                    auto loader = DiscordHistoryLoader::create_for_context(
+                    const float fill_ratio = static_cast<float>(history_fill_percentage.load()) / 100.0f;
+                    
+                    auto loader = DiscordHistoryLoader::create_for_context(
                         context_id, channel_id, context_info, llama_manager, model_id,
                         bot.get(), static_cast<uint64_t>(bot->me.id), fill_ratio);
                     
@@ -704,8 +745,11 @@ void setup_event_handlers() {
                 }
             }
         }
-          DISCORD_LOG("Initialized " + std::to_string(isolated_channels.size()) + " individual channel contexts");
-    }    // Get system prompt from main context template for new Discord contexts
+        
+        DISCORD_LOG("Initialized " + std::to_string(isolated_channels.size()) + " individual channel contexts");
+    }
+    
+    // Get system prompt from main context template for new Discord contexts
     std::string get_system_prompt_for_new_context() const {
         if (!llama_manager || main_context_id.empty()) [[unlikely]] return "";
         
@@ -715,7 +759,9 @@ void setup_event_handlers() {
         
         // Return the system message from the main context as template
         return context_info->system_message;
-    }std::string get_or_create_user_context(uint64_t user_id, const std::string& username, 
+    }
+    
+    std::string get_or_create_user_context(uint64_t user_id, const std::string& username, 
                                          uint64_t channel_id, uint64_t guild_id) {
         const bool is_dm = (guild_id == 0);
         
@@ -724,21 +770,22 @@ void setup_event_handlers() {
         if (is_dm) {
             auto it = user_contexts.find(user_id);
             if (it != user_contexts.end() && llama_manager && llama_manager->has_context(it->second)) {
-                return it->second;
-            }
+                return it->second;            }
             
-            std::string context_id = "discord_dm_" + std::to_string(user_id);
+            const std::string context_id = "discord_dm_" + std::to_string(user_id);
             
             // Check if context already exists before trying to create
             if (llama_manager && llama_manager->has_context(context_id)) {
                 user_contexts[user_id] = context_id;
                 return context_id;
             }
-              // Use new API with model_id parameter and proper system prompt
-            std::string system_prompt = get_system_prompt_for_new_context();
+            
+            // Use new API with model_id parameter and proper system prompt
+            const std::string system_prompt = get_system_prompt_for_new_context();
             if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, system_prompt)) {
                 user_contexts[user_id] = context_id;
-                  // CRITICAL: Verify context is ready for use, retry if needed
+                
+                // CRITICAL: Verify context is ready for use, retry if needed
                 auto created_context = llama_manager->get_context_info(context_id);
                 if (created_context && !created_context->fully_initialized.load()) {
                     LLAMA_LOG("WARNING: Created Discord context '" + context_id + "' not fully initialized - attempting retry");
@@ -752,22 +799,23 @@ void setup_event_handlers() {
                 }
                 
                 return context_id;
-            }        } else {
+            }
+        } else {
             // For all server channels, create individual contexts
             auto it = channel_contexts.find(channel_id);
             if (it != channel_contexts.end() && llama_manager && llama_manager->has_context(it->second)) {
                 return it->second;
-            }
-            
-            std::string context_id = "discord_channel_" + std::to_string(channel_id);
+            }            
+            const std::string context_id = "discord_channel_" + std::to_string(channel_id);
             
             // Check if context already exists before trying to create
             if (llama_manager && llama_manager->has_context(context_id)) {
                 channel_contexts[channel_id] = context_id;
                 return context_id;
             }
-              // Create new context for this channel
-            std::string system_prompt = get_system_prompt_for_new_context();
+            
+            // Create new context for this channel
+            const std::string system_prompt = get_system_prompt_for_new_context();
             if (llama_manager && !model_id.empty() && llama_manager->create_context(context_id, model_id, system_prompt)) {
                 channel_contexts[channel_id] = context_id;
                   // CRITICAL: Verify context is ready for use, retry if needed
@@ -785,7 +833,8 @@ void setup_event_handlers() {
                 
                 return context_id;
             }
-        }        return "";
+        }
+        return "";
     }
       // Helper function to get context ID for a specific channel/user
     std::string get_context_for_channel(uint64_t channel_id, uint64_t user_id = 0, uint64_t guild_id = 0) const {
@@ -816,12 +865,14 @@ void setup_event_handlers() {
             std::lock_guard<std::mutex> collectors_lock(collectors_mutex);
             pending_collectors.clear();
         }
-          // Clean up individual history loaders
+        
+        // Clean up individual history loaders
         {
             std::lock_guard<std::mutex> loaders_lock(loaders_mutex);
             context_history_loaders.clear();
         }
-          // Clean up contexts in LlamaManager
+        
+        // Clean up contexts in LlamaManager
         if (llama_manager) [[likely]] {
             std::lock_guard<std::mutex> lock(data_mutex);
             
@@ -857,7 +908,9 @@ public:
         last_activity = std::chrono::system_clock::now();
     }
     
-    ~DiscordManager() { shutdown(); }    bool configure(const DiscordBotConfig& bot_config) {
+    ~DiscordManager() { shutdown(); }
+    
+    bool configure(const DiscordBotConfig& bot_config) {
         if (is_running || bot_config.bot_token.empty()) [[unlikely]] return false;
         
         // Validate bot token format (Discord bot tokens are typically 70+ characters and contain dots)
@@ -870,7 +923,8 @@ public:
         DISCORD_LOG("Discord bot configured with token: " + bot_config.bot_token.substr(0, 10) + "...");
         return true;
     }
-      void set_isolated_channels(const std::string& channel_ids) {
+    
+    void set_isolated_channels(const std::string& channel_ids) {
         parse_channel_ids(channel_ids, isolated_channels);
     }
     
@@ -885,7 +939,8 @@ public:
         DISCORD_LOG("History settings updated: pull=" + std::string(pull_history ? "true" : "false") + 
                    ", fill=" + std::to_string(fill_percentage) + "%");
     }
-      void set_llama_manager(LlamaManager* manager) {
+    
+    void set_llama_manager(LlamaManager* manager) {
         llama_manager = manager;
         
         if (manager) [[likely]] {
@@ -897,7 +952,9 @@ public:
         } else {
             cleanup_contexts();
         }
-    }    bool initialize() {
+    }
+    
+    bool initialize() {
         if (config.bot_token.empty()) [[unlikely]] return false;
         
         try {
@@ -912,9 +969,12 @@ public:
             DISCORD_LOG("Error: Failed to initialize Discord bot: " + std::string(e.what()));
             return false;
         }
-    }bool start() {
+    }
+    
+    bool start() {
         if (is_running || !initialize()) [[unlikely]] return false;
-          // Validate that essential components are ready before starting
+        
+        // Validate that essential components are ready before starting
         if (!llama_manager) {
             DISCORD_LOG("ERROR: Cannot start Discord bot - LlamaManager not set");
             return false;
@@ -939,7 +999,8 @@ public:
             return false;
         }
     }
-      void shutdown() {
+    
+    void shutdown() {
         if (!is_running) [[unlikely]] return;
         
         should_stop = true;
@@ -953,7 +1014,8 @@ public:
         is_connected = false;
         cleanup_contexts();
     }
-      bool send_message(uint64_t channel_id, const std::string& message) {
+    
+    bool send_message(uint64_t channel_id, const std::string& message) {
         if (!is_running.load() || !is_connected.load() || !bot || message.empty()) [[unlikely]] return false;
         
         // Keep try-catch here as Discord API calls can fail due to network/rate limiting
@@ -961,7 +1023,8 @@ public:
             const auto message_parts = split_message(message);
             const std::string context_id = get_context_for_channel(channel_id, 0, 0);
             std::string footer_text = "🤖 LuminaChat AI";
-              // Get context information once outside the loop using direct access
+            
+            // Get context information once outside the loop using direct access
             if (llama_manager && !context_id.empty()) [[likely]] {
                 if (const auto* context_info = llama_manager->get_context_info(context_id)) [[likely]] {
                     const int32_t context_usage = context_info->n_past;
