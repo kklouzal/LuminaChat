@@ -113,7 +113,9 @@ private:
     std::string model_id;
     
     // Thread safety for context access
-    mutable std::mutex context_access_mutex;    // Target channel for this isolated context loader
+    mutable std::mutex context_access_mutex;
+    
+    // Target channel for this isolated context loader
     uint64_t target_channel_id = 0;
 
     // NOTE: context_fill_ratio represents the target percentage of context to fill with HISTORICAL MESSAGES ONLY
@@ -125,13 +127,16 @@ private:
     
     // Discord API access
     dpp::cluster* bot = nullptr;
-      // Pre-tokenized message storage
+    
+    // Pre-tokenized message storage
     std::vector<PreTokenizedMessage> collected_messages;
     std::atomic<int32_t> total_tokens_collected{0};
     std::atomic<bool> target_reached{false};
     std::atomic<bool> collection_complete{false};
     std::atomic<bool> messages_applied{false};  // Track if messages have been applied to prevent duplicates
-    mutable std::mutex messages_mutex;    // Processing state
+    mutable std::mutex messages_mutex;
+    
+    // Processing state - initialize all scalar fields
     uint64_t last_message_id = 0;
     std::unordered_set<uint64_t> processed_message_ids;
     mutable std::mutex processed_ids_mutex;
@@ -196,15 +201,16 @@ private:
         // Process messages synchronously on the calling thread (no deadlock risk)
         return collect_and_tokenize_messages(messages, channel_id);
     }
-    
-    // Enhanced message collection with STL optimizations and separation of concerns
+      // Enhanced message collection with STL optimizations and separation of concerns
     bool collect_and_tokenize_messages(const dpp::message_map& messages, uint64_t channel_id) {
         std::vector<PreTokenizedMessage> batch_messages;
         batch_messages.reserve(messages.size()); // STL: Pre-allocate for performance
         
         // STL: Find oldest message ID efficiently
         auto oldest_it = std::min_element(messages.begin(), messages.end(),
-            [](const auto& a, const auto& b) { return a.first < b.first; });        // Process messages with optimized filtering
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+        
+        // Process messages with optimized filtering
         for (const auto& [id, msg] : messages) {
             if (auto processed_msg = process_individual_message(msg, channel_id)) {
                 batch_messages.emplace_back(std::move(*processed_msg));
@@ -213,11 +219,11 @@ private:
         
         // Update pagination state - explicit cast to resolve type ambiguity
         last_message_id = oldest_it != messages.end() ? static_cast<uint64_t>(oldest_it->first) : last_message_id;
-          // Apply batch to context and check fill ratio
+        
+        // Apply batch to context and check fill ratio
         return apply_message_batch(std::move(batch_messages));
     }
-    
-    // Process individual message - simplified without pre-tokenization
+      // Process individual message - simplified without pre-tokenization
     std::optional<PreTokenizedMessage> process_individual_message(const dpp::message& msg, uint64_t channel_id) {
         uint64_t msg_id = static_cast<uint64_t>(msg.id);
 
@@ -243,8 +249,7 @@ private:
         if (is_our_bot && llama_manager && llama_manager->is_blacklisted_response(content)) {
             return std::nullopt;
         }
-        
-        // Create message without pre-tokenization
+          // Create message without pre-tokenization - use move semantics to avoid copies
         PreTokenizedMessage pre_msg;
         pre_msg.channel_id = channel_id;
         pre_msg.message_id = msg_id;
@@ -252,8 +257,8 @@ private:
         pre_msg.timestamp = std::chrono::system_clock::time_point(std::chrono::seconds(msg.sent));
         
         // Store formatted content - tokenization will happen during context rebuild
-        std::string formatted = is_our_bot ? content : (msg.author.username + ": " + content);
-        pre_msg.content = formatted;
+        std::string formatted = is_our_bot ? std::move(content) : (msg.author.username + ": " + std::move(content));
+        pre_msg.content = std::move(formatted);
         pre_msg.token_count = 0; // Will be calculated during context rebuild
         
         return std::make_optional(std::move(pre_msg));
@@ -266,16 +271,16 @@ private:
         }
         return safe_trim(TextSanitizer::sanitize_text(content));
     }
-    
-    // Apply batch of messages to context - exactly as specified
-    bool apply_message_batch(std::vector<PreTokenizedMessage> batch_messages) {
+      // Apply batch of messages to context - exactly as specified
+    bool apply_message_batch(std::vector<PreTokenizedMessage>&& batch_messages) {
         if (batch_messages.empty()) return false;
         
         std::lock_guard<std::mutex> lock(context_access_mutex);
         if (!validate_context_unsafe()) return false;
         
         // Step 2: Loop through batch, add to context 1-by-1
-        for (auto it = batch_messages.rbegin(); it != batch_messages.rend(); ++it) {            std::string role = (it->username == "assistant") ? "assistant" : "user";
+        for (auto it = batch_messages.rbegin(); it != batch_messages.rend(); ++it) {
+            std::string role = (it->username == "assistant") ? "assistant" : "user";
             target_context->insert_historical_message(role, it->content);
         }
         
@@ -291,7 +296,8 @@ private:
         // This prevents unexpected incremental rebuilds when the user later generates responses
         target_context->conversation_state.needs_rebuild = false;
         target_context->message_cache_dirty = false;
-          // Step 4: Check context usage size
+        
+        // Step 4: Check context usage size
         if (!target_context->context_size_manager) return false;
         
         auto analysis = analyze_context_usage(*target_context, *target_context->model_info);
@@ -303,7 +309,7 @@ private:
             1.0f - analysis.emergency_buffer_percentage - analysis.ai_allocation_percentage - 0.05f
         );
         
-        // Store messages for tracking
+        // Store messages for tracking - use move semantics
         {
             std::lock_guard<std::mutex> lock_msgs(messages_mutex);
             collected_messages.insert(collected_messages.end(), 
@@ -321,7 +327,8 @@ private:
         DISCORD_HISTORY_LOG("Batch applied to '" + target_context_id + "': " + 
                           std::to_string(current_usage * 100) + "% usage (target: " +
                           std::to_string(safe_target * 100) + "%)");
-          return true;
+        
+        return true;
     }
     
     // Collection thread main function - simplified
