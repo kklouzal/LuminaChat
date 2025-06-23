@@ -55,10 +55,10 @@
 #include <algorithm>
 #include <vector>
 #include <iterator>
+#include "LogHandler.hpp"
 #include "LlamaManager.hpp"
 #include "DiscordManager.hpp" 
 #include "SettingsManager.hpp"
-#include "LogHandler.hpp"
 
 // SummarizerConstants are defined in LlamaSummarizer.hpp
 
@@ -892,9 +892,7 @@ private:
         wxColour ai_bg = wxSystemSettings::GetColour(wxSYS_COLOUR_ACTIVECAPTION);
         ai_bg = ai_bg.ChangeLightness(140); // Lighter version of system active caption
         AddChatMessage(message, "AI", ai_bg);
-    }
-    
-    void AddSystemMessage(const wxString& message) {
+    }    void AddSystemMessage(const wxString& message) {
         // Cache system message attributes (Directive #13: Smart Caching)
         static thread_local wxRichTextAttr system_attr;
         static thread_local bool attr_initialized = false;
@@ -1608,13 +1606,11 @@ private:
         event.Skip();
     }
     
-private:
-
-    // Reset cached color attributes when theme changes
+private:    // Reset cached color attributes when theme changes
     void InvalidateCachedColors() {
         // Force regeneration of cached message attributes by clearing their initialization flags
-        // This is handled by the static thread_local variables in AddSystemMessage
-        // We'll trigger a complete UI refresh which will cause them to be regenerated
+        // We need to clear the thread_local static variables in AddSystemMessage
+        // Since we can't directly access them, we'll force a complete refresh
         
         // Clear the chat history and re-add welcome message to immediately show new theme
         if (ui.chat_history && is_started.load()) {
@@ -1624,9 +1620,16 @@ private:
             ui.chat_history->Clear();
             AddWelcomeMessage();
         }
-    }
-    
-    // Refresh UI colors to match new system theme
+        
+        // Force clear any cached user/AI message attributes by calling methods that will regenerate them
+        if (ui.chat_history) {
+            // Add a temporary message to force attribute regeneration, then clear
+            long pos = ui.chat_history->GetLastPosition();
+            AddSystemMessage("Theme refresh");
+            ui.chat_history->SetSelection(pos, ui.chat_history->GetLastPosition());
+            ui.chat_history->DeleteSelection();
+        }
+    }    // Refresh UI colors to match new system theme
     void RefreshUIColors() {
         if (!ui.main_panel) return;
         
@@ -1738,8 +1741,7 @@ private:
             ui.summary_slots_btn->SetBackgroundColour(btn_bg); 
             ui.summary_slots_btn->SetForegroundColour(btn_text); 
             ui.summary_slots_btn->Refresh();
-        }
-        
+        }        
         // Update progress labels to use system text color
         if (ui.progress_label) {
             ui.progress_label->SetForegroundColour(btntext_color);
@@ -1807,17 +1809,13 @@ private:
         Layout();
         Refresh();
         Update();
-        
-        // Force all child windows to refresh recursively
-        RefreshRect(GetClientRect(), true);
     }
     
-    void UpdateContextProgress() {
-        if (!is_started || !llama_manager || !context_created || !llama_manager->has_context("main_chat")) {
+    void UpdateContextProgress() {        if (!is_started || !llama_manager || !context_created || !llama_manager->has_context("main_chat")) {
             // Reset all progress bars and labels when not available
-            ui.overall_label->SetLabel("Overall: N/A");
-            ui.summary_label->SetLabel("Summaries: N/A");
-            ui.history_label->SetLabel("History: N/A");
+            ui.overall_label->SetLabel("Overall: N/A [0]");
+            ui.summary_label->SetLabel("Summaries: N/A [0]");
+            ui.history_label->SetLabel("History: N/A [0]");
             ui.ai_space_label->SetLabel("AI Space: N/A");
             ui.buffer_label->SetLabel("Buffer: N/A");
             
@@ -1890,27 +1888,36 @@ private:
             const float buffer_percentage = CalculatePercentage(analysis.emergency_buffer_space, analysis.context_size);
             ui.buffer_progress_bar->SetValue(ClampPercentage(buffer_percentage));
             ui.buffer_progress_bar->SetForegroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_HIGHLIGHT));
+              // Update labels with detailed information including counts
+            ui.overall_label->SetLabel(wxString::Format("Overall: %d/%d (%d%%) [%zu]", 
+                analysis.total_used_tokens, analysis.context_size, static_cast<int>(overall_percentage),
+                context_info->message_history.size()));
             
-            // Update labels with detailed information
-            ui.overall_label->SetLabel(wxString::Format("Overall: %d/%d (%d%%)", 
-                analysis.total_used_tokens, analysis.context_size, static_cast<int>(overall_percentage)));
+            ui.summary_label->SetLabel(wxString::Format("Summaries: %d (%d%%) [%zu]", 
+                analysis.summary_tokens, static_cast<int>(summary_percentage),
+                analysis.summary_slot_stats.slot_count));
             
-            ui.summary_label->SetLabel(wxString::Format("Summaries: %d (%d%%)", 
-                analysis.summary_tokens, static_cast<int>(summary_percentage)));
+            // Calculate non-summary message count for history label
+            size_t history_message_count = 0;
+            for (const auto& msg : context_info->message_history) {
+                if (!(msg.first == "system" && msg.second.find("[Previous conversation summary]: ") == 0)) {
+                    history_message_count++;
+                }
+            }
             
-            ui.history_label->SetLabel(wxString::Format("History: %d (%d%%)", 
-                analysis.active_history_tokens, static_cast<int>(history_percentage)));
+            ui.history_label->SetLabel(wxString::Format("History: %d (%d%%) [%zu]", 
+                analysis.active_history_tokens, static_cast<int>(history_percentage),
+                history_message_count));
               ui.ai_space_label->SetLabel(wxString::Format("AI Space: %d (%d%%)", 
                 analysis.required_ai_space, static_cast<int>(ai_space_percentage)));
             
             ui.buffer_label->SetLabel(wxString::Format("Buffer: %d (%d%%)", 
                 analysis.emergency_buffer_space, static_cast<int>(buffer_percentage)));
-                
-        } else {
+                  } else {
             // Context size is 0 or invalid
-            ui.overall_label->SetLabel("Overall: N/A");
-            ui.summary_label->SetLabel("Summaries: N/A");
-            ui.history_label->SetLabel("History: N/A");
+            ui.overall_label->SetLabel("Overall: N/A [0]");
+            ui.summary_label->SetLabel("Summaries: N/A [0]");
+            ui.history_label->SetLabel("History: N/A [0]");
             ui.ai_space_label->SetLabel("AI Space: N/A");
             ui.buffer_label->SetLabel("Buffer: N/A");
             
@@ -2048,10 +2055,5 @@ public:
 };
 
 wxIMPLEMENT_APP(LuminaChatApp);
-
-// Cross-platform entry point with fixed-width types (Directive #11: Portability)
-int32_t main(int32_t argc, char* argv[]) {
-    return wxEntry(argc, argv);
-}
 
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODE DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!

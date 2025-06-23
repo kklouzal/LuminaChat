@@ -100,19 +100,17 @@ private:
     struct PendingMessage {
         std::string content;
         std::string username;
-        uint64_t user_id;
-        uint64_t channel_id;
-        uint64_t guild_id;
+        uint64_t user_id = 0;
+        uint64_t channel_id = 0;
+        uint64_t guild_id = 0;
         std::chrono::system_clock::time_point timestamp;
-    };
-
-    // Multi-message collection system for handling rapid successive messages
+    };    // Multi-message collection system for handling rapid successive messages
     struct MessageCollector {
         std::vector<PendingMessage> messages;
         std::chrono::system_clock::time_point last_message_time;
         std::unique_ptr<std::thread> timer_thread;
         std::atomic<bool> timer_active{false};
-        uint64_t user_id;
+        uint64_t user_id = 0;
         std::string context_id;
     };
     

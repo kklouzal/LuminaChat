@@ -42,6 +42,7 @@
 #include <chrono>
 #include <numeric>
 #include "llama-cpp.h"
+#include "LogHandler.hpp"  // Add logging support
 
 // Enhanced bidirectional token cache - Text↔Tokens with single cache reservoir
 class TokenCache {
@@ -51,6 +52,12 @@ public:
     mutable std::atomic<size_t> cache_requests{0};
     mutable std::atomic<size_t> memory_usage_bytes{0};
     size_t max_cache_size;
+
+    // Performance tracking for debugging
+    mutable std::atomic<size_t> text_lookups{0};
+    mutable std::atomic<size_t> token_lookups{0};
+    mutable std::atomic<size_t> evictions{0};
+    mutable std::atomic<size_t> memory_reclaimed_bytes{0};
 
     // Eviction policy options
     enum class EvictionPolicy : uint8_t {
@@ -157,9 +164,17 @@ private:
             }
         }
     }
-      // Enhanced cache trimming
+      // Enhanced cache trimming with debug logging
     void trim_cache() const {
         const size_t target_size = static_cast<size_t>(max_cache_size * CACHE_TRIM_TARGET_RATIO);
+        size_t initial_size = text_to_entry.size();
+        size_t total_reclaimed = 0;
+          // Debug logging for cache pressure
+        if (initial_size > max_cache_size * 0.8f) {
+            LOG_DEBUG(LLAMA_MANAGER, "TokenCache trim triggered - pressure at " + 
+                     std::to_string(static_cast<float>(initial_size) / max_cache_size * 100.0f) + 
+                     "% (" + std::to_string(initial_size) + "/" + std::to_string(max_cache_size) + ")");
+        }
         
         while (text_to_entry.size() > target_size && !text_to_entry.empty()) {
             std::string victim_key;
@@ -189,14 +204,25 @@ private:
                     // Remove reverse mapping
                     const auto token_hash = hash_tokens(it->second->tokens);
                     token_hash_to_entry.erase(token_hash);
-                    
-                    update_memory_usage(-static_cast<int64_t>(it->second->memory_size));
+                      const size_t reclaimed_memory = it->second->memory_size;
+                    total_reclaimed += reclaimed_memory;
+                    update_memory_usage(-static_cast<int64_t>(reclaimed_memory));
                     text_to_entry.erase(it);
                     access_iterators.erase(victim_key);
-                }
-            } else [[unlikely]] {
+                    
+                    // Track eviction metrics
+                    evictions.fetch_add(1, std::memory_order_relaxed);
+                    memory_reclaimed_bytes.fetch_add(reclaimed_memory, std::memory_order_relaxed);
+                }            } else [[unlikely]] {
+                LOG_DEBUG(LLAMA_MANAGER, "TokenCache trim: No victim found, breaking");
                 break;
             }
+        }
+          // Debug logging for trim results
+        if (initial_size != text_to_entry.size()) {
+            LOG_DEBUG(LLAMA_MANAGER, "TokenCache trim completed: " + 
+                     std::to_string(initial_size - text_to_entry.size()) + " entries removed, " +
+                     std::to_string(total_reclaimed) + " bytes reclaimed");
         }
     }
       // Thread-safe wrappers
@@ -263,6 +289,7 @@ public:    explicit TokenCache(const size_t max_size = DEFAULT_CACHE_SIZE,
     [[nodiscard]] std::optional<std::vector<llama_token>> get_tokens(const std::string_view text_key) const noexcept {
         return with_lock([&]() noexcept -> std::optional<std::vector<llama_token>> {
             cache_requests.fetch_add(1, std::memory_order_relaxed);
+            text_lookups.fetch_add(1, std::memory_order_relaxed);
             
             const std::string key_str(text_key);
             if (const auto it = text_to_entry.find(key_str); it != text_to_entry.end()) [[likely]] {
@@ -270,14 +297,24 @@ public:    explicit TokenCache(const size_t max_size = DEFAULT_CACHE_SIZE,
                 update_access_order(it->first, *it->second);
                 return it->second->tokens;
             }
+              // Debug logging for frequent cache misses (potential performance issue)
+            if (cache_requests.load() % 100 == 0) {
+                float hit_ratio = static_cast<float>(cache_hits.load()) / cache_requests.load();
+                if (hit_ratio < 0.5f) {
+                    LOG_DEBUG(LLAMA_MANAGER, "TokenCache: Low hit ratio detected: " + 
+                             std::to_string(hit_ratio * 100.0f) + "% (requests: " + 
+                             std::to_string(cache_requests.load()) + ")");
+                }
+            }
             
             return std::nullopt;
         });
     }
-      // Tokens -> Text lookup (reverse)
+      // Tokens -> Text lookup (reverse) with debug logging
     [[nodiscard]] std::optional<std::string> get_text(const std::vector<llama_token>& tokens) const noexcept {
         return with_lock([&]() noexcept -> std::optional<std::string> {
             cache_requests.fetch_add(1, std::memory_order_relaxed);
+            token_lookups.fetch_add(1, std::memory_order_relaxed);
             
             const std::string token_hash = hash_tokens(tokens);
             if (const auto it = token_hash_to_entry.find(token_hash); it != token_hash_to_entry.end()) [[likely]] {
@@ -294,7 +331,9 @@ public:    explicit TokenCache(const size_t max_size = DEFAULT_CACHE_SIZE,
                     if (text_it != text_to_entry.end()) [[likely]] {
                         update_access_order(text_it->first, entry);
                     }
-                    return entry.text;
+                    return entry.text;                } else {
+                    // Hash collision detected - this is rare but important to log
+                    LOG_DEBUG(LLAMA_MANAGER, "TokenCache: Hash collision detected for token sequence");
                 }
             }
             
@@ -346,13 +385,19 @@ public:    explicit TokenCache(const size_t max_size = DEFAULT_CACHE_SIZE,
     // Clear cache
     void clear() const {
         return with_write_lock([&]() {
+            size_t entries_cleared = text_to_entry.size();
+            size_t memory_cleared = memory_usage_bytes.load();
+            
             text_to_entry.clear();
             token_hash_to_entry.clear();
             access_order.clear();
-            access_iterators.clear();
-            cache_hits.store(0, std::memory_order_relaxed);
+            access_iterators.clear();            cache_hits.store(0, std::memory_order_relaxed);
             cache_requests.store(0, std::memory_order_relaxed);
             memory_usage_bytes.store(0, std::memory_order_relaxed);
+            
+            LOG_DEBUG(LLAMA_MANAGER, "TokenCache cleared: " + 
+                     std::to_string(entries_cleared) + " entries, " + 
+                     std::to_string(memory_cleared) + " bytes freed");
         });
     }
       // Enhanced statistics

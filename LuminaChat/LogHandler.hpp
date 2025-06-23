@@ -57,6 +57,8 @@ enum class LogComponent {
     DISCORD_HISTORY,
     SETTINGS_MANAGER,
     SUMMARIZER_MANAGER,
+    BLACKLIST_MANAGER,
+    SANITIZER,
     UI
 };
 
@@ -153,6 +155,8 @@ private:
             case LogComponent::DISCORD_HISTORY: return "DiscordHistory";
             case LogComponent::SETTINGS_MANAGER: return "Settings";
             case LogComponent::SUMMARIZER_MANAGER: return "Summarizer";
+            case LogComponent::BLACKLIST_MANAGER: return "BlacklistManager";
+            case LogComponent::SANITIZER: return "Sanitizer";
             case LogComponent::UI: return "UI";
             default: return "Unknown";
         }
@@ -285,8 +289,16 @@ public:
 #define DISCORD_LOG_ERROR(message) LogHandler::error(LogComponent::DISCORD_MANAGER, message)
 #define DISCORD_HISTORY_LOG(message) LogHandler::info(LogComponent::DISCORD_HISTORY, message)
 #define SETTINGS_LOG(message) LogHandler::info(LogComponent::SETTINGS_MANAGER, message)
+#define SETTINGS_LOG_DEBUG(message) LogHandler::debug(LogComponent::SETTINGS_MANAGER, message)
+#define SETTINGS_LOG_ERROR(message) LogHandler::error(LogComponent::SETTINGS_MANAGER, message)
 #define SUMMARIZER_LOG(message) LogHandler::info(LogComponent::SUMMARIZER_MANAGER, message)
 #define SUMMARIZER_LOG_ERROR(message) LogHandler::error(LogComponent::SUMMARIZER_MANAGER, message)
+#define BLACKLIST_LOG(message) LogHandler::info(LogComponent::BLACKLIST_MANAGER, message)
+#define BLACKLIST_LOG_DEBUG(message) LogHandler::debug(LogComponent::BLACKLIST_MANAGER, message)
+#define BLACKLIST_LOG_ERROR(message) LogHandler::error(LogComponent::BLACKLIST_MANAGER, message)
+#define SANITIZER_LOG(message) LogHandler::info(LogComponent::SANITIZER, message)
+#define SANITIZER_LOG_DEBUG(message) LogHandler::debug(LogComponent::SANITIZER, message)
+#define SANITIZER_LOG_ERROR(message) LogHandler::error(LogComponent::SANITIZER, message)
 #define UI_LOG(message) LogHandler::info(LogComponent::UI, message)
 
 //

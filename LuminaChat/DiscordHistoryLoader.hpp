@@ -114,7 +114,7 @@ private:
     
     // Thread safety for context access
     mutable std::mutex context_access_mutex;    // Target channel for this isolated context loader
-    uint64_t target_channel_id;
+    uint64_t target_channel_id = 0;
 
     // NOTE: context_fill_ratio represents the target percentage of context to fill with HISTORICAL MESSAGES ONLY
     // The actual safe threshold must account for emergency buffer and AI response space
@@ -345,11 +345,10 @@ private:
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        
-        // Initialize ContextSizeManager if needed
+          // Initialize ContextSizeManager if needed
         {
             std::lock_guard<std::mutex> lock(context_access_mutex);
-            if (!target_context->context_size_manager) {
+            if (target_context && !target_context->context_size_manager) {
                 initialize_context_size_manager(*target_context, *target_context->model_info);
             }
         }

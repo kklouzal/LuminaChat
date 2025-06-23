@@ -115,11 +115,13 @@ public:
         size_samples_.reserve(ContextSizeConstants::MAX_SAMPLES_TO_TRACK);
         prediction_errors_.reserve(ContextSizeConstants::MAX_SAMPLES_TO_TRACK);
     }
-      // Thread-safe sample addition with prediction accuracy tracking
+      // Thread-safe sample addition with prediction accuracy tracking and enhanced logging
     void add_sample(T actual_size, T predicted_size = 0) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
-        
-        if (actual_size <= 0) [[unlikely]] return;
+          if (actual_size <= 0) [[unlikely]] {
+            LLAMA_LOG("DEBUG: " + tracker_name_ + ": Invalid sample size ignored: " + std::to_string(actual_size));
+            return;
+        }
         
         size_samples_.push_back(actual_size);
         
@@ -135,13 +137,29 @@ public:
             // Update average prediction error using STL algorithm (optimized)
             const float sum = std::accumulate(prediction_errors_.cbegin(), prediction_errors_.cend(), 0.0f);
             average_prediction_error_ = sum / static_cast<float>(prediction_errors_.size());
+              // Log significant prediction errors for model tuning
+            if (error > 0.5f) {
+                LLAMA_LOG("DEBUG: " + tracker_name_ + ": Large prediction error: " + 
+                         std::to_string(error * 100.0f) + "% (predicted: " + std::to_string(predicted_size) + 
+                         ", actual: " + std::to_string(actual_size) + ")");
+            }
         }
         
         // Maintain rolling window
         if (size_samples_.size() > ContextSizeConstants::MAX_SAMPLES_TO_TRACK) [[unlikely]] {
             size_samples_.erase(size_samples_.begin());        }
         
+        T old_estimate = estimated_size_;
         update_statistics();
+          // Log significant estimate changes
+        if (size_samples_.size() >= ContextSizeConstants::MIN_SAMPLES_FOR_RELIABILITY) {
+            float estimate_change = std::abs(static_cast<float>(estimated_size_ - old_estimate)) / static_cast<float>(old_estimate);
+            if (estimate_change > 0.2f) {
+                LLAMA_LOG("DEBUG: " + tracker_name_ + ": Estimate adjusted by " + 
+                         std::to_string(estimate_change * 100.0f) + "% (" + std::to_string(old_estimate) + 
+                         " -> " + std::to_string(estimated_size_) + ")");
+            }
+        }
         
         LLAMA_LOG(tracker_name_ + " tracked: " + std::to_string(actual_size) + 
                   " tokens (avg: " + std::to_string(average_size_) + 

@@ -765,9 +765,7 @@ public:
             !target_context->model_info->vocab || !target_context->batch_initialized) [[unlikely]] {
             LLAMA_LOG("ERROR: Context components not properly initialized for generation");
             return "Error: Model components not properly initialized for generation";
-        }
-
-        // Additional validation: Check if context has been through at least one tokenization cycle
+        }        // Additional validation: Check if context has been through at least one tokenization cycle
         // This catches contexts that are marked as initialized but haven't established proper state
         if (target_context->n_past == 0 && !target_context->message_history.empty()) [[unlikely]] {
             LLAMA_LOG("WARNING: Context has message history but n_past=0 - forcing rebuild before generation");
@@ -783,9 +781,8 @@ public:
             if (!target_context->update_context_from_history(token_processor, pruning_callback)) {
                 LLAMA_LOG("ERROR: Failed to rebuild context before generation - blocking to prevent garbage");
                 return "Error: Failed to initialize context for generation";
-            }
-        }
-
+            }        }
+        
         if (input.empty()) [[unlikely]] {
             return "Error: Empty input";
         }
@@ -808,26 +805,172 @@ public:
             return process_text_to_tokens(text, target_context, add_special);
         };        auto pruning_callback = [this, target_context](float keep_ratio) {
             return target_context->prune_with_summarization(keep_ratio);
-        };
-        
-        if (!target_context->prepare_context_for_generation(token_processor, pruning_callback)) [[unlikely]] {
-            LLAMA_LOG("Context preparation failed, attempting one recovery");
+        };        if (!target_context->prepare_context_for_generation(token_processor, pruning_callback)) [[unlikely]] {
+            LLAMA_LOG("Context preparation failed, attempting progressive recovery");
             
-            // Single recovery attempt - clear context state and try again
-            if (target_context->context) [[likely]] {
+            // Find context ID for debugging purposes
+            std::string context_id = "unknown";
+            for (const auto& [id, ctx] : contexts) {
+                if (ctx.get() == target_context) {
+                    context_id = id;
+                    break;
+                }
+            }
+            
+            log_context_debug_info(context_id, target_context, "INITIAL_FAILURE");
+            
+            if (!target_context->context) [[unlikely]] {
+                return "Error: Context is null, cannot attempt recovery";
+            }
+            
+            // PROGRESSIVE RECOVERY STRATEGY: Multiple attempts with increasingly aggressive pruning
+            bool recovery_successful = false;
+            
+            // RECOVERY ATTEMPT 1: Clear context state and try with more aggressive pruning
+            LLAMA_LOG("Recovery Attempt 1: Clearing context state and forcing aggressive pruning");
+            llama_memory_clear(llama_get_memory(target_context->context), true);
+            target_context->n_past = 0;
+            target_context->prev_len = 0;
+            target_context->message_cache_dirty = true;
+            target_context->conversation_state.invalidate();
+            
+            // Force aggressive pruning before retry
+            auto aggressive_pruning_callback = [this, target_context](float keep_ratio) {
+                // Use aggressive pruning ratio (keep only 25% instead of normal ratios)
+                return target_context->prune_with_summarization(ContextSizeConstants::AGGRESSIVE_PRUNING_RATIO);
+            };
+              if (target_context->prepare_context_for_generation(token_processor, aggressive_pruning_callback)) [[likely]] {
+                recovery_successful = true;
+                LLAMA_LOG("Recovery Attempt 1: Successful with aggressive pruning");
+                log_context_debug_info(context_id, target_context, "RECOVERY_1_SUCCESS");
+            } else {
+                log_context_debug_info(context_id, target_context, "RECOVERY_1_FAILED");
+                // RECOVERY ATTEMPT 2: Emergency pruning - keep only the last few messages
+                LLAMA_LOG("Recovery Attempt 2: Emergency pruning - keeping only essential messages");
+                
+                // Clear context state again
                 llama_memory_clear(llama_get_memory(target_context->context), true);
                 target_context->n_past = 0;
                 target_context->prev_len = 0;
                 target_context->message_cache_dirty = true;
                 target_context->conversation_state.invalidate();
-                  if (!target_context->prepare_context_for_generation(token_processor, pruning_callback)) [[unlikely]] {
-                    return "Error: Failed to prepare context for generation after recovery attempt";
+                  // Emergency pruning - keep only system message + last 2 exchanges (4 messages total)
+                auto emergency_pruning_callback = [this, target_context, &input, &username](float keep_ratio) {
+                    LLAMA_LOG("Performing emergency pruning - keeping only essential messages");
+                    
+                    // Emergency fallback: Keep only system message + last 2 user/assistant exchanges + current input
+                    auto& history = target_context->message_history;
+                    if (history.size() > 6) { // System + 4 messages (2 exchanges) + current input
+                        std::vector<std::pair<std::string, std::string>> emergency_history;
+                        
+                        // Keep system message if it exists
+                        if (!history.empty() && history[0].first == "system") {
+                            emergency_history.emplace_back(history[0]); // Copy, don't move
+                        }
+                        
+                        // Add emergency pruning note
+                        emergency_history.emplace_back("system", "[Emergency: Conversation heavily pruned due to context limits]");
+                        
+                        // Find the current user message (should be the last one added)
+                        std::pair<std::string, std::string> current_user_message;
+                        bool found_current_message = false;
+                        if (!history.empty() && history.back().first == username && history.back().second == input) {
+                            current_user_message = history.back();
+                            found_current_message = true;
+                        }
+                        
+                        // Keep only last 2 exchanges (4 messages), excluding the current user message
+                        size_t messages_to_keep = 4;
+                        size_t history_size_without_current = found_current_message ? history.size() - 1 : history.size();
+                        size_t available_messages = history_size_without_current - (history[0].first == "system" ? 1 : 0);
+                        
+                        if (available_messages > messages_to_keep) {
+                            size_t start_idx = history_size_without_current - messages_to_keep;
+                            // Adjust start_idx to account for system message
+                            if (!history.empty() && history[0].first == "system") {
+                                start_idx += 1;
+                            }
+                            
+                            for (size_t i = start_idx; i < (found_current_message ? history.size() - 1 : history.size()); ++i) {
+                                emergency_history.emplace_back(history[i]); // Copy, don't move
+                            }
+                        } else {
+                            // Keep all non-system messages except current user message
+                            size_t start_idx = history[0].first == "system" ? 1 : 0;
+                            for (size_t i = start_idx; i < (found_current_message ? history.size() - 1 : history.size()); ++i) {
+                                emergency_history.emplace_back(history[i]); // Copy, don't move
+                            }
+                        }
+                        
+                        // Always add the current user message back at the end
+                        if (found_current_message) {
+                            emergency_history.emplace_back(current_user_message);
+                        } else {
+                            // If we couldn't find the current message, re-add it
+                            emergency_history.emplace_back(username, input);
+                        }
+                        
+                        history = std::move(emergency_history);
+                        target_context->message_cache_dirty = true;
+                        target_context->conversation_state.needs_rebuild = true;
+                        
+                        // Clear ContextSizeManager state after emergency pruning
+                        if (target_context->context_size_manager) {
+                            target_context->context_size_manager->clear_summary_slots();
+                        }
+                        
+                        LLAMA_LOG("Emergency pruning completed - reduced to " + std::to_string(history.size()) + " messages");
+                    }
+                    return true; // Always return true for emergency pruning
+                };
+                  if (target_context->prepare_context_for_generation(token_processor, emergency_pruning_callback)) [[likely]] {
+                    recovery_successful = true;
+                    LLAMA_LOG("Recovery Attempt 2: Successful with emergency pruning");
+                    log_context_debug_info(context_id, target_context, "RECOVERY_2_SUCCESS");
+                } else {
+                    log_context_debug_info(context_id, target_context, "RECOVERY_2_FAILED");
+                    // RECOVERY ATTEMPT 3: Last resort - clear conversation entirely except system message
+                    LLAMA_LOG("Recovery Attempt 3: Last resort - clearing conversation history");
+                    
+                    // Save system message if it exists
+                    std::string saved_system_message;
+                    if (!target_context->message_history.empty() && target_context->message_history[0].first == "system") {
+                        saved_system_message = target_context->message_history[0].second;
+                    }
+                    
+                    // Clear everything and start fresh
+                    target_context->clear_conversation();
+                    
+                    // Restore system message and add emergency note
+                    if (!saved_system_message.empty()) {
+                        target_context->add_message("system", saved_system_message);
+                        target_context->add_message("system", "[Emergency: Conversation history cleared due to critical context limits]");
+                    }
+                    
+                    // Add the current user message that triggered this generation
+                    target_context->add_message(username, input);
+                    
+                    auto minimal_pruning_callback = [this, target_context](float keep_ratio) {
+                        // No pruning needed for minimal history
+                        return true;
+                    };
+                      if (target_context->prepare_context_for_generation(token_processor, minimal_pruning_callback)) [[likely]] {
+                        recovery_successful = true;
+                        LLAMA_LOG("Recovery Attempt 3: Successful with minimal conversation");
+                        log_context_debug_info(context_id, target_context, "RECOVERY_3_SUCCESS");
+                    } else {
+                        log_context_debug_info(context_id, target_context, "RECOVERY_3_FAILED");
+                    }
                 }
-                LLAMA_LOG("Context preparation recovered successfully");
-            } else {
-                return "Error: Failed to prepare context for generation";
             }
-        }        
+            
+            if (!recovery_successful) [[unlikely]] {
+                LLAMA_LOG("ERROR: All recovery attempts failed - context may be corrupted");
+                return "Error: Context recovery failed after multiple attempts. Please restart the conversation.";
+            }
+            
+            LLAMA_LOG("Context preparation recovered successfully after progressive recovery");
+        }
         // STEP 4: Generate response tokens
         // Setup callback functions for LlamaResponse
         auto token_adder = [this, target_context](llama_token token, int32_t pos, const std::vector<llama_seq_id>& seq_ids, bool output_logits) -> bool {
@@ -1167,6 +1310,37 @@ private:
         
         // Use the overloaded method that accepts a specific context
         return generate_response(input, target_context, username);
+    }
+    
+    // Helper method to log context state for debugging recovery failures
+    void log_context_debug_info(const std::string& context_id, ContextInfo* context_info, const std::string& phase) {
+        if (!context_info) return;
+        
+        LLAMA_LOG("=== CONTEXT DEBUG INFO (" + phase + ") ===");
+        LLAMA_LOG("Context ID: " + context_id);
+        LLAMA_LOG("Message history size: " + std::to_string(context_info->message_history.size()));
+        LLAMA_LOG("Current n_past: " + std::to_string(context_info->n_past));
+        LLAMA_LOG("Cached token count: " + std::to_string(context_info->message_history_token_count));
+        LLAMA_LOG("Context size: " + std::to_string(context_info->model_info ? context_info->model_info->n_ctx : 0));
+        LLAMA_LOG("Needs rebuild: " + std::string(context_info->conversation_state.needs_rebuild ? "YES" : "NO"));
+        LLAMA_LOG("Message cache dirty: " + std::string(context_info->message_cache_dirty ? "YES" : "NO"));
+        
+        if (context_info->model_info && context_info->message_history_token_count > 0) {
+            float usage = static_cast<float>(context_info->message_history_token_count) / context_info->model_info->n_ctx * 100.0f;
+            LLAMA_LOG("Estimated usage: " + std::to_string(usage) + "%");
+        }
+        
+        // Log recent messages for context
+        if (!context_info->message_history.empty()) {
+            size_t messages_to_show = std::min(size_t(3), context_info->message_history.size());
+            LLAMA_LOG("Recent messages:");
+            for (size_t i = context_info->message_history.size() - messages_to_show; i < context_info->message_history.size(); ++i) {
+                const auto& msg = context_info->message_history[i];
+                std::string content_preview = msg.second.length() > 100 ? msg.second.substr(0, 100) + "..." : msg.second;
+                LLAMA_LOG("  [" + std::to_string(i) + "] " + msg.first + ": " + content_preview);
+            }
+        }
+        LLAMA_LOG("================================");
     }
 };
 

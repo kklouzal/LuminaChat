@@ -141,12 +141,10 @@ public:
                               float keep_ratio);
                                   
     // Summarize a collection of messages using the summary context
-    std::string summarize_messages(const std::vector<std::pair<std::string, std::string>>& messages_to_summarize);
-
-    // Summary slot information structure
+    std::string summarize_messages(const std::vector<std::pair<std::string, std::string>>& messages_to_summarize);    // Summary slot information structure
     struct SummarySlotInfo {
-        size_t total_slots;
-        size_t used_slots;
+        size_t total_slots = 0;
+        size_t used_slots = 0;
         std::vector<std::string> summaries; // In chronological order (oldest to newest)
     };
     
