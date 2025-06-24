@@ -141,12 +141,10 @@ public:
                               float keep_ratio);
                                   
     // Summarize a collection of messages using the summary context
-    std::string summarize_messages(const std::vector<std::pair<std::string, std::string>>& messages_to_summarize);
-
-    // Summary slot information structure
+    std::string summarize_messages(const std::vector<std::pair<std::string, std::string>>& messages_to_summarize);    // Summary slot information structure
     struct SummarySlotInfo {
-        size_t total_slots;
-        size_t used_slots;
+        size_t total_slots = 0;
+        size_t used_slots = 0;
         std::vector<std::string> summaries; // In chronological order (oldest to newest)
     };
     
@@ -182,9 +180,10 @@ public:
                 messages_to_summarize.begin() + i, 
                 messages_to_summarize.begin() + end_idx
             );
-              std::string chunk_summary = summarize_messages(chunk);
+            
+            std::string chunk_summary = summarize_messages(chunk);
             if (!chunk_summary.empty()) [[likely]] {
-                chunk_summaries.push_back(chunk_summary);
+                chunk_summaries.push_back(std::move(chunk_summary));
                 SUMMARIZER_LOG("Successfully summarized chunk " + std::to_string(i/CHUNK_SIZE + 1) + 
                                " (" + std::to_string(chunk.size()) + " messages)");
             }
@@ -192,12 +191,13 @@ public:
         
         // If we have multiple chunk summaries, combine them into a final summary
         if (chunk_summaries.size() > 1) [[likely]] {
+            
             std::vector<std::pair<std::string, std::string>> final_summary_input;
+            final_summary_input.reserve(chunk_summaries.size());
             for (size_t i = 0; i < chunk_summaries.size(); ++i) {
                 final_summary_input.emplace_back("system", 
-                    "Summary part " + std::to_string(i + 1) + ": " + chunk_summaries[i]);
-            }
-              std::string final_summary = summarize_messages(final_summary_input);
+                    "Summary part " + std::to_string(i + 1) + ": " + std::move(chunk_summaries[i]));
+            }              std::string final_summary = summarize_messages(final_summary_input);
             if (!final_summary.empty()) [[likely]] {
                 SUMMARIZER_LOG("Successfully created final summary from " + std::to_string(chunk_summaries.size()) + " chunks");
                 return final_summary;
@@ -205,7 +205,7 @@ public:
         }
         
         // Fallback: return the first chunk summary if final combination failed
-        return chunk_summaries.empty() ? "" : chunk_summaries[0];    }
+        return chunk_summaries.empty() ? "" : std::move(chunk_summaries[0]);}
     
     // Direct summary generation using stored context pointers (eliminates LlamaManager dependency)
     std::string generate_summary_directly(const std::string& summarization_request);
@@ -422,15 +422,18 @@ inline void LlamaSummarizer::prune_message_history(std::vector<std::pair<std::st
         SUMMARIZER_LOG("No messages to prune - message history is empty");
         return;
     }
-    
-    // Check if summary resources are available
+      // Check if summary resources are available
     if (!summary_context || !summary_model || !generate_response_callback) [[unlikely]] {
         SUMMARIZER_LOG("Warning: Summary resources not available - performing simple pruning without summarization");
         
         // Fallback: simple pruning without summarization
         bool has_system = !message_history.empty() && message_history[0].first == "system";
         size_t system_offset = has_system ? 1 : 0;
-        size_t total_messages = message_history.size() - system_offset;        size_t messages_to_keep = std::max(size_t(2), static_cast<size_t>(total_messages * keep_ratio));
+        size_t total_messages = message_history.size() - system_offset;
+          // CRITICAL SAFEGUARD: Never keep fewer than 12 messages for meaningful conversation
+        // Also ensure we keep at least 50% of total messages to prevent over-aggressive pruning
+        size_t min_messages_to_keep = std::max(size_t(12), static_cast<size_t>(total_messages * 0.5f));
+        size_t messages_to_keep = std::max(min_messages_to_keep, static_cast<size_t>(total_messages * keep_ratio));
         
         if (messages_to_keep >= total_messages) [[likely]] {
             return; // No pruning needed
@@ -468,12 +471,11 @@ inline void LlamaSummarizer::prune_message_history(std::vector<std::pair<std::st
       // Always keep system message if present
     bool has_system = !message_history.empty() && message_history[0].first == "system";
     size_t system_offset = has_system ? 1 : 0;
-    
-    // SAFEGUARDS: Ensure meaningful summarization
+      // SAFEGUARDS: Ensure meaningful summarization
     // Don't summarize unless we have a meaningful amount of content
-    const size_t MIN_MESSAGES_TO_SUMMARIZE = 3;    // At least 3 messages worth summarizing
-    const size_t MIN_MESSAGES_TO_KEEP = 2;         // Always keep at least 2 recent messages
-    const size_t MIN_TOTAL_FOR_SUMMARIZATION = 5;  // Don't summarize unless we have at least 5 total messages
+    const size_t MIN_MESSAGES_TO_SUMMARIZE = 5;    // Increased to ensure meaningful summarization
+    const size_t MIN_MESSAGES_TO_KEEP = 12;        // Increased to maintain better conversation context (6 exchanges)
+    const size_t MIN_TOTAL_FOR_SUMMARIZATION = 20; // Increased threshold to prevent premature summarization
     
     // Calculate how many non-system messages to keep
     size_t total_messages = message_history.size() - system_offset;
@@ -486,10 +488,15 @@ inline void LlamaSummarizer::prune_message_history(std::vector<std::pair<std::st
         is_pruning = false;
         return;
     }
-    
-    // Calculate messages to keep based on ratio, but enforce minimums
+      // Calculate messages to keep based on ratio, but enforce minimums
     size_t messages_to_keep_by_ratio = static_cast<size_t>(total_messages * keep_ratio);
-    size_t messages_to_keep = std::max({MIN_MESSAGES_TO_KEEP, size_t(2), messages_to_keep_by_ratio});
+    size_t messages_to_keep = std::max({MIN_MESSAGES_TO_KEEP, size_t(8), messages_to_keep_by_ratio});    // CRITICAL SAFEGUARD: Ensure we never prune too aggressively
+    // If the ratio would result in keeping fewer than 50% of messages, cap it
+    if (messages_to_keep < total_messages * 0.5f) {
+        messages_to_keep = std::max(static_cast<size_t>(total_messages * 0.5f), MIN_MESSAGES_TO_KEEP);
+        SUMMARIZER_LOG("Applied aggressive pruning safeguard - keeping " + std::to_string(messages_to_keep) + 
+                       " messages (50% minimum) instead of " + std::to_string(messages_to_keep_by_ratio));
+    }
     
     // Calculate how many messages would be summarized
     size_t messages_to_summarize_count = (total_messages > messages_to_keep) ? (total_messages - messages_to_keep) : 0;

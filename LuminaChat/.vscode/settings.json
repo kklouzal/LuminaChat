@@ -85,6 +85,9 @@
         "xloctime": "cpp",
         "xmemory": "cpp",
         "xtr1common": "cpp",
-        "cinttypes": "cpp"
+        "cinttypes": "cpp",
+        "cstdarg": "cpp",
+        "execution": "cpp",
+        "regex": "cpp"
     }
 }

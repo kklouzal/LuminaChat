@@ -53,11 +53,18 @@ enum class LogLevel : int {
 enum class LogComponent {
     MAIN,
     LLAMA_MANAGER,
+    LLAMA_CONTEXT,
+    LLAMA_RESPONSE,
+    CONTEXT_SIZE_MANAGER,
+    TOKEN_CACHE,
     DISCORD_MANAGER,
     DISCORD_HISTORY,
     SETTINGS_MANAGER,
     SUMMARIZER_MANAGER,
-    UI
+    BLACKLIST_MANAGER,
+    SANITIZER,
+    UI,
+    PERFORMANCE
 };
 
 class LogHandler {
@@ -67,10 +74,13 @@ private:
     std::optional<std::function<void(std::string_view)>> summarizer_callback;
     mutable std::shared_mutex callback_mutex;
     
-    // Logging configuration - const as they are not meant to be changed after initialization
-    static constexpr LogLevel DEFAULT_MIN_LEVEL = LogLevel::INF;
+    // Dynamic logging configuration - allows runtime debug level adjustment
+    std::atomic<LogLevel> min_level{LogLevel::INF};
     static constexpr bool INCLUDE_TIMESTAMPS = true;
     static constexpr bool INCLUDE_COMPONENT_TAGS = true;
+    
+    // Performance tracing for hot paths - minimal overhead when disabled
+    std::atomic<bool> performance_tracing_enabled{false};
       // Performance optimization: cache time formatting to avoid repeated work
     mutable std::chrono::seconds last_time_cache{0};
     mutable std::array<char, 17> time_cache{};  // Pre-allocated buffer for time string "[HH:MM:SS.mmm] " + null
@@ -143,17 +153,23 @@ private:
             last_time_cache = now_seconds;
             return std::string_view(time_cache.data(), 15); // "[HH:MM:SS.mmm] "
         }
-    }    
-    // Component name mapping - constexpr for compile-time optimization
+    }    // Component name mapping - constexpr for compile-time optimization
     static constexpr std::string_view get_component_name(LogComponent component) noexcept {
         switch (component) {
             case LogComponent::MAIN: return "Main";
             case LogComponent::LLAMA_MANAGER: return "LlamaManager";
+            case LogComponent::LLAMA_CONTEXT: return "LlamaContext";
+            case LogComponent::LLAMA_RESPONSE: return "LlamaResponse";
+            case LogComponent::CONTEXT_SIZE_MANAGER: return "ContextSizeManager";
+            case LogComponent::TOKEN_CACHE: return "TokenCache";
             case LogComponent::DISCORD_MANAGER: return "Discord";
             case LogComponent::DISCORD_HISTORY: return "DiscordHistory";
             case LogComponent::SETTINGS_MANAGER: return "Settings";
             case LogComponent::SUMMARIZER_MANAGER: return "Summarizer";
+            case LogComponent::BLACKLIST_MANAGER: return "BlacklistManager";
+            case LogComponent::SANITIZER: return "Sanitizer";
             case LogComponent::UI: return "UI";
+            case LogComponent::PERFORMANCE: return "Performance";
             default: return "Unknown";
         }
     }
@@ -230,16 +246,15 @@ public:
     static void set_summarizer_callback(std::function<void(std::string_view)> callback) {
         auto& handler = instance();
         std::unique_lock<std::shared_mutex> lock(handler.callback_mutex);
-        handler.summarizer_callback = std::move(callback);
-    }
+        handler.summarizer_callback = std::move(callback);    }
       // Main logging method - optimized with shared_mutex and minimal string copies
     static void log(LogLevel level, LogComponent component, std::string_view message) {
+        auto& handler = instance();
+        
         // Early exit for filtered levels - branch prediction hint
-        if (level < DEFAULT_MIN_LEVEL) [[likely]] {
+        if (level < handler.min_level.load(std::memory_order_relaxed)) [[likely]] {
             return;
         }
-        
-        auto& handler = instance();
         
         // Format the message once
         std::string formatted = handler.format_message(level, component, message);
@@ -266,9 +281,36 @@ public:
     static void warning(LogComponent component, std::string_view message) {
         log(LogLevel::WRN, component, message);
     }
-    
-    static void error(LogComponent component, std::string_view message) {
+      static void error(LogComponent component, std::string_view message) {
         log(LogLevel::ERR, component, message);
+    }
+    
+    // Dynamic logging level control for runtime debug adjustment
+    static void set_min_log_level(LogLevel level) {
+        auto& handler = instance();
+        handler.min_level.store(level, std::memory_order_relaxed);
+    }
+    
+    static LogLevel get_min_log_level() {
+        auto& handler = instance();
+        return handler.min_level.load(std::memory_order_relaxed);
+    }
+    
+    // Performance tracing control for hot path debugging
+    static void enable_performance_tracing(bool enable = true) {
+        auto& handler = instance();
+        handler.performance_tracing_enabled.store(enable, std::memory_order_relaxed);
+    }
+    
+    static bool is_performance_tracing_enabled() {
+        auto& handler = instance();
+        return handler.performance_tracing_enabled.load(std::memory_order_relaxed);
+    }
+    
+    // Fast debug level check for conditional debug code
+    static bool is_debug_enabled() {
+        auto& handler = instance();
+        return handler.min_level.load(std::memory_order_relaxed) <= LogLevel::DBG;
     }
 };
 
@@ -278,16 +320,77 @@ public:
 #define LOG_WARNING(component, message) LogHandler::warning(LogComponent::component, message)
 #define LOG_ERROR(component, message) LogHandler::error(LogComponent::component, message)
 
+// Performance tracing macros for hot paths - minimal overhead when disabled
+#define PERF_TRACE(component, message) \
+    do { if (LogHandler::is_performance_tracing_enabled()) [[unlikely]] { \
+        LogHandler::debug(LogComponent::component, "[PERF] " message); \
+    } } while(0)
+
+// Conditional debug macros for expensive debug operations
+#define DEBUG_IF_ENABLED(component, code) \
+    do { if (LogHandler::is_debug_enabled()) [[unlikely]] { code; } } while(0)
+
+#define DEBUG_LOG_IF_ENABLED(component, message) \
+    do { if (LogHandler::is_debug_enabled()) [[unlikely]] { \
+        LogHandler::debug(LogComponent::component, message); \
+    } } while(0)
+
 // Component-specific convenience macros - for backward compatibility and convenience
 #define LLAMA_LOG(message) LogHandler::info(LogComponent::LLAMA_MANAGER, message)
+#define LLAMA_LOG_DEBUG(message) LogHandler::debug(LogComponent::LLAMA_MANAGER, message)
 #define LLAMA_LOG_ERROR(message) LogHandler::error(LogComponent::LLAMA_MANAGER, message)
+
+#define LLAMA_CONTEXT_LOG(message) LogHandler::info(LogComponent::LLAMA_CONTEXT, message)
+#define LLAMA_CONTEXT_LOG_DEBUG(message) LogHandler::debug(LogComponent::LLAMA_CONTEXT, message)
+#define LLAMA_CONTEXT_LOG_ERROR(message) LogHandler::error(LogComponent::LLAMA_CONTEXT, message)
+
+#define LLAMA_RESPONSE_LOG(message) LogHandler::info(LogComponent::LLAMA_RESPONSE, message)
+#define LLAMA_RESPONSE_LOG_DEBUG(message) LogHandler::debug(LogComponent::LLAMA_RESPONSE, message)
+#define LLAMA_RESPONSE_LOG_ERROR(message) LogHandler::error(LogComponent::LLAMA_RESPONSE, message)
+
+#define CONTEXT_SIZE_LOG(message) LogHandler::info(LogComponent::CONTEXT_SIZE_MANAGER, message)
+#define CONTEXT_SIZE_LOG_DEBUG(message) LogHandler::debug(LogComponent::CONTEXT_SIZE_MANAGER, message)
+#define CONTEXT_SIZE_LOG_ERROR(message) LogHandler::error(LogComponent::CONTEXT_SIZE_MANAGER, message)
+
+#define TOKEN_CACHE_LOG(message) LogHandler::info(LogComponent::TOKEN_CACHE, message)
+#define TOKEN_CACHE_LOG_DEBUG(message) LogHandler::debug(LogComponent::TOKEN_CACHE, message)
+#define TOKEN_CACHE_LOG_ERROR(message) LogHandler::error(LogComponent::TOKEN_CACHE, message)
+
 #define DISCORD_LOG(message) LogHandler::info(LogComponent::DISCORD_MANAGER, message)
+#define DISCORD_LOG_DEBUG(message) LogHandler::debug(LogComponent::DISCORD_MANAGER, message)
 #define DISCORD_LOG_ERROR(message) LogHandler::error(LogComponent::DISCORD_MANAGER, message)
+
 #define DISCORD_HISTORY_LOG(message) LogHandler::info(LogComponent::DISCORD_HISTORY, message)
+#define DISCORD_HISTORY_LOG_DEBUG(message) LogHandler::debug(LogComponent::DISCORD_HISTORY, message)
+#define DISCORD_HISTORY_LOG_ERROR(message) LogHandler::error(LogComponent::DISCORD_HISTORY, message)
+
 #define SETTINGS_LOG(message) LogHandler::info(LogComponent::SETTINGS_MANAGER, message)
+#define SETTINGS_LOG_DEBUG(message) LogHandler::debug(LogComponent::SETTINGS_MANAGER, message)
+#define SETTINGS_LOG_ERROR(message) LogHandler::error(LogComponent::SETTINGS_MANAGER, message)
+
 #define SUMMARIZER_LOG(message) LogHandler::info(LogComponent::SUMMARIZER_MANAGER, message)
+#define SUMMARIZER_LOG_DEBUG(message) LogHandler::debug(LogComponent::SUMMARIZER_MANAGER, message)
 #define SUMMARIZER_LOG_ERROR(message) LogHandler::error(LogComponent::SUMMARIZER_MANAGER, message)
+
+#define BLACKLIST_LOG(message) LogHandler::info(LogComponent::BLACKLIST_MANAGER, message)
+#define BLACKLIST_LOG_DEBUG(message) LogHandler::debug(LogComponent::BLACKLIST_MANAGER, message)
+#define BLACKLIST_LOG_ERROR(message) LogHandler::error(LogComponent::BLACKLIST_MANAGER, message)
+
+#define SANITIZER_LOG(message) LogHandler::info(LogComponent::SANITIZER, message)
+#define SANITIZER_LOG_DEBUG(message) LogHandler::debug(LogComponent::SANITIZER, message)
+#define SANITIZER_LOG_ERROR(message) LogHandler::error(LogComponent::SANITIZER, message)
+
 #define UI_LOG(message) LogHandler::info(LogComponent::UI, message)
+#define UI_LOG_DEBUG(message) LogHandler::debug(LogComponent::UI, message)
+#define UI_LOG_ERROR(message) LogHandler::error(LogComponent::UI, message)
+
+#define MAIN_LOG(message) LogHandler::info(LogComponent::MAIN, message)
+#define MAIN_LOG_DEBUG(message) LogHandler::debug(LogComponent::MAIN, message)
+#define MAIN_LOG_ERROR(message) LogHandler::error(LogComponent::MAIN, message)
+
+#define PERFORMANCE_LOG(message) LogHandler::info(LogComponent::PERFORMANCE, message)
+#define PERFORMANCE_LOG_DEBUG(message) LogHandler::debug(LogComponent::PERFORMANCE, message)
+#define PERFORMANCE_LOG_ERROR(message) LogHandler::error(LogComponent::PERFORMANCE, message)
 
 //
 //  !! ENSURE YOU REMEMBER TO FOLLOW THE CRITICAL CODING DIRECTIVES COMMENTED AT THE TOP OF THIS FILE !!

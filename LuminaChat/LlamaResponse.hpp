@@ -117,24 +117,29 @@ private:
     mutable std::string log_buffer; // Pre-allocated buffer for log messages
     
     // Reference to TokenCache for cached token-to-text conversion
-    const TokenCache* token_cache_ref = nullptr;
-      // C++17 optimization: Fast string building with pre-allocated buffer
+    const TokenCache* token_cache_ref = nullptr;    // C++17 optimization: Fast string building with pre-allocated buffer
     template<typename... Args>
-    std::string build_log_message(Args&&... args) const {        std::ostringstream oss;
+    std::string build_log_message(Args&&... args) const {
+        std::ostringstream oss;
         (oss << ... << std::forward<Args>(args)); // C++17 fold expression
         return oss.str();
     }
-    
-    // Enhanced sampler configuration with runtime validation - C++17 optimized
+      // Enhanced sampler configuration with runtime validation - C++17 optimized
     static void configure_sampler(ModelInfo* model_info, float temperature, float min_p, float top_p, int32_t top_k) noexcept {
         // C++17 optimization: Use string_view for efficient logging
         constexpr std::string_view config_prefix = "Configuring sampler for model '";
         std::string log_msg;
         log_msg.reserve(config_prefix.size() + model_info->model_path.size() + 2);
         log_msg.append(config_prefix).append(model_info->model_path).append("'");
-        LLAMA_LOG(std::move(log_msg));
+        LLAMA_RESPONSE_LOG_DEBUG(std::move(log_msg));
+        
+        LLAMA_RESPONSE_LOG_DEBUG("Sampler params: temp=" + std::to_string(temperature) + 
+                                ", min_p=" + std::to_string(min_p) + 
+                                ", top_p=" + std::to_string(top_p) + 
+                                ", top_k=" + std::to_string(top_k));
         
         if (model_info->sampler) {
+            LLAMA_RESPONSE_LOG_DEBUG("Freeing existing sampler");
             llama_sampler_free(model_info->sampler);
             model_info->sampler = nullptr;
         }
@@ -144,35 +149,40 @@ private:
         model_info->sampler = llama_sampler_chain_init(sparams);
         
         if (!model_info->sampler) [[unlikely]] {
-            LLAMA_LOG("Error: Failed to create sampler chain");
+            LLAMA_RESPONSE_LOG_ERROR("Failed to create sampler chain");
             return;
         }
         
         // Add sampling strategies with likely/unlikely hints
         if (top_k > 0) [[likely]] {
+            LLAMA_RESPONSE_LOG_DEBUG("Adding top_k sampler with k=" + std::to_string(top_k));
             llama_sampler_chain_add(model_info->sampler, llama_sampler_init_top_k(top_k));
         }
         
         if (top_p < 1.0f) [[likely]] {
+            LLAMA_RESPONSE_LOG_DEBUG("Adding top_p sampler with p=" + std::to_string(top_p));
             llama_sampler_chain_add(model_info->sampler, llama_sampler_init_top_p(top_p, 1));
         }
         
         if (min_p > 0.0f) [[likely]] {
+            LLAMA_RESPONSE_LOG_DEBUG("Adding min_p sampler with p=" + std::to_string(min_p));
             llama_sampler_chain_add(model_info->sampler, llama_sampler_init_min_p(min_p, 1));
         }
         
         if (temperature > 0.0f) [[likely]] {
+            LLAMA_RESPONSE_LOG_DEBUG("Adding temperature sampler with temp=" + std::to_string(temperature));
             llama_sampler_chain_add(model_info->sampler, llama_sampler_init_temp(temperature));
             llama_sampler_chain_add(model_info->sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
         } else {
+            LLAMA_RESPONSE_LOG_DEBUG("Using greedy sampler (temperature = 0)");
             llama_sampler_chain_add(model_info->sampler, llama_sampler_init_greedy());
         }
         
         // Validate final sampler state
         if (!model_info->sampler) [[unlikely]] {
-            LLAMA_LOG("Error: Sampler became null during configuration");
+            LLAMA_RESPONSE_LOG_ERROR("Sampler became null during configuration");
         } else {
-            LLAMA_LOG("Sampler configured successfully for model");
+            LLAMA_RESPONSE_LOG("Sampler configured successfully for model");
         }
     }    // Validate and recover sampler if needed - C++17 optimized
     static bool validate_and_recover_sampler(ModelInfo* model_info) noexcept {
@@ -246,8 +256,7 @@ private:
             result = llama_token_to_piece(model_info->vocab, token, temp_string_buffer.data(), 
                                          temp_string_buffer.size(), 0, true);
         }
-        
-        std::string token_text = (result > 0) ? std::string(temp_string_buffer.data(), static_cast<size_t>(result)) : std::string{};
+          std::string token_text = (result > 0) ? std::string(temp_string_buffer.data(), static_cast<size_t>(result)) : std::string{};
         
         // Cache the result if TokenCache is available and conversion was successful
         if (token_cache_ref && !token_text.empty()) [[likely]] {
@@ -256,14 +265,17 @@ private:
             token_cache_ref->put(cache_key, token_text, single_token);
         }
         
-        return token_text;
-    }// Attempt to recover logits by performing a minimal decode operation - C++17 optimized
+        return std::move(token_text);
+    }
+
+    // Attempt to recover logits by performing a minimal decode operation - C++17 optimized
     static bool recover_logits(ContextInfo* context_info, ModelInfo* model_info) noexcept {
         if (!context_info->batch_initialized || context_info->n_past <= 0) [[unlikely]] {
+            LLAMA_RESPONSE_LOG_DEBUG("Cannot recover logits: batch not initialized or n_past <= 0");
             return false;
         }
         
-        LLAMA_LOG("Warning: No logits available, attempting recovery decode");
+        LLAMA_RESPONSE_LOG_DEBUG("No logits available, attempting recovery decode");
         
         // Clear batch and set up for logit generation
         context_info->batch.n_tokens = 0;
@@ -283,6 +295,9 @@ private:
             int32_t decode_pos = std::max(0, context_info->n_past - ResponseConstants::DUMMY_TOKEN_DECODE_POS_OFFSET);
             decode_pos = std::min(decode_pos, model_info->n_ctx - 1);
             
+            LLAMA_RESPONSE_LOG_DEBUG("Attempting recovery decode at position " + std::to_string(decode_pos) + 
+                                    " with dummy token " + std::to_string(dummy_token));
+            
             context_info->batch.pos[0] = decode_pos;
             context_info->batch.logits[0] = 1; // Request logits
             context_info->batch.seq_id[0] = 0;
@@ -292,42 +307,45 @@ private:
             if (decode_result == 0) [[likely]] {
                 const float* logits = llama_get_logits(context_info->context);
                 if (logits) [[likely]] {
-                    LLAMA_LOG("Successfully recovered logits with dummy decode at position " + std::to_string(decode_pos));
+                    LLAMA_RESPONSE_LOG("Successfully recovered logits with dummy decode at position " + std::to_string(decode_pos));
                     return true;
+                } else {
+                    LLAMA_RESPONSE_LOG_ERROR("Decode succeeded but logits still null");
                 }
             } else {
-                LLAMA_LOG("Dummy decode failed with error code: " + std::to_string(decode_result));
-            }
+                LLAMA_RESPONSE_LOG_ERROR("Dummy decode failed with error code: " + std::to_string(decode_result));
+            }        } else {
+            LLAMA_RESPONSE_LOG_ERROR("Batch pointer validation failed during logit recovery");
         }
-          LLAMA_LOG("Error: Could not recover logits for generation");
+        
+        LLAMA_RESPONSE_LOG_ERROR("Could not recover logits for generation");
         return false;
     }
-    
-    // Comprehensive validation and recovery for generation components - C++17 optimized
+      // Comprehensive validation and recovery for generation components - C++17 optimized
     static bool validate_generation_components(ContextInfo* context_info, ModelInfo* model_info) noexcept {
         // Basic component validation with early returns
         if (!model_info) {
-            LLAMA_LOG("Error: model_info is NULL");
+            LLAMA_RESPONSE_LOG_ERROR("model_info is NULL");
             return false;
         }
 
         if (!model_info->model) {
-            LLAMA_LOG("Error: model is NULL");
+            LLAMA_RESPONSE_LOG_ERROR("model is NULL");
             return false;
         }
         
         if (!context_info->context) {
-            LLAMA_LOG("Error: context is NULL");
+            LLAMA_RESPONSE_LOG_ERROR("context is NULL");
             return false;
         }
         
         if (!model_info->vocab) {
-            LLAMA_LOG("Error: vocab is NULL");
+            LLAMA_RESPONSE_LOG_ERROR("vocab is NULL");
             return false;
         }
         
         if (!context_info->batch_initialized) {
-            LLAMA_LOG("Error: batch not initialized");
+            LLAMA_RESPONSE_LOG_ERROR("batch not initialized");
             return false;
         }
         
@@ -340,15 +358,14 @@ private:
             error_msg.append("Error: Invalid context position during generation: ")
                      .append(std::to_string(n_past))
                      .append(" (valid range: 0 to ")
-                     .append(std::to_string(n_ctx - 1))
-                     .append(")");
-            LLAMA_LOG(std::move(error_msg));
+                     .append(std::to_string(n_ctx - 1))                     .append(")");
+            LLAMA_RESPONSE_LOG_ERROR(std::move(error_msg));
             return false;
         }
         
         // Check for completely empty context
         if (n_past == 0 && context_info->message_history.empty()) [[unlikely]] {
-            LLAMA_LOG("Error: Context is completely empty, cannot generate");
+            LLAMA_RESPONSE_LOG_ERROR("Context is completely empty, cannot generate");
             return false;
         }
         
@@ -360,12 +377,13 @@ public:
         temp_string_buffer.reserve(ResponseConstants::MIN_STRING_RESERVE); // Pre-allocate reasonable buffer size
         log_buffer.reserve(ResponseConstants::LOG_MESSAGE_RESERVE); // Pre-allocate log buffer
     }
-    
-    // Constructor with TokenCache reference for cached token-to-text conversion
+      // Constructor with TokenCache reference for cached token-to-text conversion
     explicit LlamaResponse(const TokenCache* cache) : token_cache_ref(cache) {
         temp_string_buffer.reserve(ResponseConstants::MIN_STRING_RESERVE); // Pre-allocate reasonable buffer size
         log_buffer.reserve(ResponseConstants::LOG_MESSAGE_RESERVE); // Pre-allocate log buffer
-    }    // Main response generation function - C++17 optimized
+    }
+
+    // Main response generation function - C++17 optimized
     // Dependencies: Requires valid ModelInfo, ContextInfo, and proper LlamaManager integration
     template<typename BatchTokenAdder, typename ContextUpdater>
     std::string generate_response(std::string_view input, std::string_view username,
@@ -385,41 +403,51 @@ public:
         return generate_response_impl(input, username, context_info, add_token_to_batch, update_context, stream_callback);
     }
 
-private:
-    // Implementation method that handles both streaming and non-streaming cases
+private:    // Implementation method that handles both streaming and non-streaming cases
     template<typename BatchTokenAdder, typename ContextUpdater, typename StreamCallback = std::nullptr_t>
     std::string generate_response_impl(std::string_view input, std::string_view username,
                                      ContextInfo* context_info,
                                      BatchTokenAdder add_token_to_batch, ContextUpdater update_context,
                                      StreamCallback stream_callback) const {
         if (input.empty()) [[unlikely]] {
-            LLAMA_LOG("Error: input is empty");
+            LLAMA_RESPONSE_LOG_ERROR("Input is empty");
             return "Error: Invalid generation parameters";
         }
 
+        LLAMA_RESPONSE_LOG_DEBUG("Generation started for user '" + std::string(username) + 
+                                "', input length: " + std::to_string(input.length()));
+        
         // Comprehensive validation of all generation components
         if (!validate_generation_components(context_info, context_info->model_info)) [[unlikely]] {
+            LLAMA_RESPONSE_LOG_ERROR("Model components validation failed");
             return "Error: Model components not properly initialized or invalid context state";
         }
 
         // Validate and recover sampler if needed
         if (!validate_and_recover_sampler(context_info->model_info)) [[unlikely]] {
+            LLAMA_RESPONSE_LOG_ERROR("Sampler validation/recovery failed");
             return "Error: Sampler validation/recovery failed";
         }
+        
+        PERF_TRACE(LLAMA_RESPONSE, "Starting response generation");
         
         // Validate or attempt to recover logits
         const float* logits = llama_get_logits(context_info->context);
         if (!logits) [[unlikely]] {
             if (context_info->n_past > 0) {
+                LLAMA_RESPONSE_LOG_DEBUG("No logits available but n_past > 0, attempting recovery");
                 // Context has been processed but no logits - attempt recovery
                 if (!recover_logits(context_info, context_info->model_info)) [[unlikely]] {
+                    LLAMA_RESPONSE_LOG_ERROR("Context state invalid - no logits available and recovery failed");
                     return "Error: Context state invalid - no logits available and recovery failed";
                 }
             } else {
                 // n_past == 0, this might be normal for initial generation
                 // We'll try to proceed and let the generation loop handle the decode
-                LLAMA_LOG("Warning: No logits available at n_past=0, will attempt initial decode during generation");
+                LLAMA_RESPONSE_LOG_DEBUG("No logits available at n_past=0, will attempt initial decode during generation");
             }
+        } else {
+            LLAMA_RESPONSE_LOG_DEBUG("Logits available, proceeding with generation");
         }
 
         // C++17 optimization: Use structured binding for cleaner code
@@ -501,14 +529,15 @@ private:
                 error_msg.append("Error: Invalid token generated: ").append(std::to_string(new_token));
                 LLAMA_LOG(std::move(error_msg));
                 break;
-            }
-
-            // PRIMARY: Check for end-of-generation token (this takes priority)
+            }            // PRIMARY: Check for end-of-generation token (this takes priority)
             if (llama_vocab_is_eog(context_info->model_info->vocab, new_token)) [[likely]] {
                 LLAMA_LOG("End of generation token encountered - natural completion");
                 break;
-            }            // Convert token to text and add to response
-            auto token_text = convert_token_to_text(new_token, context_info->model_info);            if (!token_text.empty()) [[likely]] {
+            }
+            
+            // Convert token to text and add to response
+            auto token_text = convert_token_to_text(new_token, context_info->model_info);
+            if (!token_text.empty()) [[likely]] {
                 // Stream the token immediately if callback is provided
                 if constexpr (!std::is_same_v<StreamCallback, std::nullptr_t>) {
                     stream_callback(std::string_view{token_text});
@@ -539,13 +568,13 @@ private:
             }
             
             context_info->n_past++;
-            n_generated++;
-
-            // Optional: Soft limit warning (but don't break)
+            n_generated++;            // Optional: Soft limit warning (but don't break)
             if (n_generated >= max_new_tokens) [[unlikely]] {
                 LLAMA_LOG("Warning: Exceeded predicted token count, continuing until EOS or context limit");
             }
-        }        // Update performance statistics - C++17 optimized
+        }
+        
+        // Update performance statistics - C++17 optimized
         const auto generation_end = std::chrono::high_resolution_clock::now();
         context_info->last_decode_time_us = std::chrono::duration_cast<std::chrono::microseconds>(generation_end - generation_start).count();
         context_info->total_generation_tokens += n_generated;

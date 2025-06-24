@@ -132,7 +132,7 @@ struct ContextInfo; // Forward declaration
 struct ModelInfo;   // Forward declaration
 void initialize_context_size_manager(ContextInfo& context_info, const ModelInfo& model_info);
 EnhancedContextAnalysis analyze_context_usage(ContextInfo& context_info, const ModelInfo& model_info);
-bool should_trigger_pruning(ContextInfo& context_info, const ModelInfo& model_info, int32_t projected_tokens);
+bool should_trigger_pruning(ContextInfo& context_info, const ModelInfo& model_info, int32_t additional_tokens, bool is_template_total = false);
 float get_optimal_pruning_ratio(ContextInfo& context_info, const ModelInfo& model_info);
 void track_ai_response(ContextInfo& context_info, const ModelInfo& model_info, int32_t actual_tokens, int32_t predicted_tokens);
 void track_user_message(ContextInfo& context_info, const ModelInfo& model_info, int32_t user_tokens);
@@ -292,11 +292,19 @@ struct ContextInfo {
                 add_generation_prompt, template_buffer.data(), template_buffer.size()
             );
         }
-        
-        if (result_len > 0) [[likely]] {
+          if (result_len > 0) [[likely]] {
             result = std::string(template_buffer.data(), result_len);
             return true;
         }
+        
+        // Enhanced error logging for template application failures
+        LLAMA_LOG("ERROR: Template application failed completely. Details:");
+        LLAMA_LOG("  - Template pointer: " + std::string(tmpl ? "valid" : "null"));
+        LLAMA_LOG("  - Message cache size: " + std::to_string(message_cache.size()));
+        LLAMA_LOG("  - Buffer size: " + std::to_string(template_buffer.size()));
+        LLAMA_LOG("  - Result length: " + std::to_string(result_len));
+        LLAMA_LOG("  - Add generation prompt: " + std::string(add_generation_prompt ? "true" : "false"));
+        
         return false;
     }
       // Validate context state
@@ -324,8 +332,7 @@ struct ContextInfo {
     // Check if context is valid and ready for external operations (more strict)
     bool is_ready_for_external_access() const {
         return is_valid() && !loading_historical_messages;
-    }
-      // Reset context state
+    }    // Reset context state
     void reset_context_state() {
         if (context) [[likely]] {
             llama_memory_clear(llama_get_memory(context), true);
@@ -334,6 +341,8 @@ struct ContextInfo {
         prev_len = 0;
         conversation_state.invalidate();
         message_cache_dirty = true;
+        // PROPER FIX: Sync token count after resetting context state
+        sync_token_count_with_context();
     }
   
     
@@ -463,17 +472,11 @@ public:    // Add message to this context's history
         // We need to insert after: original system message + summary system messages
         // This maintains the proper chronological order: system -> summaries -> historical -> current
         size_t insert_pos = 0;
+        
         while (insert_pos < message_history.size() && message_history[insert_pos].first == "system") [[likely]] {
-            // Check if this is a summary or note system message - these should stay before historical messages
-            const std::string& content = message_history[insert_pos].second;
-            if (content.find("[Previous conversation summary]: ") == 0 || 
-                content.find("[Note: ") == 0) [[unlikely]] {
-                // This is an injected summary or note - historical messages should go after it
-                insert_pos++;
-            } else {
-                // This is the original system message - historical messages should go after it
-                insert_pos++;
-            }
+            // All system messages (original system message, summaries, and notes) should stay before historical messages
+            // Historical messages should go after all system messages regardless of their content
+            insert_pos++;
         }
           // Insert the historical message at the correct position
         message_history.insert(message_history.begin() + insert_pos, std::make_pair(role, content));
@@ -571,8 +574,7 @@ public:    // Add message to this context's history
         int32_t available_ctx = model_info->n_ctx - n_past;
         
         return std::max(1, std::min({n_batch, available_ctx, LlamaConstants::MAX_BATCH_SIZE}));
-    }
-      // Enhanced context processing - Updated for proper single-input batching
+    }    // Enhanced context processing - Updated for proper single-input batching
     // NOTE: Batching in llama.cpp is designed for processing multiple separate inputs/sequences 
     // simultaneously, NOT for splitting a single input into chunks. Each batch operation should
     // contain tokens from potentially multiple different inputs, each with their own sequence IDs.
@@ -580,43 +582,52 @@ public:    // Add message to this context's history
     template<typename SummarizerCallback>
     bool process_context_tokens(const std::vector<llama_token>& tokens, bool is_incremental, SummarizerCallback&& pruning_callback) {
         if (!batch_initialized) [[unlikely]] {
-            LLAMA_LOG("Error: No active context or batch not initialized");
+            LLAMA_CONTEXT_LOG_ERROR("No active context or batch not initialized");
             return false;
         }
         
         if (tokens.empty()) [[unlikely]] {
+            LLAMA_CONTEXT_LOG_DEBUG("Empty token vector provided to process_context_tokens");
             return true; // Empty tokens are valid
         }
         
+        LLAMA_CONTEXT_LOG_DEBUG("Processing " + std::to_string(tokens.size()) + " tokens (incremental=" + 
+                               (is_incremental ? "true" : "false") + ", n_past=" + std::to_string(n_past) + ")");
+        
         if (!model_info) [[unlikely]] {
-            LLAMA_LOG("Error: No model info available for current context");
+            LLAMA_CONTEXT_LOG_ERROR("No model info available for current context");
             return false;
         }
         
         // Additional validation before processing
         if (!context) [[unlikely]] {
-            LLAMA_LOG("Error: Context is null during token processing");
+            LLAMA_CONTEXT_LOG_ERROR("Context is null during token processing");
             return false;
         }
         
+        PERF_TRACE(LLAMA_CONTEXT, "Starting token processing");
+        
         const int32_t n_batch = calculate_optimal_batch_size();
         if (n_batch <= 0) [[unlikely]] {
-            LLAMA_LOG("Error: Invalid batch size calculated: " + std::to_string(n_batch));
+            LLAMA_CONTEXT_LOG_ERROR("Invalid batch size calculated: " + std::to_string(n_batch));
             return false;
         }
+        
+        LLAMA_CONTEXT_LOG_DEBUG("Using batch size: " + std::to_string(n_batch));
+        
           std::vector<llama_seq_id> seq_ids = {0};
         if (!is_incremental) {
-            LLAMA_LOG("Starting context rebuild: FULL (non-incremental) - processing " + std::to_string(tokens.size()) + " tokens");
+            LLAMA_CONTEXT_LOG("Starting context rebuild: FULL (non-incremental) - processing " + std::to_string(tokens.size()) + " tokens");
             n_past = 0; // Reset for full context rebuild
-        }
-          // Validate n_past bounds before processing
+        }          // Validate n_past bounds before processing
         if (n_past < 0) [[unlikely]] {
-            LLAMA_LOG("Error: Invalid n_past value: " + std::to_string(n_past));
+            LLAMA_CONTEXT_LOG_ERROR("Invalid n_past value: " + std::to_string(n_past));
             n_past = 0;
         }
         
         if (n_past >= model_info->n_ctx) [[unlikely]] {
-            LLAMA_LOG("Error: n_past exceeds context size, resetting");
+            LLAMA_CONTEXT_LOG_ERROR("n_past exceeds context size, resetting (n_past=" + std::to_string(n_past) + 
+                                   ", n_ctx=" + std::to_string(model_info->n_ctx) + ")");
             n_past = 0;
             if (context) [[likely]] {
                 llama_memory_clear(llama_get_memory(context), true); // Ensure kv memory/cache is cleared
@@ -626,36 +637,67 @@ public:    // Add message to this context's history
         // Safer overflow check
         const size_t max_safe_add = static_cast<size_t>(std::numeric_limits<int32_t>::max() - n_past);
         if (tokens.size() > max_safe_add) [[unlikely]] {
-            LLAMA_LOG("Error: Token addition would cause overflow");
-            return false;        }
+            LLAMA_CONTEXT_LOG_ERROR("Token addition would cause overflow");
+            return false;        }        // ContextSizeManager integration - check if we need pruning before processing
+        // CRITICAL FIX: Only trigger pruning if we haven't already pruned recently
+        // During post-pruning rebuilds, we should proceed even if usage appears high,
+        // since the message history has already been reduced
+        bool recently_pruned = conversation_state.needs_rebuild && message_cache_dirty;
         
-        // ContextSizeManager integration - check if we need pruning before processing
-        if (should_trigger_pruning(*this, *model_info, static_cast<int32_t>(tokens.size()))) [[unlikely]] {
+        // CRITICAL FIX: For full rebuilds (non-incremental), treat tokens as template total, not additional
+        // This prevents double-counting tokens that replace existing content
+        bool should_prune = should_trigger_pruning(*this, *model_info, static_cast<int32_t>(tokens.size()), !is_incremental);
+        
+        LLAMA_CONTEXT_LOG_DEBUG("Pruning analysis: recently_pruned=" + std::string(recently_pruned ? "true" : "false") + 
+                               ", should_prune=" + std::string(should_prune ? "true" : "false") + 
+                               ", is_template_total=" + std::string(!is_incremental ? "true" : "false"));
+        
+        // ADDITIONAL FIX: If we're in a post-pruning rebuild and the analysis thinks we need pruning,
+        // this might be due to stale ContextSizeManager state. Force a refresh of the analysis.
+        if (recently_pruned && should_prune && context_size_manager) {
+            LLAMA_CONTEXT_LOG_DEBUG("Post-pruning rebuild detected with high usage - refreshing ContextSizeManager state");
+            // Clear any stale state and force re-analysis with current message count
+            context_size_manager->clear_summary_slots();
+            should_prune = should_trigger_pruning(*this, *model_info, static_cast<int32_t>(tokens.size()), !is_incremental);
+            if (should_prune) {
+                LLAMA_CONTEXT_LOG_DEBUG("ContextSizeManager still reports pruning needed after state refresh - proceeding with rebuild anyway (post-pruning scenario)");
+                should_prune = false; // Override the decision for post-pruning rebuilds
+            }
+        }
+        
+        if (should_prune && !recently_pruned) [[unlikely]] {
             if (is_incremental) [[likely]] {
-                LLAMA_LOG("Starting context rebuild: PARTIAL (ContextSizeManager triggered pruning) - context usage analysis recommended action");
+                LLAMA_CONTEXT_LOG("Starting context rebuild: PARTIAL (ContextSizeManager triggered pruning) - context usage analysis recommended action");
+                
+                PERF_TRACE(LLAMA_CONTEXT, "Executing pruning callback");
                 
                 // Try to call the callback - handle both signatures
                 bool pruning_result = false;
                 if constexpr (std::is_invocable_v<SummarizerCallback, float>) {
                     // Callback expects a float parameter (optimal ratio)
                     float optimal_ratio = get_optimal_pruning_ratio(*this, *model_info);
+                    LLAMA_CONTEXT_LOG_DEBUG("Calling pruning callback with optimal ratio: " + std::to_string(optimal_ratio));
                     pruning_result = pruning_callback(optimal_ratio);
                 } else {
                     // Callback expects no parameters (wrapper lambda)
+                    LLAMA_CONTEXT_LOG_DEBUG("Calling pruning callback (no parameters)");
                     pruning_result = pruning_callback();
                 }
                 
                 if (pruning_result) [[likely]] {
+                    LLAMA_CONTEXT_LOG_DEBUG("Pruning completed successfully, returning for context rebuild");
                     // After pruning, the calling method will handle context rebuild
                     return false;
                 } else {
-                    LLAMA_LOG("Error: Pruning failed during token processing");
+                    LLAMA_CONTEXT_LOG_ERROR("Pruning failed during token processing");
                     return false;
                 }
             } else {
-                LLAMA_LOG("Error: Full context rebuild would exceed context limit");
+                LLAMA_CONTEXT_LOG_ERROR("Full context rebuild would exceed context limit");
                 return false;
             }
+        } else if (should_prune && recently_pruned) {
+            LLAMA_CONTEXT_LOG_DEBUG("Skipping pruning check during post-pruning rebuild (usage analysis may show high usage due to tokenization overhead)");
         }
           // Process large token sets using incremental batch processing
         // When tokens exceed batch capacity, use incremental rebuilds instead of sequential processing
@@ -862,25 +904,46 @@ public:    // Add message to this context's history
         bool needs_full_rebuild = force_full_rebuild || 
                                   (prev_len > new_len || 
                                   (prev_len == 0 && !message_history.empty()));
-        
-        if (needs_full_rebuild) {
+          if (needs_full_rebuild) {
             LLAMA_LOG("Starting context rebuild: FULL - rebuilding complete context from " + 
                       std::to_string(message_history.size()) + " messages");
+            
+            // CRITICAL SAFETY CHECK: Pre-validate that rebuild tokens won't exceed context limit
+            std::vector<llama_token> rebuild_tokens = process_text_to_tokens(formatted_content, true);
+            if (!rebuild_tokens.empty()) {
+                int32_t required_tokens = static_cast<int32_t>(rebuild_tokens.size());
+                float usage_percentage = static_cast<float>(required_tokens) / model_info->n_ctx;
+                
+                if (usage_percentage > ContextSizeConstants::MAX_CONTEXT_USAGE) [[unlikely]] {
+                    LLAMA_LOG("ERROR: Pre-rebuild validation failed - tokenized content would use " + 
+                             std::to_string(usage_percentage * 100.0f) + "% of context (" + 
+                             std::to_string(required_tokens) + "/" + std::to_string(model_info->n_ctx) + " tokens)");
+                    LLAMA_LOG("ERROR: Content is too large even after pruning - rebuild would exceed safe context limits");
+                    
+                    // Rollback to original state
+                    n_past = original_n_past;
+                    prev_len = original_prev_len;
+                    return false;
+                }
+                
+                LLAMA_LOG("Pre-rebuild validation passed: " + std::to_string(usage_percentage * 100.0f) + 
+                         "% usage (" + std::to_string(required_tokens) + "/" + std::to_string(model_info->n_ctx) + " tokens)");
+            }
             
             // Clear context state for full rebuild
             if (context) {
                 llama_memory_clear(llama_get_memory(context), true);
             }
             n_past = 0;
-            prev_len = 0;            // Process full content - CRITICAL FIX: ensure logits are generated for the final token
-            std::vector<llama_token> rebuild_tokens = process_text_to_tokens(formatted_content, true);            // CALLBACK SIGNATURE: prune_conversation_with_summary is a no-parameter callable (wrapper lambda)
+            prev_len = 0;            // CALLBACK SIGNATURE: prune_conversation_with_summary is a no-parameter callable (wrapper lambda)
             // Do NOT call it with arguments - it contains the ratio internally
             auto rebuild_pruning_callback = [prune_conversation_with_summary]() { 
                 return prune_conversation_with_summary(); 
             };
-            if (!rebuild_tokens.empty() && process_context_tokens(rebuild_tokens, false, rebuild_pruning_callback)) {
-                prev_len = new_len;
-                message_history_token_count = n_past;
+            
+            if (!rebuild_tokens.empty() && process_context_tokens(rebuild_tokens, false, rebuild_pruning_callback)) {prev_len = new_len;
+                // PROPER FIX: Always synchronize token count with actual context state
+                sync_token_count_with_context();
                 
                 // CRITICAL FIX: Ensure we have valid logits for generation after full rebuild
                 if (n_past > 0) {
@@ -916,10 +979,14 @@ public:    // Add message to this context's history
                             }
                         }
                     }
-                }
-                
+                }                
                 LLAMA_LOG("Context rebuilt successfully with " + 
                           std::to_string(rebuild_tokens.size()) + " tokens");
+                
+                // CRITICAL FIX: Reset rebuild flags after successful full rebuild
+                conversation_state.needs_rebuild = false;
+                message_cache_dirty = false;
+                
                 return true;
             }
             
@@ -943,22 +1010,28 @@ public:    // Add message to this context's history
                 };
                 if (!new_tokens.empty() && !process_context_tokens(new_tokens, true, incremental_pruning_callback)) {
                     LLAMA_LOG("Error: Failed to process incremental tokens");
-                    return false;
+                    return false;                }
+                  // PROPER FIX: Sync token count with actual context state after incremental update
+                sync_token_count_with_context();
+                
+                // CRITICAL FIX: Clear dirty flags after successful incremental update
+                if (conversation_state.needs_rebuild) {
+                    conversation_state.needs_rebuild = false;
+                    message_cache_dirty = false;
                 }
                 
-                // Update token count incrementally
-                message_history_token_count += static_cast<int32_t>(new_tokens.size());
-                LLAMA_LOG("Updated token count incrementally: +" + std::to_string(new_tokens.size()) + 
-                          " = " + std::to_string(message_history_token_count));
+                LLAMA_LOG("Updated token count incrementally - total now: " + std::to_string(message_history_token_count));
             }
-        }
-
-        prev_len = new_len;
-        
-        // Validate the rebuild was successful for non-empty histories
+        }        prev_len = new_len;
+          // FINAL VALIDATION: Check for token count consistency 
         if (n_past <= 0 && !message_history.empty()) {
-            LLAMA_LOG("Warning: Context rebuild resulted in zero tokens despite having message history");
+            LLAMA_LOG("ERROR: Context rebuild resulted in zero tokens despite having " + 
+                     std::to_string(message_history.size()) + " messages. This is a critical error.");
+            return false;
         }
+        
+        // PROPER FIX: Always sync token count with actual context state
+        sync_token_count_with_context();
         
         return true;
     }    // Pruning and rebuilding logic with clear phases
@@ -1035,24 +1108,44 @@ public:    // Add message to this context's history
         // Create a wrapper lambda since rebuild_context_from_formatted_content expects no-parameter callable
         auto pruning_wrapper = [&prune_conversation_with_summary]() {
             return prune_conversation_with_summary(ContextSizeConstants::TARGET_CONTEXT_USAGE);
-        };
-        bool success = rebuild_context_from_formatted_content(formatted_content, process_text_to_tokens, pruning_wrapper, true);
-        
+        };        bool success = rebuild_context_from_formatted_content(formatted_content, process_text_to_tokens, pruning_wrapper, true);
+
         if (success) {
-            // Update the cached message history token count since we just rebuilt the context
-            message_history_token_count = n_past;
+            // PROPER FIX: Always synchronize token count with actual context state
+            sync_token_count_with_context();
+            
+            // CRITICAL FIX: Clear rebuild flags after successful rebuild to prevent future pruning conflicts
+            conversation_state.needs_rebuild = false;
+            message_cache_dirty = false;
+            
             LLAMA_LOG("Updated cached message history token count: " + std::to_string(message_history_token_count));
+              // CRITICAL FIX: Ensure ContextSizeManager is synchronized after rebuild
+            // This prevents token count discrepancies between the actual context and manager state
+            // Note: Synchronization will be handled by the summarizer's callback mechanism
+            if (context_size_manager) {
+                LLAMA_LOG("ContextSizeManager sync scheduled after context rebuild to ensure accurate token accounting");
+            }
+            
+            // VALIDATION: Ensure token count is non-zero for non-empty message histories
+            if (!message_history.empty() && message_history_token_count == 0) {
+                LLAMA_LOG("ERROR: Token count is zero after rebuild despite having " + 
+                         std::to_string(message_history.size()) + " messages. This indicates a rebuild failure.");
+                return false;
+            }
             
             LLAMA_LOG("Successfully rebuilt context from " + std::to_string(message_history.size()) + 
-                      " messages, using " + std::to_string(n_past) + " tokens");        } else {
+                      " messages, using " + std::to_string(n_past) + " tokens");} else {
             LLAMA_LOG("Failed to update context from history");
         }
         
         return success;
+    }    // Setup summarizer with proper callbacks for message history management
+    void setup_summarizer_callbacks();    // PROPER FIX: Always use n_past as the authoritative source for token count
+    // This eliminates drift by removing manual tracking and using the actual context state
+    void sync_token_count_with_context() {
+        message_history_token_count = n_past;
+        LLAMA_LOG("Token count synchronized with context state: " + std::to_string(message_history_token_count));
     }
-    
-    // Setup summarizer with proper callbacks for message history management
-    void setup_summarizer_callbacks();
     
     // Manually refresh summaries in message history (useful when slots are externally modified)
     void refresh_summaries_in_message_history();
@@ -1083,32 +1176,46 @@ public:    // Add message to this context's history
         
         // Use the real ContextSizeManager analysis 
         return context_info.context_size_manager->analyze_context(context_info);
-    }// Check if context needs pruning using ContextSizeManager analysis
+    }    // Check if context needs pruning using ContextSizeManager analysis
     inline bool should_trigger_pruning(ContextInfo& context_info, const ModelInfo& model_info, 
-                                       int32_t projected_tokens) {
+                                       int32_t additional_tokens, bool is_template_total) {
         auto analysis = analyze_context_usage(context_info, model_info);
         
         // Calculate current and projected usage percentages
         float current_usage = static_cast<float>(analysis.total_used_tokens) / analysis.context_size;
-        int32_t projected_total = analysis.total_used_tokens + projected_tokens;
-        float projected_usage = static_cast<float>(projected_total) / analysis.context_size;
         
-        // FIXED: Use the 90% threshold from constants - only prune when truly needed
-        bool exceeds_max_usage = projected_usage > ContextSizeConstants::MAX_CONTEXT_USAGE;
-        bool needs_pruning_recommended = analysis.needs_pruning;
+        int32_t projected_total;
+        if (is_template_total) {
+            // additional_tokens represents the total tokens after template application
+            projected_total = additional_tokens + analysis.required_ai_space;
+        } else {
+            // additional_tokens represents tokens being added to current context
+            projected_total = analysis.total_used_tokens + additional_tokens + analysis.required_ai_space;
+        }
+          float projected_usage = static_cast<float>(projected_total) / analysis.context_size;
+        
+        // CRITICAL FIX: Simplify and fix decision logic for consistency
+        bool analysis_recommends_pruning = analysis.needs_pruning;
+        bool projected_exceeds_threshold = (projected_usage > ContextSizeConstants::MAX_CONTEXT_USAGE);
         bool summary_merge_needed = analysis.needs_summary_merge;
         
-        // Log the decision making process
+        // Final decision: prune if projected usage exceeds threshold OR internal analysis recommends it
+        bool final_decision = projected_exceeds_threshold || analysis_recommends_pruning || summary_merge_needed;// Log the decision making process
         LLAMA_LOG("ContextSizeManager pruning analysis:");
         LLAMA_LOG("  Current usage: " + std::to_string(current_usage * 100) + "% (" + std::to_string(analysis.total_used_tokens) + "/" + std::to_string(analysis.context_size) + ")");
-        LLAMA_LOG("  Projected usage: " + std::to_string(projected_usage * 100) + "% (" + std::to_string(projected_total) + "/" + std::to_string(analysis.context_size) + ")");
-        LLAMA_LOG("  Max usage threshold: " + std::to_string(ContextSizeConstants::MAX_CONTEXT_USAGE * 100) + "%");
-        LLAMA_LOG("  Exceeds max usage: " + std::string(exceeds_max_usage ? "YES" : "NO"));
-        LLAMA_LOG("  Analysis recommends pruning: " + std::string(needs_pruning_recommended ? "YES" : "NO"));
+        if (is_template_total) {
+            LLAMA_LOG("  Template total tokens: " + std::to_string(additional_tokens));
+        } else {
+            LLAMA_LOG("  Additional tokens: " + std::to_string(additional_tokens));
+        }
+        LLAMA_LOG("  Required AI space: " + std::to_string(analysis.required_ai_space));
+        LLAMA_LOG("  Projected usage: " + std::to_string(projected_usage * 100) + "% (" + std::to_string(projected_total) + "/" + std::to_string(analysis.context_size) + ")");        LLAMA_LOG("  Max usage threshold: " + std::to_string(ContextSizeConstants::MAX_CONTEXT_USAGE * 100) + "%");
+        LLAMA_LOG("  Exceeds max usage: " + std::string(projected_exceeds_threshold ? "YES" : "NO"));
+        LLAMA_LOG("  Analysis recommends pruning: " + std::string(analysis_recommends_pruning ? "YES" : "NO"));
         LLAMA_LOG("  Summary merge needed: " + std::string(summary_merge_needed ? "YES" : "NO"));
         
         // Only trigger if we truly exceed the 90% threshold OR analysis strongly recommends it
-        if (exceeds_max_usage || needs_pruning_recommended || summary_merge_needed) {
+        if (final_decision) {
             LLAMA_LOG("  DECISION: Pruning triggered");
             LLAMA_LOG("  Available tokens: " + std::to_string(analysis.available_tokens));
             LLAMA_LOG("  Required AI space: " + std::to_string(analysis.required_ai_space));
@@ -1117,9 +1224,7 @@ public:    // Add message to this context's history
         
         LLAMA_LOG("  DECISION: No pruning needed");
         return false;
-    }
-
-    // Get optimal pruning ratio from ContextSizeManager
+    }    // Get optimal pruning ratio from ContextSizeManager
     inline float get_optimal_pruning_ratio(ContextInfo& context_info, const ModelInfo& model_info) {
         auto analysis = analyze_context_usage(context_info, model_info);
         
@@ -1130,6 +1235,38 @@ public:    // Add message to this context's history
         
         if (current_usage > target_usage) {
             float optimal_ratio = target_usage / current_usage;
+            
+            // CRITICAL FIX: Calculate minimum messages to keep based on conversation context
+            size_t total_messages = context_info.message_history.size();
+            size_t system_messages = 0;
+            
+            // Count system messages (these should always be preserved)
+            for (const auto& msg : context_info.message_history) {
+                if (msg.first == "system") {
+                    system_messages++;
+                }
+            }
+            
+            size_t non_system_messages = total_messages - system_messages;            // CRITICAL SAFEGUARD: Never keep fewer than 15 non-system messages (7-8 exchanges)
+            // This ensures we always maintain meaningful conversation context and prevent the
+            // excessive reduction seen in logs (25 messages → 3 messages)
+            const size_t MIN_CONVERSATION_MESSAGES = 15;
+            if (non_system_messages > MIN_CONVERSATION_MESSAGES) {
+                float min_ratio_based_on_messages = static_cast<float>(MIN_CONVERSATION_MESSAGES + system_messages) / total_messages;
+                optimal_ratio = std::max(optimal_ratio, min_ratio_based_on_messages);
+                
+                LLAMA_LOG("Message-based safeguard applied:");
+                LLAMA_LOG("  Total messages: " + std::to_string(total_messages));
+                LLAMA_LOG("  System messages: " + std::to_string(system_messages));
+                LLAMA_LOG("  Non-system messages: " + std::to_string(non_system_messages));
+                LLAMA_LOG("  Minimum ratio from message count: " + std::to_string(min_ratio_based_on_messages));
+            }
+              // ENHANCED SAFEGUARD: Apply more conservative pruning ratios to prevent excessive message loss
+            // The 25 → 3 message reduction seen in logs indicates we're pruning too aggressively
+            if (optimal_ratio < 0.6f) {
+                LLAMA_LOG("Applying conservative pruning safeguard: " + std::to_string(optimal_ratio) + " -> 0.6 (to prevent excessive message loss)");
+                optimal_ratio = 0.6f;  // Never prune more than 40% of messages
+            }
             
             LLAMA_LOG("ContextSizeManager calculated optimal pruning ratio:");
             LLAMA_LOG("  Optimal ratio: " + std::to_string(optimal_ratio));
@@ -1152,12 +1289,12 @@ public:    // Add message to this context's history
                 default:
                     break;
             }
-            
-            return std::clamp(optimal_ratio, 0.3f, 0.8f); // Never prune more than 70% or less than 20%
+              // ENHANCED SAFEGUARD: Ensure conservative retention with reasonable bounds
+            return std::clamp(optimal_ratio, 0.6f, 0.9f); // Never prune more than 40% or less than 10%
         }
         
         return ContextSizeConstants::TARGET_CONTEXT_USAGE; // Default fallback ratio
-    }    // Track AI response for size learning
+    }// Track AI response for size learning
     inline void track_ai_response(ContextInfo& context_info, const ModelInfo& model_info, 
                                  int32_t actual_tokens, int32_t predicted_tokens = 0) {
         if (!context_info.context_size_manager) {
@@ -1212,12 +1349,39 @@ inline EnhancedContextAnalysis EnhancedContextSizeManager::analyze_context(const
     // n_past is the current context position, not the size of message history
     // message_history_token_count represents the actual tokens in conversation
     analysis.total_used_tokens = std::max(0, context.message_history_token_count);
-    analysis.available_tokens = analysis.context_size - analysis.total_used_tokens;
-    
-    // Get summary statistics
+    analysis.available_tokens = analysis.context_size - analysis.total_used_tokens;    // Get summary statistics
     analysis.summary_slot_stats = summary_slot_manager_.get_statistics();
+    
+    // CRITICAL FIX: Summary tokens should only be counted if they're NOT injected into message history
+    // Once summaries are injected into message history, they become part of total_used_tokens
+    // and should not be double-counted as separate summary tokens
+    bool summaries_injected = false;
+    if (context.summarizer) {
+        // Check if summaries are currently injected in the message history
+        for (const auto& msg : context.message_history) {
+            if (msg.first == "system" && msg.second.find("[Previous conversation summary]: ") == 0) {
+                summaries_injected = true;
+                break;
+            }
+        }
+    }      // CORRECTED APPROACH: Properly handle summary token accounting based on injection state
+    // This maintains accurate tracking for UI breakdown and analytics
     analysis.summary_tokens = analysis.summary_slot_stats.total_tokens;
-    analysis.active_history_tokens = analysis.total_used_tokens - analysis.summary_tokens;
+    
+    if (summaries_injected) {
+        // Summaries are included in total_used_tokens, so subtract them to get pure history
+        analysis.active_history_tokens = std::max(0, analysis.total_used_tokens - analysis.summary_tokens);
+        LLAMA_LOG("Summaries injected in history - subtracting " + std::to_string(analysis.summary_tokens) + 
+                  " summary tokens from " + std::to_string(analysis.total_used_tokens) + " total tokens = " +
+                  std::to_string(analysis.active_history_tokens) + " active history tokens");
+    } else {
+        // Summaries are tracked separately and not yet injected - they need to be added to total usage
+        analysis.active_history_tokens = analysis.total_used_tokens;
+        analysis.total_used_tokens += analysis.summary_tokens;  // Add summary tokens to total usage
+        LLAMA_LOG("Summaries not yet injected - " + std::to_string(analysis.summary_tokens) + 
+                  " summary tokens tracked separately, " + std::to_string(analysis.active_history_tokens) + 
+                  " active history tokens, " + std::to_string(analysis.total_used_tokens) + " total with summaries");
+    }
     
     // Calculate allocations based on current strategy and usage patterns
     auto ai_stats = ai_response_tracker_.get_statistics();
@@ -1241,10 +1405,9 @@ inline EnhancedContextAnalysis EnhancedContextSizeManager::analyze_context(const
     analysis.emergency_buffer_violated = (current_usage_percentage > (ContextSizeConstants::MAX_CONTEXT_USAGE - ContextSizeConstants::EMERGENCY_BUFFER));
     analysis.summary_hard_cap_exceeded = analysis.summary_allocation_percentage > ContextSizeConstants::MAX_TOTAL_SUMMARY_ALLOCATION;
     analysis.needs_summary_merge = analysis.summary_slot_stats.needs_merge || analysis.summary_hard_cap_exceeded;
-    
-    // FIXED: Only trigger pruning if we're actually approaching the usage limit (90%)
-    // Don't prune just because we don't have enough space for AI response - that's normal!
-    analysis.needs_pruning = (current_usage_percentage > ContextSizeConstants::MAX_CONTEXT_USAGE) || 
+      // FIXED: Consistent decision logic - use threshold-based approach primarily
+    // The analysis recommendation should align with projected usage check
+    analysis.needs_pruning = (current_usage_percentage > (ContextSizeConstants::MAX_CONTEXT_USAGE * 0.85f)) || 
                             analysis.emergency_buffer_violated;
     
     // Strategy assessment
@@ -1326,15 +1489,43 @@ inline bool ContextInfo::prepare_context_for_generation(TokenProcessor&& process
         LLAMA_LOG("Error: Failed to apply chat template during context preparation");
         return false;
     }
-    
-    // PHASE 2: Tokenize and get exact count
+      // PHASE 2: Tokenize and get exact count
     LLAMA_LOG("Phase 2: Tokenizing formatted content");
     std::vector<llama_token> tokens = process_text_to_tokens(formatted_content, true);
     int32_t total_token_count = static_cast<int32_t>(tokens.size());
     
-    LLAMA_LOG("Template applied and tokenized: " + std::to_string(total_token_count) + " tokens");
-      // PHASE 3: Comprehensive ContextSizeManager analysis and decision making
-    bool pruning_needed = should_trigger_pruning(*this, *model_info, total_token_count);
+    // CRITICAL FIX: Detect and handle template/tokenization failures that result in 0 tokens
+    if (total_token_count == 0 && !message_history.empty()) {
+        LLAMA_LOG("CRITICAL ERROR: Template application or tokenization resulted in 0 tokens despite having " + 
+                  std::to_string(message_history.size()) + " messages. This indicates a critical failure.");
+        LLAMA_LOG("Formatted content length: " + std::to_string(formatted_content.length()));
+        LLAMA_LOG("Attempting emergency context recovery...");
+        
+        // Emergency recovery: try to rebuild the context from scratch
+        if (!update_context_from_history(process_text_to_tokens, prune_conversation_with_summary)) {
+            LLAMA_LOG("Emergency recovery failed. Context may be corrupted.");
+            return false;
+        }
+        
+        // Re-attempt template application and tokenization after recovery
+        if (!apply_template(false, formatted_content)) {
+            LLAMA_LOG("Template application still failing after recovery. Aborting context preparation.");
+            return false;
+        }
+        
+        tokens = process_text_to_tokens(formatted_content, true);
+        total_token_count = static_cast<int32_t>(tokens.size());
+        
+        if (total_token_count == 0) {
+            LLAMA_LOG("FATAL: Template/tokenization still produces 0 tokens after recovery. Context is critically corrupted.");
+            return false;
+        }
+        
+        LLAMA_LOG("Emergency recovery successful. New token count: " + std::to_string(total_token_count));
+    }
+    
+    LLAMA_LOG("Template applied and tokenized: " + std::to_string(total_token_count) + " tokens");// PHASE 3: Comprehensive ContextSizeManager analysis and decision making
+    bool pruning_needed = should_trigger_pruning(*this, *model_info, total_token_count, true);
     
     // Skip pruning for summary contexts - they manage their own state
     if (reset_after_generation) {
@@ -1397,9 +1588,7 @@ inline bool ContextInfo::prepare_context_for_generation(TokenProcessor&& process
         if (!rebuild_context_from_formatted_content(formatted_content, process_text_to_tokens, rebuild_wrapper, false)) {
             LLAMA_LOG("Error: Failed to rebuild context from formatted content");
             return false;
-        }
-        
-        // Update conversation state to reflect current state
+        }        // Update conversation state to reflect current state
         conversation_state.update(formatted_content, tokens);
     }
     
@@ -1420,8 +1609,8 @@ inline void ContextInfo::clear_conversation() {
     message_cache_dirty = true;
     conversation_state.needs_rebuild = true;
     
-    // CRITICAL FIX: Reset token count when clearing conversation
-    message_history_token_count = 0;
+    // PROPER FIX: Sync token count after clearing conversation
+    sync_token_count_with_context();
     
     // Reset context state
     reset_context_state();
@@ -1434,16 +1623,20 @@ inline bool ContextInfo::prune_with_summarization(float keep_ratio) {
     
     if (!summarizer) {
         LLAMA_LOG("Warning: No summarizer available - performing simple pruning without summarization");
-        
-        // Fallback: simple pruning without summarization
+          // Fallback: simple pruning without summarization
         bool has_system = !message_history.empty() && message_history[0].first == "system";
         size_t system_offset = has_system ? 1 : 0;
-        size_t total_messages = message_history.size() - system_offset;
-        size_t messages_to_keep = std::max(size_t(2), static_cast<size_t>(total_messages * keep_ratio));
+        size_t total_messages = message_history.size() - system_offset;        // CRITICAL SAFEGUARD: Never keep fewer than 12 messages for meaningful conversation
+        // Also ensure we keep at least 50% of total messages to prevent over-aggressive pruning
+        size_t min_messages_to_keep = std::max(size_t(12), static_cast<size_t>(total_messages * 0.5f));
+        size_t messages_to_keep = std::max(min_messages_to_keep, static_cast<size_t>(total_messages * keep_ratio));
         
         if (messages_to_keep >= total_messages) {
             return true; // No pruning needed
         }
+        
+        LLAMA_LOG("Fallback pruning: keeping " + std::to_string(messages_to_keep) + " of " + 
+                  std::to_string(total_messages) + " messages (ratio: " + std::to_string(keep_ratio) + ")");
         
         // Keep system message + recent messages
         std::vector<std::pair<std::string, std::string>> new_history;
@@ -1460,19 +1653,23 @@ inline bool ContextInfo::prune_with_summarization(float keep_ratio) {
         size_t start_idx = message_history.size() - messages_to_keep;
         for (size_t i = start_idx; i < message_history.size(); ++i) {
             new_history.emplace_back(std::move(message_history[i]));
-        }        message_history = std::move(new_history);
+        }
+        
+        message_history = std::move(new_history);
         message_cache_dirty = true;
         conversation_state.needs_rebuild = true;
         
-        // CRITICAL: Ensure ContextSizeManager reflects no summaries after simple pruning
+        // CRITICAL: Ensure ContextSizeManager reflects no summaries after simple pruning        
         if (context_size_manager) {
             LLAMA_LOG("Post-fallback-pruning: Clearing ContextSizeManager summary slots (no summarization performed)");
             context_size_manager->clear_summary_slots();
         }
         
-        // CRITICAL FIX: Reset token count after manual pruning - it will be recalculated during next rebuild
-        message_history_token_count = 0;
-        LLAMA_LOG("Message history token count reset after pruning - will be recalculated during next context rebuild");
+        // PROPER FIX: Mark for rebuild but don't reset token count to 0
+        // The token count will be properly updated when the rebuild completes
+        conversation_state.needs_rebuild = true;
+        message_cache_dirty = true;
+        LLAMA_LOG("Message history modified after pruning - rebuild scheduled to update token count");
         
         return true;
     }
@@ -1480,6 +1677,19 @@ inline bool ContextInfo::prune_with_summarization(float keep_ratio) {
     summarizer->prune_message_history(message_history, keep_ratio);
     message_cache_dirty = true;
     conversation_state.needs_rebuild = true;
+      // CRITICAL FIX: Validate that we haven't over-pruned the conversation
+    size_t final_message_count = message_history.size();
+    size_t system_message_count = 0;
+    for (const auto& msg : message_history) {
+        if (msg.first == "system") system_message_count++;
+    }
+    size_t conversation_messages = final_message_count - system_message_count;
+    
+    // If we have fewer than 6 conversation messages (3 exchanges), this is problematic
+    if (conversation_messages < 6) {
+        LLAMA_LOG("WARNING: Pruning resulted in only " + std::to_string(conversation_messages) + 
+                  " conversation messages - this may cause poor AI responses");
+    }
     
     // CRITICAL: Ensure summary slots are synchronized and injected after pruning
     if (summarizer) {
@@ -1488,9 +1698,18 @@ inline bool ContextInfo::prune_with_summarization(float keep_ratio) {
         summarizer->refresh_summaries_in_history(message_history);
     }
     
-    // CRITICAL FIX: Reset token count after summarization pruning - it will be recalculated during next rebuild
-    message_history_token_count = 0;
-    LLAMA_LOG("Message history token count reset after summarization - will be recalculated during next context rebuild");
+    // PROPER FIX: Mark for rebuild but maintain token count accuracy
+    // After summarization, we don't reset to 0. Instead, the count will be updated during rebuild
+    conversation_state.needs_rebuild = true;
+    message_cache_dirty = true;
+    
+    // Note: We maintain separate summary token tracking in ContextSizeManager for analytics
+    // even after summaries are injected into message history. This allows proper UI breakdown.
+    if (context_size_manager) {
+        LLAMA_LOG("ContextSizeManager state synchronization scheduled after pruning");
+    }
+    
+    LLAMA_LOG("Message history modified after summarization - rebuild scheduled to update token count");
     
     LLAMA_LOG("Pruning with summarization completed - new message count: " + std::to_string(message_history.size()));
     return true;
@@ -1508,14 +1727,12 @@ inline void ContextInfo::setup_summarizer_callbacks() {
                 
                 summarizer->refresh_summaries_in_history(message_history);
                 message_cache_dirty = true; // Force cache refresh
-                conversation_state.needs_rebuild = true; // Force context rebuild
-                  // Only reset token count if message structure actually changed
-                // This prevents losing valid token counts due to timing issues
+                conversation_state.needs_rebuild = true; // Force context rebuild                // PROPER FIX: Don't reset token count - let rebuild update it properly
+                // The rebuild will recalculate the exact token count based on the new structure
                 if (message_history.size() != prev_message_count) {
-                    message_history_token_count = 0;
-                    LLAMA_LOG("Message history token count reset due to structural changes (count: " + 
+                    LLAMA_LOG("Message history structure changed due to summary modifications (count: " + 
                              std::to_string(prev_message_count) + " -> " + 
-                             std::to_string(message_history.size()) + ")");
+                             std::to_string(message_history.size()) + ") - rebuild will update token count");
                 } else {
                     LLAMA_LOG("Message history structure unchanged - preserving token count: " + 
                              std::to_string(message_history_token_count));
@@ -1536,13 +1753,12 @@ inline void ContextInfo::refresh_summaries_in_message_history() {
         
         summarizer->refresh_summaries_in_history(message_history);
         message_cache_dirty = true;
-        conversation_state.needs_rebuild = true;
-        
-        // Only reset token count if message structure actually changed
-        // This is more conservative and prevents losing valid counts
+        conversation_state.needs_rebuild = true;        // PROPER FIX: Don't reset token count - let rebuild handle it properly
+        // Mark for rebuild which will accurately recalculate the token count
         if (message_history.size() != prev_message_count) {
-            message_history_token_count = 0;
-            LLAMA_LOG("Message history token count reset due to structural changes during manual refresh");
+            LLAMA_LOG("Message history structure changed during manual refresh (count: " + 
+                     std::to_string(prev_message_count) + " -> " + 
+                     std::to_string(message_history.size()) + ") - rebuild will update token count");
         } else {
             LLAMA_LOG("Message history structure unchanged during manual refresh - preserving token count: " + 
                      std::to_string(message_history_token_count));
