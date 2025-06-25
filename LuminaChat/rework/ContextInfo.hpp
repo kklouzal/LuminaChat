@@ -347,7 +347,7 @@ inline ContextInfo::~ContextInfo() {
 }
 
 inline bool ContextInfo::InitializeLlamaContext() {
-    std::lock_guard<std::mutex> lock(context_mutex);
+    // Note: context_mutex should already be held by caller
     
     if (!parent_model || !parent_model->IsLoaded()) {
         LOG_ERROR_ContextInfo("Parent model not loaded for context initialization");
@@ -460,8 +460,8 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
             return "Context full - summarizing recent conversation...";
         }
         
-        // 5. Generate LLM response (mock implementation for testing)
-        std::string response = "Mock response generated from " + std::to_string(prompt_tokens.size()) + " prompt tokens.";
+        // 5. Generate LLM response using actual AI model
+        std::string response = GenerateResponse(full_prompt);
         
         // 6. Add assistant response to message history
         message_history.emplace_back("assistant", response);
@@ -628,7 +628,7 @@ inline bool ContextInfo::RebuildContext(RebuildStrategy strategy) {
 }
 
 inline void ContextInfo::RebuildContext_Full() {
-    std::lock_guard<std::mutex> lock(context_mutex);
+    // Note: context_mutex should already be held by caller
     
     LOG_DEBUG_ContextInfo("Performing full context rebuild");
     
@@ -652,7 +652,7 @@ inline void ContextInfo::RebuildContext_Full() {
 }
 
 inline void ContextInfo::RebuildContext_Partial() {
-    std::lock_guard<std::mutex> lock(context_mutex);
+    // Note: context_mutex should already be held by caller
     
     LOG_DEBUG_ContextInfo("Performing partial context rebuild");
     
@@ -731,6 +731,8 @@ inline bool ContextInfo::ProcessTokensBatch(const std::vector<int32_t>& tokens) 
 }
 
 inline std::string ContextInfo::GenerateResponse(const std::string& prompt) {
+    // Note: context_mutex should already be held by caller
+    
     if (!InitializeLlamaContext()) {
         LOG_ERROR_ContextInfo("Failed to initialize context for generation");
         return "Error: Context initialization failed";

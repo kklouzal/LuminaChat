@@ -345,7 +345,6 @@ public:
             }
             return result;
         }
-        
         try {
             // Get required buffer size
             const int32_t n_tokens_required = -llama_tokenize(vocab, text.c_str(), text.size(), nullptr, 0, add_special, true);

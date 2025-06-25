@@ -12,6 +12,7 @@
 #include "ProcessingPipeline.hpp"
 #include "Sanitizer.hpp"
 #include "LlamaManager.hpp"
+#include "ContextInfo.hpp"
 #include "Logger.hpp"
 
 // Forward declarations for plugin request/response types
@@ -278,10 +279,18 @@ inline void Orchestrator::InputReceived(const std::string& input, const std::str
     SetContextState(context_id, ProcessingState::NORMAL_PROCESSING);
     
     try {
-        // Route to appropriate context
-        auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model");
+        // Route to appropriate context - provide explicit template name
+        auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", "default");
         if (!context) {
             LOG_Orchestrator("Failed to get/create context: " + context_id);
+            SetContextState(context_id, ProcessingState::ERROR_STATE);
+            return;
+        }
+        
+        // Check if context is in error state (template validation failed)
+        if (context->GetState() == ContextState::ERROR_STATE) {
+            LOG_Orchestrator("Context is in error state: " + context_id);
+            SetContextState(context_id, ProcessingState::ERROR_STATE);
             return;
         }
         
@@ -362,7 +371,7 @@ inline void Orchestrator::OnSummarizationComplete(const std::string& context_id,
     
     if (response.success) {
         // Apply summary to original context
-        auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model");
+        auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", "default");
         if (context) {
             context->ApplySummary(response.summary);
             LOG_Orchestrator("Summary applied to context: " + context_id);
@@ -469,9 +478,9 @@ inline void Orchestrator::ProcessSummarizationRequest(const SummarizationRequest
     LOG_Orchestrator("Processing summarization request for: " + request.original_context_id);
     
     try {
-        // Get or create summary context
+        // Get or create summary context - use main model with summary template
         auto* summary_context = llama_manager->GetOrCreateContextInfo(
-            request.summary_context_id, "summary_model", "summary_template");
+            request.summary_context_id, "main_model", "summary");
         
         if (!summary_context) {
             callback(SummarizationResponse{
@@ -536,9 +545,9 @@ inline void Orchestrator::ProcessDiscordChannelRequest(const DiscordChannelReque
             }
             
             case DiscordChannelRequest::Type::CHANNEL_SETUP: {
-                // Setup new channel context
+                // Setup new channel context - provide explicit template name
                 std::string context_id = "discord_" + request.channel_id;
-                auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model");
+                auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", "default");
                 
                 if (context) {
                     context->UpdateEnvironment("Discord channel: " + request.channel_id);

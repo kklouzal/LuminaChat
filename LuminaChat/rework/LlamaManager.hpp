@@ -432,8 +432,12 @@ inline ContextInfo* LlamaManager::GetOrCreateContextInfo(const std::string& cont
     std::string template_content = GetTemplateInternal(template_name);
     if (template_content.empty()) {
         LOG_ERROR_LlamaManager("Template '" + template_name + "' not found for context: " + context_id);
-        // Use a minimal default template
-        template_content = "{{#each messages}}{{#if (eq role \"user\")}}User: {{content}}\n{{else}}Assistant: {{content}}\n{{/if}}{{/each}}Assistant: ";
+        // Use a minimal default template that passes validation
+        template_content = R"({% for msg in messages %}{% if msg.role == "user" %}User: {{ msg.content }}
+{% else %}Assistant: {{ msg.content }}
+{% endif %}{% endfor %}assistant<|end_header_id|>
+
+)";
     }
     
     LOG_LlamaManager("Creating new ContextInfo: " + context_id + " with model: " + model_id);
