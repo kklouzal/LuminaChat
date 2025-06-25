@@ -73,6 +73,7 @@ public:
     void OnClose(wxCloseEvent& event);
     void OnClearChat(wxCommandEvent& event);
     void OnClearLogs(wxCommandEvent& event);
+    void OnClearTemplate(wxCommandEvent& event);
     void OnLogLevelChanged(wxCommandEvent& event);
 
     // Core system lifecycle
@@ -123,6 +124,11 @@ private:
     wxButton* clear_logs_button;
     wxChoice* log_level_choice;
     
+    // Template Panel
+    wxPanel* template_panel;
+    wxTextCtrl* template_display;
+    wxButton* clear_template_button;
+    
     // Core rework components (in dependency order)
     std::unique_ptr<SettingsManager> settings_manager;
     std::unique_ptr<Sanitizer> sanitizer;
@@ -148,12 +154,14 @@ private:
     std::atomic<bool> is_streaming{false};
     std::string current_assistant_message;
     long assistant_message_start_pos = -1;
+    std::string last_finalized_template;  // Store the last template for inspection
     
     // UI creation methods
     void CreateChatPanel();
     void CreateSettingsPanel();
     void CreateDiscordPanel();
     void CreateLogsPanel();
+    void CreateTemplatePanel();
     
     // UI update methods
     void UpdateUI();
@@ -164,6 +172,7 @@ private:
     void EndStreamingMessage();
     void SetGenerationUIState(bool generating);  // Enable/disable UI during generation
     void AddLogMessage(const std::string& message);
+    void UpdateTemplateDisplay(const std::string& template_content);  // Update template inspection tab
     
     DECLARE_EVENT_TABLE()
 };
@@ -177,6 +186,7 @@ enum {
     ID_Timer,
     ID_ClearChat,
     ID_ClearLogs,
+    ID_ClearTemplate,
     ID_BrowseModel
 };
 
@@ -191,6 +201,7 @@ wxBEGIN_EVENT_TABLE(LuminaChatFrame, wxFrame)
     EVT_BUTTON(ID_BrowseModel, LuminaChatFrame::OnLoadModel)
     EVT_BUTTON(ID_ClearChat, LuminaChatFrame::OnClearChat)
     EVT_BUTTON(ID_ClearLogs, LuminaChatFrame::OnClearLogs)
+    EVT_BUTTON(ID_ClearTemplate, LuminaChatFrame::OnClearTemplate)
     EVT_TIMER(ID_Timer, LuminaChatFrame::OnTimer)
     EVT_CLOSE(LuminaChatFrame::OnClose)
 wxEND_EVENT_TABLE()
@@ -235,6 +246,7 @@ LuminaChatFrame::LuminaChatFrame()
     CreateSettingsPanel();
     CreateDiscordPanel();
     CreateLogsPanel();
+    CreateTemplatePanel();
     
     // Main layout
     wxBoxSizer* main_sizer = new wxBoxSizer(wxVERTICAL);
@@ -418,6 +430,43 @@ void LuminaChatFrame::CreateLogsPanel() {
     logs_sizer->Add(log_controls_sizer, 0, wxEXPAND);
     
     logs_panel->SetSizer(logs_sizer);
+}
+
+void LuminaChatFrame::CreateTemplatePanel() {
+    template_panel = new wxPanel(notebook);
+    notebook->AddPage(template_panel, "Template");
+    
+    // Template display (read-only monospace text control)
+    template_display = new wxTextCtrl(template_panel, wxID_ANY, wxEmptyString,
+                                     wxDefaultPosition, wxDefaultSize,
+                                     wxTE_READONLY | wxTE_MULTILINE | wxHSCROLL | wxVSCROLL);
+    template_display->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+    template_display->SetBackgroundColour(wxColour(250, 250, 250));
+    
+    // Initial text explaining the purpose
+    template_display->SetValue(
+        "Template Inspection\n"
+        "===================\n\n"
+        "This tab shows the exact finalized chat template that was sent to the AI\n"
+        "after all variable substitutions and processing has occurred.\n\n"
+        "The template will be updated each time you send a message to the AI.\n"
+        "Use this to debug template processing and verify that variables are\n"
+        "being substituted correctly.\n\n"
+        "Template content will appear here after sending your first message..."
+    );
+    
+    // Clear button
+    wxBoxSizer* template_controls_sizer = new wxBoxSizer(wxHORIZONTAL);
+    template_controls_sizer->AddStretchSpacer();
+    clear_template_button = new wxButton(template_panel, ID_ClearTemplate, "Clear Template");
+    template_controls_sizer->Add(clear_template_button, 0, wxALL, 5);
+    
+    // Layout
+    wxBoxSizer* template_sizer = new wxBoxSizer(wxVERTICAL);
+    template_sizer->Add(template_display, 1, wxEXPAND | wxALL, 5);
+    template_sizer->Add(template_controls_sizer, 0, wxEXPAND);
+    
+    template_panel->SetSizer(template_sizer);
 }
 
 // System lifecycle management
@@ -712,6 +761,20 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
         }
         
         AddLogMessage("Processing message with context: " + current_context_id);
+        
+        // Get the finalized template for inspection BEFORE starting generation
+        std::string finalized_template;
+        try {
+            // Build the full prompt to capture the template after variable substitution
+            finalized_template = context->BuildFullPrompt();
+            
+            // Update the template inspection tab with the finalized template
+            UpdateTemplateDisplay(finalized_template);
+            AddLogMessage("Template inspection updated with finalized template");
+            
+        } catch (const std::exception& template_e) {
+            AddLogMessage("Warning: Could not capture template for inspection: " + std::string(template_e.what()));
+        }
         
         // Create callbacks for streaming response
         GenerationCallbacks callbacks(
@@ -1043,4 +1106,50 @@ void LuminaChatFrame::OnStopGeneration(wxCommandEvent& event) {
     } else {
         AddLogMessage("No active generation to stop");
     }
+}
+
+void LuminaChatFrame::UpdateTemplateDisplay(const std::string& template_content) {
+    last_finalized_template = template_content;
+    
+    // Create a comprehensive header for the template with debugging info
+    wxDateTime now = wxDateTime::Now();
+    
+    std::ostringstream display_stream;
+    display_stream << "=== FINALIZED CHAT TEMPLATE INSPECTION ===\n";
+    display_stream << "Generated: " << now.Format("%Y-%m-%d %H:%M:%S").ToStdString() << "\n";
+    display_stream << "Context ID: " << current_context_id << "\n";
+    display_stream << "Model ID: " << current_model_id << "\n";
+    display_stream << "Template Length: " << template_content.length() << " characters\n";
+    display_stream << "===========================================\n\n";
+    
+    // Show the actual template that will be processed by llama.cpp
+    display_stream << "TEMPLATE CONTENT (sent to llama.cpp Jinja2 interpreter):\n";
+    display_stream << "--------------------------------------------------------\n";
+    display_stream << template_content;
+    
+    // Add footer with analysis
+    display_stream << "\n\n=== TEMPLATE ANALYSIS ===\n";
+    display_stream << "Contains 'for msg in messages': " << (template_content.find("for msg in messages") != std::string::npos ? "YES" : "NO") << "\n";
+    display_stream << "Contains '{{': " << (template_content.find("{{") != std::string::npos ? "YES" : "NO") << "\n";
+    display_stream << "Contains 'bos_token': " << (template_content.find("bos_token") != std::string::npos ? "YES" : "NO") << "\n";
+    display_stream << "Contains 'assistant<|end_header_id': " << (template_content.find("assistant<|end_header_id") != std::string::npos ? "YES" : "NO") << "\n";
+    display_stream << "=========================\n";
+    
+    template_display->SetValue(display_stream.str());
+    template_display->SetInsertionPoint(0);  // Scroll to top
+}
+
+void LuminaChatFrame::OnClearTemplate(wxCommandEvent& event) {
+    template_display->SetValue(
+        "Template Inspection\n"
+        "===================\n\n"
+        "This tab shows the exact finalized chat template that was sent to the AI\n"
+        "after all variable substitutions and processing has occurred.\n\n"
+        "The template will be updated each time you send a message to the AI.\n"
+        "Use this to debug template processing and verify that variables are\n"
+        "being substituted correctly.\n\n"
+        "Template content will appear here after sending your first message..."
+    );
+    last_finalized_template.clear();
+    AddLogMessage("Template display cleared");
 }
