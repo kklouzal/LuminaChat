@@ -44,7 +44,7 @@ enum class ResourceEvent {
 struct ModelConfig {
     std::string model_path;
     int32_t context_size = 8192;
-    int32_t gpu_layers = -1;  // -1 = auto-detect
+    int32_t gpu_layers = 999;  // 999 = full GPU offload when available
     int32_t batch_size = 512;
     int32_t threads = 0;      // 0 = auto-detect
     bool use_mmap = true;
@@ -54,7 +54,7 @@ struct ModelConfig {
     void LoadFromSettings(SettingsManager& settings, const std::string& model_prefix) {
         model_path = settings.GetString("Models", model_prefix + "_model_path", "");
         context_size = settings.GetInt("Models", model_prefix + "_context_size", 8192);
-        gpu_layers = settings.GetInt("Models", model_prefix + "_gpu_layers", -1);
+        gpu_layers = settings.GetInt("Models", model_prefix + "_gpu_layers", 999);
         batch_size = settings.GetInt("Models", model_prefix + "_batch_size", 512);
         threads = settings.GetInt("Models", model_prefix + "_threads", 0);
         use_mmap = settings.GetBool("Models", model_prefix + "_use_mmap", true);

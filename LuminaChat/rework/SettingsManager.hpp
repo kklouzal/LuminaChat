@@ -7,6 +7,10 @@
 #include <sstream>
 #include <algorithm>
 #include <mutex>
+#include <cstdint>
+// wxWidgets includes for file path management
+#include <wx/stdpaths.h>
+#include <wx/filename.h>
 
 /**
  * Configuration persistence and access using existing .ini format.
@@ -31,6 +35,43 @@ private:
     mutable std::mutex settings_mutex;
     bool settings_dirty = false;
 
+    // String escaping for INI format
+    static std::string EscapeString(const std::string& input) noexcept {
+        std::string result;
+        result.reserve(input.length() + input.length() / 4); // Reserve extra space for escapes
+        for (const char c : input) {
+            switch (c) {
+                case '\n': result += "\\n"; break;
+                case '\r': result += "\\r"; break;
+                case '\t': result += "\\t"; break;
+                case '\\': result += "\\\\"; break;
+                case '=': result += "\\="; break;
+                default: result += c; break;
+            }
+        }
+        return result;
+    }
+
+    static std::string UnescapeString(const std::string& input) noexcept {
+        std::string result;
+        result.reserve(input.length()); // Reserve space for efficiency
+        for (size_t i = 0; i < input.size(); ++i) {
+            if (input[i] == '\\' && i + 1 < input.size()) {
+                switch (input[i + 1]) {
+                    case 'n': result += '\n'; i++; break;
+                    case 'r': result += '\r'; i++; break;
+                    case 't': result += '\t'; i++; break;
+                    case '\\': result += '\\'; i++; break;
+                    case '=': result += '='; i++; break;
+                    default: result += input[i]; break;
+                }
+            } else {
+                result += input[i];
+            }
+        }
+        return result;
+    }
+
     std::string Trim(const std::string& str) {
         const char* whitespace = " \t\r\n";
         size_t start = str.find_first_not_of(whitespace);
@@ -46,21 +87,53 @@ private:
     }
 
 public:
+    // Initialize the settings manager
+    bool Initialize() {
+        std::string default_path = GetSettingsFilePath();
+        if (!LoadSettings(default_path)) {
+            // If loading failed, create with defaults and save
+            LOG_SettingsManager("Creating new settings file with defaults");
+            SetDefaults();
+            return SaveSettings();
+        }
+        return true;
+    }
+
+    // Get settings file path using wxWidgets
+    static std::string GetSettingsFilePath() noexcept {
+        // Get the directory where the executable is located
+        wxString exeDir = wxStandardPaths::Get().GetExecutablePath();
+        wxFileName exePath(exeDir);
+        wxString appDir = exePath.GetPath();
+        
+        // Create the settings file path in the same directory as the executable
+        wxFileName configFile(appDir, "luminachat.ini");
+        std::string filepath = configFile.GetFullPath().ToStdString();
+        
+        LOG_SettingsManager("Settings file path: " + filepath);
+        return filepath;
+    }
     // Load settings from .ini file
-    bool LoadSettings(const std::string& ini_path) {
+    bool LoadSettings(const std::string& ini_path = "") {
         std::lock_guard<std::mutex> lock(settings_mutex);
         
-        LOG_SettingsManager("Attempting to load settings from: " + ini_path);
+        // Use provided path or get default path
+        std::string file_path = ini_path.empty() ? GetSettingsFilePath() : ini_path;
         
-        std::ifstream file(ini_path);
+        LOG_SettingsManager("Attempting to load settings from: " + file_path);
+        
+        std::ifstream file(file_path);
         if (!file.is_open()) {
-            LOG_ERROR_SettingsManager("Failed to open settings file: " + ini_path);
+            LOG_ERROR_SettingsManager("Failed to open settings file: " + file_path);
+            // Initialize with defaults if file doesn't exist
+            SetDefaults();
+            ini_file_path = file_path;
             return false;
         }
 
         LOG_SettingsManager("File opened successfully, clearing existing sections");
         sections.clear();
-        ini_file_path = ini_path;
+        ini_file_path = file_path;
         
         std::string line;
         std::string current_section = "";
@@ -96,6 +169,9 @@ public:
                     value = value.substr(1, value.length() - 2);
                 }
                 
+                // Unescape the value
+                value = UnescapeString(value);
+                
                 sections[current_section].keys[key] = value;
                 LOG_SettingsManager("Set [" + current_section + "]." + key + " = '" + value + "'");
             }
@@ -103,7 +179,7 @@ public:
 
         file.close();
         settings_dirty = false;
-        LOG_SettingsManager("Successfully loaded " + std::to_string(line_count) + " lines from: " + ini_path);
+        LOG_SettingsManager("Successfully loaded " + std::to_string(line_count) + " lines from: " + file_path);
         return true;
     }
 
@@ -112,8 +188,7 @@ public:
         std::lock_guard<std::mutex> lock(settings_mutex);
         
         if (ini_file_path.empty()) {
-            LOG_ERROR("SettingsManager", "No ini file path set for saving");
-            return false;
+            ini_file_path = GetSettingsFilePath();
         }
 
         std::ofstream file(ini_file_path);
@@ -127,12 +202,15 @@ public:
             file << "[" << section_name << "]\n";
             
             for (const auto& [key, value] : section.keys) {
-                // Quote values that contain spaces or special characters
-                bool needs_quotes = value.find_first_of(" \t\"") != std::string::npos;
+                // Escape the value and write it
+                std::string escaped_value = EscapeString(value);
+                
+                // Quote values that contain spaces or special characters after escaping
+                bool needs_quotes = escaped_value.find_first_of(" \t\"") != std::string::npos;
                 if (needs_quotes) {
-                    file << key << "=\"" << value << "\"\n";
+                    file << key << "=\"" << escaped_value << "\"\n";
                 } else {
-                    file << key << "=" << value << "\n";
+                    file << key << "=" << escaped_value << "\n";
                 }
             }
             file << "\n";
@@ -161,7 +239,25 @@ public:
         return key_it->second;
     }
 
-    // Get integer value
+    // Validation limits (from old implementation)
+    static constexpr int32_t MIN_CONTEXT_SIZE = 1;
+    static constexpr int32_t MAX_CONTEXT_SIZE = 131072;
+    static constexpr int32_t MIN_GPU_LAYERS = 0;
+    static constexpr int32_t MAX_GPU_LAYERS = 999;
+    static constexpr int32_t MIN_PREDICT_TOKENS = 1;
+    static constexpr int32_t MAX_PREDICT_TOKENS = 4096;
+
+    // Validate and clamp integer values
+    static int32_t ValidateInt32(const std::string& value, const int32_t default_val, const int32_t min_val, const int32_t max_val) noexcept {
+        try {
+            const int32_t result = std::stoi(value);
+            return std::clamp(result, min_val, max_val);
+        } catch (...) {
+            return default_val;
+        }
+    }
+
+    // Get integer value with validation
     int GetInt(const std::string& section, const std::string& key, int default_value = 0) {
         std::string str_value = GetString(section, key);
         if (str_value.empty()) {
@@ -169,7 +265,16 @@ public:
         }
 
         try {
-            return std::stoi(str_value);
+            int result = std::stoi(str_value);
+            // Apply validation for known settings
+            if (section == "Models") {
+                if (key.find("context_size") != std::string::npos) {
+                    return std::clamp(result, MIN_CONTEXT_SIZE, MAX_CONTEXT_SIZE);
+                } else if (key.find("gpu_layers") != std::string::npos) {
+                    return std::clamp(result, MIN_GPU_LAYERS, MAX_GPU_LAYERS);
+                }
+            }
+            return result;
         } catch (const std::exception&) {
             LOG_WARNING("SettingsManager", "Failed to parse int value for [" + section + "]." + key + ": " + str_value);
             return default_value;
@@ -241,6 +346,8 @@ public:
     }
     
     // Template management
+    // Note: Main chat templates are managed by ChatTemplateManager with hardcoded defaults.
+    // SettingsManager only stores user customizations and specialized templates (e.g. summary).
     std::string GetChatTemplate(const std::string& template_name) {
         return GetString("Templates", template_name);
     }
@@ -255,101 +362,83 @@ public:
         return settings_dirty;
     }
 
-private:
     // Set default values for new installations
     void SetDefaults() {
+        std::lock_guard<std::mutex> lock(settings_mutex);
+        
         // Model configuration
-        SetString("Models", "main_model_path", "");
-        SetString("Models", "summary_model_path", "");
-        SetInt("Models", "main_context_size", 8192);
-        SetInt("Models", "summary_context_size", 4096);
-        SetInt("Models", "main_gpu_layers", -1);
-        SetInt("Models", "summary_gpu_layers", -1);
+        SetString_Unlocked("Models", "main_model_path", "");
+        SetString_Unlocked("Models", "summary_model_path", "");
+        SetInt_Unlocked("Models", "main_context_size", 8192);
+        SetInt_Unlocked("Models", "summary_context_size", 4096);
+        SetInt_Unlocked("Models", "main_gpu_layers", 999);
+        SetInt_Unlocked("Models", "summary_gpu_layers", 999);
 
         // Discord configuration
-        SetString("Discord", "bot_token", "");
-        SetString("Discord", "default_channel", "");
-        SetBool("Discord", "auto_respond", true);
-        SetBool("Discord", "history_backfill", true);
-        SetInt("Discord", "backfill_limit", 100);
+        SetString_Unlocked("Discord", "bot_token", "");
+        SetString_Unlocked("Discord", "default_channel", "");
+        SetBool_Unlocked("Discord", "auto_respond", true);
+        SetBool_Unlocked("Discord", "history_backfill", true);
+        SetInt_Unlocked("Discord", "backfill_limit", 100);
 
         // UI preferences
-        SetString("UI", "theme", "dark");
-        SetInt("UI", "window_width", 800);
-        SetInt("UI", "window_height", 600);
-        SetBool("UI", "auto_scroll", true);
+        SetString_Unlocked("UI", "theme", "dark");
+        SetInt_Unlocked("UI", "window_width", 800);
+        SetInt_Unlocked("UI", "window_height", 600);
+        SetBool_Unlocked("UI", "auto_scroll", true);
 
         // Logging configuration
-        SetString("Logging", "level", "INFO");
-        SetBool("Logging", "file_output", false);
-        SetString("Logging", "file_path", "luminachat.log");
+        SetString_Unlocked("Logging", "level", "INFO");
+        SetBool_Unlocked("Logging", "file_output", false);
+        SetString_Unlocked("Logging", "file_path", "luminachat.log");
 
         // Plugin configuration
-        SetBool("Plugins", "sanitization", true);
-        SetBool("Plugins", "summarization", true);
-        SetBool("Plugins", "discord_channel_management", true);
-        SetBool("Plugins", "history_backfill", true);
+        SetBool_Unlocked("Plugins", "sanitization", true);
+        SetBool_Unlocked("Plugins", "summarization", true);
+        SetBool_Unlocked("Plugins", "discord_channel_management", true);
+        SetBool_Unlocked("Plugins", "history_backfill", true);
 
         // Context management
-        SetFloat("Context", "prune_threshold", 0.8f);
-        SetFloat("Context", "prune_target", 0.4f);
-        SetBool("Context", "auto_summarize", true);
+        SetFloat_Unlocked("Context", "prune_threshold", 0.8f);
+        SetFloat_Unlocked("Context", "prune_target", 0.4f);
+        SetBool_Unlocked("Context", "auto_summarize", true);
 
-        // Default templates
-        SetChatTemplate("default", GetDefaultChatTemplate());
-        SetChatTemplate("summary", GetDefaultSummaryTemplate());
+        // Default summary template (main chat template is now handled by ChatTemplateManager)
+        SetChatTemplate_Unlocked("summary", GetDefaultSummaryTemplate());
 
+        settings_dirty = true;
         LOG_SettingsManager("Initialized default settings");
     }
 
-    std::string GetDefaultChatTemplate() {
-        return R"({{- bos_token }}
-
-<|start_header_id|>env<|end_header_id|>
-{{ overarching_environment }}
-<|eot_id|>
-
-<|start_header_id|>persona<|end_header_id|>
-{{ identity_directive }}
-<|eot_id|>
-
-<|start_header_id|>system_message<|end_header_id|>
-{{ system_prompt }}
-<|eot_id|>
-
-{% if old_chat_summary %}
-<|start_header_id|>old_chat_summary<|end_header_id|>
-{{ old_chat_summary }}
-<|eot_id|>
-{% endif %}
-
-{% if past_sessions and past_sessions|length > 0 %}
-  {% for memory in past_sessions %}
-<|start_header_id|>memory_{{ loop.index }}<|end_header_id|>
-{{ memory }}
-<|eot_id|>
-  {% endfor %}
-{% endif %}
-
-{% if summary %}
-<|start_header_id|>summary<|end_header_id|>
-{{ summary }}
-<|eot_id|>
-{% endif %}
-
-{%- for msg in messages %}
-  {% if msg.role == "assistant" %}
-<|start_header_id|>assistant<|end_header_id|>
-{{ msg.content | trim }}<|eot_id|>
-  {% else %}
-<|start_header_id|>user<|end_header_id|>
-[{{ msg.role }}] {{ msg.content | trim }}<|eot_id|>
-  {% endif %}
-{%- endfor %}
-
-<|start_header_id|>assistant<|end_header_id|>)";
+private:
+    // Unlocked versions for use within locked contexts (like SetDefaults)
+    void SetString_Unlocked(const std::string& section, const std::string& key, const std::string& value) {
+        sections[section].keys[key] = value;
+        settings_dirty = true;
     }
 
+    void SetInt_Unlocked(const std::string& section, const std::string& key, int value) {
+        sections[section].keys[key] = std::to_string(value);
+        settings_dirty = true;
+    }
+
+    void SetBool_Unlocked(const std::string& section, const std::string& key, bool value) {
+        sections[section].keys[key] = value ? "true" : "false";
+        settings_dirty = true;
+    }
+    
+    void SetFloat_Unlocked(const std::string& section, const std::string& key, float value) {
+        sections[section].keys[key] = std::to_string(value);
+        settings_dirty = true;
+    }
+    
+    void SetChatTemplate_Unlocked(const std::string& template_name, const std::string& template_content) {
+        sections["Templates"].keys[template_name] = template_content;
+        settings_dirty = true;
+    }
+
+    // Note: Default chat template is now handled by ChatTemplateManager::GetDefaultTemplate()
+    // This method is kept only for the summary template
     std::string GetDefaultSummaryTemplate() {
         return R"({{- bos_token }}
 
@@ -364,5 +453,35 @@ Please summarize the following conversation:
 <|eot_id|>
 
 <|start_header_id|>assistant<|end_header_id|>)";
+    }
+
+    // Auto-save if settings are dirty
+    bool AutoSave() {
+        if (IsDirty()) {
+            return SaveSettings();
+        }
+        return true;
+    }
+
+    // Backward compatibility methods for easier migration from old SettingsManager
+    void SaveAllSettings() {
+        SaveSettings();
+    }
+
+    // Validate channel IDs (useful for Discord settings)
+    std::string ValidateChannelIds(const std::string& input) {
+        std::string result;
+        std::stringstream ss(input);
+        std::string channel_id;
+        
+        while (std::getline(ss, channel_id, ',')) {
+            channel_id = Trim(channel_id);
+            if (!channel_id.empty() && std::all_of(channel_id.begin(), channel_id.end(), ::isdigit)) {
+                if (!result.empty()) result += ",";
+                result += channel_id;
+            }
+        }
+        
+        return result;
     }
 };

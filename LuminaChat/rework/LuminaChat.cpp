@@ -32,6 +32,7 @@
 #include <wx/gauge.h>
 #include <wx/filedlg.h>
 #include <wx/event.h>
+#include <wx/scrolwin.h>
 
 // Include rework components in strict dependency order
 #include "Logger.hpp"
@@ -84,6 +85,16 @@ public:
     void RegisterCallbacks();
     void LoadDefaultModels();
     
+    // Template configuration helpers
+    std::string GetEnvironmentDescriptionFromUI() const;
+    std::string GetIdentityDirectiveFromUI() const;
+    std::string GetSystemPromptFromUI() const;
+    void ApplyTemplateSettingsToContext(ContextInfo* context, const std::string& context_id);
+
+    // UI Settings persistence
+    void LoadUISettings();
+    void SaveUISettings();
+
     // Callback handlers (registered with lower-level components)
     void OnLogMessage(std::string_view log_message);
 
@@ -109,6 +120,9 @@ private:
     wxStaticText* gpu_layers_label;
     wxButton* load_model_button;
     wxGauge* model_progress;
+    wxTextCtrl* environment_description_text;
+    wxTextCtrl* identity_directive_text;
+    wxTextCtrl* system_prompt_text;
     
     // Discord Panel
     wxPanel* discord_panel;
@@ -307,50 +321,143 @@ void LuminaChatFrame::CreateSettingsPanel() {
     settings_panel = new wxPanel(notebook);
     notebook->AddPage(settings_panel, "Model Settings");
     
+    // Create a scrolled window to contain all settings
+    wxScrolledWindow* scrolled_window = new wxScrolledWindow(settings_panel, wxID_ANY, 
+                                                            wxDefaultPosition, wxDefaultSize, 
+                                                            wxVSCROLL | wxHSCROLL);
+    scrolled_window->SetScrollRate(10, 10);
+    
     // Model configuration group
-    wxStaticBoxSizer* model_box = new wxStaticBoxSizer(wxVERTICAL, settings_panel, "Model Configuration");
+    wxStaticBoxSizer* model_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Model Configuration");
     
     // Model path selection
     wxBoxSizer* path_sizer = new wxBoxSizer(wxHORIZONTAL);
-    path_sizer->Add(new wxStaticText(settings_panel, wxID_ANY, "Model Path:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-    model_path_text = new wxTextCtrl(settings_panel, wxID_ANY);
+    path_sizer->Add(new wxStaticText(scrolled_window, wxID_ANY, "Model Path:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
+    model_path_text = new wxTextCtrl(scrolled_window, wxID_ANY);
     path_sizer->Add(model_path_text, 1, wxEXPAND | wxALL, 5);
-    browse_model_button = new wxButton(settings_panel, ID_BrowseModel, "Browse...");
+    browse_model_button = new wxButton(scrolled_window, ID_BrowseModel, "Browse...");
     path_sizer->Add(browse_model_button, 0, wxALL, 5);
     model_box->Add(path_sizer, 0, wxEXPAND);
     
+    // Bind text change event to save model path
+    model_path_text->Bind(wxEVT_TEXT, [this](wxCommandEvent& event) {
+        if (settings_manager) {
+            settings_manager->SetString("Models", "main_model_path", model_path_text->GetValue().ToStdString());
+            // Don't auto-save on every keystroke for performance, just mark dirty
+        }
+    });
+    
     // Context size control
     wxBoxSizer* context_sizer = new wxBoxSizer(wxHORIZONTAL);
-    context_sizer->Add(new wxStaticText(settings_panel, wxID_ANY, "Context Size:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-    context_size_slider = new wxSlider(settings_panel, wxID_ANY, 4096, 512, 32768, 
+    context_sizer->Add(new wxStaticText(scrolled_window, wxID_ANY, "Context Size:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
+    context_size_slider = new wxSlider(scrolled_window, wxID_ANY, 4096, 512, 32768, 
                                       wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL | wxSL_LABELS);
     context_sizer->Add(context_size_slider, 1, wxEXPAND | wxALL, 5);
-    context_size_label = new wxStaticText(settings_panel, wxID_ANY, "4096");
+    context_size_label = new wxStaticText(scrolled_window, wxID_ANY, "4096");
     context_sizer->Add(context_size_label, 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
     model_box->Add(context_sizer, 0, wxEXPAND);
     
+    // Bind slider change event to save settings
+    context_size_slider->Bind(wxEVT_SLIDER, [this](wxCommandEvent& event) {
+        UpdateUI();
+        if (settings_manager) {
+            settings_manager->SetInt("Models", "main_context_size", context_size_slider->GetValue());
+            settings_manager->SaveSettings();
+        }
+    });
+    
     // GPU layers control
     wxBoxSizer* gpu_sizer = new wxBoxSizer(wxHORIZONTAL);
-    gpu_sizer->Add(new wxStaticText(settings_panel, wxID_ANY, "GPU Layers:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-    gpu_layers_slider = new wxSlider(settings_panel, wxID_ANY, 0, 0, 100, 
+    gpu_sizer->Add(new wxStaticText(scrolled_window, wxID_ANY, "GPU Layers:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
+    gpu_layers_slider = new wxSlider(scrolled_window, wxID_ANY, 999, 0, 999, 
                                     wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL | wxSL_LABELS);
     gpu_sizer->Add(gpu_layers_slider, 1, wxEXPAND | wxALL, 5);
-    gpu_layers_label = new wxStaticText(settings_panel, wxID_ANY, "0");
+    gpu_layers_label = new wxStaticText(scrolled_window, wxID_ANY, "999");
     gpu_sizer->Add(gpu_layers_label, 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
     model_box->Add(gpu_sizer, 0, wxEXPAND);
     
+    // Bind slider change event to save settings
+    gpu_layers_slider->Bind(wxEVT_SLIDER, [this](wxCommandEvent& event) {
+        UpdateUI();
+        if (settings_manager) {
+            settings_manager->SetInt("Models", "main_gpu_layers", gpu_layers_slider->GetValue());
+            settings_manager->SaveSettings();
+        }
+    });
+    
     // Load button and progress
     wxBoxSizer* load_sizer = new wxBoxSizer(wxHORIZONTAL);
-    load_model_button = new wxButton(settings_panel, ID_LoadModel, "Load Model");
+    load_model_button = new wxButton(scrolled_window, ID_LoadModel, "Load Model");
     load_sizer->Add(load_model_button, 0, wxALL, 5);
-    model_progress = new wxGauge(settings_panel, wxID_ANY, 100);
+    model_progress = new wxGauge(scrolled_window, wxID_ANY, 100);
     load_sizer->Add(model_progress, 1, wxEXPAND | wxALL, 5);
     model_box->Add(load_sizer, 0, wxEXPAND);
     
-    // Main settings layout
+    // Template configuration group
+    wxStaticBoxSizer* template_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Template Configuration");
+    
+    // Environment Description textbox
+    template_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "Environment Description:"), 0, wxALL, 5);
+    environment_description_text = new wxTextCtrl(scrolled_window, wxID_ANY, wxEmptyString,
+                                                 wxDefaultPosition, wxSize(-1, 120),
+                                                 wxTE_MULTILINE | wxTE_WORDWRAP);
+    environment_description_text->SetToolTip("Define the environment and setting where the conversation takes place. This will be used in template variable replacement for environment-related sections.");
+    template_box->Add(environment_description_text, 0, wxEXPAND | wxALL, 5);
+    
+    // Auto-save on kill focus (when user moves away from field)
+    environment_description_text->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& event) {
+        if (settings_manager) {
+            settings_manager->SetString("Templates", "environment_description", environment_description_text->GetValue().ToStdString());
+            settings_manager->SaveSettings();
+        }
+        event.Skip();
+    });
+    
+    // Identity Directive textbox
+    template_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "Identity Directive:"), 0, wxALL, 5);
+    identity_directive_text = new wxTextCtrl(scrolled_window, wxID_ANY, wxEmptyString,
+                                           wxDefaultPosition, wxSize(-1, 120),
+                                           wxTE_MULTILINE | wxTE_WORDWRAP);
+    identity_directive_text->SetToolTip("Define the AI's core identity and behavioral guidelines. This will be used in template variable replacement for identity-related sections.");
+    template_box->Add(identity_directive_text, 0, wxEXPAND | wxALL, 5);
+    
+    // Auto-save on kill focus
+    identity_directive_text->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& event) {
+        if (settings_manager) {
+            settings_manager->SetString("Templates", "identity_directive", identity_directive_text->GetValue().ToStdString());
+            settings_manager->SaveSettings();
+        }
+        event.Skip();
+    });
+    
+    // System Prompt textbox
+    template_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "System Prompt:"), 0, wxALL, 5);
+    system_prompt_text = new wxTextCtrl(scrolled_window, wxID_ANY, wxEmptyString,
+                                       wxDefaultPosition, wxSize(-1, 120),
+                                       wxTE_MULTILINE | wxTE_WORDWRAP);
+    system_prompt_text->SetToolTip("Define the system-level instructions and context. This will be used in template variable replacement for system prompt sections.");
+    template_box->Add(system_prompt_text, 0, wxEXPAND | wxALL, 5);
+    
+    // Auto-save on kill focus
+    system_prompt_text->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& event) {
+        if (settings_manager) {
+            settings_manager->SetString("Templates", "system_prompt", system_prompt_text->GetValue().ToStdString());
+            settings_manager->SaveSettings();
+        }
+        event.Skip();
+    });
+    
+    // Main settings layout for scrolled content
+    wxBoxSizer* scrolled_sizer = new wxBoxSizer(wxVERTICAL);
+    scrolled_sizer->Add(model_box, 0, wxEXPAND | wxALL, 5);
+    scrolled_sizer->Add(template_box, 0, wxEXPAND | wxALL, 5);
+    scrolled_sizer->AddStretchSpacer();
+    
+    scrolled_window->SetSizer(scrolled_sizer);
+    
+    // Main panel layout with scrolled window
     wxBoxSizer* settings_sizer = new wxBoxSizer(wxVERTICAL);
-    settings_sizer->Add(model_box, 0, wxEXPAND | wxALL, 5);
-    settings_sizer->AddStretchSpacer();
+    settings_sizer->Add(scrolled_window, 1, wxEXPAND | wxALL, 5);
     
     settings_panel->SetSizer(settings_sizer);
 }
@@ -372,6 +479,15 @@ void LuminaChatFrame::CreateDiscordPanel() {
     token_sizer->Add(connect_discord_button, 0, wxALL, 5);
     discord_box->Add(token_sizer, 0, wxEXPAND);
     
+    // Auto-save Discord token on kill focus
+    discord_token_text->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& event) {
+        if (settings_manager) {
+            settings_manager->SetString("Discord", "bot_token", discord_token_text->GetValue().ToStdString());
+            settings_manager->SaveSettings();
+        }
+        event.Skip();
+    });
+    
     // Channel management group
     wxStaticBoxSizer* channels_box = new wxStaticBoxSizer(wxVERTICAL, discord_panel, "Channel Management");
     
@@ -385,6 +501,14 @@ void LuminaChatFrame::CreateDiscordPanel() {
     auto_respond_checkbox = new wxCheckBox(discord_panel, wxID_ANY, "Auto-respond");
     channel_controls_sizer->Add(auto_respond_checkbox, 0, wxALL, 5);
     channels_box->Add(channel_controls_sizer, 0, wxEXPAND);
+    
+    // Auto-save auto-respond setting
+    auto_respond_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent& event) {
+        if (settings_manager) {
+            settings_manager->SetBool("Discord", "auto_respond", auto_respond_checkbox->GetValue());
+            settings_manager->SaveSettings();
+        }
+    });
     
     // Layout
     wxBoxSizer* discord_sizer = new wxBoxSizer(wxVERTICAL);
@@ -485,10 +609,10 @@ void LuminaChatFrame::Start() {
         AddLogMessage("Global Logger connected to UI");
         
         settings_manager = std::make_unique<SettingsManager>();
-        if (!settings_manager->LoadSettings("config.ini")) {
-            AddLogMessage("Warning: Failed to load settings file, using defaults");
+        if (!settings_manager->Initialize()) {
+            AddLogMessage("Warning: Failed to initialize settings manager, using defaults");
         } else {
-            AddLogMessage("Settings Manager initialized and loaded");
+            AddLogMessage("Settings Manager initialized successfully");
         }
         
         sanitizer = std::make_unique<Sanitizer>();
@@ -516,6 +640,9 @@ void LuminaChatFrame::Start() {
         RegisterCallbacks();
         AddLogMessage("Callback dependencies registered");
         
+        // Load UI settings from configuration
+        LoadUISettings();
+        
         // Load default models from settings
         LoadDefaultModels();
         
@@ -538,6 +665,10 @@ void LuminaChatFrame::Stop() {
     if (!running) return;
     
     AddLogMessage("Shutting down LuminaChat...");
+    
+    // Save UI settings before shutdown
+    SaveUISettings();
+    
     running = false;
     
     if (system_timer && system_timer->IsRunning()) {
@@ -700,6 +831,8 @@ void LuminaChatFrame::LoadDefaultModels() {
         auto* context = llama_manager->GetOrCreateContextInfo("main_context", "main_model", "default");
         if (context) {
             AddLogMessage("Main context created successfully");
+            // Apply template settings from UI (identity directive and system prompt)
+            ApplyTemplateSettingsToContext(context, "main_context");
         }
     }
     
@@ -759,6 +892,9 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
             AddChatMessage("System", "Error: Context not available", wxColour(150, 50, 50));
             return;
         }
+        
+        // Apply current template settings from UI before processing message
+        ApplyTemplateSettingsToContext(context, current_context_id);
         
         AddLogMessage("Processing message with context: " + current_context_id);
         
@@ -916,6 +1052,8 @@ void LuminaChatFrame::OnLoadModel(wxCommandEvent& event) {
                 
                 if (context_info) {
                     LOG_DEBUG_LuminaChat("GetOrCreateContextInfo returned valid context");
+                    // Apply template settings from UI (identity directive and system prompt)
+                    ApplyTemplateSettingsToContext(context_info, current_context_id);
                     AddLogMessage("Model loaded successfully");
                     AddChatMessage("System", "Model loaded and ready for conversation!", wxColour(0, 150, 0));
                 } else {
@@ -1089,6 +1227,9 @@ void LuminaChatFrame::EndStreamingMessage() {
     
     current_assistant_message.clear();
     assistant_message_start_pos = -1;
+    
+    // Set focus back to the input field so users can immediately type their next message
+    chat_input->SetFocus();
 }
 
 void LuminaChatFrame::OnStopGeneration(wxCommandEvent& event) {
@@ -1152,4 +1293,227 @@ void LuminaChatFrame::OnClearTemplate(wxCommandEvent& event) {
     );
     last_finalized_template.clear();
     AddLogMessage("Template display cleared");
+}
+
+// Helper methods for initialization
+std::string LuminaChatFrame::GetEnvironmentDescriptionFromUI() const {
+    if (environment_description_text) {
+        return environment_description_text->GetValue().ToStdString();
+    }
+    return "";
+}
+
+std::string LuminaChatFrame::GetIdentityDirectiveFromUI() const {
+    if (identity_directive_text) {
+        return identity_directive_text->GetValue().ToStdString();
+    }
+    return "";
+}
+
+std::string LuminaChatFrame::GetSystemPromptFromUI() const {
+    if (system_prompt_text) {
+        return system_prompt_text->GetValue().ToStdString();
+    }
+    return "";
+}
+
+void LuminaChatFrame::ApplyTemplateSettingsToContext(ContextInfo* context, const std::string& context_id) {
+    if (!context) {
+        AddLogMessage("WARNING: Cannot apply template settings to null context");
+        return;
+    }
+    
+    // Don't apply template settings to summary contexts
+    if (context_id.find("summary") != std::string::npos) {
+        AddLogMessage("Skipping template settings for summary context: " + context_id);
+        return;
+    }
+    
+    std::string environment_description = GetEnvironmentDescriptionFromUI();
+    std::string identity_directive = GetIdentityDirectiveFromUI();
+    std::string system_prompt = GetSystemPromptFromUI();
+    
+    if (!environment_description.empty()) {
+        context->UpdateEnvironment(environment_description);
+        AddLogMessage("Applied environment description to context: " + context_id);
+    }
+    
+    if (!identity_directive.empty()) {
+        context->UpdateIdentity(identity_directive);
+        AddLogMessage("Applied identity directive to context: " + context_id);
+    }
+    
+    if (!system_prompt.empty()) {
+        context->UpdateSystemPrompt(system_prompt);
+        AddLogMessage("Applied system prompt to context: " + context_id);
+    }
+}
+
+void LuminaChatFrame::LoadUISettings() {
+    if (!settings_manager) {
+        AddLogMessage("WARNING: Cannot load UI settings - SettingsManager not initialized");
+        return;
+    }
+    
+    AddLogMessage("Loading UI settings from configuration...");
+    
+    try {
+        // Load model settings
+        std::string model_path = settings_manager->GetString("Models", "main_model_path", "");
+        if (!model_path.empty() && model_path_text) {
+            model_path_text->SetValue(model_path);
+            AddLogMessage("Loaded model path: " + model_path);
+        }
+        
+        // Load model configuration sliders
+        if (context_size_slider) {
+            int context_size = settings_manager->GetInt("Models", "main_context_size", 4096);
+            context_size_slider->SetValue(context_size);
+            AddLogMessage("Loaded context size: " + std::to_string(context_size));
+        }
+        
+        if (gpu_layers_slider) {
+            int gpu_layers = settings_manager->GetInt("Models", "main_gpu_layers", 999);
+            gpu_layers_slider->SetValue(gpu_layers);
+            AddLogMessage("Loaded GPU layers: " + std::to_string(gpu_layers));
+        }
+        
+        // Load template configuration
+        if (environment_description_text) {
+            std::string env_desc = settings_manager->GetString("Templates", "environment_description", "");
+            environment_description_text->SetValue(env_desc);
+            if (!env_desc.empty()) {
+                AddLogMessage("Loaded environment description from settings");
+            }
+        }
+        
+        if (identity_directive_text) {
+            std::string identity = settings_manager->GetString("Templates", "identity_directive", "");
+            identity_directive_text->SetValue(identity);
+            if (!identity.empty()) {
+                AddLogMessage("Loaded identity directive from settings");
+            }
+        }
+        
+        if (system_prompt_text) {
+            std::string system_prompt = settings_manager->GetString("Templates", "system_prompt", "");
+            system_prompt_text->SetValue(system_prompt);
+            if (!system_prompt.empty()) {
+                AddLogMessage("Loaded system prompt from settings");
+            }
+        }
+        
+        // Load Discord settings
+        if (discord_token_text) {
+            std::string discord_token = settings_manager->GetString("Discord", "bot_token", "");
+            discord_token_text->SetValue(discord_token);
+            if (!discord_token.empty()) {
+                AddLogMessage("Loaded Discord bot token from settings");
+            }
+        }
+        
+        if (auto_respond_checkbox) {
+            bool auto_respond = settings_manager->GetBool("Discord", "auto_respond", true);
+            auto_respond_checkbox->SetValue(auto_respond);
+            AddLogMessage("Loaded Discord auto-respond setting: " + std::string(auto_respond ? "enabled" : "disabled"));
+        }
+        
+        // Load logging level
+        if (log_level_choice) {
+            std::string log_level = settings_manager->GetString("Logging", "level", "INFO");
+            int selection = 1; // Default to INFO
+            if (log_level == "DEBUG") selection = 0;
+            else if (log_level == "INFO") selection = 1;
+            else if (log_level == "WARNING") selection = 2;
+            else if (log_level == "ERROR") selection = 3;
+            
+            log_level_choice->SetSelection(selection);
+            AddLogMessage("Loaded log level: " + log_level);
+        }
+        
+        // Update UI to reflect loaded values
+        UpdateUI();
+        
+        AddLogMessage("UI settings loaded successfully");
+        
+    } catch (const std::exception& e) {
+        AddLogMessage("Error loading UI settings: " + std::string(e.what()));
+    }
+}
+
+void LuminaChatFrame::SaveUISettings() {
+    if (!settings_manager) {
+        AddLogMessage("WARNING: Cannot save UI settings - SettingsManager not initialized");
+        return;
+    }
+    
+    AddLogMessage("Saving UI settings to configuration...");
+    
+    try {
+        // Save model settings
+        if (model_path_text) {
+            std::string model_path = model_path_text->GetValue().ToStdString();
+            settings_manager->SetString("Models", "main_model_path", model_path);
+        }
+        
+        if (context_size_slider) {
+            int context_size = context_size_slider->GetValue();
+            settings_manager->SetInt("Models", "main_context_size", context_size);
+        }
+        
+        if (gpu_layers_slider) {
+            int gpu_layers = gpu_layers_slider->GetValue();
+            settings_manager->SetInt("Models", "main_gpu_layers", gpu_layers);
+        }
+        
+        // Save template configuration
+        if (environment_description_text) {
+            std::string env_desc = environment_description_text->GetValue().ToStdString();
+            settings_manager->SetString("Templates", "environment_description", env_desc);
+        }
+        
+        if (identity_directive_text) {
+            std::string identity = identity_directive_text->GetValue().ToStdString();
+            settings_manager->SetString("Templates", "identity_directive", identity);
+        }
+        
+        if (system_prompt_text) {
+            std::string system_prompt = system_prompt_text->GetValue().ToStdString();
+            settings_manager->SetString("Templates", "system_prompt", system_prompt);
+        }
+        
+        // Save Discord settings
+        if (discord_token_text) {
+            std::string discord_token = discord_token_text->GetValue().ToStdString();
+            settings_manager->SetString("Discord", "bot_token", discord_token);
+        }
+        
+        if (auto_respond_checkbox) {
+            bool auto_respond = auto_respond_checkbox->GetValue();
+            settings_manager->SetBool("Discord", "auto_respond", auto_respond);
+        }
+        
+        // Save logging level
+        if (log_level_choice) {
+            int selection = log_level_choice->GetSelection();
+            std::string log_level = "INFO"; // Default
+            switch (selection) {
+                case 0: log_level = "DEBUG"; break;
+                case 1: log_level = "INFO"; break;
+                case 2: log_level = "WARNING"; break;
+                case 3: log_level = "ERROR"; break;
+            }
+            settings_manager->SetString("Logging", "level", log_level);
+        }
+        
+        // Actually save the settings to file
+        if (settings_manager->SaveSettings()) {
+            AddLogMessage("UI settings saved successfully");
+        } else {
+            AddLogMessage("ERROR: Failed to save UI settings to file");
+        }
+        
+    } catch (const std::exception& e) {
+        AddLogMessage("Error saving UI settings: " + std::string(e.what()));
+    }
 }
