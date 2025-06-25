@@ -66,7 +66,8 @@ enum class ScheduledTaskType {
     CONTEXT_MAINTENANCE,
     CACHE_CLEANUP,
     HEALTH_CHECK,
-    DISCORD_PRESENCE_UPDATE
+    DISCORD_PRESENCE_UPDATE,
+    PRUNING_BUFFER_PROCESSING  // New scheduled task for processing pruning buffer
 };
 
 struct ScheduledTask {
@@ -197,6 +198,7 @@ private:
     void PerformCacheCleanup();
     void PerformHealthCheck();
     void UpdateDiscordPresence();
+    void ProcessPruningBuffer();  // New method for processing pruning buffer
 };
 
 // Implementation
@@ -614,6 +616,11 @@ inline void Orchestrator::SetupDefaultScheduledTasks() {
                     std::chrono::seconds(30),
                     [this]() { UpdateDiscordPresence(); });
     
+    // Pruning buffer processing every 2 minutes
+    AddScheduledTask(ScheduledTaskType::PRUNING_BUFFER_PROCESSING,
+                    std::chrono::minutes(2),
+                    [this]() { ProcessPruningBuffer(); });
+    
     LOG_Orchestrator("Default scheduled tasks configured");
 }
 
@@ -715,4 +722,58 @@ inline void Orchestrator::UpdateDiscordPresence() {
     // Update Discord bot presence/status
     // This would integrate with Discord API
     LOG_Orchestrator("Discord presence updated");
+}
+
+inline void Orchestrator::ProcessPruningBuffer() {
+    // Check if there are any pruned messages waiting for summarization
+    if (!ContextInfo::HasPendingSummarization()) {
+        return; // No work to do
+    }
+    
+    LOG_Orchestrator("Processing pruning buffer...");
+    
+    // Get all pending pruning batches
+    auto pruning_batches = ContextInfo::GetAndClearPruningBuffer();
+    
+    LOG_Orchestrator("Found " + std::to_string(pruning_batches.size()) + " pruning batches to process");
+    
+    // Process each batch through the summarization pipeline
+    for (const auto& batch : pruning_batches) {
+        if (!batch.needs_summarization) {
+            continue; // Skip batches that don't need summarization
+        }
+        
+        // Create summarization request
+        SummarizationRequest request;
+        request.original_context_id = batch.context_id;
+        request.summary_context_id = batch.context_id + "_summary";
+        
+        // Convert message history to content string
+        std::ostringstream content_stream;
+        for (const auto& msg : batch.pruned_messages) {
+            content_stream << msg.first << ": " << msg.second << "\n";
+        }
+        request.content_to_summarize = content_stream.str();
+        request.timestamp = std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
+            batch.pruned_at.time_since_epoch()).count());
+        
+        // Queue for pipeline processing
+        bool queued = summarization_pipeline.QueueRequest(request, LuminaChat::RequestPriority::NORMAL, 
+                                                         "pruning_buffer_" + batch.context_id);
+        
+        if (queued) {
+            LOG_Orchestrator("Queued summarization for context: " + batch.context_id + 
+                           " (content: " + std::to_string(request.content_to_summarize.length()) + " chars)");
+        } else {
+            LOG_ERROR_Orchestrator("Failed to queue summarization for context: " + batch.context_id);
+        }
+        
+        {
+            std::lock_guard<std::mutex> lock(stats_mutex);
+            stats.summarizations_completed++;
+        }
+    }
+    
+    LOG_Orchestrator("Pruning buffer processing complete - processed " + 
+                    std::to_string(pruning_batches.size()) + " batches");
 }

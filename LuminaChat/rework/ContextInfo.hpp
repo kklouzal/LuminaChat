@@ -40,6 +40,19 @@ std::string GenerateContextId();
 // Forward declaration for ModelInfo
 class ModelInfo;
 
+// Pruning buffer for plugin consumption
+struct PrunedMessageBatch {
+    std::string context_id;
+    std::vector<std::pair<std::string, std::string>> pruned_messages;
+    std::chrono::steady_clock::time_point pruned_at;
+    bool needs_summarization = true;
+    
+    PrunedMessageBatch(const std::string& id, 
+                       std::vector<std::pair<std::string, std::string>> messages)
+        : context_id(id), pruned_messages(std::move(messages)), 
+          pruned_at(std::chrono::steady_clock::now()) {}
+};
+
 enum class RebuildStrategy {
     FULL,           // Complete rebuild including template re-rendering
     PARTIAL,        // Efficient append-only rebuild for new messages
@@ -50,7 +63,6 @@ enum class ContextState {
     READY,
     PROCESSING,
     GENERATING,        // New state for async generation
-    AWAITING_SUMMARIZATION,
     ERROR_STATE
 };
 
@@ -102,22 +114,29 @@ struct ContextStats {
 /**
  * Individual conversation context management with dynamic template system
  * 
- * Revolutionary Processing Flow:
+ * Revolutionary Processing Flow (Plugin-Based Summarization):
  * 1. Receive input from Orchestrator (pre-sanitized if from Discord)
  * 2. Add pure conversation pair to message history (no system contamination)
  * 3. Render dynamic template with current message history via ChatTemplateManager
  * 4. Process rendered template to tokens via TokenCache
- * 5. Check context size - trigger summarization plugin if needed (updates template sections)
+ * 5. Check context size - trigger immediate pruning if needed (buffers messages for plugin)
  * 6. Generate LLM response using rendered template
  * 7. Detokenize response via TokenCache
  * 8. Add response pair to message history
  * 9. Return human-readable response
+ * 
+ * Background Plugin Processing:
+ * - SummarizationPlugin polls pruning buffer periodically
+ * - Plugin creates summary contexts on-demand via Orchestrator
+ * - Heavy summarization work happens async through ProcessingPipeline
+ * - Completed summaries applied back via ApplyCompletedSummary()
  * 
  * Template Integration Benefits:
  * - Clean Message History: Only actual conversation, no system pollution
  * - Dynamic Context: Summaries, system messages embedded in template sections
  * - Plugin-Driven Updates: Summarization updates template directly, not message history
  * - Per-Context Flexibility: Each context can have completely different template evolution
+ * - Non-Blocking: Critical path stays fast, heavy work happens in background
  */
 class ContextInfo {
 private:    // Core components
@@ -133,6 +152,10 @@ private:    // Core components
     
     // Message history - pure conversation only
     std::vector<std::pair<std::string, std::string>> message_history; // (role, content)
+    
+    // Static pruning buffer for plugin consumption
+    static std::mutex pruning_buffer_mutex;
+    static std::vector<PrunedMessageBatch> global_pruning_buffer;
     
     // Llama context management
     llama_context* llama_ctx = nullptr;
@@ -151,14 +174,11 @@ private:    // Core components
     std::mutex generation_mutex;
     GenerationCallbacks current_callbacks;
     
-    // Callback for summarization requests
-    std::function<void(std::string, std::string)> summarization_callback;
-    
     // Helper methods (moved to public for testing)
     
     // Context size management
     bool IsNearContextLimit(float threshold = 0.8f) const;
-    void RequestSummarization(const std::string& content);
+    void EmergencyPrune(); // Emergency fallback when plugin system unavailable
     void UpdateStats();
     
 public:    // Constructor overloads
@@ -168,6 +188,22 @@ public:    // Constructor overloads
     // Factory method for default template
     static std::unique_ptr<ContextInfo> CreateWithDefaultTemplate(const std::string& context_id, ModelInfo* model);
     static std::unique_ptr<ContextInfo> CreateWithDefaultTemplate(ModelInfo* model); // Auto-generated ID
+    
+    // Plugin interface for accessing pruning buffer
+    static std::vector<PrunedMessageBatch> GetAndClearPruningBuffer();
+    static bool HasPendingSummarization();
+    
+    // Core pruning method (immediate, critical path)
+    void PruneContextImmediate(size_t keep_recent_messages = 5);
+    
+private:
+    // Internal pruning method (assumes context_mutex is already held)
+    void PruneContextImmediate_Internal(size_t keep_recent_messages = 5);
+    
+public:
+    
+    // Plugin callback to apply completed summaries
+    void ApplyCompletedSummary(const std::string& summary);
     
     // Destructor
     ~ContextInfo();
@@ -223,9 +259,6 @@ public:    // Constructor overloads
     // Template access
     ChatTemplateManager& GetTemplateManager() { return *template_manager; }
     const ChatTemplateManager& GetTemplateManager() const { return *template_manager; }
-    
-    // Callback registration for plugin integration
-    void RegisterSummarizationCallback(std::function<void(std::string, std::string)> callback);
     
     // Context validation
     bool ValidateContext() const;
@@ -481,11 +514,6 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
         return "Error: Context unavailable";
     }
     
-    if (state == ContextState::AWAITING_SUMMARIZATION) {
-        LOG_ContextInfo("Input queued - context awaiting summarization");
-        return "Processing... please wait";
-    }
-    
     state = ContextState::PROCESSING;
     UpdateStats();
     
@@ -511,18 +539,16 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
         // 4. Check context size - trigger summarization if needed
         std::vector<int32_t> prompt_tokens = TokenizePrompt(full_prompt);
         if (IsNearContextLimit(0.8f)) {
-            LOG_ContextInfo("Context approaching limit, requesting summarization");
+            LOG_ContextInfo("Context approaching limit, performing immediate pruning");
             
-            // Extract content for summarization (recent conversation)
-            std::ostringstream content_stream;
-            size_t start_idx = message_history.size() > 20 ? message_history.size() - 20 : 0;
-            for (size_t i = start_idx; i < message_history.size(); ++i) {
-                content_stream << message_history[i].first << ": " << message_history[i].second << "\n";
-            }
+            // Prune messages immediately to pruning buffer - plugin will handle summarization
+            PruneContextImmediate_Internal(5); // Keep only last 5 messages
             
-            RequestSummarization(content_stream.str());
-            state = ContextState::AWAITING_SUMMARIZATION;
-            return "Context full - summarizing recent conversation...";
+            // Mark flag for background summarization
+            needs_background_summarization = true;
+            
+            // Continue processing after pruning
+            LOG_ContextInfo("Immediate pruning complete, continuing with generation");
         }
         
         // 5. Generate LLM response using actual AI model
@@ -1022,34 +1048,14 @@ inline bool ContextInfo::IsNearContextLimit(float threshold) const {
     return near_limit;
 }
 
-inline void ContextInfo::RequestSummarization(const std::string& content) {
-    if (summarization_callback) {
-        // Determine if this is background or immediate summarization based on current state
-        bool is_background = (state == ContextState::READY);
-        std::string type = is_background ? "background" : "immediate";
-        
-        LOG_ContextInfo("Requesting " + type + " summarization for context: " + context_id + 
-                       " (content length: " + std::to_string(content.length()) + " chars)");
-        LOG_DEBUG_ContextInfo("Summarization content preview: " + 
-                             content.substr(0, 200) + (content.length() > 200 ? "..." : ""));
-        summarization_callback(context_id, content);
-    } else {
-        LOG_ERROR_ContextInfo("No summarization callback available for context: " + context_id + 
-                             " - context will continue to grow without pruning!");
-        
-        // As a fallback, try to prune without summarization if context is critically full
-        if (IsNearContextLimit(0.95f)) {
-            LOG_ContextInfo("Emergency pruning without summarization - context critically full");
-            if (message_history.size() > 6) {
-                // Keep only the last 3 message pairs
-                std::vector<std::pair<std::string, std::string>> recent_messages;
-                recent_messages.assign(message_history.end() - 6, message_history.end());
-                message_history = std::move(recent_messages);
-                context_needs_rebuild = true;
-                UpdateStats();
-                LOG_ContextInfo("Emergency pruned to " + std::to_string(message_history.size()) + " messages");
-            }
-        }
+// Emergency fallback pruning for extreme situations (no plugin dependency)
+inline void ContextInfo::EmergencyPrune() {
+    LOG_ERROR_ContextInfo("EMERGENCY: Plugin system unavailable - performing emergency pruning for context: " + context_id);
+    
+    if (IsNearContextLimit(0.95f)) {
+        LOG_ContextInfo("Emergency pruning without summarization - context critically full");
+        PruneContextImmediate(3); // Very aggressive - keep only 3 most recent messages
+        LOG_ContextInfo("Emergency pruning completed");
     }
 }
 
@@ -1060,11 +1066,6 @@ inline void ContextInfo::UpdateStats() {
     stats.current_context_tokens = static_cast<size_t>(std::max(0, n_past));
     stats.total_tokens_processed += static_cast<size_t>(std::max(0, n_past));
     stats.last_activity = std::chrono::steady_clock::now();
-}
-
-inline void ContextInfo::RegisterSummarizationCallback(std::function<void(std::string, std::string)> callback) {
-    summarization_callback = std::move(callback);
-    LOG_ContextInfo("Summarization callback registered for context: " + context_id);
 }
 
 // Helper function to generate context IDs
@@ -1093,109 +1094,105 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
         return false;
     }
     
-    std::lock_guard<std::mutex> lock(context_mutex);
+    std::string full_prompt;
+    bool preparation_success = false;
     
-    try {
-        state = ContextState::PROCESSING;
+    // Critical section: prepare context for generation
+    {
+        std::lock_guard<std::mutex> lock(context_mutex);
         
-        // 1. Add user message to history
-        message_history.emplace_back(username, input);
-        context_needs_rebuild = true;
-        
-        LOG_DEBUG_ContextInfo("Processing async input: " + username + " -> " + 
-                             input.substr(0, 50) + (input.length() > 50 ? "..." : ""));
-        
-        // 2. Check context size BEFORE rebuilding - this allows us to trigger summarization
-        // before we try to process tokens that might exceed the limit
-        std::string estimated_prompt = BuildFullPrompt();
-        size_t estimated_tokens = ContextUtils::EstimateTokenCount(estimated_prompt);
-        
-        LOG_DEBUG_ContextInfo("Estimated prompt tokens: " + std::to_string(estimated_tokens) + 
-                             " (current context: " + std::to_string(static_cast<size_t>(std::max(0, n_past))) + 
-                             "/" + std::to_string(stats.max_context_tokens) + ")");
-        
-        // Check if we're approaching the limit with the new message
-        if (stats.max_context_tokens > 0) {
-            size_t total_estimated = static_cast<size_t>(std::max(0, n_past)) + estimated_tokens;
-            float estimated_usage = static_cast<float>(total_estimated) / stats.max_context_tokens;
+        try {
+            state = ContextState::PROCESSING;
             
-            if (estimated_usage >= 0.9f) {
-                // Emergency situation: context usage > 90% - must summarize before responding
-                LOG_ContextInfo("Estimated context usage after rebuild would be " + 
-                               std::to_string(estimated_usage * 100.0f) + "% - emergency summarization required");
-                
-                // Extract content for summarization (recent conversation)
-                std::ostringstream content_stream;
-                size_t start_idx = message_history.size() > 20 ? message_history.size() - 20 : 0;
-                for (size_t i = start_idx; i < message_history.size(); ++i) {
-                    content_stream << message_history[i].first << ": " << message_history[i].second << "\n";
-                }
-                
-                RequestSummarization(content_stream.str());
-                state = ContextState::AWAITING_SUMMARIZATION;
-                if (callbacks.on_complete) {
-                    callbacks.on_complete("Context critically full - summarizing before response...", true);
-                }
-                return true;
-            }
-            else if (estimated_usage >= 0.8f) {
-                // Moderate usage: 80-90% - generate response first, then summarize in background
-                LOG_ContextInfo("Estimated context usage after rebuild would be " + 
-                               std::to_string(estimated_usage * 100.0f) + "% - will summarize after response");
-                
-                // Set flag to trigger background summarization after generation completes
-                needs_background_summarization = true;
-            }
-        }
-        
-        // 3. Rebuild context with the new message
-        if (context_needs_rebuild || template_manager->IsTemplateDirty()) {
-            if (!RebuildContext(RebuildStrategy::FULL)) {
-                state = ContextState::ERROR_STATE;
-                if (callbacks.on_error) {
-                    callbacks.on_error("Failed to rebuild context");
-                }
-                return false;
-            }
-            // Sync stats after successful rebuild
-            SyncStatsWithContextState();
-        }
-        
-        // 4. Double-check context size after rebuild (safety check)
-        if (IsNearContextLimit(0.9f)) { // Higher threshold for final check
-            LOG_ContextInfo("Context still at limit after rebuild, requesting emergency summarization");
+            // 1. Add user message to history
+            message_history.emplace_back(username, input);
+            context_needs_rebuild = true;
             
-            // Extract content for summarization (recent conversation)
-            std::ostringstream content_stream;
-            size_t start_idx = message_history.size() > 10 ? message_history.size() - 10 : 0;
-            for (size_t i = start_idx; i < message_history.size(); ++i) {
-                content_stream << message_history[i].first << ": " << message_history[i].second << "\n";
+            LOG_DEBUG_ContextInfo("Processing async input: " + username + " -> " + 
+                                 input.substr(0, 50) + (input.length() > 50 ? "..." : ""));
+            
+            // 2. Check context size BEFORE rebuilding - this allows us to trigger summarization
+            // before we try to process tokens that might exceed the limit
+            std::string estimated_prompt = BuildFullPrompt();
+            size_t estimated_tokens = ContextUtils::EstimateTokenCount(estimated_prompt);
+            
+            LOG_DEBUG_ContextInfo("Estimated prompt tokens: " + std::to_string(estimated_tokens) + 
+                                 " (current context: " + std::to_string(static_cast<size_t>(std::max(0, n_past))) + 
+                                 "/" + std::to_string(stats.max_context_tokens) + ")");
+            
+            // Check if we're approaching the limit with the new message
+            if (stats.max_context_tokens > 0) {
+                size_t total_estimated = static_cast<size_t>(std::max(0, n_past)) + estimated_tokens;
+                float estimated_usage = static_cast<float>(total_estimated) / stats.max_context_tokens;
+                
+                if (estimated_usage >= 0.9f) {
+                    // Emergency situation: context usage > 90% - must prune immediately
+                    LOG_ContextInfo("Estimated context usage after rebuild would be " + 
+                                   std::to_string(estimated_usage * 100.0f) + "% - emergency pruning required");
+                    
+                    // Immediate pruning to keep conversation flowing
+                    PruneContextImmediate_Internal(5); // Keep only last 5 messages
+                    
+                    LOG_ContextInfo("Emergency pruning completed, continuing with generation");
+                }
+                else if (estimated_usage >= 0.8f) {
+                    // Moderate usage: 80-90% - prune less aggressively
+                    LOG_ContextInfo("Estimated context usage after rebuild would be " + 
+                                   std::to_string(estimated_usage * 100.0f) + "% - performing moderate pruning");
+                    
+                    // Moderate pruning - keep more messages for better context
+                    PruneContextImmediate_Internal(8); // Keep more messages for better conversation flow
+                    
+                    LOG_ContextInfo("Moderate pruning completed");
+                }
             }
             
-            RequestSummarization(content_stream.str());
-            state = ContextState::AWAITING_SUMMARIZATION;
-            if (callbacks.on_complete) {
-                callbacks.on_complete("Context requires emergency summarization...", true);
+            // 3. Rebuild context with the new message
+            if (context_needs_rebuild || template_manager->IsTemplateDirty()) {
+                if (!RebuildContext(RebuildStrategy::FULL)) {
+                    state = ContextState::ERROR_STATE;
+                    if (callbacks.on_error) {
+                        callbacks.on_error("Failed to rebuild context");
+                    }
+                    return false;
+                }
+                // Sync stats after successful rebuild
+                SyncStatsWithContextState();
             }
-            return true;
+            
+            // 4. Double-check context size after rebuild (safety check)
+            if (IsNearContextLimit(0.9f)) { // Higher threshold for final check
+                LOG_ContextInfo("Context still at limit after rebuild, performing final emergency pruning");
+                
+                // Final emergency pruning if context is still too full
+                PruneContextImmediate_Internal(3); // Very aggressive - keep only 3 most recent messages
+                
+                LOG_ContextInfo("Final emergency pruning completed");
+            }
+            
+            // 5. Prepare for generation
+            state = ContextState::GENERATING;
+            current_callbacks = callbacks;
+            full_prompt = BuildFullPrompt(); // Get the final prompt for generation
+            preparation_success = true;
+            
+        } catch (const std::exception& e) {
+            LOG_ERROR_ContextInfo("Exception in HandleInputAsync preparation: " + std::string(e.what()));
+            state = ContextState::ERROR_STATE;
+            if (callbacks.on_error) {
+                callbacks.on_error("Exception: " + std::string(e.what()));
+            }
+            return false;
         }
-        
-        // 5. Start async generation (context is already rebuilt, no need to rebuild again)
-        state = ContextState::GENERATING;
-        current_callbacks = callbacks;
-        std::string full_prompt = BuildFullPrompt(); // Get the final prompt for generation
+    } // Release context_mutex here
+    
+    // Start async generation OUTSIDE the critical section to avoid deadlock
+    if (preparation_success) {
         StartGenerationAsync(full_prompt, callbacks);
-        
         return true;
-        
-    } catch (const std::exception& e) {
-        LOG_ERROR_ContextInfo("Exception in HandleInputAsync: " + std::string(e.what()));
-        state = ContextState::ERROR_STATE;
-        if (callbacks.on_error) {
-            callbacks.on_error("Exception: " + std::string(e.what()));
-        }
-        return false;
     }
+    
+    return false;
 }
 
 inline void ContextInfo::StopGeneration() {
@@ -1238,6 +1235,7 @@ inline void ContextInfo::StartGenerationAsync(const std::string& prompt, const G
     generation_thread = std::make_unique<std::thread>([this, prompt, callbacks]() {
         std::string full_response;
         bool success = false;
+        bool trigger_background_pruning = false;
         
         try {
             // Note: We cannot hold context_mutex for the entire duration as it would block other operations
@@ -1362,28 +1360,22 @@ inline void ContextInfo::StartGenerationAsync(const std::string& prompt, const G
                     message_history.emplace_back("assistant", full_response);
                     UpdateStats();
                 }
-                
-                state = ContextState::READY;
-                is_generating = false;
-                
-                // Check if background summarization is needed
-                if (needs_background_summarization.load()) {
-                    LOG_ContextInfo("Triggering background summarization after response completion");
-                    needs_background_summarization = false;
-                    
-                    // Extract content for summarization (recent conversation)
-                    std::ostringstream content_stream;
-                    size_t start_idx = message_history.size() > 20 ? message_history.size() - 20 : 0;
-                    for (size_t i = start_idx; i < message_history.size(); ++i) {
-                        content_stream << message_history[i].first << ": " << message_history[i].second << "\n";
-                    }
-                    
-                    // Trigger background summarization (non-blocking)
-                    RequestSummarization(content_stream.str());
-                    // Note: We don't change state to AWAITING_SUMMARIZATION here since the user
-                    // can continue chatting while summarization happens in the background
-                }
+                      state = ContextState::READY;
+            is_generating = false;
+            
+            // Check if background summarization is needed
+            trigger_background_pruning = needs_background_summarization.load();
+            if (trigger_background_pruning) {
+                LOG_ContextInfo("Triggering background summarization after response completion");
+                needs_background_summarization = false;
             }
+        }
+        
+        // Perform background pruning OUTSIDE the context lock to avoid deadlock
+        if (trigger_background_pruning) {
+            PruneContextImmediate(8); // This will acquire its own lock safely
+            LOG_ContextInfo("Background pruning complete - messages buffered for plugin summarization");
+        }
             
             LOG_DEBUG_ContextInfo("Async generation completed: " + std::to_string(response_tokens.size()) + 
                                  " tokens -> " + full_response.substr(0, 100) + 
@@ -1461,50 +1453,93 @@ inline void ContextInfo::PruneMessageHistoryWithSummary(const std::string& summa
     std::lock_guard<std::mutex> lock(context_mutex);
     
     if (message_history.size() <= keep_recent_messages) {
-        LOG_DEBUG_ContextInfo("Message history too short to prune (size: " + 
-                             std::to_string(message_history.size()) + ")");
+        LOG_DEBUG_ContextInfo("No pruning needed: only " + std::to_string(message_history.size()) + " messages");
         return;
     }
     
-    // Keep only the most recent messages
-    std::vector<std::pair<std::string, std::string>> recent_messages;
-    size_t start_idx = message_history.size() - keep_recent_messages;
-    recent_messages.assign(message_history.begin() + start_idx, message_history.end());
+    // Extract messages to be pruned
+    size_t prune_count = message_history.size() - keep_recent_messages;
+    std::vector<std::pair<std::string, std::string>> pruned_messages;
+    pruned_messages.assign(message_history.begin(), message_history.begin() + prune_count);
     
-    LOG_ContextInfo("Pruning message history: keeping " + std::to_string(keep_recent_messages) + 
-                   " recent messages out of " + std::to_string(message_history.size()) + " total");
+    // Add to global pruning buffer for plugin processing
+    {
+        std::lock_guard<std::mutex> buffer_lock(pruning_buffer_mutex);
+        global_pruning_buffer.emplace_back(context_id, std::move(pruned_messages));
+    }
     
-    // Update message history with recent messages only
-    message_history = std::move(recent_messages);
-    
-    // Apply the summary to the template
-    ApplySummary(summary);
-    
-    // Force full context rebuild after pruning
+    // Immediately prune from active history
+    message_history.erase(message_history.begin(), message_history.begin() + prune_count);
     context_needs_rebuild = true;
     
-    LOG_ContextInfo("Message history pruned and summary applied: \"" + 
-                   summary.substr(0, 100) + (summary.length() > 100 ? "..." : "") + "\"");
-    
+    LOG_ContextInfo("Pruned " + std::to_string(prune_count) + " messages to buffer for summarization. " +
+                   "Keeping " + std::to_string(keep_recent_messages) + " recent messages.");
     UpdateStats();
 }
 
-inline void ContextInfo::SetContextSizeForTesting(size_t test_size) {
+inline void ContextInfo::ApplyCompletedSummary(const std::string& summary) {
     std::lock_guard<std::mutex> lock(context_mutex);
     
-    LOG_ContextInfo("Setting context size for testing: " + std::to_string(test_size) + 
-                   " (was: " + std::to_string(stats.max_context_tokens) + ")");
+    if (!summary.empty()) {
+        // Apply summary to template instead of mixing with message history
+        template_manager->UpdateSummary(summary);
+        context_needs_rebuild = true;
+        
+        LOG_ContextInfo("Applied completed summary to template: " + 
+                       summary.substr(0, 100) + (summary.length() > 100 ? "..." : ""));
+    }
+}
+
+// Context threshold checking with simplified logic
+
+// Static method implementations for pruning buffer plugin interface
+inline std::vector<PrunedMessageBatch> ContextInfo::GetAndClearPruningBuffer() {
+    std::lock_guard<std::mutex> lock(pruning_buffer_mutex);
     
-    stats.max_context_tokens = test_size;
+    std::vector<PrunedMessageBatch> result;
+    result.swap(global_pruning_buffer);
     
-    // Check if current usage exceeds new limit
-    size_t current_usage = static_cast<size_t>(std::max(0, n_past));
-    if (current_usage > test_size) {
-        LOG_ContextInfo("Current usage (" + std::to_string(current_usage) + 
-                       ") exceeds new test limit (" + std::to_string(test_size) + ")");
+    return result;
+}
+
+inline bool ContextInfo::HasPendingSummarization() {
+    std::lock_guard<std::mutex> lock(pruning_buffer_mutex);
+    
+    return !global_pruning_buffer.empty();
+}
+
+inline void ContextInfo::PruneContextImmediate(size_t keep_recent_messages) {
+    std::lock_guard<std::mutex> lock(context_mutex);
+    PruneContextImmediate_Internal(keep_recent_messages);
+}
+
+inline void ContextInfo::PruneContextImmediate_Internal(size_t keep_recent_messages) {
+    // Note: context_mutex should already be held by caller
+    
+    if (message_history.size() <= keep_recent_messages) {
+        LOG_DEBUG_ContextInfo("No pruning needed: only " + std::to_string(message_history.size()) + " messages");
+        return;
     }
     
-    // Force a context limit check with the new size
-    float usage = test_size > 0 ? static_cast<float>(current_usage) / test_size : 0.0f;
-    LOG_ContextInfo("New context usage ratio: " + std::to_string(usage * 100.0f) + "%");
+    // Extract messages to be pruned
+    size_t prune_count = message_history.size() - keep_recent_messages;
+    std::vector<std::pair<std::string, std::string>> pruned_messages;
+    pruned_messages.assign(message_history.begin(), message_history.begin() + prune_count);
+    
+    // Add to global pruning buffer for plugin processing
+    {
+        std::lock_guard<std::mutex> buffer_lock(pruning_buffer_mutex);
+        global_pruning_buffer.emplace_back(context_id, std::move(pruned_messages));
+    }
+    
+    // Immediately prune from active history
+    message_history.erase(message_history.begin(), message_history.begin() + prune_count);
+    context_needs_rebuild = true;
+    
+    LOG_ContextInfo("Pruned " + std::to_string(prune_count) + " messages to buffer for summarization");
+    UpdateStats();
 }
+
+// Static member definitions for pruning buffer
+inline std::mutex ContextInfo::pruning_buffer_mutex;
+inline std::vector<PrunedMessageBatch> ContextInfo::global_pruning_buffer;

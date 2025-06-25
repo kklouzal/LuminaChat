@@ -81,9 +81,6 @@ private:
     std::chrono::steady_clock::time_point last_pruning_request;
     std::chrono::steady_clock::time_point last_update;
     
-    // Callback for summarization requests (registered by Orchestrator)
-    std::function<void(const std::string&, const std::string&)> summarization_callback;
-    
     // Performance tracking
     std::atomic<size_t> pruning_events{0};
     std::atomic<size_t> summarization_requests{0};
@@ -129,14 +126,6 @@ public:
             std::to_string(pruning_events.load()) + ", summarization=" + 
             std::to_string(summarization_requests.load()) + ", emergency=" + 
             std::to_string(emergency_prunings.load()));
-    }
-    
-    // Callback registration for summarization requests
-    // Orchestrator (higher) registers with ContextSizeManager (lower)
-    void RegisterSummarizationCallback(std::function<void(const std::string&, const std::string&)> callback) {
-        std::lock_guard<std::mutex> lock(stats_mutex);
-        summarization_callback = std::move(callback);
-        LOG_ContextSizeManager("Summarization callback registered");
     }
     
     // Configuration
@@ -405,23 +394,15 @@ private:
     }
     
     bool RequestSummarization(const std::string& context_id) {
-        if (!summarization_callback) {
-            LOG_WARNING_ContextSizeManager("Summarization requested but no callback registered");
-            return false;
-        }
+        LOG_ContextSizeManager("Summarization request noted for context: " + context_id + 
+                              " (handled by plugin system, not via callbacks)");
+        
+        // Note: In the new architecture, summarization is handled by plugins
+        // that poll the global pruning buffer. This method is kept for compatibility
+        // but does not trigger actual summarization via callbacks.
         
         current_state = PruningState::SUMMARIZING;
         summarization_requests++;
-        
-        // Request summarization of message history
-        std::string content_to_summarize;
-        {
-            std::lock_guard<std::mutex> lock(stats_mutex);
-            content_to_summarize = "message_history"; // This would be the actual content in real implementation
-        }
-        
-        LOG_ContextSizeManager("Requesting summarization for context: " + context_id);
-        summarization_callback(context_id, content_to_summarize);
         
         return true;
     }

@@ -848,14 +848,6 @@ void LuminaChatFrame::RegisterCallbacks() {
         });
     }
     
-    if (context_size_manager && orchestrator) {
-        context_size_manager->RegisterSummarizationCallback([this](const std::string& context_id, const std::string& content) {
-            if (orchestrator) {
-                orchestrator->RequestSummarization(context_id, content);
-            }
-        });
-    }
-    
     // Note: UI now uses direct async streaming instead of Orchestrator callbacks
     // This eliminates the synchronous callback tech debt
 }

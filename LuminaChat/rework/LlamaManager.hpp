@@ -437,14 +437,6 @@ inline ContextInfo* LlamaManager::GetOrCreateContextInfo(const std::string& cont
         // Create ContextInfo - it will use default template if template_content is empty
         auto context_info = std::make_unique<ContextInfo>(context_id, model_info, template_content);
         
-        // Register summarization callback if we have resource callback
-        if (resource_callback) {
-            context_info->RegisterSummarizationCallback([this](const std::string& ctx_id, const std::string& content) {
-                NotifyResourceEvent("SUMMARIZATION_REQUEST", "Context " + ctx_id + " requests summarization");
-                // Here you would typically forward to Orchestrator
-            });
-        }
-        
         ContextInfo* context_ptr = context_info.get();
         contexts[context_id] = std::move(context_info);
         
