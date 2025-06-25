@@ -16,12 +16,6 @@
 // - Thread-safe operations
 // - Template caching for performance
 
-#define LOG_TokenCache(message) \
-    GetLogger().LogMessage(Logger::LogLevel::INFO, "TokenCache", message)
-
-#define LOG_DEBUG_TokenCache(message) \
-    GetLogger().LogMessage(Logger::LogLevel::DEBUG, "TokenCache", message)
-
 struct CacheStats {
     std::atomic<size_t> text_to_token_hits{0};
     std::atomic<size_t> text_to_token_misses{0};

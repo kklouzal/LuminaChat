@@ -13,6 +13,7 @@
 #include <fstream>
 #include <thread>
 #include <chrono>
+#include <filesystem>
 
 namespace Phase1Tests {
 
@@ -45,8 +46,17 @@ void TestLogger() {
 void TestSettingsManager() {
     std::cout << "=== Testing SettingsManager ===" << std::endl;
     
+    // Get executable path for proper file location
+    std::string exe_path = std::filesystem::current_path().string();
+    std::string settings_file = exe_path + "\\test_settings_debug.ini";
+    
     // Create test settings file
-    std::ofstream test_ini("test_settings.ini");
+    std::cout << "Creating test settings file at: " << settings_file << std::endl;
+    std::ofstream test_ini(settings_file);
+    if (!test_ini.is_open()) {
+        std::cout << "ERROR: Failed to create test file at: " << settings_file << std::endl;
+        assert(false);
+    }
     test_ini << "[Model]\n";
     test_ini << "main_model_path=./models/main.gguf\n";
     test_ini << "summary_model_path=./models/summary.gguf\n";
@@ -56,26 +66,47 @@ void TestSettingsManager() {
     test_ini << "bot_token=test_token_123\n";
     test_ini << "auto_respond=true\n";
     test_ini << "\n[Templates]\n";
-    test_ini << "main_template=llama3_chat\n";
-    test_ini << "summary_template=llama3_summary\n";
+    test_ini << "main_template=llama3_chat\n";    test_ini << "summary_template=llama3_summary\n";
     test_ini.close();
+    std::cout << "Test file created successfully." << std::endl;
     
     SettingsManager settings;
-    assert(settings.LoadSettings("test_settings.ini"));
+      std::cout << "Loading settings file..." << std::endl;
+    bool load_result = settings.LoadSettings(settings_file);
+    std::cout << "LoadSettings result: " << (load_result ? "SUCCESS" : "FAILED") << std::endl;
+    assert(load_result);
     
     // Test string values
-    assert(settings.GetString("Model", "main_model_path") == "./models/main.gguf");
-    assert(settings.GetString("Discord", "bot_token") == "test_token_123");
+    std::cout << "Testing string values..." << std::endl;
+    std::string main_model = settings.GetString("Model", "main_model_path");
+    std::cout << "main_model_path: '" << main_model << "'" << std::endl;
+    assert(main_model == "./models/main.gguf");
+    
+    std::string bot_token = settings.GetString("Discord", "bot_token");
+    std::cout << "bot_token: '" << bot_token << "'" << std::endl;
+    assert(bot_token == "test_token_123");
     
     // Test int values
-    assert(settings.GetInt("Model", "context_size") == 8192);
-    assert(settings.GetInt("Model", "gpu_layers") == 35);
+    std::cout << "Testing int values..." << std::endl;
+    int context_size = settings.GetInt("Model", "context_size");
+    std::cout << "context_size: " << context_size << std::endl;
+    assert(context_size == 8192);
+    
+    int gpu_layers = settings.GetInt("Model", "gpu_layers");
+    std::cout << "gpu_layers: " << gpu_layers << std::endl;
+    assert(gpu_layers == 35);
     
     // Test bool values
-    assert(settings.GetBool("Discord", "auto_respond") == true);
+    std::cout << "Testing bool values..." << std::endl;
+    bool auto_respond = settings.GetBool("Discord", "auto_respond");
+    std::cout << "auto_respond: " << (auto_respond ? "true" : "false") << std::endl;
+    assert(auto_respond == true);
     
     // Test template configuration
-    assert(settings.GetString("Templates", "main_template") == "llama3_chat");
+    std::cout << "Testing template values..." << std::endl;
+    std::string main_template = settings.GetString("Templates", "main_template");
+    std::cout << "main_template: '" << main_template << "'" << std::endl;
+    assert(main_template == "llama3_chat");
     
     // Test setting new values
     settings.SetString("Test", "new_value", "hello world");

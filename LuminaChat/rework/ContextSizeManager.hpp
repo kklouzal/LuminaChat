@@ -13,15 +13,6 @@
 // - Plugin Integration: Requests summarization via Orchestrator callback
 // - Template Integration: Works with ChatTemplateManager for context size calculations
 
-#define LOG_ContextSizeManager(message) \
-    GetLogger().LogMessage(Logger::LogLevel::INFO, "ContextSizeManager", message)
-
-#define LOG_DEBUG_ContextSizeManager(message) \
-    GetLogger().LogMessage(Logger::LogLevel::DEBUG, "ContextSizeManager", message)
-
-#define LOG_WARNING_ContextSizeManager(message) \
-    GetLogger().LogMessage(Logger::LogLevel::WARNING, "ContextSizeManager", message)
-
 // Forward declaration for Logger
 class Logger;
 Logger& GetLogger();

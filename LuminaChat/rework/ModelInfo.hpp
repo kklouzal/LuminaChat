@@ -16,15 +16,6 @@
 // - Settings integration for model paths and parameters
 // - Optional resource monitoring callbacks
 
-#define LOG_ModelInfo(message) \
-    GetLogger().LogMessage(Logger::LogLevel::INFO, "ModelInfo", message)
-
-#define LOG_DEBUG_ModelInfo(message) \
-    GetLogger().LogMessage(Logger::LogLevel::DEBUG, "ModelInfo", message)
-
-#define LOG_ERROR_ModelInfo(message) \
-    GetLogger().LogMessage(Logger::LogLevel::ERROR, "ModelInfo", message)
-
 // Forward declarations
 struct llama_model;
 struct llama_context;
@@ -81,21 +72,12 @@ struct ModelConfig {
         settings.SetFloat("Models", model_prefix + "_rope_freq_base", rope_freq_base);
         settings.SetFloat("Models", model_prefix + "_rope_freq_scale", rope_freq_scale);
     }
-    
-    bool IsValid() const {
+      bool IsValid() const {
         return !model_path.empty() && context_size > 0;
     }
 };
 
-// Forward declaration of IModelInfo
-class IModelInfo {
-public:
-    virtual ~IModelInfo() = default;
-    virtual TokenCache& GetTokenCache() = 0;
-    virtual const TokenCache& GetTokenCache() const = 0;
-};
-
-class ModelInfo : public IModelInfo {
+class ModelInfo {
 private:
     // Core components
     std::unique_ptr<TokenCache> token_cache;
@@ -296,13 +278,12 @@ public:
         NotifyResourceEvent(ResourceEvent::CLEANUP_COMPLETED, "Model cleanup completed");
         LOG_ModelInfo("Cleanup completed for model: " + model_id);
     }
-    
-    // IModelInfo interface implementation
-    TokenCache& GetTokenCache() override {
+      // TokenCache interface
+    TokenCache& GetTokenCache() {
         return *token_cache;
     }
     
-    const TokenCache& GetTokenCache() const override {
+    const TokenCache& GetTokenCache() const {
         return *token_cache;
     }
     

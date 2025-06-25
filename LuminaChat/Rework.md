@@ -772,8 +772,10 @@ void CompleteSummarization(const std::string& context_id, const std::string& sum
 ### Phase 7: Orchestration Layer
 -A Implement Orchestrator with plugin management
 -B Integrate Sanitizer for Discord input filtering
--C Full system integration with wxWidgets UI and Discord
--D Add scheduled task foundation
+-C Add scheduled task foundation
+
+### Phase 8: Orchestration Layer
+-A Full system integration with wxWidgets UI and Discord
 
 This phased approach ensures working functionality is maintained throughout the rewrite process, with special attention to template system integration and validation at each stage.
 

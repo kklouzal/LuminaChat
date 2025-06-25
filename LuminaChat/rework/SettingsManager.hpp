@@ -50,37 +50,41 @@ public:
     bool LoadSettings(const std::string& ini_path) {
         std::lock_guard<std::mutex> lock(settings_mutex);
         
-        ini_file_path = ini_path;
-        sections.clear();
-
+        LOG_SettingsManager("Attempting to load settings from: " + ini_path);
+        
         std::ifstream file(ini_path);
         if (!file.is_open()) {
-            LOG_SettingsManager("Creating new settings file: " + ini_path);
-            // Create default settings
-            SetDefaults();
-            return SaveSettings();
+            LOG_ERROR_SettingsManager("Failed to open settings file: " + ini_path);
+            return false;
         }
 
+        LOG_SettingsManager("File opened successfully, clearing existing sections");
+        sections.clear();
+        ini_file_path = ini_path;
+        
         std::string line;
-        std::string current_section;
-        int line_number = 0;
-
+        std::string current_section = "";
+        int line_count = 0;
+        
         while (std::getline(file, line)) {
-            line_number++;
+            line_count++;
             line = Trim(line);
-
+            
+            LOG_SettingsManager("Processing line " + std::to_string(line_count) + ": '" + line + "'");
+            
             // Skip empty lines and comments
             if (line.empty() || line[0] == ';' || line[0] == '#') {
                 continue;
             }
-
+            
             // Section headers
-            if (line[0] == '[' && line.back() == ']') {
+            if (line.front() == '[' && line.back() == ']') {
                 current_section = line.substr(1, line.length() - 2);
                 sections[current_section] = Section{};
+                LOG_SettingsManager("Found section: [" + current_section + "]");
                 continue;
             }
-
+            
             // Key-value pairs
             size_t equals_pos = line.find('=');
             if (equals_pos != std::string::npos && !current_section.empty()) {
@@ -93,12 +97,13 @@ public:
                 }
                 
                 sections[current_section].keys[key] = value;
+                LOG_SettingsManager("Set [" + current_section + "]." + key + " = '" + value + "'");
             }
         }
 
         file.close();
         settings_dirty = false;
-        LOG_SettingsManager("Loaded settings from: " + ini_path);
+        LOG_SettingsManager("Successfully loaded " + std::to_string(line_count) + " lines from: " + ini_path);
         return true;
     }
 

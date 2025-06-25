@@ -25,36 +25,13 @@
 // - Smart context rebuilding
 // - Plugin Integration: Template-based summarization and context management
 
-#define LOG_ContextInfo(message) \
-    do { \
-        GetLogger().LogMessage(Logger::LogLevel::INFO, "ContextInfo", message); \
-    } while(0)
-
-#define LOG_DEBUG_ContextInfo(message) \
-    do { \
-        GetLogger().LogMessage(Logger::LogLevel::DEBUG, "ContextInfo", message); \
-    } while(0)
-
-#define LOG_ERROR_ContextInfo(message) \
-    do { \
-        GetLogger().LogMessage(Logger::LogLevel::ERROR, "ContextInfo", message); \
-    } while(0)
-
 // Forward declarations
 struct llama_context;
 
 // Helper function declarations
 std::string GenerateContextId();
 
-// Abstract interface for model info to support testing
-class IModelInfo {
-public:
-    virtual ~IModelInfo() = default;
-    virtual TokenCache& GetTokenCache() = 0;
-    virtual const TokenCache& GetTokenCache() const = 0;
-};
-
-// Forward declaration for real ModelInfo
+// Forward declaration for ModelInfo
 class ModelInfo;
 
 enum class RebuildStrategy {
@@ -121,10 +98,9 @@ struct ContextStats {
  * - Per-Context Flexibility: Each context can have completely different template evolution
  */
 class ContextInfo {
-private:
-    // Core components
+private:    // Core components
     std::unique_ptr<ChatTemplateManager> template_manager;
-    IModelInfo* parent_model;
+    ModelInfo* parent_model;
     TokenCache* token_cache;
     
     // Context state
@@ -151,10 +127,9 @@ private:
     void RequestSummarization(const std::string& content);
     void UpdateStats();
     
-public:
-    // Constructor overloads
-    ContextInfo(const std::string& context_id, IModelInfo* model, const std::string& base_template);
-    ContextInfo(IModelInfo* model, const std::string& base_template); // For testing with auto-generated context_id
+public:    // Constructor overloads
+    ContextInfo(const std::string& context_id, ModelInfo* model, const std::string& base_template);
+    ContextInfo(ModelInfo* model, const std::string& base_template); // For testing with auto-generated context_id
     
     // Destructor
     ~ContextInfo();
@@ -287,7 +262,7 @@ namespace ContextUtils {
 }
 
 // Inline implementation of ContextInfo methods
-inline ContextInfo::ContextInfo(const std::string& context_id, IModelInfo* model, const std::string& base_template)
+inline ContextInfo::ContextInfo(const std::string& context_id, ModelInfo* model, const std::string& base_template)
     : context_id(context_id)
     , parent_model(model)
     , token_cache(model ? &model->GetTokenCache() : nullptr)
@@ -322,7 +297,7 @@ inline ContextInfo::ContextInfo(const std::string& context_id, IModelInfo* model
     UpdateStats();
 }
 
-inline ContextInfo::ContextInfo(IModelInfo* model, const std::string& base_template)
+inline ContextInfo::ContextInfo(ModelInfo* model, const std::string& base_template)
     : ContextInfo(GenerateContextId(), model, base_template) // Auto-generate context_id
 {
     LOG_DEBUG_ContextInfo("ContextInfo created with auto-generated ID: " + context_id);
