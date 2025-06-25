@@ -15,6 +15,10 @@
 #include <sstream>
 #include <algorithm>
 #include <iomanip>
+#include <thread>
+#include <atomic>
+#include <future>
+#include <condition_variable>
 
 // ContextInfo: Individual conversation context management
 // 
@@ -45,8 +49,24 @@ enum class RebuildStrategy {
 enum class ContextState {
     READY,
     PROCESSING,
+    GENERATING,        // New state for async generation
     AWAITING_SUMMARIZATION,
     ERROR_STATE
+};
+
+// Callback types for streaming generation
+using TokenCallback = std::function<void(const std::string& token_text)>;
+using GenerationCompleteCallback = std::function<void(const std::string& full_response, bool success)>;
+using GenerationErrorCallback = std::function<void(const std::string& error_message)>;
+
+struct GenerationCallbacks {
+    TokenCallback on_token;
+    GenerationCompleteCallback on_complete;
+    GenerationErrorCallback on_error;
+    
+    GenerationCallbacks() = default;
+    GenerationCallbacks(TokenCallback token_cb, GenerationCompleteCallback complete_cb, GenerationErrorCallback error_cb = nullptr)
+        : on_token(std::move(token_cb)), on_complete(std::move(complete_cb)), on_error(std::move(error_cb)) {}
 };
 
 struct ContextStats {
@@ -125,6 +145,10 @@ private:    // Core components
     // Generation state
     std::atomic<bool> is_generating{false};
     std::atomic<bool> should_stop_generation{false};
+    std::unique_ptr<std::thread> generation_thread;
+    std::condition_variable generation_cv;
+    std::mutex generation_mutex;
+    GenerationCallbacks current_callbacks;
     
     // Callback for summarization requests
     std::function<void(std::string, std::string)> summarization_callback;
@@ -137,20 +161,30 @@ private:    // Core components
     void UpdateStats();
     
 public:    // Constructor overloads
-    ContextInfo(const std::string& context_id, ModelInfo* model, const std::string& base_template);
-    ContextInfo(ModelInfo* model, const std::string& base_template); // For testing with auto-generated context_id
+    ContextInfo(const std::string& context_id, ModelInfo* model, const std::string& base_template = "");
+    ContextInfo(ModelInfo* model, const std::string& base_template = ""); // For testing with auto-generated context_id
+    
+    // Factory method for default template
+    static std::unique_ptr<ContextInfo> CreateWithDefaultTemplate(const std::string& context_id, ModelInfo* model);
+    static std::unique_ptr<ContextInfo> CreateWithDefaultTemplate(ModelInfo* model); // Auto-generated ID
     
     // Destructor
     ~ContextInfo();
     
     // Core processing interface
-    std::string HandleInput(const std::string& input, const std::string& username = "user");
+    std::string HandleInput(const std::string& input, const std::string& username = "user"); // DEPRECATED for UI: Use HandleInputAsync instead
+    bool HandleInputAsync(const std::string& input, const GenerationCallbacks& callbacks, const std::string& username = "user");
     void AddHistoricalMessage(const std::string& role, const std::string& content);
+    
+    // Generation control
+    void StopGeneration();
+    bool IsGenerating() const { return is_generating.load(); }
     
     // Llama.cpp integration methods
     bool InitializeLlamaContext();
     bool ProcessTokensBatch(const std::vector<int32_t>& tokens);
     std::string GenerateResponse(const std::string& prompt);
+    void StartGenerationAsync(const std::string& prompt, const GenerationCallbacks& callbacks);
     
     // Template section management - direct access to ChatTemplateManager
     void UpdateEnvironment(const std::string& env);
@@ -285,7 +319,8 @@ inline ContextInfo::ContextInfo(const std::string& context_id, ModelInfo* model,
     , parent_model(model)
     , token_cache(model ? &model->GetTokenCache() : nullptr)
     , state(ContextState::READY)
-    , template_manager(std::make_unique<ChatTemplateManager>(base_template))
+    , template_manager(std::make_unique<ChatTemplateManager>(
+        base_template.empty() ? ChatTemplateManager::GetDefaultTemplate() : base_template))
     , llama_ctx(nullptr)
     , context_needs_rebuild(true)
 {
@@ -322,12 +357,18 @@ inline ContextInfo::ContextInfo(ModelInfo* model, const std::string& base_templa
 }
 
 inline ContextInfo::~ContextInfo() {
+    // Stop any ongoing generation first
+    should_stop_generation = true;
+    
+    // Wait for generation thread to complete
+    if (generation_thread && generation_thread->joinable()) {
+        generation_cv.notify_all();  // Wake up the generation thread
+        generation_thread->join();
+    }
+    
     std::lock_guard<std::mutex> lock(context_mutex);
     
     LOG_DEBUG_ContextInfo("ContextInfo destructor called for: " + context_id);
-    
-    // Stop any ongoing generation
-    should_stop_generation = true;
     
     // Clean up batch
     if (batch_initialized) {
@@ -411,6 +452,9 @@ inline bool ContextInfo::InitializeLlamaContext() {
 }
 
 inline std::string ContextInfo::HandleInput(const std::string& input, const std::string& username) {
+    // DEPRECATED FOR UI CONTEXTS: This method blocks and should only be used for non-UI contexts
+    // like Discord bot responses or batch processing. For UI contexts, use HandleInputAsync instead.
+    
     std::lock_guard<std::mutex> lock(context_mutex);
     
     if (state == ContextState::ERROR_STATE) {
@@ -877,4 +921,259 @@ inline std::string GenerateContextId() {
     auto now = std::chrono::system_clock::now();
     auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     return "ctx_" + std::to_string(timestamp) + "_" + std::to_string(counter++);
+}
+
+// Factory methods for creating contexts with default template
+inline std::unique_ptr<ContextInfo> ContextInfo::CreateWithDefaultTemplate(const std::string& context_id, ModelInfo* model) {
+    return std::make_unique<ContextInfo>(context_id, model, ""); // Empty string triggers default template
+}
+
+inline std::unique_ptr<ContextInfo> ContextInfo::CreateWithDefaultTemplate(ModelInfo* model) {
+    return std::make_unique<ContextInfo>(model, ""); // Empty string triggers default template
+}
+
+inline bool ContextInfo::HandleInputAsync(const std::string& input, const GenerationCallbacks& callbacks, const std::string& username) {
+    // Check if already generating
+    if (is_generating.load()) {
+        if (callbacks.on_error) {
+            callbacks.on_error("Generation already in progress");
+        }
+        return false;
+    }
+    
+    std::lock_guard<std::mutex> lock(context_mutex);
+    
+    try {
+        state = ContextState::PROCESSING;
+        
+        // 1. Add user message to history
+        message_history.emplace_back(username, input);
+        context_needs_rebuild = true;
+        
+        LOG_DEBUG_ContextInfo("Processing async input: " + username + " -> " + 
+                             input.substr(0, 50) + (input.length() > 50 ? "..." : ""));
+        
+        // 2. Check if context needs rebuilding after adding message
+        if (context_needs_rebuild || template_manager->IsTemplateDirty()) {
+            if (!RebuildContext(RebuildStrategy::FULL)) {
+                state = ContextState::ERROR_STATE;
+                if (callbacks.on_error) {
+                    callbacks.on_error("Failed to rebuild context");
+                }
+                return false;
+            }
+        }
+        
+        // 3. Render dynamic template with current message history
+        std::string full_prompt = BuildFullPrompt();
+        
+        // 4. Check context size - trigger summarization if needed
+        std::vector<int32_t> prompt_tokens = TokenizePrompt(full_prompt);
+        if (IsNearContextLimit(0.8f)) {
+            LOG_ContextInfo("Context approaching limit, requesting summarization");
+            
+            // Extract content for summarization (recent conversation)
+            std::ostringstream content_stream;
+            size_t start_idx = message_history.size() > 20 ? message_history.size() - 20 : 0;
+            for (size_t i = start_idx; i < message_history.size(); ++i) {
+                content_stream << message_history[i].first << ": " << message_history[i].second << "\n";
+            }
+            
+            RequestSummarization(content_stream.str());
+            state = ContextState::AWAITING_SUMMARIZATION;
+            if (callbacks.on_complete) {
+                callbacks.on_complete("Context full - summarizing recent conversation...", true);
+            }
+            return true;
+        }
+        
+        // 5. Start async generation
+        state = ContextState::GENERATING;
+        current_callbacks = callbacks;
+        StartGenerationAsync(full_prompt, callbacks);
+        
+        return true;
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR_ContextInfo("Exception in HandleInputAsync: " + std::string(e.what()));
+        state = ContextState::ERROR_STATE;
+        if (callbacks.on_error) {
+            callbacks.on_error("Exception: " + std::string(e.what()));
+        }
+        return false;
+    }
+}
+
+inline void ContextInfo::StopGeneration() {
+    should_stop_generation = true;
+    
+    // Notify generation thread to wake up and check the stop flag
+    {
+        std::lock_guard<std::mutex> lock(generation_mutex);
+        generation_cv.notify_all();
+    }
+    
+    // Wait for generation thread to complete
+    if (generation_thread && generation_thread->joinable()) {
+        generation_thread->join();
+        generation_thread.reset();
+    }
+    
+    std::lock_guard<std::mutex> lock(context_mutex);
+    if (state == ContextState::GENERATING) {
+        state = ContextState::READY;
+        is_generating = false;
+        LOG_DEBUG_ContextInfo("Generation stopped for context: " + context_id);
+    }
+}
+
+inline void ContextInfo::StartGenerationAsync(const std::string& prompt, const GenerationCallbacks& callbacks) {
+    // Stop any existing generation first
+    if (generation_thread && generation_thread->joinable()) {
+        should_stop_generation = true;
+        generation_cv.notify_all();
+        generation_thread->join();
+    }
+    
+    // Reset generation state
+    should_stop_generation = false;
+    is_generating = true;
+    
+    // Start new generation thread
+    generation_thread = std::make_unique<std::thread>([this, prompt, callbacks]() {
+        std::string full_response;
+        bool success = false;
+        
+        try {
+            // Note: We cannot hold context_mutex for the entire duration as it would block other operations
+            // We need to carefully manage locking for thread safety
+            
+            {
+                std::lock_guard<std::mutex> lock(context_mutex);
+                
+                if (!InitializeLlamaContext()) {
+                    LOG_ERROR_ContextInfo("Failed to initialize context for async generation");
+                    if (callbacks.on_error) {
+                        callbacks.on_error("Context initialization failed");
+                    }
+                    is_generating = false;
+                    state = ContextState::ERROR_STATE;
+                    return;
+                }
+                
+                // Tokenize the prompt
+                std::vector<int32_t> prompt_tokens = TokenizePrompt(prompt);
+                
+                // Process prompt tokens
+                if (!ProcessTokensBatch(prompt_tokens)) {
+                    if (callbacks.on_error) {
+                        callbacks.on_error("Failed to process prompt");
+                    }
+                    is_generating = false;
+                    state = ContextState::ERROR_STATE;
+                    return;
+                }
+            }
+            
+            // Generate response tokens with streaming
+            std::vector<int32_t> response_tokens;
+            const int max_new_tokens = 512;
+            
+            for (int i = 0; i < max_new_tokens && !should_stop_generation.load(); ++i) {
+                std::lock_guard<std::mutex> lock(context_mutex);
+                
+                // Get logits for next token
+                float* logits = llama_get_logits_ith(llama_ctx, batch.n_tokens - 1);
+                if (!logits) {
+                    break;
+                }
+                
+                // Simple greedy sampling (take highest probability token)
+                const llama_vocab* vocab = parent_model->GetVocab();
+                int32_t vocab_size = llama_vocab_n_tokens(vocab);
+                llama_token next_token = 0;
+                float max_logit = logits[0];
+                
+                for (int32_t j = 1; j < vocab_size; ++j) {
+                    if (logits[j] > max_logit) {
+                        max_logit = logits[j];
+                        next_token = j;
+                    }
+                }
+                
+                // Check for EOS token
+                if (next_token == llama_vocab_eos(vocab)) {
+                    break;
+                }
+                
+                response_tokens.push_back(next_token);
+                
+                // Convert this token to text and stream it
+                std::vector<int32_t> single_token = {next_token};
+                std::string token_text = DetokenizeResponse(single_token);
+                
+                // Call the streaming callback with the new token
+                if (callbacks.on_token && !token_text.empty()) {
+                    callbacks.on_token(token_text);
+                }
+                
+                full_response += token_text;
+                
+                // Process the generated token for next iteration
+                clear_batch();
+                
+                // Add token to batch manually (proper API)
+                batch.token[0] = next_token;
+                batch.pos[0] = n_past;
+                batch.n_seq_id[0] = 1;  // Single sequence
+                batch.seq_id[0][0] = 0; // Sequence ID 0
+                batch.logits[0] = true; // Generate logits for next token
+                batch.n_tokens = 1;
+                
+                if (llama_decode(llama_ctx, batch) != 0) {
+                    LOG_ERROR_ContextInfo("Failed to decode generated token");
+                    break;
+                }
+                
+                n_past++;
+                
+                // Small delay to prevent overwhelming the UI
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            
+            success = !should_stop_generation.load();
+            
+            // Add assistant response to message history
+            {
+                std::lock_guard<std::mutex> lock(context_mutex);
+                if (success && !full_response.empty()) {
+                    message_history.emplace_back("assistant", full_response);
+                    UpdateStats();
+                }
+                
+                state = ContextState::READY;
+                is_generating = false;
+            }
+            
+            LOG_DEBUG_ContextInfo("Async generation completed: " + std::to_string(response_tokens.size()) + 
+                                 " tokens -> " + full_response.substr(0, 100) + 
+                                 (full_response.length() > 100 ? "..." : ""));
+            
+        } catch (const std::exception& e) {
+            std::lock_guard<std::mutex> lock(context_mutex);
+            is_generating = false;
+            state = ContextState::ERROR_STATE;
+            LOG_ERROR_ContextInfo("Exception during async generation: " + std::string(e.what()));
+            
+            if (callbacks.on_error) {
+                callbacks.on_error("Exception: " + std::string(e.what()));
+            }
+            return;
+        }
+        
+        // Call completion callback
+        if (callbacks.on_complete) {
+            callbacks.on_complete(full_response, success);
+        }
+    });
 }

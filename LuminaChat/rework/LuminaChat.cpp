@@ -31,6 +31,7 @@
 #include <wx/slider.h>
 #include <wx/gauge.h>
 #include <wx/filedlg.h>
+#include <wx/event.h>
 
 // Include rework components in strict dependency order
 #include "Logger.hpp"
@@ -65,6 +66,7 @@ public:
     void OnExit(wxCommandEvent& event);
     void OnAbout(wxCommandEvent& event);
     void OnSendMessage(wxCommandEvent& event);
+    void OnStopGeneration(wxCommandEvent& event);
     void OnLoadModel(wxCommandEvent& event);
     void OnConnectDiscord(wxCommandEvent& event);
     void OnTimer(wxTimerEvent& event);
@@ -82,7 +84,6 @@ public:
     void LoadDefaultModels();
     
     // Callback handlers (registered with lower-level components)
-    void OnOrchestratorOutput(std::string_view output, InputSource source);
     void OnLogMessage(std::string_view log_message);
 
 private:
@@ -94,6 +95,7 @@ private:
     wxRichTextCtrl* chat_display;
     wxTextCtrl* chat_input;
     wxButton* send_button;
+    wxButton* stop_button;
     wxButton* clear_button;
     
     // Settings Panel
@@ -142,6 +144,11 @@ private:
     std::string current_context_id{"main_chat"};
     std::string current_model_id{"main_model"};
     
+    // Streaming state management
+    std::atomic<bool> is_streaming{false};
+    std::string current_assistant_message;
+    long assistant_message_start_pos = -1;
+    
     // UI creation methods
     void CreateChatPanel();
     void CreateSettingsPanel();
@@ -152,6 +159,10 @@ private:
     void UpdateUI();
     void UpdateModelProgress(int progress);
     void AddChatMessage(const std::string& sender, const std::string& message, const wxColour& color = wxNullColour);
+    void StartStreamingMessage(const std::string& sender, const wxColour& color = wxNullColour);
+    void AppendToStreamingMessage(const std::string& text);
+    void EndStreamingMessage();
+    void SetGenerationUIState(bool generating);  // Enable/disable UI during generation
     void AddLogMessage(const std::string& message);
     
     DECLARE_EVENT_TABLE()
@@ -160,6 +171,7 @@ private:
 // Event IDs
 enum {
     ID_Send = 1000,
+    ID_Stop,
     ID_LoadModel,
     ID_ConnectDiscord,
     ID_Timer,
@@ -173,6 +185,7 @@ wxBEGIN_EVENT_TABLE(LuminaChatFrame, wxFrame)
     EVT_MENU(wxID_EXIT, LuminaChatFrame::OnExit)
     EVT_MENU(wxID_ABOUT, LuminaChatFrame::OnAbout)
     EVT_BUTTON(ID_Send, LuminaChatFrame::OnSendMessage)
+    EVT_BUTTON(ID_Stop, LuminaChatFrame::OnStopGeneration)
     EVT_BUTTON(ID_LoadModel, LuminaChatFrame::OnLoadModel)
     EVT_BUTTON(ID_ConnectDiscord, LuminaChatFrame::OnConnectDiscord)
     EVT_BUTTON(ID_BrowseModel, LuminaChatFrame::OnLoadModel)
@@ -256,11 +269,14 @@ void LuminaChatFrame::CreateChatPanel() {
     
     // Control buttons
     send_button = new wxButton(chat_panel, ID_Send, "Send");
+    stop_button = new wxButton(chat_panel, ID_Stop, "Stop");
+    stop_button->Enable(false);  // Initially disabled
     clear_button = new wxButton(chat_panel, ID_ClearChat, "Clear");
     
     // Layout
     wxBoxSizer* button_sizer = new wxBoxSizer(wxHORIZONTAL);
     button_sizer->Add(send_button, 0, wxALL, 5);
+    button_sizer->Add(stop_button, 0, wxALL, 5);
     button_sizer->Add(clear_button, 0, wxALL, 5);
     button_sizer->AddStretchSpacer();
     
@@ -492,32 +508,6 @@ void LuminaChatFrame::Stop() {
 }
 
 // Callback implementations
-void LuminaChatFrame::OnOrchestratorOutput(std::string_view output, InputSource source) {
-    wxString source_name;
-    wxColour color;
-    
-    switch (source) {
-        case InputSource::UI:
-            source_name = "Assistant";
-            color = wxColour(0, 100, 200);
-            break;
-        case InputSource::DISCORD:
-            source_name = "Discord Bot";
-            color = wxColour(114, 137, 218);
-            break;
-        case InputSource::SYSTEM:
-            source_name = "System";
-            color = wxColour(200, 100, 0);
-            break;
-        case InputSource::SCHEDULED_TASK:
-            source_name = "Scheduled";
-            color = wxColour(100, 200, 100);
-            break;
-    }
-    
-    AddChatMessage(source_name.ToStdString(), std::string(output), color);
-}
-
 void LuminaChatFrame::OnLogMessage(std::string_view log_message) {
     AddLogMessage(std::string(log_message));
 }
@@ -606,17 +596,22 @@ void LuminaChatFrame::UpdateUI() {
     }
 }
 
+void LuminaChatFrame::SetGenerationUIState(bool generating) {
+    send_button->Enable(!generating && model_loaded && running);
+    stop_button->Enable(generating);
+    chat_input->Enable(!generating);
+    
+    if (generating) {
+        send_button->SetLabel("Generating...");
+        SetStatusText("Generating response...", 0);
+    } else {
+        send_button->SetLabel("Send");
+        SetStatusText("System Ready - llama.cpp Integrated", 0);
+    }
+}
+
 // Helper methods for initialization
 void LuminaChatFrame::RegisterCallbacks() {
-    // UI Output callbacks - LuminaChat (higher) registers with lower components
-    if (orchestrator) {
-        orchestrator->RegisterOutputCallback([this](std::string_view output, InputSource source) {
-            CallAfter([this, output_str = std::string(output), source]() {
-                OnOrchestratorOutput(output_str, source);
-            });
-        });
-    }
-    
     // Communication callbacks - Orchestrator (higher) registers with lower components
     if (discord_manager && orchestrator) {
         discord_manager->RegisterMessageCallback([this](const std::string& content, const std::string& channel_id, const std::string& username) {
@@ -633,6 +628,9 @@ void LuminaChatFrame::RegisterCallbacks() {
             }
         });
     }
+    
+    // Note: UI now uses direct async streaming instead of Orchestrator callbacks
+    // This eliminates the synchronous callback tech debt
 }
 
 void LuminaChatFrame::LoadDefaultModels() {
@@ -705,28 +703,75 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
         chat_input->Clear();
         AddChatMessage("You", input.ToStdString(), wxColour(50, 150, 50));
         
-        // Use orchestrator to route input (it will handle sanitization and context routing)
-        if (orchestrator) {
-            orchestrator->InputReceived(input.ToStdString(), current_context_id, InputSource::UI);
-        } else {
-            // Fallback: direct context interaction for testing
-            auto* context = llama_manager->GetContextInfo(current_context_id);
-            if (context) {
-                AddLogMessage("Processing message with context: " + current_context_id);
-                std::string response = context->HandleInput(input.ToStdString(), "user");
-                if (!response.empty() && response.substr(0, 6) != "Error:") {
-                    AddChatMessage("Assistant", response, wxColour(50, 50, 150));
-                } else {
-                    AddLogMessage("Error generating response: " + response);
-                }
-            } else {
-                AddLogMessage("Error: Context not found: " + current_context_id);
+        // Get context and use async streaming for all UI output
+        auto* context = llama_manager->GetContextInfo(current_context_id);
+        if (!context) {
+            AddLogMessage("Error: Context not found: " + current_context_id);
+            AddChatMessage("System", "Error: Context not available", wxColour(150, 50, 50));
+            return;
+        }
+        
+        AddLogMessage("Processing message with context: " + current_context_id);
+        
+        // Create callbacks for streaming response
+        GenerationCallbacks callbacks(
+            // Token callback - called for each token as it's generated
+            [this](const std::string& token_text) {
+                // Update UI on main thread
+                this->CallAfter([this, token_text]() {
+                    AppendToStreamingMessage(token_text);
+                });
+            },
+            
+            // Completion callback - called when generation is done
+            [this](const std::string& full_response, bool success) {
+                this->CallAfter([this, full_response, success]() {
+                    EndStreamingMessage();
+                    SetGenerationUIState(false);  // Re-enable UI after generation
+                    if (success) {
+                        AddLogMessage("Response generation completed successfully");
+                    } else {
+                        AddLogMessage("Response generation was stopped or failed");
+                        if (full_response.empty()) {
+                            AddChatMessage("System", "Response generation was interrupted.", wxColour(150, 50, 50));
+                        }
+                    }
+                });
+            },
+            
+            // Error callback - called if there's an error
+            [this](const std::string& error_message) {
+                this->CallAfter([this, error_message]() {
+                    if (is_streaming) {
+                        EndStreamingMessage();
+                    }
+                    SetGenerationUIState(false);  // Re-enable UI on error
+                    AddLogMessage("Error generating response: " + error_message);
+                    AddChatMessage("System", "Error: " + error_message, wxColour(150, 50, 50));
+                });
             }
+        );
+        
+        // Start streaming message display
+        StartStreamingMessage("Assistant", wxColour(50, 50, 150));
+        SetGenerationUIState(true);  // Disable UI during generation
+        
+        // Start async generation
+        bool started = context->HandleInputAsync(input.ToStdString(), callbacks, "user");
+        if (!started) {
+            EndStreamingMessage();
+            SetGenerationUIState(false);  // Re-enable UI on failure
+            AddLogMessage("Failed to start async generation");
+            AddChatMessage("System", "Failed to start response generation", wxColour(150, 50, 50));
         }
         
     } catch (const std::exception& e) {
+        if (is_streaming) {
+            EndStreamingMessage();
+        }
+        SetGenerationUIState(false);  // Re-enable UI on exception
         AddLogMessage(wxString::Format("Error sending message: %s", e.what()).ToStdString());
-        wxMessageBox(wxString::Format("Error: %s", e.what()), "Send Error", wxOK | wxICON_ERROR);
+        AddChatMessage("System", wxString::Format("Error: %s", e.what()).ToStdString(), wxColour(150, 50, 50));
     }
 }
 
@@ -747,7 +792,8 @@ void LuminaChatFrame::OnLoadModel(wxCommandEvent& event) {
     // Handle load model
     wxString model_path = model_path_text->GetValue().Trim();
     if (model_path.IsEmpty()) {
-        wxMessageBox("Please select a model file first", "No Model Selected", wxOK | wxICON_WARNING);
+        AddLogMessage("Please select a model file first");
+        AddChatMessage("System", "Please select a model file first", wxColour(150, 100, 50));
         return;
     }
     
@@ -820,14 +866,13 @@ void LuminaChatFrame::OnLoadModel(wxCommandEvent& event) {
         } else {
             LOG_ERROR_LuminaChat("LlamaManager::LoadModel returned false - failure");
             AddLogMessage("ERROR: Failed to load model");
-            wxMessageBox("Failed to load model. Check the file path and try again.", "Model Load Error", wxOK | wxICON_ERROR);
+            AddChatMessage("System", "Failed to load model. Check the file path and try again.", wxColour(150, 50, 50));
         }
         
     } catch (const std::exception& e) {
         LOG_ERROR_LuminaChat(wxString::Format("Exception caught in OnLoadModel: %s", e.what()).ToStdString());
         AddLogMessage(wxString::Format("Error loading model: %s", e.what()).ToStdString());
-        wxMessageBox(wxString::Format("Failed to load model: %s", e.what()), 
-                     "Model Load Error", wxOK | wxICON_ERROR);
+        AddChatMessage("System", wxString::Format("Failed to load model: %s", e.what()).ToStdString(), wxColour(150, 50, 50));
         model_loaded = false;
     }
     
@@ -853,7 +898,8 @@ void LuminaChatFrame::OnConnectDiscord(wxCommandEvent& event) {
     
     wxString token = discord_token_text->GetValue().Trim();
     if (token.IsEmpty()) {
-        wxMessageBox("Please enter a Discord bot token first", "No Token", wxOK | wxICON_WARNING);
+        AddLogMessage("Please enter a Discord bot token first");
+        AddChatMessage("System", "Please enter a Discord bot token first", wxColour(150, 100, 50));
         return;
     }
     
@@ -893,8 +939,7 @@ void LuminaChatFrame::OnConnectDiscord(wxCommandEvent& event) {
         
     } catch (const std::exception& e) {
         AddLogMessage(wxString::Format("Error connecting to Discord: %s", e.what()).ToStdString());
-        wxMessageBox(wxString::Format("Failed to connect to Discord: %s", e.what()),
-                     "Discord Connection Error", wxOK | wxICON_ERROR);
+        AddChatMessage("System", wxString::Format("Failed to connect to Discord: %s", e.what()).ToStdString(), wxColour(150, 50, 50));
         discord_connected = false;
     }
     
@@ -921,4 +966,81 @@ void LuminaChatFrame::OnTimer(wxTimerEvent& event) {
 void LuminaChatFrame::OnClose(wxCloseEvent& event) {
     Stop();
     event.Skip();
+}
+
+void LuminaChatFrame::StartStreamingMessage(const std::string& sender, const wxColour& color) {
+    is_streaming = true;
+    current_assistant_message.clear();
+    
+    wxDateTime now = wxDateTime::Now();
+    
+    chat_display->BeginSuppressUndo();
+    chat_display->SetInsertionPointEnd();
+    
+    chat_display->BeginTextColour(wxColour(128, 128, 128));
+    chat_display->WriteText(wxString::Format("[%s] ", now.Format("%H:%M:%S")));
+    chat_display->EndTextColour();
+    
+    if (color.IsOk()) {
+        chat_display->BeginTextColour(color);
+    }
+    chat_display->BeginBold();
+    chat_display->WriteText(sender + ": ");
+    chat_display->EndBold();
+    if (color.IsOk()) {
+        chat_display->EndTextColour();
+    }
+    
+    // Store the position where the assistant message content starts
+    assistant_message_start_pos = chat_display->GetLastPosition();
+    
+    chat_display->EndSuppressUndo();
+}
+
+void LuminaChatFrame::AppendToStreamingMessage(const std::string& text) {
+    if (!is_streaming) {
+        return;
+    }
+    
+    current_assistant_message += text;
+    
+    chat_display->BeginSuppressUndo();
+    chat_display->SetInsertionPointEnd();
+    chat_display->WriteText(text);
+    chat_display->EndSuppressUndo();
+    chat_display->ScrollIntoView(chat_display->GetLastPosition(), WXK_DOWN);
+}
+
+void LuminaChatFrame::EndStreamingMessage() {
+    if (!is_streaming) {
+        return;
+    }
+    
+    is_streaming = false;
+    
+    chat_display->BeginSuppressUndo();
+    chat_display->SetInsertionPointEnd();
+    chat_display->WriteText("\n");
+    chat_display->EndSuppressUndo();
+    chat_display->ScrollIntoView(chat_display->GetLastPosition(), WXK_DOWN);
+    
+    current_assistant_message.clear();
+    assistant_message_start_pos = -1;
+}
+
+void LuminaChatFrame::OnStopGeneration(wxCommandEvent& event) {
+    if (!running || !llama_manager) {
+        return;
+    }
+    
+    AddLogMessage("Stopping generation...");
+    
+    // Get the current context and stop generation
+    auto* context = llama_manager->GetContextInfo(current_context_id);
+    if (context && context->IsGenerating()) {
+        context->StopGeneration();
+        AddLogMessage("Generation stop requested");
+    } else {
+        AddLogMessage("No active generation to stop");
+    }
 }

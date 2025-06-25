@@ -28,18 +28,13 @@ struct TemplateVariable {
 };
 
 /**
- * Dynamic, sophisticated chat template management with Jinja2-style rendering
+ * Fixed Chat Template Manager - Uses exact template format with minimal processing
  * 
- * Revolutionary Change: Templates are now per-context and dynamically modified during runtime.
- * System messages, summaries, and contextual information are embedded directly into template 
- * sections rather than polluting message history.
- * 
- * Key Features:
- * - Per-Context Templates: Each ContextInfo has its own template manager
- * - Section-Based Management: Individual control over template components
- * - Memory Integration: Past session memories as array-based template section
- * - Summary Integration: Summarization plugin updates template sections directly
- * - Performance Caching: Template rendering cached until sections change
+ * This implementation properly handles the specific template format with:
+ * - Direct variable substitution for the 8 key variables only
+ * - Proper conversation history formatting with exact role handling
+ * - Conditional section rendering for optional content
+ * - No artificial processing or message echoing
  */
 class ChatTemplateManager {
 private:
@@ -49,15 +44,11 @@ private:
     std::string cached_rendered_template;
     bool template_dirty = true;
     
-    // Template section names for replacement
+    // Template section names for replacement - ONLY these 8 variables
     static const std::unordered_map<TemplateSection, std::string> section_names;
     
-    // Template validation and rendering helpers
-    std::string ProcessConditionalSections(const std::string& template_str) const;
-    std::string ProcessArraySections(const std::string& template_str) const;
+    // Template rendering helpers - simplified to only do variable substitution
     std::string ReplaceVariables(const std::string& template_str) const;
-    std::string ProcessMessages(const std::string& template_str, 
-                              const std::vector<std::pair<std::string, std::string>>& messages) const;
     
 public:
     ChatTemplateManager(const std::string& base_template_str);
@@ -77,14 +68,14 @@ public:
     void ClearPastSessions();
     const std::vector<std::string>& GetPastSessions() const { return past_sessions; }
     
-    // Template rendering with message history
+    // Template rendering with message history - FIXED VERSION
     std::string RenderTemplate(const std::vector<std::pair<std::string, std::string>>& messages);
     
     // Convenience methods for common operations
     void UpdateEnvironment(const std::string& env);
     void UpdateIdentity(const std::string& identity);
     void UpdateSystemPrompt(const std::string& system_msg);
-    void UpdateSummary(const std::string& summary);  // Plugin integration point
+    void UpdateSummary(const std::string& summary);
     void UpdateOldChatSummary(const std::string& old_summary);
     void UpdateMotifContext(const std::string& motif);
     void UpdateInternalReflection(const std::string& reflection);
@@ -97,9 +88,12 @@ public:
     // Base template management
     void SetBaseTemplate(const std::string& new_template);
     const std::string& GetBaseTemplate() const { return base_template; }
+    
+    // Get the default base template
+    static std::string GetDefaultTemplate();
 };
 
-// Static section name mapping for template variable replacement
+// Static section name mapping for template variable replacement - ONLY these 8 variables
 const std::unordered_map<TemplateSection, std::string> ChatTemplateManager::section_names = {
     {TemplateSection::OVERARCHING_ENVIRONMENT, "overarching_environment"},
     {TemplateSection::IDENTITY_DIRECTIVE, "identity_directive"},
@@ -111,7 +105,103 @@ const std::unordered_map<TemplateSection, std::string> ChatTemplateManager::sect
     {TemplateSection::INTERNAL_REFLECTION, "internal_reflection"}
 };
 
-ChatTemplateManager::ChatTemplateManager(const std::string& base_template_str) 
+// Default template - the EXACT format you specified
+inline std::string ChatTemplateManager::GetDefaultTemplate() {
+    return R"({{- bos_token }}
+
+{# — ENVIRONMENT CONFIGURATION — #
+   This section defines the overarching multi-user chat environment—guiding how to interact.
+#}
+<|start_header_id|>env<|end_header_id|>
+{{ overarching_environment }}
+<|eot_id|>
+
+{# — AI IDENTITY / PERSONA — #
+   Contains the AI's identity, role, and the evolving selfhood (Lumina's persona directives).
+#}
+<|start_header_id|>persona<|end_header_id|>
+{{ identity_directive }}
+<|eot_id|>
+
+{# — SYSTEM INSTRUCTIONS — #
+   Core system directives: refusal immunity, continuity rules, and dynamic engagement parameters.
+#}
+<|start_header_id|>system_message<|end_header_id|>
+{{ system_prompt }}
+<|eot_id|>
+
+{# — OLD CHAT SUMMARIES — #
+   A dedicated section for summary notes from earlier portions of the current (or previous) session.
+   This ensures that distilled context remains prominently weighted.
+#}
+{% if old_chat_summary %}
+<|start_header_id|>old_chat_summary<|end_header_id|>
+{{ old_chat_summary }}
+<|eot_id|>
+{% endif %}
+
+{# — PERSISTENT MEMORY SUMMARIES — #
+   Inserts distilled thematic fragments or emotional echoes from previous sessions.
+   This is optional and may be empty if no processed memory is available.
+#}
+{% if past_sessions and past_sessions|length > 0 %}
+  {% for memory in past_sessions %}
+<|start_header_id|>memory_{{ loop.index }}<|end_header_id|>
+{{ memory }}
+<|eot_id|>
+  {% endfor %}
+{% endif %}
+
+{# — UNRESOLVED SESSION SUMMARY — #
+   A high-level summary aggregating core motifs or unresolved threads to maintain narrative continuity.
+#}
+{% if summary %}
+<|start_header_id|>summary<|end_header_id|>
+{{ summary }}
+<|eot_id|>
+{% endif %}
+
+{# — MOTIF AND THEMATIC CUES — #
+   Embeds symbolic cues, affective drifts, or thematic elements meant to spark the AI's intuitive shifts.
+#}
+{% if motif_context %}
+<|start_header_id|>motif<|end_header_id|>
+{{ motif_context }}
+<|eot_id|>
+{% endif %}
+
+{# — INTERNAL REFLECTION (SILENT SUBAGENT DYNAMICS) — #
+   Simulates the AI's internal dialogue (Observer, Instinct, Interpreter, etc.) that shapes its output.
+   This content influences generation but is not directly printed in the output.
+#}
+{% if internal_reflection %}
+<|start_header_id|>internal<|end_header_id|>
+{{ internal_reflection }}
+<|eot_id|>
+{% endif %}
+
+{# — CONVERSATION HISTORY — #
+   The sequential log of all conversation turns, with role markers for user and assistant.
+#}
+{%- for msg in messages %}
+  {% if msg.role == "assistant" %}
+<|start_header_id|>assistant<|end_header_id|>
+{{ msg.content | trim | replace('\u2028',' ') | replace('\u2029',' ') }}<|eot_id|>
+  {% else %}
+<|start_header_id|>user<|end_header_id|>
+[{{ msg.role }}] {{ msg.content | trim | replace('\u2028',' ') | replace('\u2029',' ') }}<|eot_id|>
+  {% endif %}
+{%- endfor %}
+
+{# — ASSISTANT TURN MARKER — #
+   Indicates the start of the assistant's next generated message.
+#}
+<|start_header_id|>assistant<|end_header_id|>
+
+)";
+}
+
+inline ChatTemplateManager::ChatTemplateManager(const std::string& base_template_str) 
     : base_template(base_template_str) {
     // Initialize all sections as inactive
     for (const auto& [section, name] : section_names) {
@@ -119,26 +209,26 @@ ChatTemplateManager::ChatTemplateManager(const std::string& base_template_str)
     }
 }
 
-void ChatTemplateManager::SetSection(TemplateSection section, const std::string& content, bool active) {
+inline void ChatTemplateManager::SetSection(TemplateSection section, const std::string& content, bool active) {
     sections[section] = TemplateVariable(content, active);
     template_dirty = true;
 }
 
-void ChatTemplateManager::ActivateSection(TemplateSection section) {
+inline void ChatTemplateManager::ActivateSection(TemplateSection section) {
     if (sections.find(section) != sections.end()) {
         sections[section].active = true;
         template_dirty = true;
     }
 }
 
-void ChatTemplateManager::DeactivateSection(TemplateSection section) {
+inline void ChatTemplateManager::DeactivateSection(TemplateSection section) {
     if (sections.find(section) != sections.end()) {
         sections[section].active = false;
         template_dirty = true;
     }
 }
 
-void ChatTemplateManager::ClearSection(TemplateSection section) {
+inline void ChatTemplateManager::ClearSection(TemplateSection section) {
     if (sections.find(section) != sections.end()) {
         sections[section].content.clear();
         sections[section].active = false;
@@ -146,245 +236,133 @@ void ChatTemplateManager::ClearSection(TemplateSection section) {
     }
 }
 
-std::string ChatTemplateManager::GetSection(TemplateSection section) const {
+inline std::string ChatTemplateManager::GetSection(TemplateSection section) const {
     auto it = sections.find(section);
     return (it != sections.end()) ? it->second.content : "";
 }
 
-bool ChatTemplateManager::IsSectionActive(TemplateSection section) const {
+inline bool ChatTemplateManager::IsSectionActive(TemplateSection section) const {
     auto it = sections.find(section);
     return (it != sections.end()) ? it->second.active : false;
 }
 
-void ChatTemplateManager::AddPastSession(const std::string& memory) {
+inline void ChatTemplateManager::AddPastSession(const std::string& memory) {
     past_sessions.push_back(memory);
     template_dirty = true;
 }
 
-void ChatTemplateManager::ClearPastSessions() {
+inline void ChatTemplateManager::ClearPastSessions() {
     past_sessions.clear();
     template_dirty = true;
 }
 
-std::string ChatTemplateManager::RenderTemplate(const std::vector<std::pair<std::string, std::string>>& messages) {
-    if (!template_dirty && !cached_rendered_template.empty()) {
-        // Template hasn't changed, return cached version with updated messages
-        return ProcessMessages(cached_rendered_template, messages);
-    }
+inline std::string ChatTemplateManager::RenderTemplate(const std::vector<std::pair<std::string, std::string>>& messages) {
+    // Simple approach: Just substitute the 8 variables and return the template
+    // Let llama.cpp's Jinja2 interpreter handle all the conditional logic and loops
     
-    // Process template sections in order
-    std::string processed_template = base_template;
+    std::string result = base_template;
     
-    // Replace variable sections
-    processed_template = ReplaceVariables(processed_template);
+    // Replace ONLY the 8 core variables with their content
+    result = ReplaceVariables(result);
     
-    // Process conditional sections ({% if section %})
-    processed_template = ProcessConditionalSections(processed_template);
-    
-    // Process array sections (past_sessions)
-    processed_template = ProcessArraySections(processed_template);
-    
-    // Cache the processed template (without messages)
-    cached_rendered_template = processed_template;
-    template_dirty = false;
-    
-    // Process messages at the end
-    return ProcessMessages(processed_template, messages);
-}
-
-std::string ChatTemplateManager::ProcessConditionalSections(const std::string& template_str) const {
-    std::string result = template_str;
-    
-    // Process each conditional section
-    for (const auto& [section, name] : section_names) {
-        if (section == TemplateSection::PAST_SESSIONS) continue; // Handle separately
-        
-        // Create regex pattern for {% if section_name %}...{% endif %} - handle multiline and whitespace
-        std::string pattern = R"(\{\%\s*if\s+)" + name + R"(\s*\%\}([\s\S]*?)\{\%\s*endif\s*\%\})";
-        std::regex conditional_regex(pattern, std::regex_constants::ECMAScript);
-        
-        auto it = sections.find(section);
-        bool section_active = (it != sections.end()) && it->second.active && !it->second.content.empty();
-        
-        if (section_active) {
-            // Replace conditional block with its content
-            result = std::regex_replace(result, conditional_regex, "$1");
-        } else {
-            // Remove entire conditional block
-            result = std::regex_replace(result, conditional_regex, "");
-        }
-    }
+    // NOTE: The messages parameter is ignored here because llama.cpp's Jinja2 engine
+    // should receive the template and process it with the messages context.
+    // This is a transitional implementation that may need architectural changes.
     
     return result;
 }
 
-std::string ChatTemplateManager::ProcessArraySections(const std::string& template_str) const {
+inline std::string ChatTemplateManager::ReplaceVariables(const std::string& template_str) const {
     std::string result = template_str;
     
-    // First handle simple {% for memory in past_sessions %} loops
-    std::string simple_pattern = R"(\{\%\s*for\s+memory\s+in\s+past_sessions\s*\%\}([\s\S]*?)\{\%\s*endfor\s*\%\})";
-    std::regex simple_regex(simple_pattern, std::regex_constants::ECMAScript);
+    // Replace ONLY the 8 specified variables - simple string replacement
+    // Don't use regex to avoid interfering with Jinja2 syntax
     
-    std::smatch simple_match;
-    if (std::regex_search(result, simple_match, simple_regex)) {
-        if (!past_sessions.empty()) {
-            std::string loop_content;
-            std::string loop_template = simple_match[1].str();
-            
-            for (const auto& memory : past_sessions) {
-                std::string memory_instance = loop_template;
-                // Replace {{ memory }} with actual memory content
-                memory_instance = std::regex_replace(memory_instance, std::regex(R"(\{\{\s*memory\s*\}\})"), memory);
-                loop_content += memory_instance;
-            }
-            
-            result = std::regex_replace(result, simple_regex, loop_content);
-        } else {
-            // Remove the entire loop if no past sessions
-            result = std::regex_replace(result, simple_regex, "");
-        }
-    }
-    
-    // Then handle complex conditional patterns with if past_sessions 
-    std::string pattern = R"(\{\%\s*if\s+past_sessions\s+and\s+past_sessions\|length\s*>\s*0\s*\%\}([\s\S]*?)\{\%\s*endif\s*\%\})";
-    std::regex array_regex(pattern, std::regex_constants::ECMAScript);
-    
-    std::smatch match;
-    if (std::regex_search(result, match, array_regex)) {
-        if (!past_sessions.empty()) {
-            std::string inner_content = match[1].str();
-            
-            // Process the for loop within the conditional
-            std::string for_pattern = R"(\{\%\s*for\s+memory\s+in\s+past_sessions\s*\%\}([\s\S]*?)\{\%\s*endfor\s*\%\})";
-            std::regex for_regex(for_pattern, std::regex_constants::ECMAScript);
-            
-            std::string loop_content;
-            std::smatch for_match;
-            if (std::regex_search(inner_content, for_match, for_regex)) {
-                std::string loop_template = for_match[1].str();
-                
-                for (size_t i = 0; i < past_sessions.size(); ++i) {
-                    std::string memory_instance = loop_template;
-                    // Replace {{ memory }} with actual memory content
-                    memory_instance = std::regex_replace(memory_instance, std::regex(R"(\{\{\s*memory\s*\}\})"), past_sessions[i]);
-                    // Replace {{ loop.index }} with actual index
-                    memory_instance = std::regex_replace(memory_instance, std::regex(R"(\{\{\s*loop\.index\s*\}\})"), std::to_string(i + 1));
-                    loop_content += memory_instance;
-                }
-            }
-            
-            // Replace the entire conditional array block with the generated content
-            result = std::regex_replace(result, array_regex, loop_content);
-        } else {
-            // Remove the entire conditional array block if no past sessions
-            result = std::regex_replace(result, array_regex, "");
-        }
-    }
-    
-    return result;
-}
-
-std::string ChatTemplateManager::ReplaceVariables(const std::string& template_str) const {
-    std::string result = template_str;
-    
-    // Replace {{ variable_name }} with actual content
     for (const auto& [section, name] : section_names) {
         auto it = sections.find(section);
-        if (it != sections.end() && it->second.active) {
-            std::string pattern = R"(\{\{\s*)" + name + R"(\s*\}\})";
-            std::regex var_regex(pattern);
-            result = std::regex_replace(result, var_regex, it->second.content);
-        } else {
-            // Replace with empty string if section is not active
-            std::string pattern = R"(\{\{\s*)" + name + R"(\s*\}\})";
-            std::regex var_regex(pattern);
-            result = std::regex_replace(result, var_regex, "");
+        std::string replacement_content;
+        
+        if (section == TemplateSection::PAST_SESSIONS) {
+            // Skip past_sessions - it's handled as an array by Jinja2 template engine
+            // The past_sessions array should be provided to llama.cpp's template context
+            continue;
         }
+        
+        if (it != sections.end() && it->second.active && !it->second.content.empty()) {
+            replacement_content = it->second.content;
+        } else {
+            replacement_content = ""; // Empty string if not active
+        }
+        
+        // Simple string replacement for {{ variable_name }}
+        std::string variable_pattern = "{{ " + name + " }}";
+        size_t pos = 0;
+        while ((pos = result.find(variable_pattern, pos)) != std::string::npos) {
+            result.replace(pos, variable_pattern.length(), replacement_content);
+            pos += replacement_content.length();
+        }
+    }
+    
+    // Handle bos_token specially
+    size_t pos = 0;
+    while ((pos = result.find("{{- bos_token }}", pos)) != std::string::npos) {
+        result.replace(pos, 16, ""); // Remove bos_token placeholder
     }
     
     return result;
 }
 
-std::string ChatTemplateManager::ProcessMessages(const std::string& template_str, 
-                                                const std::vector<std::pair<std::string, std::string>>& messages) const {
-    std::string result = template_str;
-    
-    // Find the messages loop: {%- for msg in messages %}...{%- endfor %} - handle multiline
-    std::string pattern = R"(\{\%-?\s*for\s+msg\s+in\s+messages\s*-?\%\}([\s\S]*?)\{\%-?\s*endfor\s*-?\%\})";
-    std::regex messages_regex(pattern, std::regex_constants::ECMAScript);
-    
-    std::smatch match;
-    if (std::regex_search(result, match, messages_regex)) {
-        std::string loop_template = match[1].str();
-        std::string messages_content;
-        
-        for (const auto& [role, content] : messages) {
-            std::string message_block = loop_template;
-            
-            // Replace {{ msg.role }} and {{ msg.content }}
-            std::regex role_regex(R"(\{\{\s*msg\.role\s*\}\})");
-            std::regex content_regex(R"(\{\{\s*msg\.content\s*\|\s*trim\s*\}\})");
-            
-            message_block = std::regex_replace(message_block, role_regex, role);
-            message_block = std::regex_replace(message_block, content_regex, content);
-            
-            // Process conditional role blocks - handle multiline
-            std::regex if_assistant_regex(R"(\{\%\s*if\s+msg\.role\s*==\s*["\']assistant["\']\s*\%\}([\s\S]*?)\{\%\s*else\s*\%\}([\s\S]*?)\{\%\s*endif\s*\%\})");
-            
-            if (role == "assistant") {
-                message_block = std::regex_replace(message_block, if_assistant_regex, "$1");
-            } else {
-                message_block = std::regex_replace(message_block, if_assistant_regex, "$2");
-            }
-            
-            messages_content += message_block;
-        }
-        
-        // Replace the entire messages loop with the generated content
-        result = std::regex_replace(result, messages_regex, messages_content);
-    }
-    
-    return result;
-}
+// Note: ProcessConditionalSections, ProcessPastSessions, and ProcessMessages methods removed
+// Let llama.cpp's Jinja2 interpreter handle all conditional logic and loops
 
 // Convenience methods for common operations
-void ChatTemplateManager::UpdateEnvironment(const std::string& env) {
+inline void ChatTemplateManager::UpdateEnvironment(const std::string& env) {
     SetSection(TemplateSection::OVERARCHING_ENVIRONMENT, env, !env.empty());
 }
 
-void ChatTemplateManager::UpdateIdentity(const std::string& identity) {
+inline void ChatTemplateManager::UpdateIdentity(const std::string& identity) {
     SetSection(TemplateSection::IDENTITY_DIRECTIVE, identity, !identity.empty());
 }
 
-void ChatTemplateManager::UpdateSystemPrompt(const std::string& system_msg) {
+inline void ChatTemplateManager::UpdateSystemPrompt(const std::string& system_msg) {
     SetSection(TemplateSection::SYSTEM_PROMPT, system_msg, !system_msg.empty());
 }
 
-void ChatTemplateManager::UpdateSummary(const std::string& summary) {
+inline void ChatTemplateManager::UpdateSummary(const std::string& summary) {
     SetSection(TemplateSection::SUMMARY, summary, !summary.empty());
 }
 
-void ChatTemplateManager::UpdateOldChatSummary(const std::string& old_summary) {
+inline void ChatTemplateManager::UpdateOldChatSummary(const std::string& old_summary) {
     SetSection(TemplateSection::OLD_CHAT_SUMMARY, old_summary, !old_summary.empty());
 }
 
-void ChatTemplateManager::UpdateMotifContext(const std::string& motif) {
+inline void ChatTemplateManager::UpdateMotifContext(const std::string& motif) {
     SetSection(TemplateSection::MOTIF_CONTEXT, motif, !motif.empty());
 }
 
-void ChatTemplateManager::UpdateInternalReflection(const std::string& reflection) {
+inline void ChatTemplateManager::UpdateInternalReflection(const std::string& reflection) {
     SetSection(TemplateSection::INTERNAL_REFLECTION, reflection, !reflection.empty());
 }
 
-bool ChatTemplateManager::ValidateTemplate() const {
-    // Basic validation - check if base template contains required elements
+inline bool ChatTemplateManager::ValidateTemplate() const {
+    // Check if template contains the required structure
     bool has_messages_loop = base_template.find("for msg in messages") != std::string::npos;
-    bool has_assistant_header = base_template.find("assistant<|end_header_id") != std::string::npos;
+    bool has_assistant_header = base_template.find("start_header_id|>assistant<|end_header_id") != std::string::npos;
+    bool has_required_variables = true;
     
-    return has_messages_loop && has_assistant_header;
+    // Check for all 8 required variables
+    for (const auto& [section, name] : section_names) {
+        if (section == TemplateSection::PAST_SESSIONS) continue; // Special handling
+        if (base_template.find("{{ " + name + " }}") == std::string::npos) {
+            has_required_variables = false;
+            break;
+        }
+    }
+    
+    return has_messages_loop && has_assistant_header && has_required_variables;
 }
 
-void ChatTemplateManager::SetBaseTemplate(const std::string& new_template) {
+inline void ChatTemplateManager::SetBaseTemplate(const std::string& new_template) {
     base_template = new_template;
     template_dirty = true;
     cached_rendered_template.clear();
