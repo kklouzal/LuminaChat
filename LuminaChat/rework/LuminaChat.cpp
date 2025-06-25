@@ -71,6 +71,7 @@ public:
     void OnClose(wxCloseEvent& event);
     void OnClearChat(wxCommandEvent& event);
     void OnClearLogs(wxCommandEvent& event);
+    void OnLogLevelChanged(wxCommandEvent& event);
 
     // Core system lifecycle
     void Start();
@@ -121,7 +122,6 @@ private:
     wxChoice* log_level_choice;
     
     // Core rework components (in dependency order)
-    std::unique_ptr<Logger> logger;
     std::unique_ptr<SettingsManager> settings_manager;
     std::unique_ptr<Sanitizer> sanitizer;
     std::unique_ptr<DiscordManager> discord_manager;
@@ -132,6 +132,7 @@ private:
     // System state
     std::atomic<bool> running{false};
     std::atomic<bool> model_loaded{false};
+    std::atomic<bool> model_loading{false};
     std::atomic<bool> discord_connected{false};
     
     // Timer for scheduled operations
@@ -385,6 +386,12 @@ void LuminaChatFrame::CreateLogsPanel() {
     log_level_choice->Append("ERROR");
     log_level_choice->SetSelection(1); // Default to INFO
     log_controls_sizer->Add(log_level_choice, 0, wxALL, 5);
+    
+    // Bind log level change event
+    log_level_choice->Bind(wxEVT_CHOICE, [this](wxCommandEvent& event) {
+        OnLogLevelChanged(event);
+    });
+    
     log_controls_sizer->AddStretchSpacer();
     clear_logs_button = new wxButton(logs_panel, ID_ClearLogs, "Clear Logs");
     log_controls_sizer->Add(clear_logs_button, 0, wxALL, 5);
@@ -403,8 +410,14 @@ void LuminaChatFrame::Start() {
     
     try {
         // Initialize components in strict dependency order
-        logger = std::make_unique<Logger>();
-        AddLogMessage("Logger initialized");
+        // Register GLOBAL Logger output callback to display logs in UI
+        GetLogger().RegisterOutputCallback([this](std::string_view log_message) {
+            CallAfter([this, log_str = std::string(log_message)]() {
+                OnLogMessage(log_str);
+            });
+        });
+        
+        AddLogMessage("Global Logger connected to UI");
         
         settings_manager = std::make_unique<SettingsManager>();
         if (!settings_manager->LoadSettings("config.ini")) {
@@ -473,7 +486,6 @@ void LuminaChatFrame::Stop() {
     discord_manager.reset();
     sanitizer.reset();
     settings_manager.reset();
-    logger.reset();
     
     AddLogMessage("LuminaChat stopped cleanly");
     SetStatusText("Stopped", 0);
@@ -508,6 +520,37 @@ void LuminaChatFrame::OnOrchestratorOutput(std::string_view output, InputSource 
 
 void LuminaChatFrame::OnLogMessage(std::string_view log_message) {
     AddLogMessage(std::string(log_message));
+}
+
+void LuminaChatFrame::OnLogLevelChanged(wxCommandEvent& event) {
+    int selection = log_level_choice->GetSelection();
+    Logger::LogLevel new_level;
+    
+    switch (selection) {
+        case 0: // DEBUG
+            new_level = Logger::LogLevel::DBG;
+            AddLogMessage("Log level changed to DEBUG");
+            break;
+        case 1: // INFO
+            new_level = Logger::LogLevel::INF;
+            AddLogMessage("Log level changed to INFO");
+            break;
+        case 2: // WARNING
+            new_level = Logger::LogLevel::WRN;
+            AddLogMessage("Log level changed to WARNING");
+            break;
+        case 3: // ERROR
+            new_level = Logger::LogLevel::ERR;
+            AddLogMessage("Log level changed to ERROR");
+            break;
+        default:
+            new_level = Logger::LogLevel::INF;
+            AddLogMessage("Unknown log level selected, defaulting to INFO");
+            break;
+    }
+    
+    // Set level on the GLOBAL Logger instance that the macros use
+    GetLogger().SetLogLevel(new_level);
 }
 
 // UI helper methods
@@ -551,11 +594,13 @@ void LuminaChatFrame::UpdateUI() {
     gpu_layers_label->SetLabel(wxString::Format("%d", gpu_layers_slider->GetValue()));
     
     send_button->Enable(model_loaded && running);
-    load_model_button->Enable(running && !model_path_text->GetValue().IsEmpty());
+    load_model_button->Enable(running && !model_path_text->GetValue().IsEmpty() && !model_loading);
     connect_discord_button->Enable(running && !discord_token_text->GetValue().IsEmpty());
     
     if (model_loaded) {
         SetStatusText("Model Loaded", 1);
+    } else if (model_loading) {
+        SetStatusText("Loading Model...", 1);
     } else {
         SetStatusText("No Model", 1);
     }
@@ -711,21 +756,30 @@ void LuminaChatFrame::OnLoadModel(wxCommandEvent& event) {
         return;
     }
     
+    // Check if already loading
+    if (model_loading) {
+        AddLogMessage("Model loading already in progress");
+        return;
+    }
+    
     try {
+        LOG_DEBUG_LuminaChat("Starting model load process");
         AddLogMessage(wxString::Format("Loading model: %s", model_path).ToStdString());
+        
+        // Set loading state FIRST
+        model_loading = true;
+        UpdateUI(); // This will disable the button and update status
+        
+        LOG_DEBUG_LuminaChat("Set loading state, calling UpdateUI()");
         
         int context_size = context_size_slider->GetValue();
         int gpu_layers = gpu_layers_slider->GetValue();
         
-        load_model_button->Enable(false);
+        LOG_DEBUG_LuminaChat(wxString::Format("Got slider values - context_size: %d, gpu_layers: %d", context_size, gpu_layers).ToStdString());
+        
         model_progress->SetValue(0);
         
-        // Simulate loading progress
-        for (int i = 0; i <= 100; i += 10) {
-            model_progress->SetValue(i);
-            wxSafeYield();
-            wxMilliSleep(50);
-        }
+        LOG_DEBUG_LuminaChat("About to call LlamaManager::LoadModel");
         
         // Load model through LlamaManager
         ModelConfig config;
@@ -734,30 +788,53 @@ void LuminaChatFrame::OnLoadModel(wxCommandEvent& event) {
         config.gpu_layers = gpu_layers;
         
         if (llama_manager->LoadModel(current_model_id, config)) {
+            LOG_DEBUG_LuminaChat("LlamaManager::LoadModel returned true - success");
+            
+            LOG_DEBUG_LuminaChat("Setting model_loaded = true");
             model_loaded = true;
+            
+            LOG_DEBUG_LuminaChat("Setting progress bar to 100%");
+            model_progress->SetValue(100);  // Show completion
+            
+            LOG_DEBUG_LuminaChat("Setting status text to Model Loaded");
             SetStatusText("Model Loaded", 1);
             
-            auto* context_info = llama_manager->GetOrCreateContextInfo(current_context_id, current_model_id);
-            if (context_info) {
-                AddLogMessage("Model loaded successfully");
-                AddChatMessage("System", "Model loaded and ready for conversation!", wxColour(0, 150, 0));
-            } else {
-                AddLogMessage("ERROR: Failed to create context after model loading");
+            LOG_DEBUG_LuminaChat("About to call GetOrCreateContextInfo");
+            try {
+                LOG_DEBUG_LuminaChat("Calling GetOrCreateContextInfo with context_id=" + current_context_id + ", model_id=" + current_model_id);
+                auto* context_info = llama_manager->GetOrCreateContextInfo(current_context_id, current_model_id);
+                LOG_DEBUG_LuminaChat("GetOrCreateContextInfo call completed");
+                
+                if (context_info) {
+                    LOG_DEBUG_LuminaChat("GetOrCreateContextInfo returned valid context");
+                    AddLogMessage("Model loaded successfully");
+                    AddChatMessage("System", "Model loaded and ready for conversation!", wxColour(0, 150, 0));
+                } else {
+                    LOG_ERROR_LuminaChat("GetOrCreateContextInfo returned null");
+                    AddLogMessage("ERROR: Failed to create context after model loading");
+                }
+            } catch (const std::exception& inner_e) {
+                LOG_ERROR_LuminaChat(wxString::Format("Exception in GetOrCreateContextInfo: %s", inner_e.what()).ToStdString());
+                throw; // Re-throw to be caught by outer handler
             }
         } else {
+            LOG_ERROR_LuminaChat("LlamaManager::LoadModel returned false - failure");
             AddLogMessage("ERROR: Failed to load model");
             wxMessageBox("Failed to load model. Check the file path and try again.", "Model Load Error", wxOK | wxICON_ERROR);
         }
         
     } catch (const std::exception& e) {
+        LOG_ERROR_LuminaChat(wxString::Format("Exception caught in OnLoadModel: %s", e.what()).ToStdString());
         AddLogMessage(wxString::Format("Error loading model: %s", e.what()).ToStdString());
         wxMessageBox(wxString::Format("Failed to load model: %s", e.what()), 
                      "Model Load Error", wxOK | wxICON_ERROR);
         model_loaded = false;
     }
     
+    // Always reset loading state and update UI
+    LOG_DEBUG_LuminaChat("Resetting loading state and updating UI");
+    model_loading = false;
     model_progress->SetValue(0);
-    load_model_button->Enable(true);
     UpdateUI();
 }
 

@@ -14,8 +14,6 @@
 #include "LlamaManager.hpp"
 #include "Logger.hpp"
 
-using namespace LuminaChat;
-
 // Forward declarations for plugin request/response types
 struct SummarizationRequest {
     std::string original_context_id;
@@ -100,8 +98,8 @@ private:
     LlamaManager* llama_manager;
     
     // Processing pipelines for plugin architecture
-    ProcessingPipeline<SummarizationRequest, SummarizationResponse> summarization_pipeline;
-    ProcessingPipeline<DiscordChannelRequest, DiscordChannelResponse> discord_channel_pipeline;
+    LuminaChat::ProcessingPipeline<SummarizationRequest, SummarizationResponse> summarization_pipeline;
+    LuminaChat::ProcessingPipeline<DiscordChannelRequest, DiscordChannelResponse> discord_channel_pipeline;
     
     // State tracking for contexts
     std::unordered_map<std::string, ProcessingState> context_states;

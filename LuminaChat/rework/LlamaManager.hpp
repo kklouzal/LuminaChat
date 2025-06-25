@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <string>
 #include <mutex>
+#include <thread>
 #include <vector>
 #include <functional>
 #include <atomic>
@@ -93,11 +94,13 @@ private:
     
     // llama.cpp initialization state
     static std::atomic<bool> llama_backend_initialized;
+    static std::mutex backend_init_mutex;
     
     // Helper methods
     void UpdateStats();
     void NotifyResourceEvent(const std::string& event, const std::string& details);
     std::string LoadTemplateFromSettings(const std::string& template_name);
+    std::string GetTemplateInternal(const std::string& template_name); // Internal version - no mutex
     bool ValidateModelId(const std::string& model_id) const;
     bool ValidateContextId(const std::string& context_id) const;
     bool EnsureBackendInitialized();
@@ -200,6 +203,7 @@ namespace LlamaManagerHelpers {
 
 // Static initialization
 std::atomic<bool> LlamaManager::llama_backend_initialized{false};
+std::mutex LlamaManager::backend_init_mutex;
 
 // Constructor
 inline LlamaManager::LlamaManager(SettingsManager* settings) 
@@ -272,6 +276,14 @@ inline bool LlamaManager::Initialize() {
 
 // Ensure llama.cpp backend is initialized (thread-safe)
 inline bool LlamaManager::EnsureBackendInitialized() {
+    // Double-checked locking pattern for thread-safe initialization
+    if (llama_backend_initialized.load()) {
+        return true;
+    }
+    
+    std::lock_guard<std::mutex> lock(backend_init_mutex);
+    
+    // Check again after acquiring lock
     if (llama_backend_initialized.load()) {
         return true;
     }
@@ -286,7 +298,7 @@ inline bool LlamaManager::EnsureBackendInitialized() {
         return true;
         
     } catch (const std::exception& e) {
-        LOG_ERROR_LlamaManager("Failed to initialize llama.cpp backend: " + std::string(e.what()));
+        LOG_ERROR_LlamaManager("Exception in ggml_backend_load_all: " + std::string(e.what()));
         return false;
     }
 }
@@ -314,8 +326,10 @@ inline ModelInfo* LlamaManager::GetOrCreateModelInfo(const std::string& model_id
         // Register resource callback if we have one
         if (resource_callback) {
             model_info->RegisterResourceCallback([this](const std::string& id, ResourceEvent event, const std::string& msg) {
-                NotifyResourceEvent("MODEL_" + std::to_string(static_cast<int>(event)), 
-                                   "Model " + id + ": " + msg);
+                // Capture values to avoid potential reference issues in async callback
+                std::string event_name = "MODEL_" + std::to_string(static_cast<int>(event));
+                std::string message = "Model " + id + ": " + msg;
+                NotifyResourceEvent(event_name, message);
             });
         }
         
@@ -351,8 +365,13 @@ inline bool LlamaManager::LoadModel(const std::string& model_id, const ModelConf
     
     LOG_LlamaManager("Loading model: " + model_id + " from " + config.model_path);
     
+    // Call LoadModel without holding manager_mutex to prevent callback deadlock
     if (model_info->LoadModel(config)) {
-        UpdateStats();
+        // Acquire mutex only for UpdateStats which accesses containers
+        {
+            std::lock_guard<std::mutex> lock(manager_mutex);
+            UpdateStats();
+        }
         NotifyResourceEvent("MODEL_LOADED", "Successfully loaded: " + model_id);
         LOG_LlamaManager("Model loaded successfully: " + model_id);
         return true;
@@ -396,8 +415,9 @@ inline ContextInfo* LlamaManager::GetOrCreateContextInfo(const std::string& cont
         return it->second.get();
     }
     
-    // Get the model
-    ModelInfo* model_info = GetModelInfo(model_id);
+    // Get the model - Use internal method that doesn't acquire mutex again
+    auto model_it = models.find(model_id);
+    ModelInfo* model_info = (model_it != models.end()) ? model_it->second.get() : nullptr;
     if (!model_info) {
         LOG_ERROR_LlamaManager("Model " + model_id + " not found for context creation: " + context_id);
         return nullptr;
@@ -408,8 +428,8 @@ inline ContextInfo* LlamaManager::GetOrCreateContextInfo(const std::string& cont
         return nullptr;
     }
     
-    // Get template
-    std::string template_content = GetTemplate(template_name);
+    // Get template (internal call - mutex already held)
+    std::string template_content = GetTemplateInternal(template_name);
     if (template_content.empty()) {
         LOG_ERROR_LlamaManager("Template '" + template_name + "' not found for context: " + context_id);
         // Use a minimal default template
@@ -518,6 +538,8 @@ inline void LlamaManager::Cleanup() {
 
 // Helper methods
 inline void LlamaManager::UpdateStats() {
+    // Note: This method should be called while holding manager_mutex
+    // since it accesses the models and contexts containers
     stats.total_models = models.size();
     stats.total_contexts = contexts.size();
     
@@ -541,7 +563,15 @@ inline void LlamaManager::UpdateStats() {
 
 inline void LlamaManager::NotifyResourceEvent(const std::string& event, const std::string& details) {
     if (resource_callback) {
-        resource_callback(event, details);
+        // CRITICAL FIX: Run callbacks synchronously during system initialization to prevent deadlock
+        // Creating detached threads while the system is starting up can cause resource conflicts
+        // on Windows, especially during the first model load
+        try {
+            resource_callback(event, details);
+        } catch (...) {
+            // Ignore callback exceptions to prevent propagation
+            LOG_ERROR_LlamaManager("Exception in resource callback: " + event);
+        }
     }
 }
 
@@ -618,4 +648,26 @@ inline void LlamaManager::RegisterResourceCallback(std::function<void(std::strin
     std::lock_guard<std::mutex> lock(manager_mutex);
     resource_callback = std::move(callback);
     LOG_LlamaManager("Resource callback registered");
+}
+
+// Internal template getter - assumes mutex is already held
+inline std::string LlamaManager::GetTemplateInternal(const std::string& template_name) {
+    // Note: This method assumes manager_mutex is already acquired by the caller
+    auto it = default_templates.find(template_name);
+    if (it != default_templates.end()) {
+        return it->second;
+    }
+    
+    // Try to load from settings if available
+    if (settings_manager) {
+        std::string template_content = settings_manager->GetString("Templates", template_name, "");
+        if (!template_content.empty()) {
+            // Cache it for future use
+            default_templates[template_name] = template_content;
+            return template_content;
+        }
+    }
+    
+    LOG_DEBUG_LlamaManager("Template not found: " + template_name);
+    return "";
 }
