@@ -110,8 +110,8 @@ private:
     CacheStats stats;
     
     // Cache management
-    static constexpr size_t MAX_CACHE_SIZE = 10000;
-    static constexpr size_t CLEANUP_THRESHOLD = 8000;
+    size_t max_cache_size;
+    size_t cleanup_threshold;
     
     // Callback for cache invalidation notifications (optional)
     std::function<void(const std::string&)> invalidation_callback;
@@ -164,8 +164,11 @@ private:
     }
     
 public:
-    TokenCache() {
-        LOG_TokenCache("TokenCache initialized");
+    explicit TokenCache(size_t cache_size = 10000) 
+        : max_cache_size(cache_size)
+        , cleanup_threshold(static_cast<size_t>(cache_size * 0.8)) // 80% of max size
+    {
+        LOG_TokenCache("TokenCache initialized with max size: " + std::to_string(max_cache_size));
     }
     
     ~TokenCache() {
@@ -206,7 +209,7 @@ public:
         std::lock_guard<std::mutex> lock(cache_mutex);
         
         // Check if cleanup needed
-        if (text_to_token_cache.size() > CLEANUP_THRESHOLD) {
+        if (text_to_token_cache.size() > cleanup_threshold) {
             CleanupOldEntries();
         }
         
@@ -239,7 +242,7 @@ public:
         std::lock_guard<std::mutex> lock(cache_mutex);
         
         // Check if cleanup needed
-        if (token_to_text_cache.size() > CLEANUP_THRESHOLD) {
+        if (token_to_text_cache.size() > cleanup_threshold) {
             CleanupOldEntries();
         }
         
@@ -272,7 +275,7 @@ public:
         std::lock_guard<std::mutex> lock(cache_mutex);
         
         // Check if cleanup needed
-        if (template_cache.size() > CLEANUP_THRESHOLD) {
+        if (template_cache.size() > cleanup_threshold) {
             CleanupOldEntries();
         }
         

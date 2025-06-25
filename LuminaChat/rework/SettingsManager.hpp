@@ -188,19 +188,30 @@ public:
 
     // Get float value
     float GetFloat(const std::string& section, const std::string& key, float default_value = 0.0f) {
-        std::string str_value = GetString(section, key);
-        if (str_value.empty()) {
+        std::lock_guard<std::mutex> lock(settings_mutex);
+        
+        auto section_it = sections.find(section);
+        if (section_it == sections.end()) {
+            LOG_SettingsManager("GetFloat [" + section + "]." + key + " - section not found, using default: " + std::to_string(default_value));
             return default_value;
         }
-
+        
+        auto key_it = section_it->second.keys.find(key);
+        if (key_it == section_it->second.keys.end()) {
+            LOG_SettingsManager("GetFloat [" + section + "]." + key + " - key not found, using default: " + std::to_string(default_value));
+            return default_value;
+        }
+        
         try {
-            return std::stof(str_value);
-        } catch (const std::exception&) {
-            LOG_WARNING("SettingsManager", "Failed to parse float value for [" + section + "]." + key + ": " + str_value);
+            float value = std::stof(key_it->second);
+            LOG_SettingsManager("GetFloat [" + section + "]." + key + " = " + std::to_string(value));
+            return value;
+        } catch (const std::exception& e) {
+            LOG_ERROR_SettingsManager("GetFloat [" + section + "]." + key + " - conversion failed: " + std::string(e.what()) + ", using default: " + std::to_string(default_value));
             return default_value;
         }
     }
-
+    
     // Set string value
     void SetString(const std::string& section, const std::string& key, const std::string& value) {
         std::lock_guard<std::mutex> lock(settings_mutex);
@@ -215,14 +226,20 @@ public:
 
     // Set boolean value
     void SetBool(const std::string& section, const std::string& key, bool value) {
-        SetString(section, key, value ? "true" : "false");
+        std::lock_guard<std::mutex> lock(settings_mutex);
+        sections[section].keys[key] = value ? "true" : "false";
+        settings_dirty = true;
+        LOG_SettingsManager("SetBool [" + section + "]." + key + " = " + (value ? "true" : "false"));
     }
-
-    // Set float value
+    
+    // Float support methods
     void SetFloat(const std::string& section, const std::string& key, float value) {
-        SetString(section, key, std::to_string(value));
+        std::lock_guard<std::mutex> lock(settings_mutex);
+        sections[section].keys[key] = std::to_string(value);
+        settings_dirty = true;
+        LOG_SettingsManager("SetFloat [" + section + "]." + key + " = " + std::to_string(value));
     }
-
+    
     // Template management
     std::string GetChatTemplate(const std::string& template_name) {
         return GetString("Templates", template_name);

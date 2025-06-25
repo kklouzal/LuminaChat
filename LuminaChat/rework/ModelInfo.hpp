@@ -3,11 +3,15 @@
 #include "TokenCache.hpp"
 #include "SettingsManager.hpp"
 #include "Logger.hpp"
+// llama.cpp includes
+#include "llama.h"
 #include <memory>
 #include <string>
 #include <functional>
 #include <atomic>
 #include <mutex>
+#include <filesystem>
+#include <thread>
 
 // ModelInfo: Model resource management and vocabulary access
 // - Owns TokenCache instance for this model
@@ -44,8 +48,6 @@ struct ModelConfig {
     int32_t threads = 0;      // 0 = auto-detect
     bool use_mmap = true;
     bool use_mlock = false;
-    float rope_freq_base = 0.0f;  // 0.0 = auto
-    float rope_freq_scale = 0.0f; // 0.0 = auto
     
     // Load from settings
     void LoadFromSettings(SettingsManager& settings, const std::string& model_prefix) {
@@ -56,8 +58,6 @@ struct ModelConfig {
         threads = settings.GetInt("Models", model_prefix + "_threads", 0);
         use_mmap = settings.GetBool("Models", model_prefix + "_use_mmap", true);
         use_mlock = settings.GetBool("Models", model_prefix + "_use_mlock", false);
-        rope_freq_base = settings.GetFloat("Models", model_prefix + "_rope_freq_base", 0.0f);
-        rope_freq_scale = settings.GetFloat("Models", model_prefix + "_rope_freq_scale", 0.0f);
     }
     
     // Save to settings
@@ -69,10 +69,9 @@ struct ModelConfig {
         settings.SetInt("Models", model_prefix + "_threads", threads);
         settings.SetBool("Models", model_prefix + "_use_mmap", use_mmap);
         settings.SetBool("Models", model_prefix + "_use_mlock", use_mlock);
-        settings.SetFloat("Models", model_prefix + "_rope_freq_base", rope_freq_base);
-        settings.SetFloat("Models", model_prefix + "_rope_freq_scale", rope_freq_scale);
     }
-      bool IsValid() const {
+      
+    bool IsValid() const {
         return !model_path.empty() && context_size > 0;
     }
 };
@@ -86,8 +85,10 @@ private:
     
     // Model state
     std::atomic<ModelState> state{ModelState::UNLOADED};
+    
+    // llama.cpp objects
     llama_model* model = nullptr;
-    llama_context* temp_context = nullptr; // For tokenization operations
+    llama_context* temp_context = nullptr; // For tokenization operations only
     
     // Thread safety
     mutable std::mutex model_mutex;
@@ -100,347 +101,306 @@ private:
     std::atomic<size_t> estimated_memory_usage{0};
     
     // Helper methods
-    void NotifyResourceEvent(ResourceEvent event, const std::string& details = "") {
+    void NotifyResourceEvent(ResourceEvent event, const std::string& message = "") const {
         if (resource_callback) {
-            try {
-                resource_callback(model_id, event, details);
-            } catch (const std::exception& e) {
-                LOG_ERROR_ModelInfo("Exception in resource callback: " + std::string(e.what()));
-            }
+            resource_callback(model_id, event, message);
         }
     }
     
-    bool InitializeLlama() {
-        // This would initialize the llama.cpp library if needed
-        // For now, we'll assume it's initialized elsewhere
-        return true;
+    void UpdateMemoryUsage() {
+        if (model) {
+            // Rough estimate based on model parameters
+            estimated_memory_usage = llama_model_size(model);
+        }
     }
     
 public:
+    // Constructor
     explicit ModelInfo(const std::string& id) 
-        : model_id(id), token_cache(std::make_unique<TokenCache>()) {
-        LOG_ModelInfo("Created ModelInfo for: " + model_id);
+        : model_id(id)
+        , token_cache(std::make_unique<TokenCache>(1024)) // Default cache size
+    {
+        LOG_ModelInfo("ModelInfo created for: " + model_id);
     }
     
-    // Constructor with config
-    ModelInfo(const std::string& id, const ModelConfig& initial_config) 
-        : model_id(id), config(initial_config), token_cache(std::make_unique<TokenCache>()) {
-        LOG_ModelInfo("Created ModelInfo for: " + model_id + " with initial config");
+    // Destructor - ensures proper cleanup
+    ~ModelInfo() {
+        LOG_ModelInfo("ModelInfo destructor called for: " + model_id);
+        Cleanup();
     }
     
-    // Static helper method to create config from settings
-    static ModelConfig CreateConfigFromSettings(SettingsManager& settings, const std::string& model_prefix) {
-        ModelConfig config;
-        config.LoadFromSettings(settings, model_prefix);
-        return config;
-    }
-    
-    // Method to trigger resource events (for testing)
-    void TriggerResourceEvent(ResourceEvent event, const std::string& details = "") {
-        NotifyResourceEvent(event, details);
-    }
-
-    // Non-copyable, movable
+    // Delete copy constructor and assignment operator (RAII)
     ModelInfo(const ModelInfo&) = delete;
     ModelInfo& operator=(const ModelInfo&) = delete;
+    
+    // Move constructor and assignment
     ModelInfo(ModelInfo&&) = default;
     ModelInfo& operator=(ModelInfo&&) = default;
     
-    // Model configuration
-    void SetConfig(const ModelConfig& new_config) {
-        std::lock_guard<std::mutex> lock(model_mutex);
-        config = new_config;
-        LOG_ModelInfo("Updated config for model: " + model_id);
-    }
-    
-    const ModelConfig& GetConfig() const {
-        std::lock_guard<std::mutex> lock(model_mutex);
-        return config;
-    }
-    
-    // Settings integration
-    bool LoadConfigFromSettings(SettingsManager& settings, const std::string& model_prefix) {
-        std::lock_guard<std::mutex> lock(model_mutex);
-        
-        config.LoadFromSettings(settings, model_prefix);
-        
-        if (!config.IsValid()) {
-            LOG_ERROR_ModelInfo("Invalid configuration loaded for model: " + model_id);
-            return false;
-        }
-        
-        LOG_ModelInfo("Loaded config from settings for model: " + model_id + 
-            " (path: " + config.model_path + ", context: " + std::to_string(config.context_size) + ")");
-        return true;
-    }
-    
-    void SaveConfigToSettings(SettingsManager& settings, const std::string& model_prefix) const {
-        std::lock_guard<std::mutex> lock(model_mutex);
-        config.SaveToSettings(settings, model_prefix);
-        LOG_ModelInfo("Saved config to settings for model: " + model_id);
-    }
-    
-    // Model lifecycle management
-    bool LoadModel() {
+    // Model loading and management
+    bool LoadModel(const ModelConfig& model_config) {
         std::lock_guard<std::mutex> lock(model_mutex);
         
         if (state == ModelState::LOADED) {
-            LOG_ModelInfo("Model already loaded: " + model_id);
+            LOG_ModelInfo("Model " + model_id + " already loaded");
             return true;
         }
         
         if (state == ModelState::LOADING) {
-            LOG_ModelInfo("Model already loading: " + model_id);
-            return false; // Caller should wait
+            LOG_ERROR_ModelInfo("Model " + model_id + " is already being loaded");
+            return false;
         }
         
-        if (!config.IsValid()) {
-            LOG_ERROR_ModelInfo("Cannot load model with invalid config: " + model_id);
+        LOG_ModelInfo("Loading model: " + model_config.model_path);
+        
+        if (!std::filesystem::exists(model_config.model_path)) {
+            LOG_ERROR_ModelInfo("Model file does not exist: " + model_config.model_path);
             state = ModelState::ERROR_STATE;
             return false;
         }
         
         state = ModelState::LOADING;
-        NotifyResourceEvent(ResourceEvent::MODEL_LOADING_STARTED, "Loading model: " + config.model_path);
+        NotifyResourceEvent(ResourceEvent::MODEL_LOADING_STARTED, "Loading " + model_config.model_path);
         
-        LOG_ModelInfo("Loading model: " + model_id + " from " + config.model_path);
-        
-        // TODO: Implement actual llama.cpp model loading
-        // For now, we'll simulate the loading process
         try {
-            if (!InitializeLlama()) {
-                throw std::runtime_error("Failed to initialize llama.cpp");
+            // Set up model parameters
+            llama_model_params model_params = llama_model_default_params();
+            model_params.n_gpu_layers = model_config.gpu_layers;
+            model_params.use_mmap = model_config.use_mmap;
+            model_params.use_mlock = model_config.use_mlock;
+            
+            // Load the model
+            model = llama_model_load_from_file(model_config.model_path.c_str(), model_params);
+            if (!model) {
+                LOG_ERROR_ModelInfo("Failed to load model from: " + model_config.model_path);
+                state = ModelState::ERROR_STATE;
+                return false;
             }
             
-            // Simulated model loading - replace with actual llama.cpp calls
-            // model = llama_load_model_from_file(config.model_path.c_str(), model_params);
-            // if (!model) { throw std::runtime_error("Failed to load model"); }
-            
             // Create temporary context for tokenization
-            // llama_context_params ctx_params = llama_context_default_params();
-            // ctx_params.n_ctx = 512; // Small context just for tokenization
-            // temp_context = llama_new_context_with_model(model, ctx_params);
+            llama_context_params ctx_params = llama_context_default_params();
+            ctx_params.n_ctx = 512; // Small context just for tokenization
+            ctx_params.n_batch = 512;
+            ctx_params.n_threads = std::max(1u, std::thread::hardware_concurrency());
             
-            // Estimate memory usage (placeholder)
-            estimated_memory_usage = config.context_size * 1024; // Rough estimate
+            temp_context = llama_init_from_model(model, ctx_params);
+            if (!temp_context) {
+                LOG_ERROR_ModelInfo("Failed to create tokenization context");
+                llama_model_free(model);
+                model = nullptr;
+                state = ModelState::ERROR_STATE;
+                return false;
+            }
             
+            // Store configuration
+            config = model_config;
             state = ModelState::LOADED;
-            NotifyResourceEvent(ResourceEvent::MODEL_LOADED, 
-                "Model loaded successfully, estimated memory: " + std::to_string(estimated_memory_usage / 1024 / 1024) + " MB");
             
-            LOG_ModelInfo("Successfully loaded model: " + model_id);
+            UpdateMemoryUsage();
+            NotifyResourceEvent(ResourceEvent::MODEL_LOADED, "Successfully loaded: " + model_config.model_path);
+            
+            LOG_ModelInfo("Model loaded successfully: " + model_config.model_path + 
+                         " (GPU layers: " + std::to_string(model_config.gpu_layers) + ")");
+            
             return true;
             
         } catch (const std::exception& e) {
-            LOG_ERROR_ModelInfo("Failed to load model " + model_id + ": " + e.what());
+            LOG_ERROR_ModelInfo("Exception during model loading: " + std::string(e.what()));
             state = ModelState::ERROR_STATE;
-            NotifyResourceEvent(ResourceEvent::TOKENIZATION_ERROR, e.what());
+            if (temp_context) {
+                llama_free(temp_context);
+                temp_context = nullptr;
+            }
+            if (model) {
+                llama_model_free(model);
+                model = nullptr;
+            }
             return false;
         }
     }
     
-    bool IsLoaded() const {
-        return state == ModelState::LOADED;
-    }
-    
-    ModelState GetState() const {
-        return state;
-    }
-    
+    // Cleanup resources
     void Cleanup() {
         std::lock_guard<std::mutex> lock(model_mutex);
         
-        if (state == ModelState::UNLOADED) {
-            return;
+        if (temp_context) {
+            llama_free(temp_context);
+            temp_context = nullptr;
+            LOG_ModelInfo("Temp context freed for: " + model_id);
         }
         
-        LOG_ModelInfo("Cleaning up model: " + model_id);
+        if (model) {
+            llama_model_free(model);
+            model = nullptr;
+            LOG_ModelInfo("Model freed for: " + model_id);
+        }
         
-        // Clear token cache first
+        state = ModelState::UNLOADED;
+        estimated_memory_usage = 0;
+        
         if (token_cache) {
             token_cache->ClearAll();
+            LOG_ModelInfo("Token cache cleared for: " + model_id);
         }
         
-        // TODO: Implement actual llama.cpp cleanup
-        // if (temp_context) {
-        //     llama_free(temp_context);
-        //     temp_context = nullptr;
-        // }
-        // 
-        // if (model) {
-        //     llama_free_model(model);
-        //     model = nullptr;
-        // }
-        
-        estimated_memory_usage = 0;
-        state = ModelState::UNLOADED;
-        
-        NotifyResourceEvent(ResourceEvent::CLEANUP_COMPLETED, "Model cleanup completed");
-        LOG_ModelInfo("Cleanup completed for model: " + model_id);
-    }
-      // TokenCache interface
-    TokenCache& GetTokenCache() {
-        return *token_cache;
+        NotifyResourceEvent(ResourceEvent::CLEANUP_COMPLETED, "Model resources cleaned up");
     }
     
-    const TokenCache& GetTokenCache() const {
-        return *token_cache;
-    }
-    
-    // Tokenization interface (requires loaded model)
-    bool TokenizeText(const std::string& text, std::vector<int32_t>& tokens) {
-        if (state != ModelState::LOADED) {
-            LOG_ERROR_ModelInfo("Cannot tokenize - model not loaded: " + model_id);
-            return false;
+    // Tokenization methods
+    std::vector<llama_token> TokenizeText(const std::string& text, bool add_special = true) {
+        std::lock_guard<std::mutex> lock(model_mutex);
+        
+        if (state != ModelState::LOADED || !model) {
+            LOG_ERROR_ModelInfo("Model not loaded for tokenization");
+            NotifyResourceEvent(ResourceEvent::TOKENIZATION_ERROR, "Model not loaded");
+            return {};
+        }
+        
+        if (text.empty()) {
+            return {};
         }
         
         // Check cache first
-        if (token_cache->GetTokens(text, tokens)) {
-            return true;
+        std::string cache_key = text + (add_special ? ":s" : ":n");
+        std::vector<int32_t> cached_tokens;
+        if (token_cache->GetTokens(cache_key, cached_tokens)) {
+            // Convert int32_t to llama_token
+            std::vector<llama_token> result;
+            result.reserve(cached_tokens.size());
+            for (int32_t token : cached_tokens) {
+                result.push_back(static_cast<llama_token>(token));
+            }
+            return result;
         }
-        
-        std::lock_guard<std::mutex> lock(model_mutex);
         
         try {
-            // TODO: Implement actual tokenization with llama.cpp
-            // For now, simulate tokenization
-            tokens.clear();
-            // int32_t* token_array = new int32_t[text.length() + 10];
-            // int token_count = llama_tokenize(temp_context, text.c_str(), text.length(), 
-            //                                 token_array, text.length() + 10, true, true);
-            // if (token_count > 0) {
-            //     tokens.assign(token_array, token_array + token_count);
-            // }
-            // delete[] token_array;
-            
-            // Placeholder tokenization (1 token per 4 characters, roughly)
-            size_t estimated_tokens = (text.length() + 3) / 4;
-            tokens.reserve(estimated_tokens);
-            for (size_t i = 0; i < estimated_tokens; ++i) {
-                tokens.push_back(static_cast<int32_t>(1000 + i)); // Fake token IDs
+            // Get required buffer size
+            const int32_t n_tokens_required = -llama_tokenize(GetVocab(), text.c_str(), text.size(), nullptr, 0, add_special, true);
+            if (n_tokens_required <= 0) {
+                return {};
             }
             
-            // Store in cache
-            token_cache->StoreTokens(text, tokens);
+            // Tokenize
+            std::vector<llama_token> tokens(n_tokens_required);
+            const int32_t n_tokens_actual = llama_tokenize(GetVocab(), text.c_str(), text.size(),
+                                                          tokens.data(), tokens.size(), add_special, true);
             
-            LOG_DEBUG_ModelInfo("Tokenized text (" + std::to_string(text.length()) + 
-                " chars → " + std::to_string(tokens.size()) + " tokens)");
-            return true;
+            if (n_tokens_actual < 0 || n_tokens_actual != n_tokens_required) {
+                LOG_ERROR_ModelInfo("Tokenization failed - expected: " + std::to_string(n_tokens_required) + 
+                                   ", got: " + std::to_string(n_tokens_actual));
+                NotifyResourceEvent(ResourceEvent::TOKENIZATION_ERROR, "Token count mismatch");
+                return {};
+            }
+            
+            // Cache result - convert llama_token to int32_t for storage
+            std::vector<int32_t> tokens_for_cache;
+            tokens_for_cache.reserve(tokens.size());
+            for (llama_token token : tokens) {
+                tokens_for_cache.push_back(static_cast<int32_t>(token));
+            }
+            token_cache->StoreTokens(cache_key, tokens_for_cache);
+            
+            return tokens;
             
         } catch (const std::exception& e) {
-            LOG_ERROR_ModelInfo("Tokenization error for model " + model_id + ": " + e.what());
+            LOG_ERROR_ModelInfo("Exception during tokenization: " + std::string(e.what()));
             NotifyResourceEvent(ResourceEvent::TOKENIZATION_ERROR, e.what());
-            return false;
+            return {};
         }
     }
     
-    bool DetokenizeText(const std::vector<int32_t>& tokens, std::string& text) {
-        if (state != ModelState::LOADED) {
-            LOG_ERROR_ModelInfo("Cannot detokenize - model not loaded: " + model_id);
-            return false;
-        }
-        
-        // Check cache first
-        if (token_cache->GetText(tokens, text)) {
-            return true;
-        }
-        
+    std::string DetokenizeTokens(const std::vector<llama_token>& tokens) {
         std::lock_guard<std::mutex> lock(model_mutex);
+        
+        if (state != ModelState::LOADED || !model) {
+            LOG_ERROR_ModelInfo("Model not loaded for detokenization");
+            return "";
+        }
+        
+        if (tokens.empty()) {
+            return "";
+        }
+        
+        // Check cache first - convert llama_token to int32_t for hash lookup
+        std::vector<int32_t> tokens_for_cache;
+        tokens_for_cache.reserve(tokens.size());
+        for (llama_token token : tokens) {
+            tokens_for_cache.push_back(static_cast<int32_t>(token));
+        }
+        
+        std::string cached_text;
+        if (token_cache->GetText(tokens_for_cache, cached_text)) {
+            return cached_text;
+        }
         
         try {
-            // TODO: Implement actual detokenization with llama.cpp
-            // For now, simulate detokenization
-            text.clear();
-            // for (int32_t token : tokens) {
-            //     const char* piece = llama_token_to_piece(temp_context, token);
-            //     if (piece) {
-            //         text += piece;
-            //     }
-            // }
+            std::string result;
+            result.reserve(tokens.size() * 4); // Rough estimate
             
-            // Placeholder detokenization
-            text.reserve(tokens.size() * 4); // Rough estimate
-            for (size_t i = 0; i < tokens.size(); ++i) {
-                if (i > 0) text += " ";
-                text += "tok" + std::to_string(i);
+            for (const auto& token : tokens) {
+                std::vector<char> buffer(32);
+                
+                int32_t result_length = llama_token_to_piece(GetVocab(), token, buffer.data(), buffer.size(), 0, true);
+                
+                if (result_length < 0) {
+                    // Buffer too small, resize and retry
+                    buffer.resize(-result_length);
+                    result_length = llama_token_to_piece(GetVocab(), token, buffer.data(), buffer.size(), 0, true);
+                }
+                
+                if (result_length > 0) {
+                    result.append(buffer.data(), result_length);
+                }
             }
             
-            // Store in cache
-            token_cache->StoreText(tokens, text);
+            // Cache result
+            token_cache->StoreText(tokens_for_cache, result);
             
-            LOG_DEBUG_ModelInfo("Detokenized tokens (" + std::to_string(tokens.size()) + 
-                " tokens → " + std::to_string(text.length()) + " chars)");
-            return true;
+            return result;
             
         } catch (const std::exception& e) {
-            LOG_ERROR_ModelInfo("Detokenization error for model " + model_id + ": " + e.what());
-            NotifyResourceEvent(ResourceEvent::TOKENIZATION_ERROR, e.what());
-            return false;
+            LOG_ERROR_ModelInfo("Exception during detokenization: " + std::string(e.what()));
+            return "";
         }
     }
     
-    // Model information
-    const std::string& GetModelId() const {
-        return model_id;
+    // Accessors
+    TokenCache& GetTokenCache() { return *token_cache; }
+    const TokenCache& GetTokenCache() const { return *token_cache; }
+    
+    ModelState GetState() const { return state; }
+    bool IsLoaded() const { return state == ModelState::LOADED; }
+    const std::string& GetModelId() const { return model_id; }
+    const ModelConfig& GetConfig() const { return config; }
+    
+    llama_model* GetModel() const { return model; } // For direct access when needed
+    
+    // Get vocab from model for tokenization functions
+    const llama_vocab* GetVocab() const {
+        
+        return model ? llama_model_get_vocab(model) : nullptr;
     }
     
-    std::string GetModelPath() const {
-        std::lock_guard<std::mutex> lock(model_mutex);
-        return config.model_path;
-    }
+    size_t GetMemoryUsage() const { return estimated_memory_usage; }
     
-    int32_t GetContextSize() const {
-        std::lock_guard<std::mutex> lock(model_mutex);
-        return config.context_size;
-    }
-    
-    size_t GetEstimatedMemoryUsage() const {
-        return estimated_memory_usage;
-    }
-    
-    // Resource monitoring callback registration
-    // Optional: Orchestrator (higher) registers with ModelInfo (lower) for resource events
+    // Callback registration for resource monitoring
     void RegisterResourceCallback(std::function<void(const std::string&, ResourceEvent, const std::string&)> callback) {
-        std::lock_guard<std::mutex> lock(model_mutex);
         resource_callback = std::move(callback);
-        LOG_ModelInfo("Resource callback registered for model: " + model_id);
     }
     
-    // Performance monitoring
-    void LogStatistics() const {
-        if (token_cache) {
-            token_cache->LogStatistics();
-        }
-        
-        LOG_ModelInfo("=== Model Statistics for " + model_id + " ===");
-        LOG_ModelInfo("State: " + StateToString(state));
-        LOG_ModelInfo("Config: " + config.model_path);
-        LOG_ModelInfo("Context Size: " + std::to_string(config.context_size));
-        LOG_ModelInfo("GPU Layers: " + std::to_string(config.gpu_layers));
-        LOG_ModelInfo("Estimated Memory: " + std::to_string(estimated_memory_usage / 1024 / 1024) + " MB");
+    // Statistics
+    size_t GetTokenCacheHits() const {
+        return token_cache ? token_cache->GetStats().GetTotalHits() : 0;
     }
     
-private:
-    std::string StateToString(ModelState s) const {
-        switch (s) {
-            case ModelState::UNLOADED: return "UNLOADED";
-            case ModelState::LOADING: return "LOADING";
-            case ModelState::LOADED: return "LOADED";
-            case ModelState::ERROR_STATE: return "ERROR";
-            default: return "UNKNOWN";
-        }
+    size_t GetTokenCacheRequests() const {
+        return token_cache ? token_cache->GetStats().GetTotalRequests() : 0;
+    }
+    
+    float GetTokenCacheHitRatio() const {
+        if (!token_cache) return 0.0f;
+        auto stats = token_cache->GetStats();
+        size_t total = stats.GetTotalRequests();
+        return total > 0 ? static_cast<float>(stats.GetTotalHits()) / total : 0.0f;
     }
 };
-
-// Helper function to convert ResourceEvent to string for logging
-inline std::string ResourceEventToString(ResourceEvent event) {
-    switch (event) {
-        case ResourceEvent::MODEL_LOADING_STARTED: return "MODEL_LOADING_STARTED";
-        case ResourceEvent::MODEL_LOADED: return "MODEL_LOADED";
-        case ResourceEvent::MODEL_UNLOADED: return "MODEL_UNLOADED";
-        case ResourceEvent::MEMORY_USAGE_HIGH: return "MEMORY_USAGE_HIGH";
-        case ResourceEvent::TOKENIZATION_ERROR: return "TOKENIZATION_ERROR";
-        case ResourceEvent::CLEANUP_COMPLETED: return "CLEANUP_COMPLETED";
-        default: return "UNKNOWN_EVENT";
-    }
-}

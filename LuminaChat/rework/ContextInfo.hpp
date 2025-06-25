@@ -4,6 +4,8 @@
 #include "ModelInfo.hpp"
 #include "TokenCache.hpp"
 #include "Logger.hpp"
+// llama.cpp includes
+#include "llama-cpp.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -113,9 +115,16 @@ private:    // Core components
     std::vector<std::pair<std::string, std::string>> message_history; // (role, content)
     
     // Llama context management
-    llama_context* llama_ctx;
+    llama_context* llama_ctx = nullptr;
+    llama_batch batch;
+    bool batch_initialized = false;
     std::vector<int32_t> current_tokens;
-    bool context_needs_rebuild;
+    int32_t n_past = 0;  // Number of tokens processed in context
+    bool context_needs_rebuild = true;
+    
+    // Generation state
+    std::atomic<bool> is_generating{false};
+    std::atomic<bool> should_stop_generation{false};
     
     // Callback for summarization requests
     std::function<void(std::string, std::string)> summarization_callback;
@@ -137,6 +146,11 @@ public:    // Constructor overloads
     // Core processing interface
     std::string HandleInput(const std::string& input, const std::string& username = "user");
     void AddHistoricalMessage(const std::string& role, const std::string& content);
+    
+    // Llama.cpp integration methods
+    bool InitializeLlamaContext();
+    bool ProcessTokensBatch(const std::vector<int32_t>& tokens);
+    std::string GenerateResponse(const std::string& prompt);
     
     // Template section management - direct access to ChatTemplateManager
     void UpdateEnvironment(const std::string& env);
@@ -185,6 +199,9 @@ public:    // Constructor overloads
     std::string BuildFullPrompt();
     std::vector<int32_t> TokenizePrompt(const std::string& prompt);
     std::string DetokenizeResponse(const std::vector<int32_t>& tokens);
+    
+    // Batch management methods - context-specific
+    void clear_batch();
     
     // Context rebuilding helpers (made public for testing)
     void RebuildContext_Full();
@@ -307,12 +324,90 @@ inline ContextInfo::ContextInfo(ModelInfo* model, const std::string& base_templa
 inline ContextInfo::~ContextInfo() {
     std::lock_guard<std::mutex> lock(context_mutex);
     
+    LOG_DEBUG_ContextInfo("ContextInfo destructor called for: " + context_id);
+    
+    // Stop any ongoing generation
+    should_stop_generation = true;
+    
+    // Clean up batch
+    if (batch_initialized) {
+        llama_batch_free(batch);
+        batch_initialized = false;
+        LOG_DEBUG_ContextInfo("Batch freed for context: " + context_id);
+    }
+    
+    // Clean up llama context
     if (llama_ctx) {
-        // llama_free(llama_ctx); // Would need actual llama.cpp integration
+        llama_free(llama_ctx);
         llama_ctx = nullptr;
+        LOG_DEBUG_ContextInfo("Llama context freed for: " + context_id);
     }
     
     LOG_DEBUG_ContextInfo("ContextInfo destroyed: " + context_id);
+}
+
+inline bool ContextInfo::InitializeLlamaContext() {
+    std::lock_guard<std::mutex> lock(context_mutex);
+    
+    if (!parent_model || !parent_model->IsLoaded()) {
+        LOG_ERROR_ContextInfo("Parent model not loaded for context initialization");
+        return false;
+    }
+    
+    if (llama_ctx) {
+        LOG_DEBUG_ContextInfo("Llama context already initialized");
+        return true;
+    }
+    
+    try {
+        // Set up context parameters using model's settings
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx = parent_model->GetConfig().context_size;
+        ctx_params.n_batch = std::min(512, parent_model->GetConfig().context_size / 8);
+        ctx_params.n_threads = parent_model->GetConfig().threads > 0 ? 
+                               parent_model->GetConfig().threads : 
+                               std::max(1u, std::thread::hardware_concurrency());
+        ctx_params.n_threads_batch = ctx_params.n_threads;
+        
+        // Performance optimizations
+        ctx_params.flash_attn = true;
+        ctx_params.offload_kqv = true;
+        
+        LOG_DEBUG_ContextInfo("Creating llama context with params: n_ctx=" + 
+                             std::to_string(ctx_params.n_ctx) + 
+                             ", n_batch=" + std::to_string(ctx_params.n_batch) + 
+                             ", n_threads=" + std::to_string(ctx_params.n_threads));
+        
+        // Create context
+        llama_ctx = llama_init_from_model(parent_model->GetModel(), ctx_params);
+        if (!llama_ctx) {
+            LOG_ERROR_ContextInfo("Failed to create llama context");
+            return false;
+        }
+        
+        // Initialize batch
+        batch = llama_batch_init(ctx_params.n_batch, 0, 1);
+        if (!batch.token) {
+            LOG_ERROR_ContextInfo("Failed to initialize batch");
+            llama_free(llama_ctx);
+            llama_ctx = nullptr;
+            return false;
+        }
+        
+        batch_initialized = true;
+        stats.max_context_tokens = ctx_params.n_ctx;
+        
+        LOG_ContextInfo("Llama context initialized successfully for: " + context_id);
+        return true;
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR_ContextInfo("Exception during llama context initialization: " + std::string(e.what()));
+        if (llama_ctx) {
+            llama_free(llama_ctx);
+            llama_ctx = nullptr;
+        }
+        return false;
+    }
 }
 
 inline std::string ContextInfo::HandleInput(const std::string& input, const std::string& username) {
@@ -447,164 +542,288 @@ inline void ContextInfo::AddPastSessionMemory(const std::string& memory) {
     LOG_DEBUG_ContextInfo("Added past session memory");
 }
 
+inline std::string ContextInfo::BuildFullPrompt() {
+    if (!template_manager) {
+        LOG_ERROR_ContextInfo("Template manager not available");
+        return "";
+    }
+    
+    // Render template with current message history
+    std::string rendered_prompt = template_manager->RenderTemplate(message_history);
+    stats.template_renders++;
+    
+    LOG_DEBUG_ContextInfo("Built full prompt: " + std::to_string(rendered_prompt.length()) + " characters");
+    return rendered_prompt;
+}
+
+inline std::vector<int32_t> ContextInfo::TokenizePrompt(const std::string& prompt) {
+    if (!parent_model || !parent_model->IsLoaded()) {
+        LOG_ERROR_ContextInfo("Parent model not available for tokenization");
+        return {};
+    }
+    
+    // Use ModelInfo's tokenization
+    std::vector<llama_token> llama_tokens = parent_model->TokenizeText(prompt, true);
+    
+    // Convert to int32_t
+    std::vector<int32_t> tokens;
+    tokens.reserve(llama_tokens.size());
+    for (llama_token token : llama_tokens) {
+        tokens.push_back(static_cast<int32_t>(token));
+    }
+    
+    current_tokens = tokens;
+    stats.current_context_tokens = tokens.size();
+    
+    LOG_DEBUG_ContextInfo("Tokenized prompt: " + std::to_string(tokens.size()) + " tokens");
+    return tokens;
+}
+
+inline std::string ContextInfo::DetokenizeResponse(const std::vector<int32_t>& tokens) {
+    if (!parent_model || !parent_model->IsLoaded()) {
+        LOG_ERROR_ContextInfo("Parent model not available for detokenization");
+        return "";
+    }
+    
+    // Convert to llama_token
+    std::vector<llama_token> llama_tokens;
+    llama_tokens.reserve(tokens.size());
+    for (int32_t token : tokens) {
+        llama_tokens.push_back(static_cast<llama_token>(token));
+    }
+    
+    // Use ModelInfo's detokenization
+    std::string result = parent_model->DetokenizeTokens(llama_tokens);
+    
+    LOG_DEBUG_ContextInfo("Detokenized response: " + std::to_string(result.length()) + " characters");
+    return result;
+}
+
+// Batch management methods - context-specific
+inline void ContextInfo::clear_batch() {
+    if (!batch_initialized) return;
+    batch.n_tokens = 0;
+}
+
 inline bool ContextInfo::RebuildContext(RebuildStrategy strategy) {
-    try {
-        switch (strategy) {
-            case RebuildStrategy::FULL:
-                RebuildContext_Full();
-                stats.full_rebuilds++;
-                break;
-            case RebuildStrategy::PARTIAL:
-                RebuildContext_Partial();
-                stats.partial_rebuilds++;
-                break;
-            case RebuildStrategy::TEMPLATE_ONLY:
-                RebuildContext_TemplateOnly();
-                stats.template_renders++;
-                break;
-        }
-        
-        context_needs_rebuild = false;
-        return true;
-        
-    } catch (const std::exception& e) {
-        LOG_ERROR_ContextInfo("Context rebuild failed: " + std::string(e.what()));
+    if (!InitializeLlamaContext()) {
+        LOG_ERROR_ContextInfo("Failed to initialize llama context for rebuild");
         return false;
     }
+    
+    switch (strategy) {
+        case RebuildStrategy::FULL:
+            RebuildContext_Full();
+            break;
+        case RebuildStrategy::PARTIAL:
+            RebuildContext_Partial();
+            break;
+        case RebuildStrategy::TEMPLATE_ONLY:
+            RebuildContext_TemplateOnly();
+            break;
+    }
+    
+    context_needs_rebuild = false;
+    return true;
 }
 
 inline void ContextInfo::RebuildContext_Full() {
+    std::lock_guard<std::mutex> lock(context_mutex);
+    
     LOG_DEBUG_ContextInfo("Performing full context rebuild");
     
-    // Clear existing context
-    current_tokens.clear();
+    // Clear current context
+    if (llama_ctx) {
+        llama_memory_clear(llama_get_memory(llama_ctx), true);
+        n_past = 0;
+    }
     
-    // Render template with current message history
+    // Build and tokenize full prompt
     std::string full_prompt = BuildFullPrompt();
+    std::vector<int32_t> tokens = TokenizePrompt(full_prompt);
     
-    // Tokenize the complete prompt
-    current_tokens = TokenizePrompt(full_prompt);
+    if (!tokens.empty() && llama_ctx) {
+        // Process tokens in batch
+        ProcessTokensBatch(tokens);
+    }
     
-    // Update statistics
-    stats.current_context_tokens = current_tokens.size();
-    
-    LOG_DEBUG_ContextInfo("Full rebuild complete: " + std::to_string(current_tokens.size()) + " tokens");
+    stats.full_rebuilds++;
+    LOG_DEBUG_ContextInfo("Full rebuild completed: " + std::to_string(n_past) + " tokens processed");
 }
 
 inline void ContextInfo::RebuildContext_Partial() {
+    std::lock_guard<std::mutex> lock(context_mutex);
+    
     LOG_DEBUG_ContextInfo("Performing partial context rebuild");
     
-    // For partial rebuild, we assume only new messages were added
-    // This is an optimization that would require more sophisticated tracking
+    // This is a simplified partial rebuild - in practice, you'd implement
+    // incremental token processing based on what changed
     // For now, fall back to full rebuild
-    RebuildContext_Full();
+    RebuildContext_Full(); // Fallback to full rebuild for now
+    
+    stats.partial_rebuilds++;
 }
 
 inline void ContextInfo::RebuildContext_TemplateOnly() {
     LOG_DEBUG_ContextInfo("Performing template-only rebuild");
     
-    // Re-render template without changing message history
-    // This would be used when only template sections change
-    RebuildContext_Full(); // Simplified implementation
+    // Just re-render template without reprocessing tokens
+    BuildFullPrompt();
+    stats.template_renders++;
 }
 
-inline std::string ContextInfo::BuildFullPrompt() {
-    // Use ChatTemplateManager to render the complete template
-    return template_manager->RenderTemplate(message_history);
-}
-
-inline std::vector<int32_t> ContextInfo::TokenizePrompt(const std::string& prompt) {
-    if (!token_cache) {
-        throw std::runtime_error("Token cache not available");
+inline bool ContextInfo::ProcessTokensBatch(const std::vector<int32_t>& tokens) {
+    if (!llama_ctx || !batch_initialized) {
+        LOG_ERROR_ContextInfo("Llama context or batch not initialized");
+        return false;
     }
     
-    std::vector<int32_t> tokens;
-    if (!token_cache->GetTokens(prompt, tokens)) {
-        // Cache miss - need to tokenize using actual model
-        // For now, create mock tokens for testing
-        // In real implementation, this would call llama tokenization
-        tokens.clear();
-        for (size_t i = 0; i < prompt.length(); i += 4) {
-            tokens.push_back(static_cast<int32_t>(i / 4 + 1000)); // Mock token IDs
+    if (tokens.empty()) {
+        return true;
+    }
+    
+    try {
+        // Process tokens in batches
+        const int32_t n_batch = llama_n_batch(llama_ctx);
+        if (n_batch <= 0) {
+            LOG_ERROR_ContextInfo("Invalid batch size from llama context: " + std::to_string(n_batch));
+            return false;
         }
         
-        // Store in cache for future use
-        token_cache->StoreTokens(prompt, tokens);
-    }
-    
-    return tokens;
-}
-
-inline std::string ContextInfo::DetokenizeResponse(const std::vector<int32_t>& tokens) {
-    if (!token_cache) {
-        throw std::runtime_error("Token cache not available");
-    }
-    
-    std::string text;
-    if (!token_cache->GetText(tokens, text)) {
-        // Cache miss - need to detokenize using actual model
-        // For now, create mock text for testing
-        // In real implementation, this would call llama detokenization
-        std::ostringstream oss;
-        oss << "Generated text from " << tokens.size() << " tokens: ";
-        for (size_t i = 0; i < std::min(tokens.size(), static_cast<size_t>(5)); ++i) {
-            oss << "[" << tokens[i] << "] ";
-        }
-        text = oss.str();
+        const size_t max_batch_size = static_cast<size_t>(n_batch);
         
-        // Store in cache for future use
-        token_cache->StoreText(tokens, text);
-    }
-    
-    return text;
-}
-
-inline bool ContextInfo::IsNearContextLimit(float threshold) const {
-    if (stats.max_context_tokens == 0) {
+        for (size_t i = 0; i < tokens.size(); i += max_batch_size) {
+            size_t end = std::min(i + max_batch_size, tokens.size());
+            size_t chunk_size = end - i;
+            
+            // Clear batch properly (don't free, just reset)
+            clear_batch();
+            
+            // Add tokens to batch manually (proper API)
+            for (size_t j = i; j < end && batch.n_tokens < max_batch_size; ++j) {
+                size_t batch_idx = j - i;
+                
+                batch.token[batch.n_tokens] = static_cast<llama_token>(tokens[j]);
+                batch.pos[batch.n_tokens] = n_past + batch_idx;
+                batch.n_seq_id[batch.n_tokens] = 1;  // Single sequence
+                batch.seq_id[batch.n_tokens][0] = 0; // Sequence ID 0
+                batch.logits[batch.n_tokens] = (j == end - 1); // Only last token gets logits
+                batch.n_tokens++;
+            }
+            
+            // Decode batch
+            int result = llama_decode(llama_ctx, batch);
+            if (result != 0) {
+                LOG_ERROR_ContextInfo("Batch decode failed with result: " + std::to_string(result));
+                return false;
+            }
+            
+            n_past += chunk_size;
+        }
+        
+        LOG_DEBUG_ContextInfo("Processed " + std::to_string(tokens.size()) + " tokens, n_past=" + std::to_string(n_past));
+        return true;
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR_ContextInfo("Exception during token processing: " + std::string(e.what()));
         return false;
     }
-    
-    return stats.GetContextUsageRatio() >= threshold;
 }
 
-inline void ContextInfo::RequestSummarization(const std::string& content) {
-    if (summarization_callback) {
-        LOG_ContextInfo("Requesting summarization for context: " + context_id);
-        summarization_callback(context_id, content);
-    } else {
-        LOG_ERROR_ContextInfo("No summarization callback registered");
-    }
-}
-
-inline void ContextInfo::RegisterSummarizationCallback(std::function<void(std::string, std::string)> callback) {
-    summarization_callback = std::move(callback);
-    LOG_DEBUG_ContextInfo("Summarization callback registered");
-}
-
-inline void ContextInfo::UpdateStats() {
-    stats.last_activity = std::chrono::steady_clock::now();
-    stats.message_pairs = message_history.size();
-    stats.current_context_tokens = current_tokens.size();
-}
-
-inline bool ContextInfo::ValidateContext() const {
-    if (state == ContextState::ERROR_STATE) {
-        return false;
+inline std::string ContextInfo::GenerateResponse(const std::string& prompt) {
+    if (!InitializeLlamaContext()) {
+        LOG_ERROR_ContextInfo("Failed to initialize context for generation");
+        return "Error: Context initialization failed";
     }
     
-    if (!template_manager || !template_manager->ValidateTemplate()) {
-        return false;
-    }
+    is_generating = true;
+    should_stop_generation = false;
     
-    if (!parent_model || !token_cache) {
-        return false;
+    try {
+        // Tokenize the prompt
+        std::vector<int32_t> prompt_tokens = TokenizePrompt(prompt);
+        
+        // Process prompt tokens
+        if (!ProcessTokensBatch(prompt_tokens)) {
+            is_generating = false;
+            return "Error: Failed to process prompt";
+        }
+        
+        // Generate response tokens (simplified - real implementation would use sampling)
+        std::vector<int32_t> response_tokens;
+        const int max_new_tokens = 512;
+        
+        for (int i = 0; i < max_new_tokens && !should_stop_generation; ++i) {
+            // Get logits for next token
+            float* logits = llama_get_logits_ith(llama_ctx, batch.n_tokens - 1);
+            if (!logits) {
+                break;
+            }
+            
+            // Simple greedy sampling (take highest probability token)
+            const llama_vocab* vocab = parent_model->GetVocab();
+            int32_t vocab_size = llama_vocab_n_tokens(vocab);
+            llama_token next_token = 0;
+            float max_logit = logits[0];
+            
+            for (int32_t j = 1; j < vocab_size; ++j) {
+                if (logits[j] > max_logit) {
+                    max_logit = logits[j];
+                    next_token = j;
+                }
+            }
+            
+            // Check for EOS token
+            if (next_token == llama_vocab_eos(vocab)) {
+                break;
+            }
+            
+            response_tokens.push_back(next_token);
+            
+            // Process the generated token
+            clear_batch();
+            
+            // Add token to batch manually (proper API)
+            batch.token[0] = next_token;
+            batch.pos[0] = n_past;
+            batch.n_seq_id[0] = 1;  // Single sequence
+            batch.seq_id[0][0] = 0; // Sequence ID 0
+            batch.logits[0] = true; // Generate logits for next token
+            batch.n_tokens = 1;
+            
+            if (llama_decode(llama_ctx, batch) != 0) {
+                LOG_ERROR_ContextInfo("Failed to decode generated token");
+                break;
+            }
+            
+            n_past++;
+        }
+        
+        is_generating = false;
+        
+        // Convert response tokens back to text
+        std::string response = DetokenizeResponse(response_tokens);
+        
+        LOG_DEBUG_ContextInfo("Generated response: " + std::to_string(response_tokens.size()) + 
+                             " tokens -> " + response.substr(0, 100) + 
+                             (response.length() > 100 ? "..." : ""));
+        
+        return response;
+        
+    } catch (const std::exception& e) {
+        is_generating = false;
+        LOG_ERROR_ContextInfo("Exception during generation: " + std::string(e.what()));
+        return "Error: " + std::string(e.what());
     }
-    
-    return true;
 }
 
 inline void ContextInfo::ClearContext() {
     std::lock_guard<std::mutex> lock(context_mutex);
+    
+    if (llama_ctx) {
+        llama_memory_clear(llama_get_memory(llama_ctx), true);
+        n_past = 0;
+    }
     
     current_tokens.clear();
     context_needs_rebuild = true;
@@ -623,78 +842,31 @@ inline void ContextInfo::ClearMessageHistory() {
     LOG_DEBUG_ContextInfo("Message history cleared");
 }
 
-inline void ContextInfo::SetMaxContextTokens(size_t max_tokens) {
-    stats.max_context_tokens = max_tokens;
-    LOG_DEBUG_ContextInfo("Max context tokens set to: " + std::to_string(max_tokens));
+inline bool ContextInfo::IsNearContextLimit(float threshold) const {
+    if (stats.max_context_tokens == 0) return false;
+    float usage = static_cast<float>(stats.current_context_tokens) / stats.max_context_tokens;
+    return usage >= threshold;
 }
 
-inline std::string ContextInfo::GetCurrentPrompt() const {
-    if (template_manager) {
-        return template_manager->RenderTemplate(message_history);
+inline void ContextInfo::RequestSummarization(const std::string& content) {
+    if (summarization_callback) {
+        LOG_DEBUG_ContextInfo("Requesting summarization for context: " + context_id);
+        summarization_callback(context_id, content);
+    } else {
+        LOG_ERROR_ContextInfo("No summarization callback available");
     }
-    return "";
 }
 
-inline void ContextInfo::DumpContextInfo() const {
-    std::ostringstream oss;
-    oss << "=== ContextInfo Debug Dump ===" << std::endl;
-    oss << "Context ID: " << context_id << std::endl;
-    oss << "State: " << static_cast<int>(state) << std::endl;
-    oss << "Message pairs: " << stats.message_pairs << std::endl;
-    oss << "Current tokens: " << stats.current_context_tokens << std::endl;
-    oss << "Max tokens: " << stats.max_context_tokens << std::endl;
-    oss << "Usage ratio: " << std::fixed << std::setprecision(2) << stats.GetContextUsageRatio() << std::endl;
-    oss << "Full rebuilds: " << stats.full_rebuilds << std::endl;
-    oss << "Partial rebuilds: " << stats.partial_rebuilds << std::endl;
-    oss << "Template renders: " << stats.template_renders << std::endl;
-    oss << "Age: " << stats.GetAge().count() << " seconds" << std::endl;
-    oss << "Time since activity: " << stats.GetTimeSinceActivity().count() << " seconds" << std::endl;
-    oss << "Template dirty: " << (template_manager ? template_manager->IsTemplateDirty() : false) << std::endl;
-    
-    LOG_ContextInfo(oss.str());
+inline void ContextInfo::UpdateStats() {
+    stats.message_pairs = message_history.size();
+    stats.current_context_tokens = current_tokens.size();
+    stats.total_tokens_processed += current_tokens.size();
+    stats.last_activity = std::chrono::steady_clock::now();
 }
 
-inline std::string ContextInfo::GetContextSummary() const {
-    std::ostringstream oss;
-    oss << "Context[" << context_id << "]: ";
-    oss << stats.message_pairs << " messages, ";
-    oss << stats.current_context_tokens << "/" << stats.max_context_tokens << " tokens ";
-    oss << "(" << std::fixed << std::setprecision(1) << stats.GetContextUsageRatio() * 100 << "%)";
-    
-    return oss.str();
-}
-
-inline void ContextInfo::AddMessage(const std::string& role, const std::string& content) {
-    std::lock_guard<std::mutex> lock(context_mutex);
-    message_history.emplace_back(role, content);
-    context_needs_rebuild = true;
-    UpdateStats();
-    LOG_DEBUG_ContextInfo("Added message: " + role + " -> " + content.substr(0, 50) + 
-                         (content.length() > 50 ? "..." : ""));
-}
-
-inline std::vector<std::pair<std::string, std::string>> ContextInfo::GetMessages() const {
-    std::lock_guard<std::mutex> lock(context_mutex);
-    return message_history;
-}
-
-inline int32_t ContextInfo::GetCurrentTokenCount() const {
-    return static_cast<int32_t>(current_tokens.size());
-}
-
-inline void ContextInfo::UpdateMotif(const std::string& motif) {
-    UpdateMotifContext(motif);
-}
-
-inline std::string ContextInfo::GetConversationHistory() const {
-    std::lock_guard<std::mutex> lock(context_mutex);
-    std::ostringstream oss;
-    
-    for (const auto& msg : message_history) {
-        oss << msg.first << ": " << msg.second << "\n";
-    }
-    
-    return oss.str();
+inline void ContextInfo::RegisterSummarizationCallback(std::function<void(std::string, std::string)> callback) {
+    summarization_callback = std::move(callback);
+    LOG_ContextInfo("Summarization callback registered for context: " + context_id);
 }
 
 // Helper function to generate context IDs

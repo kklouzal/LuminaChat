@@ -88,6 +88,7 @@
         "cinttypes": "cpp",
         "cstdarg": "cpp",
         "execution": "cpp",
-        "regex": "cpp"
+        "regex": "cpp",
+        "expected": "cpp"
     }
 }

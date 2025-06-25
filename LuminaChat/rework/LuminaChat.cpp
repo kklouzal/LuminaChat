@@ -76,6 +76,10 @@ public:
     void Start();
     void Stop();
     
+    // Helper methods for initialization
+    void RegisterCallbacks();
+    void LoadDefaultModels();
+    
     // Callback handlers (registered with lower-level components)
     void OnOrchestratorOutput(std::string_view output, InputSource source);
     void OnLogMessage(std::string_view log_message);
@@ -395,7 +399,7 @@ void LuminaChatFrame::CreateLogsPanel() {
 
 // System lifecycle management
 void LuminaChatFrame::Start() {
-    AddLogMessage("Initializing LuminaChat Rework Architecture...");
+    AddLogMessage("Initializing LuminaChat Rework Architecture with llama.cpp integration...");
     
     try {
         // Initialize components in strict dependency order
@@ -403,9 +407,14 @@ void LuminaChatFrame::Start() {
         AddLogMessage("Logger initialized");
         
         settings_manager = std::make_unique<SettingsManager>();
-        AddLogMessage("Settings Manager initialized");
+        if (!settings_manager->LoadSettings("config.ini")) {
+            AddLogMessage("Warning: Failed to load settings file, using defaults");
+        } else {
+            AddLogMessage("Settings Manager initialized and loaded");
+        }
         
         sanitizer = std::make_unique<Sanitizer>();
+        sanitizer->LoadBlacklist("blacklist.txt");
         AddLogMessage("Sanitizer initialized");
         
         discord_manager = std::make_unique<DiscordManager>();
@@ -414,24 +423,29 @@ void LuminaChatFrame::Start() {
         context_size_manager = std::make_unique<ContextSizeManager>();
         AddLogMessage("Context Size Manager initialized");
         
-        llama_manager = std::make_unique<LlamaManager>();
-        AddLogMessage("Llama Manager initialized");
+        // Initialize LlamaManager with settings integration
+        llama_manager = std::make_unique<LlamaManager>(settings_manager.get());
+        if (!llama_manager->Initialize()) {
+            AddLogMessage("ERROR: Failed to initialize LlamaManager");
+            throw std::runtime_error("LlamaManager initialization failed");
+        }
+        AddLogMessage("Llama Manager initialized with llama.cpp backend");
         
         orchestrator = std::make_unique<Orchestrator>(llama_manager.get());
         AddLogMessage("Orchestrator initialized");
         
-        // Register callbacks
-        orchestrator->RegisterOutputCallback([this](std::string_view output, InputSource source) {
-            CallAfter([this, output_str = std::string(output), source]() {
-                OnOrchestratorOutput(output_str, source);
-            });
-        });
+        // Register callbacks (higher components register with lower)
+        RegisterCallbacks();
+        AddLogMessage("Callback dependencies registered");
+        
+        // Load default models from settings
+        LoadDefaultModels();
         
         running = true;
         system_timer->Start(100);
         
-        AddLogMessage("LuminaChat started successfully");
-        SetStatusText("System Ready", 0);
+        AddLogMessage("LuminaChat started successfully with full llama.cpp integration");
+        SetStatusText("System Ready - llama.cpp Integrated", 0);
         UpdateUI();
         
     } catch (const std::exception& e) {
@@ -547,6 +561,70 @@ void LuminaChatFrame::UpdateUI() {
     }
 }
 
+// Helper methods for initialization
+void LuminaChatFrame::RegisterCallbacks() {
+    // UI Output callbacks - LuminaChat (higher) registers with lower components
+    if (orchestrator) {
+        orchestrator->RegisterOutputCallback([this](std::string_view output, InputSource source) {
+            CallAfter([this, output_str = std::string(output), source]() {
+                OnOrchestratorOutput(output_str, source);
+            });
+        });
+    }
+    
+    // Communication callbacks - Orchestrator (higher) registers with lower components
+    if (discord_manager && orchestrator) {
+        discord_manager->RegisterMessageCallback([this](const std::string& content, const std::string& channel_id, const std::string& username) {
+            if (orchestrator) {
+                orchestrator->OnRawDiscordMessage(content, channel_id, username);
+            }
+        });
+    }
+    
+    if (context_size_manager && orchestrator) {
+        context_size_manager->RegisterSummarizationCallback([this](const std::string& context_id, const std::string& content) {
+            if (orchestrator) {
+                orchestrator->RequestSummarization(context_id, content);
+            }
+        });
+    }
+}
+
+void LuminaChatFrame::LoadDefaultModels() {
+    if (!llama_manager || !settings_manager) {
+        AddLogMessage("ERROR: Cannot load models - components not initialized");
+        return;
+    }
+    
+    AddLogMessage("Loading default models from settings...");
+    
+    // Load main model
+    if (!llama_manager->LoadModelFromSettings("main_model", "main")) {
+        AddLogMessage("WARNING: Failed to load main model from settings");
+    } else {
+        AddLogMessage("Main model loaded successfully");
+        
+        // Create default context with main model
+        auto* context = llama_manager->GetOrCreateContextInfo("main_context", "main_model", "default");
+        if (context) {
+            AddLogMessage("Main context created successfully");
+        }
+    }
+    
+    // Load summary model (optional)
+    if (!llama_manager->LoadModelFromSettings("summary_model", "summary")) {
+        AddLogMessage("Summary model not configured or failed to load (optional)");
+    } else {
+        AddLogMessage("Summary model loaded successfully");
+        
+        // Create summary context
+        auto* summary_context = llama_manager->GetOrCreateContextInfo("summary_context", "summary_model", "summary");
+        if (summary_context) {
+            AddLogMessage("Summary context created successfully");
+        }
+    }
+}
+
 // Event handlers
 void LuminaChatFrame::OnExit(wxCommandEvent& event) {
     Close(true);
@@ -568,8 +646,8 @@ void LuminaChatFrame::OnAbout(wxCommandEvent& event) {
 }
 
 void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
-    if (!model_loaded || !running) {
-        AddLogMessage("Cannot send message: model not loaded or system not running");
+    if (!running || !llama_manager || !llama_manager->IsReady()) {
+        AddLogMessage("Cannot send message: system not ready");
         return;
     }
     
@@ -582,8 +660,23 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
         chat_input->Clear();
         AddChatMessage("You", input.ToStdString(), wxColour(50, 150, 50));
         
+        // Use orchestrator to route input (it will handle sanitization and context routing)
         if (orchestrator) {
             orchestrator->InputReceived(input.ToStdString(), current_context_id, InputSource::UI);
+        } else {
+            // Fallback: direct context interaction for testing
+            auto* context = llama_manager->GetContextInfo(current_context_id);
+            if (context) {
+                AddLogMessage("Processing message with context: " + current_context_id);
+                std::string response = context->HandleInput(input.ToStdString(), "user");
+                if (!response.empty() && response.substr(0, 6) != "Error:") {
+                    AddChatMessage("Assistant", response, wxColour(50, 50, 150));
+                } else {
+                    AddLogMessage("Error generating response: " + response);
+                }
+            } else {
+                AddLogMessage("Error: Context not found: " + current_context_id);
+            }
         }
         
     } catch (const std::exception& e) {
@@ -635,30 +728,25 @@ void LuminaChatFrame::OnLoadModel(wxCommandEvent& event) {
         }
         
         // Load model through LlamaManager
-        auto* model_info = llama_manager->GetOrCreateModelInfo(current_model_id);
-        if (model_info) {
-            ModelConfig config;
-            config.model_path = model_path.ToStdString();
-            config.context_size = context_size;
-            config.gpu_layers = gpu_layers;
-            model_info->SetConfig(config);
+        ModelConfig config;
+        config.model_path = model_path.ToStdString();
+        config.context_size = context_size;
+        config.gpu_layers = gpu_layers;
+        
+        if (llama_manager->LoadModel(current_model_id, config)) {
+            model_loaded = true;
+            SetStatusText("Model Loaded", 1);
             
-            if (model_info->LoadModel()) {
-                model_loaded = true;
-                SetStatusText("Model Loaded", 1);
-                
-                auto* context_info = llama_manager->GetOrCreateContextInfo(current_context_id, current_model_id);
-                if (context_info) {
-                    AddLogMessage("Model loaded successfully");
-                    AddChatMessage("System", "Model loaded and ready for conversation!", wxColour(0, 150, 0));
-                } else {
-                    throw std::runtime_error("Failed to create main chat context");
-                }
+            auto* context_info = llama_manager->GetOrCreateContextInfo(current_context_id, current_model_id);
+            if (context_info) {
+                AddLogMessage("Model loaded successfully");
+                AddChatMessage("System", "Model loaded and ready for conversation!", wxColour(0, 150, 0));
             } else {
-                throw std::runtime_error("Model loading failed");
+                AddLogMessage("ERROR: Failed to create context after model loading");
             }
         } else {
-            throw std::runtime_error("Failed to get/create model info");
+            AddLogMessage("ERROR: Failed to load model");
+            wxMessageBox("Failed to load model. Check the file path and try again.", "Model Load Error", wxOK | wxICON_ERROR);
         }
         
     } catch (const std::exception& e) {
