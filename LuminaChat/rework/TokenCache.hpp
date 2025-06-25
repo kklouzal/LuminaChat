@@ -8,6 +8,7 @@
 #include <functional>
 #include <chrono>
 #include <atomic>
+#include <optional>
 
 // TokenCache: High-performance token caching system
 // - Text-to-token and token-to-text caching

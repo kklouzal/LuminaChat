@@ -221,26 +221,64 @@ std::string ChatTemplateManager::ProcessConditionalSections(const std::string& t
 std::string ChatTemplateManager::ProcessArraySections(const std::string& template_str) const {
     std::string result = template_str;
     
-    // Process past_sessions array - handle multiline with [\s\S]*?
-    std::string pattern = R"(\{\%\s*if\s+past_sessions\s+and\s+past_sessions\|length\s*>\s*0\s*\%\}([\s\S]*?)\{\%\s*endfor\s*\%\}([\s\S]*?)\{\%\s*endif\s*\%\})";
+    // First handle simple {% for memory in past_sessions %} loops
+    std::string simple_pattern = R"(\{\%\s*for\s+memory\s+in\s+past_sessions\s*\%\}([\s\S]*?)\{\%\s*endfor\s*\%\})";
+    std::regex simple_regex(simple_pattern, std::regex_constants::ECMAScript);
+    
+    std::smatch simple_match;
+    if (std::regex_search(result, simple_match, simple_regex)) {
+        if (!past_sessions.empty()) {
+            std::string loop_content;
+            std::string loop_template = simple_match[1].str();
+            
+            for (const auto& memory : past_sessions) {
+                std::string memory_instance = loop_template;
+                // Replace {{ memory }} with actual memory content
+                memory_instance = std::regex_replace(memory_instance, std::regex(R"(\{\{\s*memory\s*\}\})"), memory);
+                loop_content += memory_instance;
+            }
+            
+            result = std::regex_replace(result, simple_regex, loop_content);
+        } else {
+            // Remove the entire loop if no past sessions
+            result = std::regex_replace(result, simple_regex, "");
+        }
+    }
+    
+    // Then handle complex conditional patterns with if past_sessions 
+    std::string pattern = R"(\{\%\s*if\s+past_sessions\s+and\s+past_sessions\|length\s*>\s*0\s*\%\}([\s\S]*?)\{\%\s*endif\s*\%\})";
     std::regex array_regex(pattern, std::regex_constants::ECMAScript);
     
-    if (!past_sessions.empty()) {
-        // Build the repeated content for each memory
-        std::string loop_content;
-        for (size_t i = 0; i < past_sessions.size(); ++i) {
-            std::string memory_block = R"(
-<|start_header_id|>memory_)" + std::to_string(i + 1) + R"(<|end_header_id|>
-)" + past_sessions[i] + R"(
-<|eot_id|>)";
-            loop_content += memory_block;
+    std::smatch match;
+    if (std::regex_search(result, match, array_regex)) {
+        if (!past_sessions.empty()) {
+            std::string inner_content = match[1].str();
+            
+            // Process the for loop within the conditional
+            std::string for_pattern = R"(\{\%\s*for\s+memory\s+in\s+past_sessions\s*\%\}([\s\S]*?)\{\%\s*endfor\s*\%\})";
+            std::regex for_regex(for_pattern, std::regex_constants::ECMAScript);
+            
+            std::string loop_content;
+            std::smatch for_match;
+            if (std::regex_search(inner_content, for_match, for_regex)) {
+                std::string loop_template = for_match[1].str();
+                
+                for (size_t i = 0; i < past_sessions.size(); ++i) {
+                    std::string memory_instance = loop_template;
+                    // Replace {{ memory }} with actual memory content
+                    memory_instance = std::regex_replace(memory_instance, std::regex(R"(\{\{\s*memory\s*\}\})"), past_sessions[i]);
+                    // Replace {{ loop.index }} with actual index
+                    memory_instance = std::regex_replace(memory_instance, std::regex(R"(\{\{\s*loop\.index\s*\}\})"), std::to_string(i + 1));
+                    loop_content += memory_instance;
+                }
+            }
+            
+            // Replace the entire conditional array block with the generated content
+            result = std::regex_replace(result, array_regex, loop_content);
+        } else {
+            // Remove the entire conditional array block if no past sessions
+            result = std::regex_replace(result, array_regex, "");
         }
-        
-        // Replace the entire conditional array block with the generated content
-        result = std::regex_replace(result, array_regex, loop_content);
-    } else {
-        // Remove the entire conditional array block if no past sessions
-        result = std::regex_replace(result, array_regex, "");
     }
     
     return result;
@@ -341,7 +379,7 @@ void ChatTemplateManager::UpdateInternalReflection(const std::string& reflection
 bool ChatTemplateManager::ValidateTemplate() const {
     // Basic validation - check if base template contains required elements
     bool has_messages_loop = base_template.find("for msg in messages") != std::string::npos;
-    bool has_assistant_header = base_template.find("<|start_header_id|>assistant<|end_header_id>") != std::string::npos;
+    bool has_assistant_header = base_template.find("assistant<|end_header_id") != std::string::npos;
     
     return has_messages_loop && has_assistant_header;
 }

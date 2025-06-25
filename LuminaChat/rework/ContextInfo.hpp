@@ -161,6 +161,7 @@ public:    // Constructor overloads
     // Message history access
     const std::vector<std::pair<std::string, std::string>>& GetMessageHistory() const { return message_history; }
     size_t GetMessageCount() const { return message_history.size(); }
+    std::string GetConversationHistory() const;  // String representation of conversation
     
     // Template access
     ChatTemplateManager& GetTemplateManager() { return *template_manager; }
@@ -683,6 +684,17 @@ inline int32_t ContextInfo::GetCurrentTokenCount() const {
 
 inline void ContextInfo::UpdateMotif(const std::string& motif) {
     UpdateMotifContext(motif);
+}
+
+inline std::string ContextInfo::GetConversationHistory() const {
+    std::lock_guard<std::mutex> lock(context_mutex);
+    std::ostringstream oss;
+    
+    for (const auto& msg : message_history) {
+        oss << msg.first << ": " << msg.second << "\n";
+    }
+    
+    return oss.str();
 }
 
 // Helper function to generate context IDs

@@ -19,17 +19,18 @@
 
 class Logger {
 public:
+    //  CRITICAL: These MUST be abbreviations to avoid conflicts.
     enum class LogLevel {
-        DEBUG = 0,
-        INFO = 1,
-        WARNING = 2,
-        ERROR = 3
+        DBG = 0,
+        INF = 1,
+        WRN = 2,
+        ERR = 3
     };
 
 private:
     std::function<void(std::string_view)> output_callback;
     std::mutex callback_mutex;
-    LogLevel current_level = LogLevel::INFO;
+    LogLevel current_level = LogLevel::INF;
 
     std::string GetTimestamp() {
         auto now = std::chrono::system_clock::now();
@@ -65,10 +66,10 @@ public:
 
         std::string level_str;
         switch (level) {
-            case LogLevel::DEBUG:   level_str = "DEBUG"; break;
-            case LogLevel::INFO:    level_str = "INFO";  break;
-            case LogLevel::WARNING: level_str = "WARN";  break;
-            case LogLevel::ERROR:   level_str = "ERROR"; break;
+            case LogLevel::DBG:     level_str = "DEBUG"; break;
+            case LogLevel::INF:     level_str = "INFO";  break;
+            case LogLevel::WRN:     level_str = "WARN";  break;
+            case LogLevel::ERR:     level_str = "ERROR"; break;
         }
 
         std::stringstream log_line;
@@ -90,16 +91,16 @@ inline Logger& GetLogger() {
 
 // Component-specific logging macros (unique per file as specified in design)
 #define LOG_DEBUG(component, message) \
-    GetLogger().LogMessage(Logger::LogLevel::DEBUG, component, message)
+    GetLogger().LogMessage(Logger::LogLevel::DBG, component, message)
 
 #define LOG_INFO(component, message) \
-    GetLogger().LogMessage(Logger::LogLevel::INFO, component, message)
+    GetLogger().LogMessage(Logger::LogLevel::INF, component, message)
 
 #define LOG_WARNING(component, message) \
-    GetLogger().LogMessage(Logger::LogLevel::WARNING, component, message)
+    GetLogger().LogMessage(Logger::LogLevel::WRN, component, message)
 
 #define LOG_ERROR(component, message) \
-    GetLogger().LogMessage(Logger::LogLevel::ERROR, component, message)
+    GetLogger().LogMessage(Logger::LogLevel::ERR, component, message)
 
 // File-specific convenience macros (to be customized per component file)
 #define LOG_Logger(message) LOG_INFO("Logger", message)

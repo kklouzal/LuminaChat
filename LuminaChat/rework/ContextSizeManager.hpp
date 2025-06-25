@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Logger.hpp"
 #include <functional>
 #include <cstdint>
 #include <atomic>
@@ -12,10 +13,6 @@
 // - Smart analysis of token distribution (summaries, active history, AI space, buffer)
 // - Plugin Integration: Requests summarization via Orchestrator callback
 // - Template Integration: Works with ChatTemplateManager for context size calculations
-
-// Forward declaration for Logger
-class Logger;
-Logger& GetLogger();
 
 struct ContextUsageStats {
     int32_t total_tokens = 0;

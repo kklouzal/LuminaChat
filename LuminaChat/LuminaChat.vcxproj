@@ -119,7 +119,7 @@
       <LanguageStandard_C>stdc17</LanguageStandard_C>
     </ClCompile>
     <Link>
-      <SubSystem>Console</SubSystem>
+      <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>llama.lib;ggml.lib;dpp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
@@ -139,65 +139,28 @@
       <RuntimeTypeInfo>true</RuntimeTypeInfo>
     </ClCompile>
     <Link>
-      <SubSystem>Console</SubSystem>
+      <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <IgnoreSpecificDefaultLibraries>%(IgnoreSpecificDefaultLibraries)</IgnoreSpecificDefaultLibraries>
       <AdditionalDependencies>llama.lib;ggml.lib;dpp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="Blacklist.hpp" />
-    <ClInclude Include="common_utils.hpp" />
-    <ClInclude Include="ContextSizeManager.hpp" />
-    <ClInclude Include="DiscordHistoryLoader.hpp" />
-    <ClInclude Include="DiscordManager.hpp" />
-    <ClInclude Include="LlamaContext.hpp" />
-    <ClInclude Include="LlamaManager.hpp" />
-    <ClInclude Include="LlamaResponse.hpp" />
-    <ClInclude Include="LlamaSummarizer.hpp" />
-    <ClInclude Include="LogHandler.hpp" />
-    <ClInclude Include="Sanitizer.hpp" />
-    <ClInclude Include="SettingsManager.hpp" />
-    <ClInclude Include="TokenCache.hpp" />
-    <ClInclude Include="rework\Logger.hpp" />
-    <ClInclude Include="rework\SettingsManager.hpp" />
-    <ClInclude Include="rework\Sanitizer.hpp" />
-    <ClInclude Include="rework\TokenCache.hpp" />
-    <ClInclude Include="rework\ContextSizeManager.hpp" />
-    <ClInclude Include="rework\ModelInfo.hpp" />
-    <ClInclude Include="rework\ChatTemplateManager.hpp" />
-    <ClInclude Include="rework\ContextInfo.hpp" />
-    <ClInclude Include="test_phase1_impl.hpp" />
-    <ClInclude Include="test_phase2_impl.hpp" />
-    <ClInclude Include="test_phase3_impl.hpp" />
-    <ClInclude Include="test_phase4_impl.hpp" />
+    <ClCompile Include="rework\LuminaChat.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="test_phases.cpp" />
-    <ClCompile Include="LuminaChat.cpp">
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
-    </ClCompile>
-    <ClCompile Include="rework\test_contextinfo.cpp">
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
-    </ClCompile>
-    <ClCompile Include="test_phase1_foundation.cpp">
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
-    </ClCompile>
-    <ClCompile Include="test_phase2_model.cpp">
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
-    </ClCompile>
-    <ClCompile Include="test_phase3_template.cpp">
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
-    </ClCompile>
-    <ClCompile Include="test_phase4_context.cpp">
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
-    </ClCompile>
+    <ClInclude Include="rework\ChatTemplateManager.hpp" />
+    <ClInclude Include="rework\ContextInfo.hpp" />
+    <ClInclude Include="rework\ContextSizeManager.hpp" />
+    <ClInclude Include="rework\DiscordManager.hpp" />
+    <ClInclude Include="rework\LlamaManager.hpp" />
+    <ClInclude Include="rework\Logger.hpp" />
+    <ClInclude Include="rework\ModelInfo.hpp" />
+    <ClInclude Include="rework\Orchestrator.hpp" />
+    <ClInclude Include="rework\ProcessingPipeline.hpp" />
+    <ClInclude Include="rework\Sanitizer.hpp" />
+    <ClInclude Include="rework\SettingsManager.hpp" />
+    <ClInclude Include="rework\TokenCache.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

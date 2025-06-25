@@ -66,6 +66,29 @@ struct PipelineStats {
     std::atomic<uint64_t> pending_requests{0};
     std::chrono::steady_clock::time_point last_activity;
     
+    // Default constructor
+    PipelineStats() : last_activity(std::chrono::steady_clock::now()) {}
+    
+    // Copy constructor for atomic variables
+    PipelineStats(const PipelineStats& other) 
+        : total_requests(other.total_requests.load()),
+          completed_requests(other.completed_requests.load()),
+          failed_requests(other.failed_requests.load()),
+          pending_requests(other.pending_requests.load()),
+          last_activity(other.last_activity) {}
+    
+    // Copy assignment operator
+    PipelineStats& operator=(const PipelineStats& other) {
+        if (this != &other) {
+            total_requests.store(other.total_requests.load());
+            completed_requests.store(other.completed_requests.load());
+            failed_requests.store(other.failed_requests.load());
+            pending_requests.store(other.pending_requests.load());
+            last_activity = other.last_activity;
+        }
+        return *this;
+    }
+    
     double GetCompletionRate() const noexcept {
         uint64_t total = total_requests.load();
         return total > 0 ? static_cast<double>(completed_requests.load()) / total : 0.0;
@@ -184,7 +207,7 @@ private:
             // Execute the processor
             processor_(pipeline_request.request, success_callback, error_callback);
             
-        } catch (const std::exception& e) {
+        } catch (const std::exception&) {
             stats_.failed_requests++;
             // Could log exception details here
         } catch (...) {
