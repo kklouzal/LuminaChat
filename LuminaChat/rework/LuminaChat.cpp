@@ -180,6 +180,7 @@ private:
     // UI update methods
     void UpdateUI();
     void UpdateModelProgress(int progress);
+    void UpdateContextStatus();  // Track and display context usage
     void AddChatMessage(const std::string& sender, const std::string& message, const wxColour& color = wxNullColour);
     void StartStreamingMessage(const std::string& sender, const wxColour& color = wxNullColour);
     void AppendToStreamingMessage(const std::string& text);
@@ -247,10 +248,11 @@ LuminaChatFrame::LuminaChatFrame()
     menuBar->Append(helpMenu, "&Help");
     SetMenuBar(menuBar);
     
-    // Create status bar
-    CreateStatusBar(2);
+    // Create status bar with 3 sections: [System Status] [Model Status] [Context Status]
+    CreateStatusBar(3);
     SetStatusText("Welcome to LuminaChat!", 0);
     SetStatusText("No Model", 1);
+    SetStatusText("Context: --/--", 2);
     
     // Create main notebook for tabbed interface
     notebook = new wxNotebook(this, wxID_ANY);
@@ -774,6 +776,51 @@ void LuminaChatFrame::UpdateUI() {
     } else {
         SetStatusText("No Model", 1);
     }
+    
+    // Update context status whenever UI is updated
+    UpdateContextStatus();
+}
+
+void LuminaChatFrame::UpdateContextStatus() {
+    if (!llama_manager || !model_loaded || !running) {
+        SetStatusText("Context: --/--", 2);
+        return;
+    }
+    
+    try {
+        // Get the current context info
+        auto* context = llama_manager->GetContextInfo(current_context_id);
+        if (!context) {
+            SetStatusText("Context: No Context", 2);
+            return;
+        }
+        
+        // Get context usage information from stats
+        const auto& stats = context->GetStats();
+        int used_tokens = static_cast<int>(stats.current_context_tokens);
+        int max_tokens = static_cast<int>(stats.max_context_tokens);
+        
+        // Format the status text
+        wxString context_status = wxString::Format("Context: %d/%d", used_tokens, max_tokens);
+        
+        // Add visual indicators based on usage percentage
+        if (max_tokens > 0) {
+            double usage_percent = (double)used_tokens / max_tokens * 100.0;
+            if (usage_percent >= 90.0) {
+                context_status += " (FULL)";
+            } else if (usage_percent >= 75.0) {
+                context_status += " (HIGH)";
+            } else if (usage_percent >= 50.0) {
+                context_status += " (MED)";
+            }
+        }
+        
+        SetStatusText(context_status, 2);
+        
+    } catch (const std::exception& e) {
+        AddLogMessage(wxString::Format("Error updating context status: %s", e.what()).ToStdString());
+        SetStatusText("Context: Error", 2);
+    }
 }
 
 void LuminaChatFrame::SetGenerationUIState(bool generating) {
@@ -927,6 +974,7 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
                 this->CallAfter([this, full_response, success]() {
                     EndStreamingMessage();
                     SetGenerationUIState(false);  // Re-enable UI after generation
+                    UpdateContextStatus();  // Update context usage in status bar
                     if (success) {
                         AddLogMessage("Response generation completed successfully");
                     } else {
@@ -945,6 +993,7 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
                         EndStreamingMessage();
                     }
                     SetGenerationUIState(false);  // Re-enable UI on error
+                    UpdateContextStatus();  // Update context usage in status bar
                     AddLogMessage("Error generating response: " + error_message);
                     AddChatMessage("System", "Error: " + error_message, wxColour(150, 50, 50));
                 });
@@ -1150,6 +1199,17 @@ void LuminaChatFrame::OnConnectDiscord(wxCommandEvent& event) {
 
 void LuminaChatFrame::OnClearChat(wxCommandEvent& event) {
     chat_display->Clear();
+    
+    // Also clear the context history to reset token count
+    if (llama_manager && model_loaded) {
+        auto* context = llama_manager->GetContextInfo(current_context_id);
+        if (context) {
+            context->ClearContext();  // This clears both context and resets token count
+            AddLogMessage("Chat context cleared - token count reset");
+            UpdateContextStatus();  // Update status bar to reflect cleared context
+        }
+    }
+    
     AddLogMessage("Chat display cleared");
 }
 
@@ -1517,3 +1577,5 @@ void LuminaChatFrame::SaveUISettings() {
         AddLogMessage("Error saving UI settings: " + std::string(e.what()));
     }
 }
+
+
