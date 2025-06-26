@@ -153,6 +153,10 @@ private:    // Core components
     // Message history - pure conversation only
     std::vector<std::pair<std::string, std::string>> message_history; // (role, content)
     
+    // Summary storage - maintains up to 5 summaries in chronological order (oldest to newest)
+    std::vector<std::string> summaries;
+    static constexpr size_t MAX_SUMMARIES = 5;
+    
     // Static pruning buffer for plugin consumption
     static std::mutex pruning_buffer_mutex;
     static std::vector<PrunedMessageBatch> global_pruning_buffer;
@@ -180,6 +184,10 @@ private:    // Core components
     bool IsNearContextLimit(float threshold = 0.8f) const;
     void EmergencyPrune(); // Emergency fallback when plugin system unavailable
     void UpdateStats();
+    
+    // Summary management methods
+    void AddSummaryToList(const std::string& summary);
+    void UpdateTemplateWithAllSummaries();
     
 public:    // Constructor overloads
     ContextInfo(const std::string& context_id, ModelInfo* model, const std::string& base_template = "");
@@ -299,6 +307,20 @@ public:
     
     // Context pruning for summarization
     void PruneMessageHistoryWithSummary(const std::string& summary, size_t keep_recent_messages = 5);
+    
+    // Debug helper to dump all context size values
+    void DumpContextSizeValues() const {
+        LOG_DEBUG_ContextInfo("=== Context Size Debug Dump ===");
+        LOG_DEBUG_ContextInfo("n_past: " + std::to_string(n_past));
+        LOG_DEBUG_ContextInfo("stats.current_context_tokens: " + std::to_string(stats.current_context_tokens));
+        LOG_DEBUG_ContextInfo("stats.max_context_tokens: " + std::to_string(stats.max_context_tokens));
+        LOG_DEBUG_ContextInfo("stats.total_tokens_processed: " + std::to_string(stats.total_tokens_processed));
+        LOG_DEBUG_ContextInfo("current_tokens.size(): " + std::to_string(current_tokens.size()));
+        LOG_DEBUG_ContextInfo("GetActualContextTokens(): " + std::to_string(GetActualContextTokens()));
+        LOG_DEBUG_ContextInfo("GetActualContextUsageRatio(): " + std::to_string(GetActualContextUsageRatio()));
+        LOG_DEBUG_ContextInfo("stats.GetContextUsageRatio(): " + std::to_string(stats.GetContextUsageRatio()));
+        LOG_DEBUG_ContextInfo("=== End Context Size Debug ===");
+    }
 };
 
 // Helper functions for context management
@@ -531,6 +553,9 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
             }
             // Sync stats after successful rebuild
             SyncStatsWithContextState();
+            
+            // Debug: Dump context size values after rebuild
+            DumpContextSizeValues();
         }
         
         // 3. Render dynamic template with current message history
@@ -892,12 +917,18 @@ inline bool ContextInfo::ProcessTokensBatch(const std::vector<int32_t>& tokens) 
             }
             
             n_past += static_cast<int32_t>(chunk_size);
+            
+            // Track tokens actually processed in this batch
+            stats.total_tokens_processed += chunk_size;
         }
         
         LOG_DEBUG_ContextInfo("Processed " + std::to_string(tokens.size()) + " tokens, n_past=" + std::to_string(n_past));
         
         // CRITICAL FIX: Synchronize stats with actual context state after batch processing
         SyncStatsWithContextState();
+        
+        // Debug: Dump context size values after processing
+        DumpContextSizeValues();
         
         return true;
         
@@ -930,7 +961,12 @@ inline std::string ContextInfo::GenerateResponse(const std::string& prompt) {
         
         // Generate response tokens (simplified - real implementation would use sampling)
         std::vector<int32_t> response_tokens;
-        const int max_new_tokens = 512;
+        
+        // Calculate max tokens based on available context space
+        // Reserve some space for context management and leave room for user's next message
+        const int context_reserve = 256; // Reserve space for context management
+        const int available_space = static_cast<int>(stats.max_context_tokens) - n_past - context_reserve;
+        const int max_new_tokens = std::max(512, std::min(4096, available_space)); // At least 512, up to 4096 tokens
         
         for (int i = 0; i < max_new_tokens && !should_stop_generation; ++i) {
             // Get logits for next token
@@ -954,6 +990,12 @@ inline std::string ContextInfo::GenerateResponse(const std::string& prompt) {
             
             // Check for EOS token
             if (next_token == llama_vocab_eos(vocab)) {
+                break;
+            }
+            
+            // Check if we're approaching context limit during generation
+            if (n_past + static_cast<int32_t>(response_tokens.size()) >= static_cast<int32_t>(stats.max_context_tokens) - 50) {
+                LOG_DEBUG_ContextInfo("Approaching context limit during generation, stopping early");
                 break;
             }
             
@@ -1064,7 +1106,8 @@ inline void ContextInfo::UpdateStats() {
     // CRITICAL FIX: Use n_past as the single source of truth for context size
     // This ensures UI and internal logic always reflect the actual llama.cpp context state
     stats.current_context_tokens = static_cast<size_t>(std::max(0, n_past));
-    stats.total_tokens_processed += static_cast<size_t>(std::max(0, n_past));
+    // NOTE: total_tokens_processed should NOT be updated here - it tracks cumulative processing
+    // and should only be incremented when actually processing new tokens, not on every stats update
     stats.last_activity = std::chrono::steady_clock::now();
 }
 
@@ -1279,7 +1322,16 @@ inline void ContextInfo::StartGenerationAsync(const std::string& prompt, const G
             
             // Generate response tokens with streaming
             std::vector<int32_t> response_tokens;
-            const int max_new_tokens = 512;
+            
+            // Calculate max tokens based on available context space
+            // Reserve some space for context management and leave room for user's next message
+            const int context_reserve = 256; // Reserve space for context management  
+            const int available_space = static_cast<int>(stats.max_context_tokens) - n_past - context_reserve;
+            const int max_new_tokens = std::max(512, std::min(4096, available_space)); // At least 512, up to 4096 tokens
+            
+            LOG_DEBUG_ContextInfo("Generation limits: max_new_tokens=" + std::to_string(max_new_tokens) + 
+                                 ", available_space=" + std::to_string(available_space) + 
+                                 ", n_past=" + std::to_string(n_past));
             
             for (int i = 0; i < max_new_tokens && !should_stop_generation.load(); ++i) {
                 std::lock_guard<std::mutex> lock(context_mutex);
@@ -1313,6 +1365,12 @@ inline void ContextInfo::StartGenerationAsync(const std::string& prompt, const G
                 // Check for EOS token
                 if (next_token == llama_vocab_eos(vocab)) {
                     LOG_DEBUG_ContextInfo("EOS token encountered, ending generation");
+                    break;
+                }
+                
+                // Check if we're approaching context limit during generation
+                if (n_past + static_cast<int32_t>(response_tokens.size()) >= static_cast<int32_t>(stats.max_context_tokens) - 50) {
+                    LOG_DEBUG_ContextInfo("Approaching context limit during generation, stopping early");
                     break;
                 }
                 
@@ -1481,11 +1539,13 @@ inline void ContextInfo::ApplyCompletedSummary(const std::string& summary) {
     std::lock_guard<std::mutex> lock(context_mutex);
     
     if (!summary.empty()) {
-        // Apply summary to template instead of mixing with message history
-        template_manager->UpdateSummary(summary);
+        // Add summary to chronological list and update template with all summaries
+        AddSummaryToList(summary);
+        UpdateTemplateWithAllSummaries();
         context_needs_rebuild = true;
         
-        LOG_ContextInfo("Applied completed summary to template: " + 
+        LOG_ContextInfo("Added new summary to chronological list (total: " + 
+                       std::to_string(summaries.size()) + "/" + std::to_string(MAX_SUMMARIES) + "): " + 
                        summary.substr(0, 100) + (summary.length() > 100 ? "..." : ""));
     }
 }
@@ -1543,3 +1603,29 @@ inline void ContextInfo::PruneContextImmediate_Internal(size_t keep_recent_messa
 // Static member definitions for pruning buffer
 inline std::mutex ContextInfo::pruning_buffer_mutex;
 inline std::vector<PrunedMessageBatch> ContextInfo::global_pruning_buffer;
+
+// Implementation of new summary management methods
+inline void ContextInfo::AddSummaryToList(const std::string& summary) {
+    if (summary.empty()) return;
+    
+    // Add new summary to the end (newest)
+    summaries.push_back(summary);
+    
+    // Enforce maximum limit by removing oldest summary if needed
+    if (summaries.size() > MAX_SUMMARIES) {
+        summaries.erase(summaries.begin()); // Remove oldest (first) summary
+        LOG_ContextInfo("Removed oldest summary to maintain maximum of " + 
+                       std::to_string(MAX_SUMMARIES) + " summaries");
+    }
+    
+    LOG_ContextInfo("Summary list updated: " + std::to_string(summaries.size()) + 
+                   " summaries in chronological order");
+}
+
+inline void ContextInfo::UpdateTemplateWithAllSummaries() {
+    if (template_manager) {
+        template_manager->UpdateMultipleSummaries(summaries);
+        LOG_ContextInfo("Updated template with " + std::to_string(summaries.size()) + 
+                       " summaries in chronological order");
+    }
+}

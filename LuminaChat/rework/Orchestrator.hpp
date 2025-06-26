@@ -172,6 +172,18 @@ public:
     Sanitizer* GetSanitizer() { return sanitizer.get(); }
     const Sanitizer* GetSanitizer() const { return sanitizer.get(); }
     
+    // Core component access for plugins
+    LlamaManager* GetLlamaManager() { return llama_manager; }
+    const LlamaManager* GetLlamaManager() const { return llama_manager; }
+    
+    // Get SettingsManager from LlamaManager (convenience method)
+    SettingsManager* GetSettingsManager() { 
+        return llama_manager ? llama_manager->GetSettingsManager() : nullptr; 
+    }
+    const SettingsManager* GetSettingsManager() const { 
+        return llama_manager ? llama_manager->GetSettingsManager() : nullptr; 
+    }
+    
     // Statistics and monitoring
     struct OrchestrationStats {
         size_t messages_processed = 0;
@@ -375,7 +387,7 @@ inline void Orchestrator::OnSummarizationComplete(const std::string& context_id,
         // Apply summary to original context
         auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", "default");
         if (context) {
-            context->ApplySummary(response.summary);
+            context->ApplyCompletedSummary(response.summary);
             LOG_Orchestrator("Summary applied to context: " + context_id);
         }
         

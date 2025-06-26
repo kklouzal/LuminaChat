@@ -46,6 +46,7 @@
 #include "ContextInfo.hpp"
 #include "LlamaManager.hpp"
 #include "Orchestrator.hpp"
+#include "SummarizationPlugin.hpp"
 
 #include <memory>
 #include <thread>
@@ -75,6 +76,7 @@ public:
     void OnClearChat(wxCommandEvent& event);
     void OnClearLogs(wxCommandEvent& event);
     void OnClearTemplate(wxCommandEvent& event);
+    void OnLoadSummaryModel(wxCommandEvent& event);
     void OnLogLevelChanged(wxCommandEvent& event);
 
     // Core system lifecycle
@@ -138,6 +140,13 @@ private:
     wxButton* clear_logs_button;
     wxChoice* log_level_choice;
     
+    // Summary Settings Panel
+    wxPanel* summary_panel;
+    wxTextCtrl* summary_model_path_text;
+    wxButton* browse_summary_model_button;
+    wxStaticText* summary_status_text;
+    wxTextCtrl* summary_system_prompt_text;
+    
     // Template Panel
     wxPanel* template_panel;
     wxTextCtrl* template_display;
@@ -150,6 +159,7 @@ private:
     std::unique_ptr<ContextSizeManager> context_size_manager;
     std::unique_ptr<LlamaManager> llama_manager;
     std::unique_ptr<Orchestrator> orchestrator;
+    std::unique_ptr<LuminaChat::SummarizationPlugin> summarization_plugin;
     
     // System state
     std::atomic<bool> running{false};
@@ -175,6 +185,7 @@ private:
     void CreateSettingsPanel();
     void CreateDiscordPanel();
     void CreateLogsPanel();
+    void CreateSummaryPanel();
     void CreateTemplatePanel();
     
     // UI update methods
@@ -188,6 +199,7 @@ private:
     void SetGenerationUIState(bool generating);  // Enable/disable UI during generation
     void AddLogMessage(const std::string& message);
     void UpdateTemplateDisplay(const std::string& template_content);  // Update template inspection tab
+    void UpdateSummaryPluginStatus(const std::string& status, const wxColour& color = wxNullColour);  // Update summary plugin status
     
     DECLARE_EVENT_TABLE()
 };
@@ -202,7 +214,8 @@ enum {
     ID_ClearChat,
     ID_ClearLogs,
     ID_ClearTemplate,
-    ID_BrowseModel
+    ID_BrowseModel,
+    ID_BrowseSummaryModel
 };
 
 // Event table mapping
@@ -217,6 +230,7 @@ wxBEGIN_EVENT_TABLE(LuminaChatFrame, wxFrame)
     EVT_BUTTON(ID_ClearChat, LuminaChatFrame::OnClearChat)
     EVT_BUTTON(ID_ClearLogs, LuminaChatFrame::OnClearLogs)
     EVT_BUTTON(ID_ClearTemplate, LuminaChatFrame::OnClearTemplate)
+    EVT_BUTTON(ID_BrowseSummaryModel, LuminaChatFrame::OnLoadSummaryModel)
     EVT_TIMER(ID_Timer, LuminaChatFrame::OnTimer)
     EVT_CLOSE(LuminaChatFrame::OnClose)
 wxEND_EVENT_TABLE()
@@ -262,6 +276,7 @@ LuminaChatFrame::LuminaChatFrame()
     CreateSettingsPanel();
     CreateDiscordPanel();
     CreateLogsPanel();
+    CreateSummaryPanel();
     CreateTemplatePanel();
     
     // Main layout
@@ -558,6 +573,97 @@ void LuminaChatFrame::CreateLogsPanel() {
     logs_panel->SetSizer(logs_sizer);
 }
 
+void LuminaChatFrame::CreateSummaryPanel() {
+    summary_panel = new wxPanel(notebook);
+    notebook->AddPage(summary_panel, "Summary Settings");
+    
+    // Create a scrolled window to contain all settings
+    wxScrolledWindow* scrolled_window = new wxScrolledWindow(summary_panel, wxID_ANY, 
+                                                            wxDefaultPosition, wxDefaultSize, 
+                                                            wxVSCROLL | wxHSCROLL);
+    scrolled_window->SetScrollRate(10, 10);
+    
+    // Summary model configuration group
+    wxStaticBoxSizer* model_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Summary Model Configuration");
+    
+    // Model path selection
+    wxBoxSizer* path_sizer = new wxBoxSizer(wxHORIZONTAL);
+    path_sizer->Add(new wxStaticText(scrolled_window, wxID_ANY, "Summary Model Path:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
+    summary_model_path_text = new wxTextCtrl(scrolled_window, wxID_ANY);
+    path_sizer->Add(summary_model_path_text, 1, wxEXPAND | wxALL, 5);
+    browse_summary_model_button = new wxButton(scrolled_window, ID_BrowseSummaryModel, "Browse...");
+    path_sizer->Add(browse_summary_model_button, 0, wxALL, 5);
+    model_box->Add(path_sizer, 0, wxEXPAND);
+    
+    // Bind text change event to save model path
+    summary_model_path_text->Bind(wxEVT_TEXT, [this](wxCommandEvent& event) {
+        if (settings_manager) {
+            settings_manager->SetString("Models", "summary_model_path", summary_model_path_text->GetValue().ToStdString());
+            // Don't auto-save on every keystroke for performance, just mark dirty
+        }
+    });
+    
+    // Auto-configuration note
+    wxStaticText* auto_config_note = new wxStaticText(scrolled_window, wxID_ANY, 
+        "Note: Context size will be automatically set to 25% of main model context size.\n"
+        "GPU layers will match the main model setting.\n"
+        "Model loading is managed automatically by the SummarizationPlugin.");
+    auto_config_note->SetFont(auto_config_note->GetFont().Italic());
+    auto_config_note->SetForegroundColour(wxColour(100, 100, 100));
+    model_box->Add(auto_config_note, 0, wxALL, 5);
+    
+    // Status display
+    wxStaticBoxSizer* status_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Plugin Status");
+    summary_status_text = new wxStaticText(scrolled_window, wxID_ANY, "SummarizationPlugin: Not initialized");
+    summary_status_text->SetFont(summary_status_text->GetFont().Bold());
+    summary_status_text->SetForegroundColour(wxColour(150, 100, 50));
+    status_box->Add(summary_status_text, 0, wxALL, 5);
+    
+    // Summary system prompt configuration group
+    wxStaticBoxSizer* prompt_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Summary System Prompt");
+    
+    // System Prompt textbox
+    prompt_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "System Prompt for Summarization:"), 0, wxALL, 5);
+    summary_system_prompt_text = new wxTextCtrl(scrolled_window, wxID_ANY, wxEmptyString,
+                                               wxDefaultPosition, wxSize(-1, 200),
+                                               wxTE_MULTILINE | wxTE_WORDWRAP);
+    summary_system_prompt_text->SetToolTip("Define the system prompt for the summarization model. This will instruct the AI on how to create summaries of conversation history.");
+    
+    // Set default summary prompt if empty
+    summary_system_prompt_text->SetValue(
+        "You are a helpful AI assistant that creates concise summaries of conversations. "
+        "When given a conversation history, provide a clear and informative summary that captures "
+        "the key points, decisions, and context. Focus on preserving important information while "
+        "being concise. Format your summary in a structured way with bullet points when appropriate."
+    );
+    
+    prompt_box->Add(summary_system_prompt_text, 1, wxEXPAND | wxALL, 5);
+    
+    // Auto-save on kill focus
+    summary_system_prompt_text->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& event) {
+        if (settings_manager) {
+            settings_manager->SetString("Summary", "system_prompt", summary_system_prompt_text->GetValue().ToStdString());
+            settings_manager->SaveSettings();
+        }
+        event.Skip();
+    });
+    
+    // Main settings layout for scrolled content
+    wxBoxSizer* scrolled_sizer = new wxBoxSizer(wxVERTICAL);
+    scrolled_sizer->Add(model_box, 0, wxEXPAND | wxALL, 5);
+    scrolled_sizer->Add(status_box, 0, wxEXPAND | wxALL, 5);
+    scrolled_sizer->Add(prompt_box, 1, wxEXPAND | wxALL, 5);
+    scrolled_sizer->AddStretchSpacer();
+    
+    scrolled_window->SetSizer(scrolled_sizer);
+    
+    // Main panel layout with scrolled window
+    wxBoxSizer* summary_sizer = new wxBoxSizer(wxVERTICAL);
+    summary_sizer->Add(scrolled_window, 1, wxEXPAND | wxALL, 5);
+    
+    summary_panel->SetSizer(summary_sizer);
+}
+
 void LuminaChatFrame::CreateTemplatePanel() {
     template_panel = new wxPanel(notebook);
     notebook->AddPage(template_panel, "Template");
@@ -638,6 +744,26 @@ void LuminaChatFrame::Start() {
         orchestrator = std::make_unique<Orchestrator>(llama_manager.get());
         AddLogMessage("Orchestrator initialized");
         
+        // Initialize and start SummarizationPlugin
+        summarization_plugin = std::make_unique<LuminaChat::SummarizationPlugin>(orchestrator.get());
+        
+        // Register callback for plugin status updates
+        if (summarization_plugin) {
+            // TODO: When SummarizationPlugin supports status callbacks, register here
+            // summarization_plugin->RegisterStatusCallback([this](const std::string& status, bool is_error) {
+            //     CallAfter([this, status, is_error]() {
+            //         wxColour color = is_error ? wxColour(150, 50, 50) : wxColour(0, 150, 0);
+            //         UpdateSummaryPluginStatus(status, color);
+            //     });
+            // });
+        }
+        
+        summarization_plugin->Start();
+        AddLogMessage("SummarizationPlugin initialized and started");
+        
+        // Update initial status
+        UpdateSummaryPluginStatus("Starting up...", wxColour(150, 100, 50));
+        
         // Register callbacks (higher components register with lower)
         RegisterCallbacks();
         AddLogMessage("Callback dependencies registered");
@@ -678,6 +804,11 @@ void LuminaChatFrame::Stop() {
     }
     
     // Clean shutdown in reverse dependency order
+    if (summarization_plugin) {
+        summarization_plugin->Stop();
+        summarization_plugin.reset();
+        AddLogMessage("SummarizationPlugin stopped");
+    }
     orchestrator.reset();
     llama_manager.reset();
     context_size_manager.reset();
@@ -834,6 +965,8 @@ void LuminaChatFrame::SetGenerationUIState(bool generating) {
     } else {
         send_button->SetLabel("Send");
         SetStatusText("System Ready - llama.cpp Integrated", 0);
+        // Refocus the chat input when generation is complete
+        chat_input->SetFocus();
     }
 }
 
@@ -875,18 +1008,8 @@ void LuminaChatFrame::LoadDefaultModels() {
         }
     }
     
-    // Load summary model (optional)
-    if (!llama_manager->LoadModelFromSettings("summary_model", "summary")) {
-        AddLogMessage("Summary model not configured or failed to load (optional)");
-    } else {
-        AddLogMessage("Summary model loaded successfully");
-        
-        // Create summary context
-        auto* summary_context = llama_manager->GetOrCreateContextInfo("summary_context", "summary_model", "summary");
-        if (summary_context) {
-            AddLogMessage("Summary context created successfully");
-        }
-    }
+    // Note: Summary model loading is now handled by SummarizationPlugin during its initialization
+    AddLogMessage("Summary model initialization will be handled by SummarizationPlugin");
 }
 
 // Event handlers
@@ -1125,6 +1248,30 @@ void LuminaChatFrame::OnLoadModel(wxCommandEvent& event) {
     UpdateUI();
 }
 
+void LuminaChatFrame::OnLoadSummaryModel(wxCommandEvent& event) {
+    // Handle browse button for summary model
+    if (event.GetId() == ID_BrowseSummaryModel) {
+        wxFileDialog openFileDialog(this, "Select Summary GGUF Model File", "", "",
+                                   "GGUF Model files (*.gguf)|*.gguf|All files (*.*)|*.*",
+                                   wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+        
+        if (openFileDialog.ShowModal() == wxID_OK) {
+            summary_model_path_text->SetValue(openFileDialog.GetPath());
+            
+            // Save the path immediately when selected
+            if (settings_manager) {
+                settings_manager->SetString("Models", "summary_model_path", openFileDialog.GetPath().ToStdString());
+                settings_manager->SaveSettings();
+                AddLogMessage("Summary model path updated: " + openFileDialog.GetPath().ToStdString());
+            }
+        }
+        return;
+    }
+    
+    // Note: Direct model loading is now handled by SummarizationPlugin
+    AddLogMessage("Summary model loading is managed by SummarizationPlugin - use the configuration above and restart the plugin");
+}
+
 void LuminaChatFrame::OnConnectDiscord(wxCommandEvent& event) {
     if (discord_connected) {
         discord_manager->Disconnect();
@@ -1347,6 +1494,16 @@ void LuminaChatFrame::OnClearTemplate(wxCommandEvent& event) {
     AddLogMessage("Template display cleared");
 }
 
+void LuminaChatFrame::UpdateSummaryPluginStatus(const std::string& status, const wxColour& color) {
+    if (summary_status_text) {
+        summary_status_text->SetLabel("SummarizationPlugin: " + status);
+        if (color.IsOk()) {
+            summary_status_text->SetForegroundColour(color);
+        }
+        summary_status_text->GetParent()->Layout();  // Refresh the layout
+    }
+}
+
 // Helper methods for initialization
 std::string LuminaChatFrame::GetEnvironmentDescriptionFromUI() const {
     if (environment_description_text) {
@@ -1455,6 +1612,27 @@ void LuminaChatFrame::LoadUISettings() {
             }
         }
         
+        // Load summary model settings
+        if (summary_model_path_text) {
+            std::string summary_model_path = settings_manager->GetString("Models", "summary_model_path", "");
+            summary_model_path_text->SetValue(summary_model_path);
+            if (!summary_model_path.empty()) {
+                AddLogMessage("Loaded summary model path: " + summary_model_path);
+            }
+        }
+        
+        if (summary_system_prompt_text) {
+            std::string default_summary_prompt = 
+                "You are a helpful AI assistant that creates concise summaries of conversations. "
+                "When given a conversation history, provide a clear and informative summary that captures "
+                "the key points, decisions, and context. Focus on preserving important information while "
+                "being concise. Format your summary in a structured way with bullet points when appropriate.";
+                
+            std::string summary_prompt = settings_manager->GetString("Summary", "system_prompt", default_summary_prompt);
+            summary_system_prompt_text->SetValue(summary_prompt);
+            AddLogMessage("Loaded summary system prompt from settings");
+        }
+        
         // Load Discord settings
         if (discord_token_text) {
             std::string discord_token = settings_manager->GetString("Discord", "bot_token", "");
@@ -1532,6 +1710,17 @@ void LuminaChatFrame::SaveUISettings() {
         if (system_prompt_text) {
             std::string system_prompt = system_prompt_text->GetValue().ToStdString();
             settings_manager->SetString("Templates", "system_prompt", system_prompt);
+        }
+        
+        // Save summary model settings
+        if (summary_model_path_text) {
+            std::string summary_model_path = summary_model_path_text->GetValue().ToStdString();
+            settings_manager->SetString("Models", "summary_model_path", summary_model_path);
+        }
+        
+        if (summary_system_prompt_text) {
+            std::string summary_prompt = summary_system_prompt_text->GetValue().ToStdString();
+            settings_manager->SetString("Summary", "system_prompt", summary_prompt);
         }
         
         // Save Discord settings

@@ -41,6 +41,7 @@ private:
     std::string base_template;
     std::unordered_map<TemplateSection, TemplateVariable> sections;
     std::vector<std::string> past_sessions;
+    std::vector<std::string> summaries; // Multiple summaries in chronological order (oldest to newest)
     std::string cached_rendered_template;
     bool template_dirty = true;
     
@@ -82,6 +83,12 @@ public:
     void UpdateOldChatSummary(const std::string& old_summary);
     void UpdateMotifContext(const std::string& motif);
     void UpdateInternalReflection(const std::string& reflection);
+    
+    // Multiple summary management
+    void UpdateMultipleSummaries(const std::vector<std::string>& summary_list);
+    void AddSummaryToList(const std::string& summary, size_t max_summaries = 5);
+    void ClearAllSummaries();
+    const std::vector<std::string>& GetAllSummaries() const { return summaries; }
     
     // Template validation and status
     bool ValidateTemplate() const;
@@ -263,21 +270,21 @@ inline std::string ChatTemplateManager::RenderTemplate(const std::vector<std::pa
     // Simple string building approach - no Jinja2 processing, no UTF-8 corruption risk
     std::string result;
     
-    // Always add environment section
-    result += "<|start_header_id|>env<|end_header_id|>\n";
-    if (IsSectionActive(TemplateSection::OVERARCHING_ENVIRONMENT)) {
+    // Optional environment section - only add if we have content
+    if (IsSectionActive(TemplateSection::OVERARCHING_ENVIRONMENT) && !GetSection(TemplateSection::OVERARCHING_ENVIRONMENT).empty()) {
+        result += "<|start_header_id|>env<|end_header_id|>\n";
         result += GetSection(TemplateSection::OVERARCHING_ENVIRONMENT);
+        result += "\n<|eot_id|>\n\n";
     }
-    result += "\n<|eot_id|>\n\n";
     
-    // Always add persona section  
-    result += "<|start_header_id|>persona<|end_header_id|>\n";
-    if (IsSectionActive(TemplateSection::IDENTITY_DIRECTIVE)) {
+    // Optional persona section - only add if we have content
+    if (IsSectionActive(TemplateSection::IDENTITY_DIRECTIVE) && !GetSection(TemplateSection::IDENTITY_DIRECTIVE).empty()) {
+        result += "<|start_header_id|>persona<|end_header_id|>\n";
         result += GetSection(TemplateSection::IDENTITY_DIRECTIVE);
+        result += "\n<|eot_id|>\n\n";
     }
-    result += "\n<|eot_id|>\n\n";
     
-    // Always add system message section
+    // Always add system message section (guaranteed to be supplied)
     result += "<|start_header_id|>system_message<|end_header_id|>\n";
     if (IsSectionActive(TemplateSection::SYSTEM_PROMPT)) {
         result += GetSection(TemplateSection::SYSTEM_PROMPT);
@@ -300,7 +307,18 @@ inline std::string ChatTemplateManager::RenderTemplate(const std::vector<std::pa
         }
     }
     
-    // Optional summary section
+    // Multiple summary sections (chronological order: oldest to newest)
+    if (!summaries.empty()) {
+        for (size_t i = 0; i < summaries.size(); ++i) {
+            if (!summaries[i].empty()) {
+                result += "<|start_header_id|>summary_" + std::to_string(i + 1) + "<|end_header_id|>\n";
+                result += summaries[i];
+                result += "\n<|eot_id|>\n\n";
+            }
+        }
+    }
+    
+    // Optional single summary section (for backward compatibility)
     if (IsSectionActive(TemplateSection::SUMMARY) && !GetSection(TemplateSection::SUMMARY).empty()) {
         result += "<|start_header_id|>summary<|end_header_id|>\n";
         result += GetSection(TemplateSection::SUMMARY);
@@ -371,6 +389,28 @@ inline void ChatTemplateManager::UpdateMotifContext(const std::string& motif) {
 
 inline void ChatTemplateManager::UpdateInternalReflection(const std::string& reflection) {
     SetSection(TemplateSection::INTERNAL_REFLECTION, reflection, !reflection.empty());
+}
+
+inline void ChatTemplateManager::UpdateMultipleSummaries(const std::vector<std::string>& summary_list) {
+    summaries.clear();
+    for (const auto& summary : summary_list) {
+        summaries.push_back(summary);
+    }
+    template_dirty = true;
+}
+
+inline void ChatTemplateManager::AddSummaryToList(const std::string& summary, size_t max_summaries) {
+    summaries.push_back(summary);
+    // Enforce maximum size
+    if (summaries.size() > max_summaries) {
+        summaries.erase(summaries.begin()); // Remove oldest summary
+    }
+    template_dirty = true;
+}
+
+inline void ChatTemplateManager::ClearAllSummaries() {
+    summaries.clear();
+    template_dirty = true;
 }
 
 inline bool ChatTemplateManager::ValidateTemplate() const {

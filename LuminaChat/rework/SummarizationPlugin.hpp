@@ -3,11 +3,17 @@
 #include "ContextInfo.hpp"
 #include "ProcessingPipeline.hpp"
 #include "Orchestrator.hpp"
-#include "LogHandler.hpp"
+#include "LlamaManager.hpp"
+#include "SettingsManager.hpp"
+#include "Logger.hpp"
 #include <chrono>
 #include <thread>
+#include <memory>
 
 namespace LuminaChat {
+
+// Callback type for status updates
+using StatusUpdateCallback = std::function<void(const std::string& status, bool is_error)>;
 
 /**
  * Summarization Plugin - Handles background processing of pruned messages
@@ -26,8 +32,19 @@ private:
     std::atomic<bool> should_stop{false};
     std::chrono::milliseconds check_interval{1000}; // Check every second
     
-    // Reference to orchestrator for summarization processing
+    // Reference to orchestrator for context management
     Orchestrator* orchestrator = nullptr;
+    
+    // Summary model and context management
+    LlamaManager* llama_manager = nullptr;
+    SettingsManager* settings_manager = nullptr;
+    std::unique_ptr<ContextInfo> summary_context;
+    std::string summary_model_id = "summary_model";
+    std::string summary_context_id = "plugin_summary_context";
+    std::atomic<bool> summary_model_ready{false};
+    
+    // Status callback for UI updates
+    StatusUpdateCallback status_callback;
     
     // Statistics
     std::atomic<size_t> batches_processed{0};
@@ -37,6 +54,12 @@ private:
 public:
     explicit SummarizationPlugin(Orchestrator* orch) 
         : orchestrator(orch) {
+        
+        if (orchestrator) {
+            llama_manager = orchestrator->GetLlamaManager();
+            settings_manager = orchestrator->GetSettingsManager();
+        }
+        
         LOG_SummarizationPlugin("SummarizationPlugin initialized");
     }
     
@@ -53,9 +76,15 @@ public:
             return;
         }
         
+        // Initialize summary model and context first
+        if (!InitializeSummaryModel()) {
+            LOG_ERROR_SummarizationPlugin("Failed to initialize summary model - plugin will not process summarizations");
+            return;
+        }
+        
         should_stop = false;
         processing_thread = std::make_unique<std::thread>(&SummarizationPlugin::ProcessingLoop, this);
-        LOG_SummarizationPlugin("SummarizationPlugin started");
+        LOG_SummarizationPlugin("SummarizationPlugin started with summary model ready");
     }
     
     /**
@@ -66,6 +95,11 @@ public:
         if (processing_thread && processing_thread->joinable()) {
             processing_thread->join();
         }
+        
+        // Clean up summary context and model
+        summary_context.reset();
+        summary_model_ready = false;
+        
         LOG_SummarizationPlugin("SummarizationPlugin stopped");
     }
     
@@ -77,6 +111,13 @@ public:
     }
     
     /**
+     * Set status update callback for UI notifications
+     */
+    void SetStatusCallback(StatusUpdateCallback callback) {
+        status_callback = callback;
+    }
+    
+    /**
      * Get plugin statistics
      */
     struct PluginStats {
@@ -84,18 +125,117 @@ public:
         size_t messages_summarized;
         size_t summaries_applied;
         bool is_running;
+        bool summary_model_ready;
+        std::string summary_model_path;
     };
     
     PluginStats GetStats() const {
+        std::string model_path = "";
+        if (settings_manager) {
+            model_path = settings_manager->GetString("Models", "summary_model_path", "");
+        }
+        
         return {
             batches_processed.load(),
             messages_summarized.load(),
             summaries_applied.load(),
-            !should_stop.load()
+            !should_stop.load(),
+            summary_model_ready.load(),
+            model_path
         };
     }
     
 private:
+    /**
+     * Initialize the summary model and context for the plugin
+     */
+    bool InitializeSummaryModel() {
+        if (!llama_manager || !settings_manager) {
+            LOG_ERROR_SummarizationPlugin("LlamaManager or SettingsManager not available");
+            if (status_callback) status_callback("Error: Core services not available", true);
+            return false;
+        }
+        
+        LOG_SummarizationPlugin("Initializing summary model...");
+        if (status_callback) status_callback("Initializing summary model...", false);
+        
+        // Get summary model configuration from settings
+        std::string summary_model_path = settings_manager->GetString("Models", "summary_model_path", "");
+        if (summary_model_path.empty()) {
+            LOG_WARNING_SummarizationPlugin("No summary model path configured - plugin will be disabled");
+            if (status_callback) status_callback("No summary model configured", true);
+            return false;
+        }
+        
+        // Get main model settings to derive summary model config
+        int main_context_size = settings_manager->GetInt("Models", "main_context_size", 4096);
+        int main_gpu_layers = settings_manager->GetInt("Models", "main_gpu_layers", 999);
+        
+        // Calculate summary model config (25% context size, same GPU layers)
+        int summary_context_size = main_context_size / 4;
+        if (summary_context_size < 512) summary_context_size = 512; // Minimum context
+        
+        LOG_SummarizationPlugin("Loading summary model: " + summary_model_path + 
+                               " (context: " + std::to_string(summary_context_size) + 
+                               ", gpu_layers: " + std::to_string(main_gpu_layers) + ")");
+        
+        if (status_callback) status_callback("Loading summary model: " + summary_model_path, false);
+        
+        try {
+            // Load summary model
+            ModelConfig config;
+            config.model_path = summary_model_path;
+            config.context_size = summary_context_size;
+            config.gpu_layers = main_gpu_layers;
+            
+            if (!llama_manager->LoadModel(summary_model_id, config)) {
+                LOG_ERROR_SummarizationPlugin("Failed to load summary model: " + summary_model_path);
+                if (status_callback) status_callback("Failed to load summary model", true);
+                return false;
+            }
+            
+            LOG_SummarizationPlugin("Summary model loaded successfully");
+            if (status_callback) status_callback("Creating summary context...", false);
+            
+            // Create summary context
+            auto* context_ptr = llama_manager->GetOrCreateContextInfo(summary_context_id, summary_model_id, "summary");
+            if (!context_ptr) {
+                LOG_ERROR_SummarizationPlugin("Failed to create summary context");
+                if (status_callback) status_callback("Failed to create summary context", true);
+                return false;
+            }
+            
+            // Store the context (we don't own it, LlamaManager does)
+            // But we keep a reference for easier access
+            summary_context = nullptr; // We'll access it through LlamaManager
+            
+            LOG_SummarizationPlugin("Summary context created: " + summary_context_id);
+            if (status_callback) status_callback("Applying summary system prompt...", false);
+            
+            // Apply summary system prompt from settings
+            std::string summary_system_prompt = settings_manager->GetString("Summary", "system_prompt",
+                "You are a helpful AI assistant that creates concise summaries of conversations. "
+                "When given a conversation history, provide a clear and informative summary that captures "
+                "the key points, decisions, and context. Focus on preserving important information while "
+                "being concise. Format your summary in a structured way with bullet points when appropriate.");
+            
+            if (!summary_system_prompt.empty()) {
+                context_ptr->UpdateSystemPrompt(summary_system_prompt);
+                LOG_SummarizationPlugin("Applied summary system prompt to context");
+            }
+            
+            summary_model_ready = true;
+            LOG_SummarizationPlugin("Summary model initialization completed successfully");
+            if (status_callback) status_callback("Summary model ready", false);
+            return true;
+            
+        } catch (const std::exception& e) {
+            LOG_ERROR_SummarizationPlugin("Exception during summary model initialization: " + std::string(e.what()));
+            if (status_callback) status_callback("Error: " + std::string(e.what()), true);
+            return false;
+        }
+    }
+    
     /**
      * Main processing loop - runs in background thread
      */
@@ -119,6 +259,11 @@ private:
      * Check for and process any pending summarization requests
      */
     void ProcessPendingSummarizations() {
+        // Skip processing if summary model is not ready
+        if (!summary_model_ready.load()) {
+            return;
+        }
+        
         // Check if there are any pruned messages waiting for summarization
         if (!ContextInfo::HasPendingSummarization()) {
             return; // No work to do
@@ -147,18 +292,79 @@ private:
         LOG_SummarizationPlugin("Processing batch for context: " + batch.context_id + 
                                " (" + std::to_string(batch.pruned_messages.size()) + " messages)");
         
-        // Convert message history to content string
-        std::ostringstream content_stream;
-        for (const auto& [role, content] : batch.pruned_messages) {
-            content_stream << role << ": " << content << "\n";
+        if (!summary_model_ready.load() || !llama_manager) {
+            LOG_ERROR_SummarizationPlugin("Summary model not ready for processing batch");
+            return;
         }
         
-        if (orchestrator) {
-            // Use orchestrator to handle the summarization request
-            orchestrator->RequestSummarization(batch.context_id, content_stream.str());
-            messages_summarized += batch.pruned_messages.size();
-        } else {
-            LOG_ERROR_SummarizationPlugin("No orchestrator available for summarization");
+        try {
+            // Get the summary context
+            auto* summary_ctx = llama_manager->GetContextInfo(summary_context_id);
+            if (!summary_ctx) {
+                LOG_ERROR_SummarizationPlugin("Summary context not available");
+                return;
+            }
+            
+            // Convert message history to a summarization prompt
+            std::ostringstream prompt_stream;
+            prompt_stream << "Please summarize the following conversation history:\n\n";
+            
+            for (const auto& [role, content] : batch.pruned_messages) {
+                prompt_stream << role << ": " << content << "\n";
+            }
+            
+            prompt_stream << "\nProvide a concise summary that captures the key points and context:";
+            
+            std::string summarization_prompt = prompt_stream.str();
+            
+            LOG_SummarizationPlugin("Generating summary for " + std::to_string(batch.pruned_messages.size()) + " messages");
+            
+            // Generate summary using the summary context (synchronous for now)
+            // Use "user" role to ensure proper template formatting
+            std::string summary = summary_ctx->HandleInput(summarization_prompt, "user");
+            
+            if (!summary.empty()) {
+                LOG_SummarizationPlugin("Generated summary: " + summary.substr(0, 100) + 
+                                       (summary.length() > 100 ? "..." : ""));
+                
+                // Apply the summary back to the original context
+                ApplySummaryToContext(batch.context_id, summary);
+                
+                messages_summarized += batch.pruned_messages.size();
+                summaries_applied++;
+            } else {
+                LOG_ERROR_SummarizationPlugin("Failed to generate summary for batch");
+            }
+            
+        } catch (const std::exception& e) {
+            LOG_ERROR_SummarizationPlugin("Exception processing summarization batch: " + std::string(e.what()));
+        }
+    }
+    
+    /**
+     * Apply a generated summary back to the original context
+     */
+    void ApplySummaryToContext(const std::string& context_id, const std::string& summary) {
+        if (!llama_manager) {
+            LOG_ERROR_SummarizationPlugin("LlamaManager not available for applying summary");
+            return;
+        }
+        
+        try {
+            // Get the original context that requested summarization
+            auto* original_context = llama_manager->GetContextInfo(context_id);
+            if (!original_context) {
+                LOG_WARNING_SummarizationPlugin("Original context not found for summary application: " + context_id);
+                return;
+            }
+            
+            // Apply the completed summary to the context
+            original_context->ApplyCompletedSummary(summary);
+            
+            LOG_SummarizationPlugin("Applied summary to context: " + context_id);
+            
+        } catch (const std::exception& e) {
+            LOG_ERROR_SummarizationPlugin("Exception applying summary to context: " + std::string(e.what()));
         }
     }
 };

@@ -114,6 +114,7 @@ inline Logger& GetLogger() {
 #define LOG_ContextInfo(message) LOG_INFO("ContextInfo", message)
 #define LOG_LlamaManager(message) LOG_INFO("LlamaManager", message)
 #define LOG_Orchestrator(message) LOG_INFO("Orchestrator", message)
+#define LOG_SummarizationPlugin(message) LOG_INFO("SummarizationPlugin", message)
 #define LOG_LuminaChat(message) LOG_INFO("LuminaChat", message)
 
 // DEBUG macros for all components
@@ -128,6 +129,7 @@ inline Logger& GetLogger() {
 #define LOG_DEBUG_ContextInfo(message) LOG_DEBUG("ContextInfo", message)
 #define LOG_DEBUG_LlamaManager(message) LOG_DEBUG("LlamaManager", message)
 #define LOG_DEBUG_Orchestrator(message) LOG_DEBUG("Orchestrator", message)
+#define LOG_DEBUG_SummarizationPlugin(message) LOG_DEBUG("SummarizationPlugin", message)
 #define LOG_DEBUG_LuminaChat(message) LOG_DEBUG("LuminaChat", message)
 
 // ERROR macros for all components
@@ -142,6 +144,7 @@ inline Logger& GetLogger() {
 #define LOG_ERROR_ContextInfo(message) LOG_ERROR("ContextInfo", message)
 #define LOG_ERROR_LlamaManager(message) LOG_ERROR("LlamaManager", message)
 #define LOG_ERROR_Orchestrator(message) LOG_ERROR("Orchestrator", message)
+#define LOG_ERROR_SummarizationPlugin(message) LOG_ERROR("SummarizationPlugin", message)
 #define LOG_ERROR_LuminaChat(message) LOG_ERROR("LuminaChat", message)
 
 // WARNING macros for all components
@@ -156,4 +159,5 @@ inline Logger& GetLogger() {
 #define LOG_WARNING_ContextInfo(message) LOG_WARNING("ContextInfo", message)
 #define LOG_WARNING_LlamaManager(message) LOG_WARNING("LlamaManager", message)
 #define LOG_WARNING_Orchestrator(message) LOG_WARNING("Orchestrator", message)
+#define LOG_WARNING_SummarizationPlugin(message) LOG_WARNING("SummarizationPlugin", message)
 #define LOG_WARNING_LuminaChat(message) LOG_WARNING("LuminaChat", message)

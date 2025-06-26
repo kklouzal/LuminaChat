@@ -153,6 +153,8 @@ public:
     
     // Settings integration
     void SetSettingsManager(SettingsManager* settings);
+    SettingsManager* GetSettingsManager() { return settings_manager; }
+    const SettingsManager* GetSettingsManager() const { return settings_manager; }
     bool LoadDefaultTemplatesFromSettings();
     bool SaveStatsToSettings() const;
     
