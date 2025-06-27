@@ -6,6 +6,7 @@
 #include <functional>
 #include <regex>
 #include <sstream>
+#include <stdexcept>
 
 enum class TemplateSection {
     OVERARCHING_ENVIRONMENT,
@@ -220,6 +221,16 @@ inline ChatTemplateManager::ChatTemplateManager(const std::string& base_template
 }
 
 inline void ChatTemplateManager::SetSection(TemplateSection section, const std::string& content, bool active) {
+    // Input validation - prevent malformed content from corrupting the template
+    if (!content.empty()) {
+        // Check for control characters that could break template parsing
+        if (content.find("<|start_header_id|>") != std::string::npos || 
+            content.find("<|end_header_id|>") != std::string::npos ||
+            content.find("<|eot_id|>") != std::string::npos) {
+            throw std::invalid_argument("SetSection: Content contains reserved template tokens");
+        }
+    }
+    
     sections[section] = TemplateVariable(content, active);
     template_dirty = true;
 }
@@ -257,6 +268,15 @@ inline bool ChatTemplateManager::IsSectionActive(TemplateSection section) const 
 }
 
 inline void ChatTemplateManager::AddPastSession(const std::string& memory) {
+    // Input validation - prevent malformed content
+    if (!memory.empty()) {
+        if (memory.find("<|start_header_id|>") != std::string::npos || 
+            memory.find("<|end_header_id|>") != std::string::npos ||
+            memory.find("<|eot_id|>") != std::string::npos) {
+            throw std::invalid_argument("AddPastSession: Memory content contains reserved template tokens");
+        }
+    }
+    
     past_sessions.push_back(memory);
     template_dirty = true;
 }
@@ -267,21 +287,40 @@ inline void ChatTemplateManager::ClearPastSessions() {
 }
 
 inline std::string ChatTemplateManager::RenderTemplate(const std::vector<std::pair<std::string, std::string>>& messages) {
+    // Input validation - prevent malformed content from corrupting the template
+    for (const auto& [role, content] : messages) {
+        if (role.empty() || content.empty()) {
+            throw std::invalid_argument("RenderTemplate: Empty role or content detected in message history");
+        }
+        // Check for control characters that could break template parsing
+        if (content.find("<|start_header_id|>") != std::string::npos || 
+            content.find("<|end_header_id|>") != std::string::npos ||
+            content.find("<|eot_id|>") != std::string::npos) {
+            throw std::invalid_argument("RenderTemplate: Message content contains reserved template tokens");
+        }
+    }
+    
     // Simple string building approach - no Jinja2 processing, no UTF-8 corruption risk
     std::string result;
+    result.reserve(8192); // Pre-allocate reasonable buffer to reduce allocations
+    
+    // Helper lambda for consistent section rendering
+    auto render_section = [&result](const std::string& header, const std::string& content) {
+        if (!content.empty()) {
+            result += "<|start_header_id|>" + header + "<|end_header_id|>\n";
+            result += content;
+            result += "\n<|eot_id|>\n\n";
+        }
+    };
     
     // Optional environment section - only add if we have content
-    if (IsSectionActive(TemplateSection::OVERARCHING_ENVIRONMENT) && !GetSection(TemplateSection::OVERARCHING_ENVIRONMENT).empty()) {
-        result += "<|start_header_id|>env<|end_header_id|>\n";
-        result += GetSection(TemplateSection::OVERARCHING_ENVIRONMENT);
-        result += "\n<|eot_id|>\n\n";
+    if (IsSectionActive(TemplateSection::OVERARCHING_ENVIRONMENT)) {
+        render_section("env", GetSection(TemplateSection::OVERARCHING_ENVIRONMENT));
     }
     
     // Optional persona section - only add if we have content
-    if (IsSectionActive(TemplateSection::IDENTITY_DIRECTIVE) && !GetSection(TemplateSection::IDENTITY_DIRECTIVE).empty()) {
-        result += "<|start_header_id|>persona<|end_header_id|>\n";
-        result += GetSection(TemplateSection::IDENTITY_DIRECTIVE);
-        result += "\n<|eot_id|>\n\n";
+    if (IsSectionActive(TemplateSection::IDENTITY_DIRECTIVE)) {
+        render_section("persona", GetSection(TemplateSection::IDENTITY_DIRECTIVE));
     }
     
     // Always add system message section (guaranteed to be supplied)
@@ -291,71 +330,79 @@ inline std::string ChatTemplateManager::RenderTemplate(const std::vector<std::pa
     }
     result += "\n<|eot_id|>\n\n";
     
-    // Optional old chat summary section
-    if (IsSectionActive(TemplateSection::OLD_CHAT_SUMMARY) && !GetSection(TemplateSection::OLD_CHAT_SUMMARY).empty()) {
-        result += "<|start_header_id|>old_chat_summary<|end_header_id|>\n";
-        result += GetSection(TemplateSection::OLD_CHAT_SUMMARY);
-        result += "\n<|eot_id|>\n\n";
-    }
-    
     // Optional past sessions (memory fragments)
     if (!past_sessions.empty()) {
         for (size_t i = 0; i < past_sessions.size(); ++i) {
-            result += "<|start_header_id|>memory_" + std::to_string(i + 1) + "<|end_header_id|>\n";
-            result += past_sessions[i];
-            result += "\n<|eot_id|>\n\n";
+            render_section("memory_" + std::to_string(i + 1), past_sessions[i]);
         }
     }
     
-    // Multiple summary sections (chronological order: oldest to newest)
+    // Combine all summaries into the old_chat_summary section (chronological order: oldest to newest)
+    std::string combined_summaries;
+    
+    // Add the specific old_chat_summary content if active
+    if (IsSectionActive(TemplateSection::OLD_CHAT_SUMMARY)) {
+        std::string old_summary = GetSection(TemplateSection::OLD_CHAT_SUMMARY);
+        if (!old_summary.empty()) {
+            combined_summaries += old_summary;
+        }
+    }
+    
+    // Add all additional summaries from the summaries vector
     if (!summaries.empty()) {
-        for (size_t i = 0; i < summaries.size(); ++i) {
-            if (!summaries[i].empty()) {
-                result += "<|start_header_id|>summary_" + std::to_string(i + 1) + "<|end_header_id|>\n";
-                result += summaries[i];
-                result += "\n<|eot_id|>\n\n";
+        for (const auto& summary : summaries) {
+            if (!summary.empty()) {
+                if (!combined_summaries.empty()) {
+                    combined_summaries += "\n\n"; // Separate summaries with double newline
+                }
+                combined_summaries += summary;
             }
         }
     }
     
-    // Optional single summary section (for backward compatibility)
-    if (IsSectionActive(TemplateSection::SUMMARY) && !GetSection(TemplateSection::SUMMARY).empty()) {
-        result += "<|start_header_id|>summary<|end_header_id|>\n";
-        result += GetSection(TemplateSection::SUMMARY);
-        result += "\n<|eot_id|>\n\n";
+    // Add the single summary section content if active (for backward compatibility)
+    if (IsSectionActive(TemplateSection::SUMMARY)) {
+        std::string summary_content = GetSection(TemplateSection::SUMMARY);
+        if (!summary_content.empty()) {
+            if (!combined_summaries.empty()) {
+                combined_summaries += "\n\n";
+            }
+            combined_summaries += summary_content;
+        }
+    }
+    
+    // Render the combined old_chat_summary section if we have any content
+    if (!combined_summaries.empty()) {
+        render_section("old_chat_summary", combined_summaries);
     }
     
     // Optional motif context section
-    if (IsSectionActive(TemplateSection::MOTIF_CONTEXT) && !GetSection(TemplateSection::MOTIF_CONTEXT).empty()) {
-        result += "<|start_header_id|>motif<|end_header_id|>\n";
-        result += GetSection(TemplateSection::MOTIF_CONTEXT);
-        result += "\n<|eot_id|>\n\n";
+    if (IsSectionActive(TemplateSection::MOTIF_CONTEXT)) {
+        render_section("motif", GetSection(TemplateSection::MOTIF_CONTEXT));
     }
     
     // Optional internal reflection section
-    if (IsSectionActive(TemplateSection::INTERNAL_REFLECTION) && !GetSection(TemplateSection::INTERNAL_REFLECTION).empty()) {
-        result += "<|start_header_id|>internal<|end_header_id|>\n";
-        result += GetSection(TemplateSection::INTERNAL_REFLECTION);
-        result += "\n<|eot_id|>\n\n";
+    if (IsSectionActive(TemplateSection::INTERNAL_REFLECTION)) {
+        render_section("internal", GetSection(TemplateSection::INTERNAL_REFLECTION));
     }
     
-    // Add conversation history
+    // Add conversation history with consistent formatting
     for (const auto& [role, content] : messages) {
         if (role == "assistant") {
             result += "<|start_header_id|>assistant<|end_header_id|>\n";
             result += content;  // No trimming or filtering - preserve content exactly
-            result += "<|eot_id|>\n";
+            result += "\n<|eot_id|>\n";
         } else {
             result += "<|start_header_id|>user<|end_header_id|>\n";
             result += "[" + role + "] " + content;  // No trimming or filtering - preserve content exactly
-            result += "<|eot_id|>\n";
+            result += "\n<|eot_id|>\n";
         }
     }
     
     // Add final assistant turn marker
     result += "<|start_header_id|>assistant<|end_header_id|>\n";
     
-    // Cache the result
+    // Cache the result and mark as clean
     cached_rendered_template = result;
     template_dirty = false;
     
@@ -400,6 +447,15 @@ inline void ChatTemplateManager::UpdateMultipleSummaries(const std::vector<std::
 }
 
 inline void ChatTemplateManager::AddSummaryToList(const std::string& summary, size_t max_summaries) {
+    // Input validation - prevent malformed content
+    if (!summary.empty()) {
+        if (summary.find("<|start_header_id|>") != std::string::npos || 
+            summary.find("<|end_header_id|>") != std::string::npos ||
+            summary.find("<|eot_id|>") != std::string::npos) {
+            throw std::invalid_argument("AddSummaryToList: Summary content contains reserved template tokens");
+        }
+    }
+    
     summaries.push_back(summary);
     // Enforce maximum size
     if (summaries.size() > max_summaries) {

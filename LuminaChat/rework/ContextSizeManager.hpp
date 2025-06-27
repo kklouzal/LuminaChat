@@ -132,8 +132,10 @@ public:
     void SetMaxTokens(int32_t max_tokens) {
         std::lock_guard<std::mutex> lock(stats_mutex);
         current_stats.max_tokens = max_tokens;
-        emergency_threshold_tokens = static_cast<int32_t>(max_tokens * 0.95f); // 95% is emergency
-        LOG_ContextSizeManager("Max tokens set to: " + std::to_string(max_tokens));
+        // Set emergency threshold to 85% (was 95%) to ensure sufficient buffer for response generation
+        emergency_threshold_tokens = static_cast<int32_t>(max_tokens * 0.85f);
+        LOG_ContextSizeManager("Max tokens set to: " + std::to_string(max_tokens) + 
+                              ", emergency threshold: " + std::to_string(emergency_threshold_tokens));
     }
     
     void SetPruningThreshold(float threshold) {
@@ -346,18 +348,22 @@ public:
     
 private:
     void CheckPruningNeeded() {
-        // Called with stats_mutex already locked
+        // Called with stats_mutex already locked - do not acquire mutex again
         
-        if (IsEmergencyPruningNeeded()) {
+        // Direct access to current_stats (mutex already held)
+        bool is_emergency = (current_stats.total_tokens >= emergency_threshold_tokens);
+        float usage_percentage = current_stats.GetUsagePercentage();
+        
+        if (is_emergency) {
             current_state = PruningState::EMERGENCY_PRUNING;
             LOG_WARNING_ContextSizeManager("Emergency pruning threshold reached!");
-        } else if (current_stats.GetUsagePercentage() >= pruning_threshold) {
+        } else if (usage_percentage >= pruning_threshold) {
             if (current_state == PruningState::NORMAL) {
                 current_state = PruningState::MONITORING;
                 LOG_ContextSizeManager("Approaching pruning threshold (" + 
-                    std::to_string(static_cast<int>(current_stats.GetUsagePercentage() * 100)) + "%)");
+                    std::to_string(static_cast<int>(usage_percentage * 100)) + "%)");
             }
-        } else if (current_stats.GetUsagePercentage() < 0.60f) {
+        } else if (usage_percentage < 0.60f) {
             // Return to normal if usage drops significantly
             if (current_state == PruningState::MONITORING) {
                 current_state = PruningState::NORMAL;

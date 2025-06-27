@@ -13,6 +13,7 @@
 #include <mutex>
 #include <filesystem>
 #include <system_error>
+#include <unordered_map>
 
 // ModelInfo: Model resource management and vocabulary access
 // - Owns TokenCache instance for this model
@@ -90,6 +91,7 @@ private:
     // llama.cpp objects
     llama_model* model = nullptr;
     llama_context* temp_context = nullptr; // For tokenization operations only
+    bool owns_model = true; // Whether this instance owns the model and should free it
     
     // Thread safety
     mutable std::mutex model_mutex;
@@ -100,6 +102,10 @@ private:
     
     // Memory tracking
     std::atomic<size_t> estimated_memory_usage{0};
+    
+    // Static tracking of loaded model files to prevent duplicate loading
+    static std::unordered_map<std::string, ModelInfo*> loaded_model_files;
+    static std::mutex loaded_files_mutex;
     
     // Helper methods
     void NotifyResourceEvent(ResourceEvent event, const std::string& message = "") const {
@@ -120,6 +126,38 @@ private:
         if (model) {
             // Rough estimate based on model parameters
             estimated_memory_usage = llama_model_size(model);
+        }
+    }
+    
+    // Check if the same model file is already loaded
+    static ModelInfo* FindExistingModelByPath(const std::string& model_path) {
+        std::lock_guard<std::mutex> lock(loaded_files_mutex);
+        auto it = loaded_model_files.find(model_path);
+        if (it != loaded_model_files.end()) {
+            // Verify the ModelInfo is still valid and loaded
+            ModelInfo* existing_model = it->second;
+            if (existing_model && existing_model->IsLoaded()) {
+                return existing_model;
+            } else {
+                // Clean up invalid entry
+                loaded_model_files.erase(it);
+            }
+        }
+        return nullptr;
+    }
+    
+    // Register this model instance for the given file path
+    static void RegisterModelForPath(const std::string& model_path, ModelInfo* model_info) {
+        std::lock_guard<std::mutex> lock(loaded_files_mutex);
+        loaded_model_files[model_path] = model_info;
+    }
+    
+    // Unregister this model instance from the given file path
+    static void UnregisterModelForPath(const std::string& model_path) {
+        std::lock_guard<std::mutex> lock(loaded_files_mutex);
+        auto it = loaded_model_files.find(model_path);
+        if (it != loaded_model_files.end()) {
+            loaded_model_files.erase(it);
         }
     }
     
@@ -173,6 +211,26 @@ public:
                 LOG_ERROR_ModelInfo("Model file does not exist: " + model_config.model_path);
                 state = ModelState::ERROR_STATE;
                 return false;
+            }
+            
+            // Check if the same model file is already loaded by another ModelInfo instance
+            if (auto existing_model = FindExistingModelByPath(model_config.model_path)) {
+                if (existing_model != this) {
+                    LOG_ModelInfo("Model file " + model_config.model_path + " is already loaded by model " + 
+                                 existing_model->GetModelId() + ", sharing the model instance");
+                    
+                    // Share the model resources from the existing ModelInfo
+                    model = existing_model->GetModel();
+                    temp_context = nullptr; // We'll create our own tokenization context if needed
+                    config = model_config;
+                    state = ModelState::LOADED;
+                    owns_model = false; // We don't own this model, so don't free it
+                    UpdateMemoryUsage();
+                    
+                    // Note: We don't register this path again since the existing model already has it registered
+                    NotifyResourceEvent(ResourceEvent::MODEL_LOADED, "Shared model from existing instance: " + model_config.model_path);
+                    return true;
+                }
             }
             
             state = ModelState::LOADING;
@@ -235,6 +293,9 @@ public:
             LOG_ModelInfo("Model loaded successfully: " + model_config.model_path + 
                          " (GPU layers: " + std::to_string(model_config.gpu_layers) + ")");
             
+            // Register this model instance for the file path to prevent duplicate loading
+            RegisterModelForPath(model_config.model_path, this);
+            
             // Notify outside of lock to prevent deadlock
             NotifyResourceEvent(ResourceEvent::MODEL_LOADED, "Successfully loaded: " + model_config.model_path);
             
@@ -286,8 +347,14 @@ public:
     
     // Cleanup resources
     void Cleanup() {
+        std::string model_path_to_unregister;
         {
             std::lock_guard<std::mutex> lock(model_mutex);
+            
+            // Save the model path for unregistration
+            if (state == ModelState::LOADED && !config.model_path.empty()) {
+                model_path_to_unregister = config.model_path;
+            }
             
             if (temp_context) {
                 llama_free(temp_context);
@@ -295,10 +362,13 @@ public:
                 LOG_ModelInfo("Temp context freed for: " + model_id);
             }
             
-            if (model) {
+            if (model && owns_model) {
                 llama_model_free(model);
                 model = nullptr;
                 LOG_ModelInfo("Model freed for: " + model_id);
+            } else if (model && !owns_model) {
+                model = nullptr; // Just clear the pointer, don't free
+                LOG_ModelInfo("Shared model pointer cleared for: " + model_id);
             }
             
             state = ModelState::UNLOADED;
@@ -308,6 +378,11 @@ public:
                 token_cache->ClearAll();
                 LOG_ModelInfo("Token cache cleared for: " + model_id);
             }
+        }
+        
+        // Unregister model path outside of the model_mutex lock (only if we owned the model)
+        if (!model_path_to_unregister.empty() && owns_model) {
+            UnregisterModelForPath(model_path_to_unregister);
         }
         
         // Don't notify during cleanup to prevent use-after-free in destructor
@@ -467,6 +542,19 @@ public:
         resource_callback = std::move(callback);
     }
     
+    // Model path registration for duplicate prevention
+    static void RegisterModelInstance(const std::string& model_path, ModelInfo* model_info) {
+        RegisterModelForPath(model_path, model_info);
+    }
+    
+    static void UnregisterModelInstance(const std::string& model_path) {
+        UnregisterModelForPath(model_path);
+    }
+    
+    static ModelInfo* FindExistingModel(const std::string& model_path) {
+        return FindExistingModelByPath(model_path);
+    }
+    
     // Statistics
     size_t GetTokenCacheHits() const {
         return token_cache ? token_cache->GetStats().GetTotalHits() : 0;
@@ -483,3 +571,7 @@ public:
         return total > 0 ? static_cast<float>(stats.GetTotalHits()) / total : 0.0f;
     }
 };
+
+// Static member definitions
+inline std::unordered_map<std::string, ModelInfo*> ModelInfo::loaded_model_files;
+inline std::mutex ModelInfo::loaded_files_mutex;

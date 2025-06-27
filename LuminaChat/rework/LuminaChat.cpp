@@ -86,6 +86,7 @@ public:
     // Helper methods for initialization
     void RegisterCallbacks();
     void LoadDefaultModels();
+    void InitializePlugins();  // New method for plugin initialization after model loading
     
     // Template configuration helpers
     std::string GetEnvironmentDescriptionFromUI() const;
@@ -744,25 +745,8 @@ void LuminaChatFrame::Start() {
         orchestrator = std::make_unique<Orchestrator>(llama_manager.get());
         AddLogMessage("Orchestrator initialized");
         
-        // Initialize and start SummarizationPlugin
-        summarization_plugin = std::make_unique<LuminaChat::SummarizationPlugin>(orchestrator.get());
-        
-        // Register callback for plugin status updates
-        if (summarization_plugin) {
-            // TODO: When SummarizationPlugin supports status callbacks, register here
-            // summarization_plugin->RegisterStatusCallback([this](const std::string& status, bool is_error) {
-            //     CallAfter([this, status, is_error]() {
-            //         wxColour color = is_error ? wxColour(150, 50, 50) : wxColour(0, 150, 0);
-            //         UpdateSummaryPluginStatus(status, color);
-            //     });
-            // });
-        }
-        
-        summarization_plugin->Start();
-        AddLogMessage("SummarizationPlugin initialized and started");
-        
-        // Update initial status
-        UpdateSummaryPluginStatus("Starting up...", wxColour(150, 100, 50));
+        // Note: SummarizationPlugin initialization is now deferred until model loading
+        AddLogMessage("Plugin initialization will be handled when user loads a model");
         
         // Register callbacks (higher components register with lower)
         RegisterCallbacks();
@@ -771,15 +755,18 @@ void LuminaChatFrame::Start() {
         // Load UI settings from configuration
         LoadUISettings();
         
-        // Load default models from settings
-        LoadDefaultModels();
+        // Note: Model loading is now manual - user must click "Load Model" button
+        AddLogMessage("Ready for manual model loading - click 'Load Model' button to proceed");
         
         running = true;
         system_timer->Start(100);
         
-        AddLogMessage("LuminaChat started successfully with full llama.cpp integration");
-        SetStatusText("System Ready - llama.cpp Integrated", 0);
+        AddLogMessage("LuminaChat started successfully - ready for manual model loading");
+        SetStatusText("System Ready - Click 'Load Model' to begin", 0);
         UpdateUI();
+        
+        // Set initial plugin status
+        UpdateSummaryPluginStatus("Waiting for model loading", wxColour(100, 100, 100));
         
     } catch (const std::exception& e) {
         wxString error_msg = wxString::Format("Failed to start LuminaChat: %s", e.what());
@@ -964,7 +951,11 @@ void LuminaChatFrame::SetGenerationUIState(bool generating) {
         SetStatusText("Generating response...", 0);
     } else {
         send_button->SetLabel("Send");
-        SetStatusText("System Ready - llama.cpp Integrated", 0);
+        if (model_loaded) {
+            SetStatusText("System Ready - Model Loaded", 0);
+        } else {
+            SetStatusText("System Ready - Click 'Load Model' to begin", 0);
+        }
         // Refocus the chat input when generation is complete
         chat_input->SetFocus();
     }
@@ -1010,6 +1001,43 @@ void LuminaChatFrame::LoadDefaultModels() {
     
     // Note: Summary model loading is now handled by SummarizationPlugin during its initialization
     AddLogMessage("Summary model initialization will be handled by SummarizationPlugin");
+}
+
+void LuminaChatFrame::InitializePlugins() {
+    if (!llama_manager || !orchestrator || !model_loaded) {
+        AddLogMessage("ERROR: Cannot initialize plugins - prerequisites not met");
+        return;
+    }
+    
+    AddLogMessage("Initializing plugins after successful model loading...");
+    
+    try {
+        // Initialize and start SummarizationPlugin
+        summarization_plugin = std::make_unique<LuminaChat::SummarizationPlugin>(orchestrator.get());
+        
+        // Register callback for plugin status updates
+        if (summarization_plugin) {
+            // TODO: When SummarizationPlugin supports status callbacks, register here
+            // summarization_plugin->RegisterStatusCallback([this](const std::string& status, bool is_error) {
+            //     CallAfter([this, status, is_error]() {
+            //         wxColour color = is_error ? wxColour(150, 50, 50) : wxColour(0, 150, 0);
+            //         UpdateSummaryPluginStatus(status, color);
+            //     });
+            // });
+        }
+        
+        summarization_plugin->Start();
+        AddLogMessage("SummarizationPlugin initialized and started");
+        
+        // Update plugin status
+        UpdateSummaryPluginStatus("Initialized and ready", wxColour(0, 150, 0));
+        
+        AddLogMessage("All plugins initialized successfully");
+        
+    } catch (const std::exception& e) {
+        AddLogMessage(wxString::Format("Error initializing plugins: %s", e.what()).ToStdString());
+        UpdateSummaryPluginStatus("Initialization failed", wxColour(150, 50, 50));
+    }
 }
 
 // Event handlers
@@ -1219,6 +1247,10 @@ void LuminaChatFrame::OnLoadModel(wxCommandEvent& event) {
                     // Apply template settings from UI (identity directive and system prompt)
                     ApplyTemplateSettingsToContext(context_info, current_context_id);
                     AddLogMessage("Model loaded successfully");
+                    
+                    // Now initialize plugins after successful model loading
+                    InitializePlugins();
+                    
                     AddChatMessage("System", "Model loaded and ready for conversation!", wxColour(0, 150, 0));
                 } else {
                     LOG_ERROR_LuminaChat("GetOrCreateContextInfo returned null");

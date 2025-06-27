@@ -20,6 +20,12 @@
 #include <future>
 #include <condition_variable>
 
+// ContextInfo Configuration Constants
+namespace ContextConstants {
+    constexpr int32_t SAFETY_BUFFER_TOKENS = 64;      // Safety margin for all context operations
+    constexpr int32_t GENERATION_BUFFER_TOKENS = 128; // Buffer for response generation (larger to account for responses)
+}
+
 // ContextInfo: Individual conversation context management
 // 
 // Key Features:
@@ -832,15 +838,46 @@ inline bool ContextInfo::ProcessTokensBatch(const std::vector<int32_t>& tokens) 
         return true;
     }
     
-    // CRITICAL FIX: Validate and synchronize context state before batch processing
+    // CRITICAL FIX: Validate context size and bounds before any processing
+    if (stats.max_context_tokens == 0) {
+        LOG_ERROR_ContextInfo("Context size not set - cannot validate bounds");
+        return false;
+    }
+    
+    // CRITICAL FIX: Strict bounds validation - context must have space for tokens plus safety buffer
+    const int32_t context_size = static_cast<int32_t>(stats.max_context_tokens);
+    const int32_t safety_buffer = ContextConstants::SAFETY_BUFFER_TOKENS;
+    
+    if (n_past < 0) {
+        LOG_ERROR_ContextInfo("Invalid n_past value: " + std::to_string(n_past) + " - cannot continue");
+        return false;
+    }
+    
+    // CRITICAL: n_past must never reach context_size - 1 (llama.cpp uses 0-based indexing)
+    if (n_past >= (context_size - safety_buffer)) {
+        LOG_ERROR_ContextInfo("Context position (" + std::to_string(n_past) + 
+                             ") too close to context limit (" + std::to_string(context_size) + 
+                             ") - batch processing rejected");
+        return false;
+    }
+    
+    // CRITICAL FIX: Check available space with safety margin
+    const int32_t available_space = context_size - n_past - safety_buffer;
+    if (static_cast<int32_t>(tokens.size()) > available_space) {
+        LOG_ERROR_ContextInfo("Token batch size (" + std::to_string(tokens.size()) + 
+                             ") exceeds available context space (" + std::to_string(available_space) + 
+                             ") - batch processing rejected to prevent overflow");
+        return false;
+    }
+    
+    // CRITICAL FIX: Remove recovery logic completely - failures indicate bugs
+    // If bounds checking is correct, decode failures should not occur
+    // Recovery logic masks the real problems and creates infinite loops
+    
+    // Validate context state before processing
     if (!ValidateAndSyncContextState()) {
-        LOG_ERROR_ContextInfo("Context state validation failed - resetting context");
-        n_past = 0;
-        if (llama_ctx) {
-            llama_memory_clear(llama_get_memory(llama_ctx), true);
-        }
-        // Sync stats after emergency reset
-        SyncStatsWithContextState();
+        LOG_ERROR_ContextInfo("Context state validation failed before batch processing");
+        return false;
     }
     
     try {
@@ -857,6 +894,15 @@ inline bool ContextInfo::ProcessTokensBatch(const std::vector<int32_t>& tokens) 
             size_t end = std::min(i + max_batch_size, tokens.size());
             size_t chunk_size = end - i;
             
+            // CRITICAL FIX: Validate that this chunk will fit with safety margin
+            const int32_t remaining_space = (context_size - safety_buffer) - n_past;
+            if (static_cast<int32_t>(chunk_size) > remaining_space) {
+                LOG_ERROR_ContextInfo("Chunk size (" + std::to_string(chunk_size) + 
+                                     ") exceeds remaining safe context space (" + std::to_string(remaining_space) + 
+                                     ") - stopping batch processing");
+                break;
+            }
+            
             // Clear batch properly (don't free, just reset)
             clear_batch();
             
@@ -864,62 +910,51 @@ inline bool ContextInfo::ProcessTokensBatch(const std::vector<int32_t>& tokens) 
             for (size_t j = i; j < end && batch.n_tokens < max_batch_size; ++j) {
                 size_t batch_idx = j - i;
                 
+                // CRITICAL FIX: Validate position bounds with safety margin
+                const int32_t token_position = n_past + static_cast<int32_t>(batch_idx);
+                if (token_position >= (context_size - safety_buffer)) {
+                    LOG_ERROR_ContextInfo("Token position (" + std::to_string(token_position) + 
+                                         ") would exceed safe context limit (" + std::to_string(context_size - safety_buffer) + 
+                                         ") - stopping batch at token " + std::to_string(j));
+                    break;
+                }
+                
                 batch.token[batch.n_tokens] = static_cast<llama_token>(tokens[j]);
-                batch.pos[batch.n_tokens] = n_past + static_cast<int32_t>(batch_idx);
+                batch.pos[batch.n_tokens] = token_position;
                 batch.n_seq_id[batch.n_tokens] = 1;  // Number of sequences this token belongs to
                 batch.seq_id[batch.n_tokens][0] = 0; // Sequence ID 0
                 batch.logits[batch.n_tokens] = (j == end - 1); // Only last token gets logits
                 batch.n_tokens++;
             }
             
-            LOG_DEBUG_ContextInfo("Processing batch: " + std::to_string(batch.n_tokens) + 
-                                 " tokens, positions " + std::to_string(n_past) + 
-                                 " to " + std::to_string(n_past + chunk_size - 1));
-            
-            // Decode batch
-            int result = llama_decode(llama_ctx, batch);
-            if (result != 0) {
-                LOG_ERROR_ContextInfo("Batch decode failed with result: " + std::to_string(result) + 
-                                     " (batch size: " + std::to_string(batch.n_tokens) + 
-                                     ", n_past: " + std::to_string(n_past) + ")");
-                
-                // Try to recover by clearing context and starting fresh
-                if (result == 1) { // Common error code for context overflow
-                    LOG_ContextInfo("Attempting recovery from batch decode failure - clearing context");
-                    if (llama_ctx) {
-                        llama_memory_clear(llama_get_memory(llama_ctx), true);
-                    }
-                    n_past = 0;
-                    SyncStatsWithContextState();
-                    
-                    // Try processing the batch again from clean state
-                    clear_batch();
-                    for (size_t j = i; j < end && batch.n_tokens < max_batch_size; ++j) {
-                        size_t batch_idx = j - i;
-                        batch.token[batch.n_tokens] = static_cast<llama_token>(tokens[j]);
-                        batch.pos[batch.n_tokens] = static_cast<int32_t>(batch_idx);
-                        batch.n_seq_id[batch.n_tokens] = 1;
-                        batch.seq_id[batch.n_tokens][0] = 0;
-                        batch.logits[batch.n_tokens] = (j == end - 1);
-                        batch.n_tokens++;
-                    }
-                    
-                    result = llama_decode(llama_ctx, batch);
-                    if (result != 0) {
-                        LOG_ERROR_ContextInfo("Recovery attempt failed with result: " + std::to_string(result));
-                        return false;
-                    } else {
-                        LOG_ContextInfo("Successfully recovered from batch decode failure");
-                    }
-                } else {
-                    return false;
-                }
+            // CRITICAL FIX: Skip empty batches
+            if (batch.n_tokens == 0) {
+                LOG_DEBUG_ContextInfo("Skipping empty batch at position " + std::to_string(n_past));
+                break;
             }
             
-            n_past += static_cast<int32_t>(chunk_size);
+            LOG_DEBUG_ContextInfo("Processing batch: " + std::to_string(batch.n_tokens) + 
+                                 " tokens, positions " + std::to_string(n_past) + 
+                                 " to " + std::to_string(n_past + batch.n_tokens - 1) + 
+                                 " (context size: " + std::to_string(context_size) + ")");
+            
+            // Decode batch - if this fails with proper bounds checking, it indicates a bug
+            int result = llama_decode(llama_ctx, batch);
+            if (result != 0) {
+                LOG_ERROR_ContextInfo("CRITICAL BUG: Batch decode failed with result: " + std::to_string(result) + 
+                                     " despite proper bounds checking - this should not happen");
+                LOG_ERROR_ContextInfo("Debug info: batch_size=" + std::to_string(batch.n_tokens) + 
+                                     ", n_past=" + std::to_string(n_past) + 
+                                     ", positions=" + std::to_string(n_past) + "-" + 
+                                     std::to_string(n_past + batch.n_tokens - 1) + 
+                                     ", safe_limit=" + std::to_string(context_size - safety_buffer));
+                return false;
+            }
+            
+            n_past += static_cast<int32_t>(batch.n_tokens);
             
             // Track tokens actually processed in this batch
-            stats.total_tokens_processed += chunk_size;
+            stats.total_tokens_processed += batch.n_tokens;
         }
         
         LOG_DEBUG_ContextInfo("Processed " + std::to_string(tokens.size()) + " tokens, n_past=" + std::to_string(n_past));
@@ -993,9 +1028,15 @@ inline std::string ContextInfo::GenerateResponse(const std::string& prompt) {
                 break;
             }
             
-            // Check if we're approaching context limit during generation
-            if (n_past + static_cast<int32_t>(response_tokens.size()) >= static_cast<int32_t>(stats.max_context_tokens) - 50) {
-                LOG_DEBUG_ContextInfo("Approaching context limit during generation, stopping early");
+            // CRITICAL FIX: Check if we're approaching context limit during generation
+            // Use consistent generation buffer to prevent decode failures
+            const int32_t generation_buffer = ContextConstants::GENERATION_BUFFER_TOKENS;
+            const int32_t current_usage = n_past + static_cast<int32_t>(response_tokens.size());
+            if (current_usage >= static_cast<int32_t>(stats.max_context_tokens) - generation_buffer) {
+                LOG_DEBUG_ContextInfo("Approaching context limit during generation (usage: " + 
+                                     std::to_string(current_usage) + "/" + 
+                                     std::to_string(stats.max_context_tokens) + 
+                                     "), stopping early with buffer: " + std::to_string(generation_buffer));
                 break;
             }
             
@@ -1012,8 +1053,17 @@ inline std::string ContextInfo::GenerateResponse(const std::string& prompt) {
             batch.logits[0] = true; // Generate logits for next token
             batch.n_tokens = 1;
             
+            // CRITICAL FIX: Validate position before decode to prevent overflow
+            if (n_past >= static_cast<int32_t>(stats.max_context_tokens)) {
+                LOG_ERROR_ContextInfo("Cannot decode token - position (" + std::to_string(n_past) + 
+                                     ") exceeds context size (" + std::to_string(stats.max_context_tokens) + ")");
+                break;
+            }
+            
             if (llama_decode(llama_ctx, batch) != 0) {
-                LOG_ERROR_ContextInfo("Failed to decode generated token");
+                LOG_ERROR_ContextInfo("Failed to decode generated token at position " + 
+                                     std::to_string(n_past) + " (context size: " + 
+                                     std::to_string(stats.max_context_tokens) + ")");
                 break;
             }
             
@@ -1082,9 +1132,18 @@ inline bool ContextInfo::IsNearContextLimit(float threshold) const {
                          std::to_string(threshold * 100.0f) + "%");
     
     bool near_limit = usage >= threshold;
+    
+    // CRITICAL FIX: Also check if we're within a dangerous margin of the limit
+    // Use consistent safety buffer
+    const size_t safety_buffer = ContextConstants::SAFETY_BUFFER_TOKENS;
+    if (actual_context_tokens + safety_buffer >= stats.max_context_tokens) {
+        LOG_ContextInfo("Context within safety buffer of limit - treating as near limit");
+        near_limit = true;
+    }
+    
     if (near_limit) {
         LOG_ContextInfo("Context is near limit: " + std::to_string(usage * 100.0f) + "% >= " + 
-                       std::to_string(threshold * 100.0f) + "%");
+                       std::to_string(threshold * 100.0f) + "% (or within safety buffer)");
     }
     
     return near_limit;
@@ -1368,9 +1427,15 @@ inline void ContextInfo::StartGenerationAsync(const std::string& prompt, const G
                     break;
                 }
                 
-                // Check if we're approaching context limit during generation
-                if (n_past + static_cast<int32_t>(response_tokens.size()) >= static_cast<int32_t>(stats.max_context_tokens) - 50) {
-                    LOG_DEBUG_ContextInfo("Approaching context limit during generation, stopping early");
+                // CRITICAL FIX: Check if we're approaching context limit during generation
+                // Use consistent generation buffer to prevent decode failures
+                const int32_t generation_buffer = ContextConstants::GENERATION_BUFFER_TOKENS;
+                const int32_t current_usage = n_past + static_cast<int32_t>(response_tokens.size());
+                if (current_usage >= static_cast<int32_t>(stats.max_context_tokens) - generation_buffer) {
+                    LOG_DEBUG_ContextInfo("Approaching context limit during generation (usage: " + 
+                                         std::to_string(current_usage) + "/" + 
+                                         std::to_string(stats.max_context_tokens) + 
+                                         "), stopping early with buffer: " + std::to_string(generation_buffer));
                     break;
                 }
                 
@@ -1398,8 +1463,17 @@ inline void ContextInfo::StartGenerationAsync(const std::string& prompt, const G
                 batch.logits[0] = true; // Generate logits for next token
                 batch.n_tokens = 1;
                 
+                // CRITICAL FIX: Validate position before decode to prevent overflow
+                if (n_past >= static_cast<int32_t>(stats.max_context_tokens)) {
+                    LOG_ERROR_ContextInfo("Cannot decode token - position (" + std::to_string(n_past) + 
+                                         ") exceeds context size (" + std::to_string(stats.max_context_tokens) + ")");
+                    break;
+                }
+                
                 if (llama_decode(llama_ctx, batch) != 0) {
-                    LOG_ERROR_ContextInfo("Failed to decode generated token");
+                    LOG_ERROR_ContextInfo("Failed to decode generated token at position " + 
+                                         std::to_string(n_past) + " (context size: " + 
+                                         std::to_string(stats.max_context_tokens) + ")");
                     break;
                 }
                 
@@ -1466,32 +1540,46 @@ inline bool ContextInfo::ValidateAndSyncContextState() {
         return false;
     }
     
-    // Check if context was recently rebuilt or cleared
-    if (context_needs_rebuild) {
-        LOG_DEBUG_ContextInfo("Context rebuild flag detected - resetting n_past");
-        n_past = 0;
-        context_needs_rebuild = false;
-        SyncStatsWithContextState(); // Sync stats after reset
-        return true;
-    }
-    
-    // Validate that n_past doesn't exceed reasonable bounds
-    if (n_past < 0 || n_past > static_cast<int32_t>(current_tokens.size() + 1000)) {
-        LOG_WARNING_ContextInfo("n_past value appears invalid (" + std::to_string(n_past) + 
-                               "), resetting to 0");
-        n_past = 0;
-        SyncStatsWithContextState(); // Sync stats after reset
+    // CRITICAL FIX: Check context size bounds first
+    if (stats.max_context_tokens == 0) {
+        LOG_ERROR_ContextInfo("Context size not initialized - cannot validate state");
         return false;
     }
     
-    // Additional validation: ensure n_past is consistent with context state
-    // This helps catch cases where context was modified without proper n_past update
-    if (stats.current_context_tokens > 0 && n_past == 0 && !current_tokens.empty()) {
-        LOG_DEBUG_ContextInfo("Detected inconsistent state: tokens exist but n_past=0, keeping n_past=0");
-        // Keep n_past = 0 for safety
-        SyncStatsWithContextState(); // Sync stats to reflect the actual state
+    const int32_t max_context = static_cast<int32_t>(stats.max_context_tokens);
+    
+    // CRITICAL FIX: Strict validation with safety margin
+    const int32_t safety_buffer = ContextConstants::SAFETY_BUFFER_TOKENS;
+    
+    if (n_past < 0) {
+        LOG_ERROR_ContextInfo("n_past is negative (" + std::to_string(n_past) + ") - invalid state");
+        return false;
     }
     
+    // CRITICAL: n_past must never reach the context limit
+    if (n_past >= (max_context - safety_buffer)) {
+        LOG_ERROR_ContextInfo("CRITICAL: n_past (" + std::to_string(n_past) + 
+                             ") is at or beyond safe context limit (" + std::to_string(max_context - safety_buffer) + 
+                             ") - context requires rebuild");
+        return false;
+    }
+    
+    // Check if context was flagged for rebuild
+    if (context_needs_rebuild) {
+        LOG_DEBUG_ContextInfo("Context rebuild flag detected - n_past will be reset during rebuild");
+        context_needs_rebuild = false;
+    }
+    
+    // Validate consistency between n_past and available tokens (more lenient check)
+    if (n_past > static_cast<int32_t>(current_tokens.size() + 500)) {
+        LOG_WARNING_ContextInfo("n_past (" + std::to_string(n_past) + 
+                               ") appears inconsistent with token count (" + std::to_string(current_tokens.size()) + 
+                               ") - this may indicate context state issues");
+        return false;
+    }
+    
+    // Sync stats with validated state
+    SyncStatsWithContextState();
     return true;
 }
 

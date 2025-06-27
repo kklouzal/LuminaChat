@@ -359,6 +359,32 @@ inline bool LlamaManager::LoadModel(const std::string& model_id, const ModelConf
         return false;
     }
     
+    // Check if the same model file is already loaded by another model ID
+    {
+        std::lock_guard<std::mutex> lock(manager_mutex);
+        for (const auto& [existing_id, existing_model] : models) {
+            if (existing_model && existing_model->IsLoaded() && 
+                existing_model->GetConfig().model_path == config.model_path) {
+                
+                LOG_LlamaManager("Model file " + config.model_path + " is already loaded as model ID: " + existing_id + 
+                               ", creating reference for: " + model_id);
+                
+                // Create a new ModelInfo that shares the loaded model
+                auto shared_model_info = std::make_unique<ModelInfo>(model_id);
+                if (shared_model_info->LoadModel(config)) {
+                    models[model_id] = std::move(shared_model_info);
+                    UpdateStats();
+                    NotifyResourceEvent("MODEL_LOADED", "Successfully loaded (shared): " + model_id);
+                    LOG_LlamaManager("Model loaded successfully (shared): " + model_id);
+                    return true;
+                } else {
+                    LOG_ERROR_LlamaManager("Failed to share loaded model for: " + model_id);
+                    return false;
+                }
+            }
+        }
+    }
+    
     ModelInfo* model_info = GetOrCreateModelInfo(model_id);
     if (!model_info) {
         LOG_ERROR_LlamaManager("Failed to get/create ModelInfo for: " + model_id);
