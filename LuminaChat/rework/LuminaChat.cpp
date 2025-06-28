@@ -47,6 +47,7 @@
 #include "LlamaManager.hpp"
 #include "Orchestrator.hpp"
 #include "SummarizationPlugin.hpp"
+#include "EmoTagPlugin.hpp"
 
 #include <memory>
 #include <thread>
@@ -77,6 +78,7 @@ public:
     void OnClearLogs(wxCommandEvent& event);
     void OnClearTemplate(wxCommandEvent& event);
     void OnLoadSummaryModel(wxCommandEvent& event);
+    void OnLoadEmoTagModel(wxCommandEvent& event);
     void OnLogLevelChanged(wxCommandEvent& event);
 
     // Core system lifecycle
@@ -148,6 +150,16 @@ private:
     wxStaticText* summary_status_text;
     wxTextCtrl* summary_system_prompt_text;
     
+    // EmoTag Settings Panel
+    wxPanel* emotag_panel;
+    wxTextCtrl* emotag_model_path_text;
+    wxButton* browse_emotag_model_button;
+    wxStaticText* emotag_status_text;
+    wxTextCtrl* emotag_system_prompt_text;
+    wxSlider* emotag_window_size_slider;
+    wxStaticText* emotag_window_size_text;
+    wxCheckBox* emotag_include_user_checkbox;
+    
     // Template Panel
     wxPanel* template_panel;
     wxTextCtrl* template_display;
@@ -161,6 +173,7 @@ private:
     std::unique_ptr<LlamaManager> llama_manager;
     std::unique_ptr<Orchestrator> orchestrator;
     std::unique_ptr<LuminaChat::SummarizationPlugin> summarization_plugin;
+    std::unique_ptr<LuminaChat::EmoTagPlugin> emotag_plugin;
     
     // System state
     std::atomic<bool> running{false};
@@ -187,6 +200,7 @@ private:
     void CreateDiscordPanel();
     void CreateLogsPanel();
     void CreateSummaryPanel();
+    void CreateEmoTagPanel();
     void CreateTemplatePanel();
     
     // UI update methods
@@ -201,6 +215,7 @@ private:
     void AddLogMessage(const std::string& message);
     void UpdateTemplateDisplay(const std::string& template_content);  // Update template inspection tab
     void UpdateSummaryPluginStatus(const std::string& status, const wxColour& color = wxNullColour);  // Update summary plugin status
+    void UpdateEmoTagPluginStatus(const std::string& status, const wxColour& color = wxNullColour);  // Update emotag plugin status
     
     DECLARE_EVENT_TABLE()
 };
@@ -216,7 +231,8 @@ enum {
     ID_ClearLogs,
     ID_ClearTemplate,
     ID_BrowseModel,
-    ID_BrowseSummaryModel
+    ID_BrowseSummaryModel,
+    ID_BrowseEmoTagModel
 };
 
 // Event table mapping
@@ -232,6 +248,7 @@ wxBEGIN_EVENT_TABLE(LuminaChatFrame, wxFrame)
     EVT_BUTTON(ID_ClearLogs, LuminaChatFrame::OnClearLogs)
     EVT_BUTTON(ID_ClearTemplate, LuminaChatFrame::OnClearTemplate)
     EVT_BUTTON(ID_BrowseSummaryModel, LuminaChatFrame::OnLoadSummaryModel)
+    EVT_BUTTON(ID_BrowseEmoTagModel, LuminaChatFrame::OnLoadEmoTagModel)
     EVT_TIMER(ID_Timer, LuminaChatFrame::OnTimer)
     EVT_CLOSE(LuminaChatFrame::OnClose)
 wxEND_EVENT_TABLE()
@@ -278,6 +295,7 @@ LuminaChatFrame::LuminaChatFrame()
     CreateDiscordPanel();
     CreateLogsPanel();
     CreateSummaryPanel();
+    CreateEmoTagPanel();
     CreateTemplatePanel();
     
     // Main layout
@@ -665,6 +683,153 @@ void LuminaChatFrame::CreateSummaryPanel() {
     summary_panel->SetSizer(summary_sizer);
 }
 
+void LuminaChatFrame::CreateEmoTagPanel() {
+    emotag_panel = new wxPanel(notebook);
+    notebook->AddPage(emotag_panel, "EmoTag Settings");
+    
+    // Create a scrolled window to contain all settings
+    wxScrolledWindow* scrolled_window = new wxScrolledWindow(emotag_panel, wxID_ANY, 
+                                                            wxDefaultPosition, wxDefaultSize, 
+                                                            wxVSCROLL | wxHSCROLL);
+    scrolled_window->SetScrollRate(10, 10);
+    
+    // EmoTag model configuration group
+    wxStaticBoxSizer* model_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Emotion Analysis Model Configuration");
+    
+    // Model path selection
+    wxBoxSizer* path_sizer = new wxBoxSizer(wxHORIZONTAL);
+    path_sizer->Add(new wxStaticText(scrolled_window, wxID_ANY, "Emotion Model Path:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
+    emotag_model_path_text = new wxTextCtrl(scrolled_window, wxID_ANY);
+    path_sizer->Add(emotag_model_path_text, 1, wxEXPAND | wxALL, 5);
+    browse_emotag_model_button = new wxButton(scrolled_window, ID_BrowseEmoTagModel, "Browse...");
+    path_sizer->Add(browse_emotag_model_button, 0, wxALL, 5);
+    model_box->Add(path_sizer, 0, wxEXPAND);
+    
+    // Bind text change event to save model path
+    emotag_model_path_text->Bind(wxEVT_TEXT, [this](wxCommandEvent& event) {
+        if (settings_manager) {
+            settings_manager->SetString("Models", "emotion_model_path", emotag_model_path_text->GetValue().ToStdString());
+            // Don't auto-save on every keystroke for performance, just mark dirty
+        }
+    });
+    
+    // Auto-configuration note
+    wxStaticText* auto_config_note = new wxStaticText(scrolled_window, wxID_ANY, 
+        "Note: Context size will be automatically set to 30% of main model context size.\n"
+        "GPU layers will match the main model setting.\n"
+        "Model loading is managed automatically by the EmoTagPlugin.");
+    auto_config_note->SetFont(auto_config_note->GetFont().Italic());
+    auto_config_note->SetForegroundColour(wxColour(100, 100, 100));
+    model_box->Add(auto_config_note, 0, wxALL, 5);
+    
+    // Status display
+    wxStaticBoxSizer* status_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Plugin Status");
+    emotag_status_text = new wxStaticText(scrolled_window, wxID_ANY, "EmoTagPlugin: Not initialized");
+    emotag_status_text->SetFont(emotag_status_text->GetFont().Bold());
+    emotag_status_text->SetForegroundColour(wxColour(150, 100, 50));
+    status_box->Add(emotag_status_text, 0, wxALL, 5);
+    
+    // Plugin configuration group
+    wxStaticBoxSizer* config_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Analysis Configuration");
+    
+    // Analysis Window Size
+    wxBoxSizer* window_size_sizer = new wxBoxSizer(wxHORIZONTAL);
+    window_size_sizer->Add(new wxStaticText(scrolled_window, wxID_ANY, "Analysis Window Size:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
+    emotag_window_size_slider = new wxSlider(scrolled_window, wxID_ANY, 3, 1, 10, wxDefaultPosition, wxSize(200, -1));
+    emotag_window_size_slider->SetToolTip("Number of recent messages to keep and analyze (1-10)");
+    window_size_sizer->Add(emotag_window_size_slider, 1, wxEXPAND | wxALL, 5);
+    emotag_window_size_text = new wxStaticText(scrolled_window, wxID_ANY, "3");
+    emotag_window_size_text->SetFont(emotag_window_size_text->GetFont().Bold());
+    window_size_sizer->Add(emotag_window_size_text, 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
+    config_box->Add(window_size_sizer, 0, wxEXPAND);
+    
+    // Bind slider change event
+    emotag_window_size_slider->Bind(wxEVT_SLIDER, [this](wxCommandEvent& event) {
+        int value = emotag_window_size_slider->GetValue();
+        emotag_window_size_text->SetLabel(wxString::Format("%d", value));
+        if (settings_manager) {
+            settings_manager->SetInt("Emotion", "analysis_window_size", value);
+            settings_manager->SaveSettings();
+        }
+        if (emotag_plugin) {
+            emotag_plugin->SetAnalysisWindow(static_cast<size_t>(value));
+        }
+    });
+    
+    // Include User Messages checkbox
+    emotag_include_user_checkbox = new wxCheckBox(scrolled_window, wxID_ANY, "Include User Messages in Analysis");
+    emotag_include_user_checkbox->SetToolTip("When enabled, user messages will be included in emotional analysis for richer context");
+    emotag_include_user_checkbox->SetValue(false); // Default to false
+    config_box->Add(emotag_include_user_checkbox, 0, wxALL, 5);
+    
+    // Bind checkbox change event
+    emotag_include_user_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent& event) {
+        bool value = emotag_include_user_checkbox->GetValue();
+        if (settings_manager) {
+            settings_manager->SetBool("Emotion", "include_user_messages", value);
+            settings_manager->SaveSettings();
+        }
+        if (emotag_plugin) {
+            emotag_plugin->SetIncludeUserMessages(value);
+        }
+    });
+    
+    // Configuration note
+    wxStaticText* config_note = new wxStaticText(scrolled_window, wxID_ANY, 
+        "Analysis is triggered immediately after each AI response.\n"
+        "Window size determines how many recent messages are analyzed.\n"
+        "Including user messages provides fuller context but uses more tokens.");
+    config_note->SetFont(config_note->GetFont().Italic());
+    config_note->SetForegroundColour(wxColour(100, 100, 100));
+    config_box->Add(config_note, 0, wxALL, 5);
+    
+    // EmoTag system prompt configuration group
+    wxStaticBoxSizer* prompt_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Emotional Analysis System Prompt");
+    
+    // System Prompt textbox
+    prompt_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "System Prompt for Emotional Analysis:"), 0, wxALL, 5);
+    emotag_system_prompt_text = new wxTextCtrl(scrolled_window, wxID_ANY, wxEmptyString,
+                                               wxDefaultPosition, wxSize(-1, 200),
+                                               wxTE_MULTILINE | wxTE_WORDWRAP);
+    emotag_system_prompt_text->SetToolTip("Define the system prompt for the emotional analysis model. This will instruct the AI on how to analyze the emotional state of AI responses.");
+    
+    // Set default emotion prompt if empty
+    emotag_system_prompt_text->SetValue(
+        "You are an emotional state analyzer. When given AI assistant responses, analyze the emotional tone, "
+        "mood, and psychological state conveyed in the text. Provide a brief emotional overview that captures "
+        "the assistant's apparent emotional state, confidence level, and overall demeanor. "
+        "Focus on identifying patterns like: confident, uncertain, empathetic, analytical, cheerful, "
+        "cautious, enthusiastic, or reserved. Keep your analysis concise and actionable."
+    );
+    
+    prompt_box->Add(emotag_system_prompt_text, 1, wxEXPAND | wxALL, 5);
+    
+    // Auto-save on kill focus
+    emotag_system_prompt_text->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& event) {
+        if (settings_manager) {
+            settings_manager->SetString("Emotion", "system_prompt", emotag_system_prompt_text->GetValue().ToStdString());
+            settings_manager->SaveSettings();
+        }
+        event.Skip();
+    });
+    
+    // Main settings layout for scrolled content
+    wxBoxSizer* scrolled_sizer = new wxBoxSizer(wxVERTICAL);
+    scrolled_sizer->Add(model_box, 0, wxEXPAND | wxALL, 5);
+    scrolled_sizer->Add(status_box, 0, wxEXPAND | wxALL, 5);
+    scrolled_sizer->Add(config_box, 0, wxEXPAND | wxALL, 5);
+    scrolled_sizer->Add(prompt_box, 1, wxEXPAND | wxALL, 5);
+    scrolled_sizer->AddStretchSpacer();
+    
+    scrolled_window->SetSizer(scrolled_sizer);
+    
+    // Main panel layout with scrolled window
+    wxBoxSizer* emotag_sizer = new wxBoxSizer(wxVERTICAL);
+    emotag_sizer->Add(scrolled_window, 1, wxEXPAND | wxALL, 5);
+    
+    emotag_panel->SetSizer(emotag_sizer);
+}
+
 void LuminaChatFrame::CreateTemplatePanel() {
     template_panel = new wxPanel(notebook);
     notebook->AddPage(template_panel, "Template");
@@ -767,6 +932,7 @@ void LuminaChatFrame::Start() {
         
         // Set initial plugin status
         UpdateSummaryPluginStatus("Waiting for model loading", wxColour(100, 100, 100));
+        UpdateEmoTagPluginStatus("Waiting for model loading", wxColour(100, 100, 100));
         
     } catch (const std::exception& e) {
         wxString error_msg = wxString::Format("Failed to start LuminaChat: %s", e.what());
@@ -791,6 +957,11 @@ void LuminaChatFrame::Stop() {
     }
     
     // Clean shutdown in reverse dependency order
+    if (emotag_plugin) {
+        emotag_plugin->Stop();
+        emotag_plugin.reset();
+        AddLogMessage("EmoTagPlugin stopped");
+    }
     if (summarization_plugin) {
         summarization_plugin->Stop();
         summarization_plugin.reset();
@@ -1035,6 +1206,39 @@ void LuminaChatFrame::InitializePlugins() {
         // Update plugin status
         UpdateSummaryPluginStatus("Initialized and ready", wxColour(0, 150, 0));
         
+        // Initialize and start EmoTagPlugin
+        emotag_plugin = std::make_unique<LuminaChat::EmoTagPlugin>(orchestrator.get());
+        
+        // Register callback for plugin status updates
+        if (emotag_plugin) {
+            emotag_plugin->SetStatusCallback([this](const std::string& status, bool is_error) {
+                CallAfter([this, status, is_error]() {
+                    wxColour color = is_error ? wxColour(150, 50, 50) : wxColour(0, 150, 0);
+                    UpdateEmoTagPluginStatus(status, color);
+                });
+            });
+        }
+        
+        emotag_plugin->Start();
+        
+        // Configure plugin with current UI settings
+        if (emotag_window_size_slider) {
+            int window_size = emotag_window_size_slider->GetValue();
+            emotag_plugin->SetAnalysisWindow(static_cast<size_t>(window_size));
+            AddLogMessage("Configured EmoTagPlugin analysis window size: " + std::to_string(window_size));
+        }
+        
+        if (emotag_include_user_checkbox) {
+            bool include_user = emotag_include_user_checkbox->GetValue();
+            emotag_plugin->SetIncludeUserMessages(include_user);
+            AddLogMessage("Configured EmoTagPlugin include user messages: " + std::string(include_user ? "enabled" : "disabled"));
+        }
+        
+        AddLogMessage("EmoTagPlugin initialized and started");
+        
+        // Update plugin status
+        UpdateEmoTagPluginStatus("Initialized and ready", wxColour(0, 150, 0));
+        
         AddLogMessage("All plugins initialized successfully");
         
     } catch (const std::exception& e) {
@@ -1091,6 +1295,12 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
         
         AddLogMessage("Processing message with context: " + current_context_id);
         
+        // Record user message in EmoTagPlugin if enabled
+        if (emotag_plugin) {
+            emotag_plugin->RecordUserMessage(current_context_id, input.ToStdString());
+            AddLogMessage("User message recorded in EmoTagPlugin for context: " + current_context_id);
+        }
+        
         // Get the finalized template for inspection BEFORE starting generation
         std::string finalized_template;
         try {
@@ -1123,6 +1333,12 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
                     UpdateContextStatus();  // Update context usage in status bar
                     if (success) {
                         AddLogMessage("Response generation completed successfully");
+                        
+                        // Record AI response in EmoTagPlugin for emotional analysis
+                        if (emotag_plugin && !full_response.empty()) {
+                            emotag_plugin->RecordAIResponse(current_context_id, full_response);
+                            AddLogMessage("AI response recorded in EmoTagPlugin for emotional analysis");
+                        }
                     } else {
                         AddLogMessage("Response generation was stopped or failed");
                         if (full_response.empty()) {
@@ -1310,6 +1526,30 @@ void LuminaChatFrame::OnLoadSummaryModel(wxCommandEvent& event) {
     
     // Note: Direct model loading is now handled by SummarizationPlugin
     AddLogMessage("Summary model loading is managed by SummarizationPlugin - use the configuration above and restart the plugin");
+}
+
+void LuminaChatFrame::OnLoadEmoTagModel(wxCommandEvent& event) {
+    // Handle browse button for emotion model
+    if (event.GetId() == ID_BrowseEmoTagModel) {
+        wxFileDialog openFileDialog(this, "Select Emotion Analysis GGUF Model File", "", "",
+                                   "GGUF Model files (*.gguf)|*.gguf|All files (*.*)|*.*",
+                                   wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+        
+        if (openFileDialog.ShowModal() == wxID_OK) {
+            emotag_model_path_text->SetValue(openFileDialog.GetPath());
+            
+            // Save the path immediately when selected
+            if (settings_manager) {
+                settings_manager->SetString("Models", "emotion_model_path", openFileDialog.GetPath().ToStdString());
+                settings_manager->SaveSettings();
+                AddLogMessage("Emotion model path updated: " + openFileDialog.GetPath().ToStdString());
+            }
+        }
+        return;
+    }
+    
+    // Note: Direct model loading is now handled by EmoTagPlugin
+    AddLogMessage("Emotion model loading is managed by EmoTagPlugin - use the configuration above and restart the plugin");
 }
 
 void LuminaChatFrame::OnConnectDiscord(wxCommandEvent& event) {
@@ -1544,6 +1784,16 @@ void LuminaChatFrame::UpdateSummaryPluginStatus(const std::string& status, const
     }
 }
 
+void LuminaChatFrame::UpdateEmoTagPluginStatus(const std::string& status, const wxColour& color) {
+    if (emotag_status_text) {
+        emotag_status_text->SetLabel("EmoTagPlugin: " + status);
+        if (color.IsOk()) {
+            emotag_status_text->SetForegroundColour(color);
+        }
+        emotag_status_text->GetParent()->Layout();  // Refresh the layout
+    }
+}
+
 // Helper methods for initialization
 std::string LuminaChatFrame::GetEnvironmentDescriptionFromUI() const {
     if (environment_description_text) {
@@ -1671,6 +1921,42 @@ void LuminaChatFrame::LoadUISettings() {
             std::string summary_prompt = settings_manager->GetString("Summary", "system_prompt", default_summary_prompt);
             summary_system_prompt_text->SetValue(summary_prompt);
             AddLogMessage("Loaded summary system prompt from settings");
+        }
+        
+        // Load emotion model settings
+        if (emotag_model_path_text) {
+            std::string emotag_model_path = settings_manager->GetString("Models", "emotion_model_path", "");
+            emotag_model_path_text->SetValue(emotag_model_path);
+            if (!emotag_model_path.empty()) {
+                AddLogMessage("Loaded emotion model path: " + emotag_model_path);
+            }
+        }
+        
+        if (emotag_system_prompt_text) {
+            std::string default_emotion_prompt = 
+                "You are an emotional state analyzer. When given AI assistant responses, analyze the emotional tone, "
+                "mood, and psychological state conveyed in the text. Provide a brief emotional overview that captures "
+                "the assistant's apparent emotional state, confidence level, and overall demeanor. "
+                "Focus on identifying patterns like: confident, uncertain, empathetic, analytical, cheerful, "
+                "cautious, enthusiastic, or reserved. Keep your analysis concise and actionable.";
+                
+            std::string emotion_prompt = settings_manager->GetString("Emotion", "system_prompt", default_emotion_prompt);
+            emotag_system_prompt_text->SetValue(emotion_prompt);
+            AddLogMessage("Loaded emotion system prompt from settings");
+        }
+        
+        // Load EmoTag configuration parameters
+        if (emotag_window_size_slider && emotag_window_size_text) {
+            int window_size = settings_manager->GetInt("Emotion", "analysis_window_size", 3);
+            emotag_window_size_slider->SetValue(window_size);
+            emotag_window_size_text->SetLabel(wxString::Format("%d", window_size));
+            AddLogMessage("Loaded emotion analysis window size: " + std::to_string(window_size));
+        }
+        
+        if (emotag_include_user_checkbox) {
+            bool include_user = settings_manager->GetBool("Emotion", "include_user_messages", false);
+            emotag_include_user_checkbox->SetValue(include_user);
+            AddLogMessage("Loaded emotion include user messages setting: " + std::string(include_user ? "enabled" : "disabled"));
         }
         
         // Load Discord settings

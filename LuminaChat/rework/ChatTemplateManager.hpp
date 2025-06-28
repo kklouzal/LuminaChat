@@ -16,7 +16,8 @@ enum class TemplateSection {
     PAST_SESSIONS,
     SUMMARY,
     MOTIF_CONTEXT,
-    INTERNAL_REFLECTION
+    INTERNAL_REFLECTION,
+    EMOTIONAL_STATE
 };
 
 struct TemplateVariable {
@@ -32,7 +33,7 @@ struct TemplateVariable {
  * Chat Template Manager - Direct template building without legacy Jinja2 processing
  * 
  * This implementation uses direct string building for template rendering:
- * - Direct variable substitution for the 8 key variables only
+ * - Direct variable substitution for the 9 key variables only
  * - Proper conversation history formatting with exact role handling
  * - Conditional section rendering for optional content
  * - No artificial processing or message echoing
@@ -45,7 +46,7 @@ private:
     std::string cached_rendered_template;
     bool template_dirty = true;
     
-    // Template section names for replacement - ONLY these 8 variables
+    // Template section names for replacement - ONLY these 9 variables
     static const std::unordered_map<TemplateSection, std::string> section_names;
     
 public:
@@ -80,6 +81,7 @@ public:
     void UpdateOldChatSummary(const std::string& old_summary);
     void UpdateMotifContext(const std::string& motif);
     void UpdateInternalReflection(const std::string& reflection);
+    void UpdateEmotionalState(const std::string& emotional_state);
     
     // Multiple summary management
     void UpdateMultipleSummaries(const std::vector<std::string>& summary_list);
@@ -92,7 +94,7 @@ public:
     void MarkDirty() { template_dirty = true; }
 };
 
-// Static section name mapping for template variable replacement - ONLY these 8 variables
+// Static section name mapping for template variable replacement - ONLY these 9 variables
 const std::unordered_map<TemplateSection, std::string> ChatTemplateManager::section_names = {
     {TemplateSection::OVERARCHING_ENVIRONMENT, "overarching_environment"},
     {TemplateSection::IDENTITY_DIRECTIVE, "identity_directive"},
@@ -101,7 +103,8 @@ const std::unordered_map<TemplateSection, std::string> ChatTemplateManager::sect
     {TemplateSection::PAST_SESSIONS, "past_sessions"},
     {TemplateSection::SUMMARY, "summary"},
     {TemplateSection::MOTIF_CONTEXT, "motif_context"},
-    {TemplateSection::INTERNAL_REFLECTION, "internal_reflection"}
+    {TemplateSection::INTERNAL_REFLECTION, "internal_reflection"},
+    {TemplateSection::EMOTIONAL_STATE, "emotional_state"}
 };
 
 inline ChatTemplateManager::ChatTemplateManager() {
@@ -277,6 +280,11 @@ inline std::string ChatTemplateManager::RenderTemplate(const std::vector<std::pa
         render_section("internal", GetSection(TemplateSection::INTERNAL_REFLECTION));
     }
     
+    // Optional emotional state section
+    if (IsSectionActive(TemplateSection::EMOTIONAL_STATE)) {
+        render_section("emotion", GetSection(TemplateSection::EMOTIONAL_STATE));
+    }
+    
     // Add conversation history with consistent formatting
     for (const auto& [role, content] : messages) {
         if (role == "assistant") {
@@ -327,6 +335,10 @@ inline void ChatTemplateManager::UpdateMotifContext(const std::string& motif) {
 
 inline void ChatTemplateManager::UpdateInternalReflection(const std::string& reflection) {
     SetSection(TemplateSection::INTERNAL_REFLECTION, reflection, !reflection.empty());
+}
+
+inline void ChatTemplateManager::UpdateEmotionalState(const std::string& emotional_state) {
+    SetSection(TemplateSection::EMOTIONAL_STATE, emotional_state, !emotional_state.empty());
 }
 
 inline void ChatTemplateManager::UpdateMultipleSummaries(const std::vector<std::string>& summary_list) {

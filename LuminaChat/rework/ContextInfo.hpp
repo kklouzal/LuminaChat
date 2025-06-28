@@ -250,6 +250,7 @@ public:
     void UpdateOldChatSummary(const std::string& old_summary); // For context pruning
     void UpdateMotifContext(const std::string& motif);
     void UpdateInternalReflection(const std::string& reflection);
+    void UpdateEmotionalState(const std::string& emotional_state);
     void AddPastSessionMemory(const std::string& memory);
     
     // Context management
@@ -682,6 +683,12 @@ inline void ContextInfo::UpdateInternalReflection(const std::string& reflection)
     template_manager->UpdateInternalReflection(reflection);
     context_needs_rebuild = true;
     LOG_DEBUG_ContextInfo("Updated internal reflection");
+}
+
+inline void ContextInfo::UpdateEmotionalState(const std::string& emotional_state) {
+    template_manager->UpdateEmotionalState(emotional_state);
+    context_needs_rebuild = true;
+    LOG_DEBUG_ContextInfo("Updated emotional state");
 }
 
 inline void ContextInfo::AddPastSessionMemory(const std::string& memory) {
