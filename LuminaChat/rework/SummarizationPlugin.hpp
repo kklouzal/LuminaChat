@@ -10,6 +10,9 @@
 #include <chrono>
 #include <thread>
 #include <memory>
+#include <optional>
+#include <sstream>
+#include <iomanip>
 
 namespace LuminaChat {
 
@@ -51,6 +54,19 @@ private:
     std::atomic<size_t> batches_processed{0};
     std::atomic<size_t> messages_summarized{0};
     std::atomic<size_t> summaries_applied{0};
+    
+    // Debugging features
+    struct DebugGeneration {
+        std::string input;
+        std::string output;
+        std::string context_id;
+        std::chrono::system_clock::time_point timestamp;
+    };
+    
+    mutable std::mutex debug_mutex;
+    std::deque<std::string> log_history; // Plugin-specific log history
+    static constexpr size_t MAX_LOG_HISTORY = 100; // Keep last 100 log entries
+    std::optional<DebugGeneration> last_generation; // Last generation for debugging
 
 public:
     explicit SummarizationPlugin(Orchestrator* orch) 
@@ -61,7 +77,7 @@ public:
             settings_manager = orchestrator->GetSettingsManager();
         }
         
-        LOG_SummarizationPlugin("SummarizationPlugin initialized");
+        LogInfo("SummarizationPlugin initialized");
     }
     
     ~SummarizationPlugin() {
@@ -73,19 +89,19 @@ public:
      */
     void Start() {
         if (processing_thread && processing_thread->joinable()) {
-            LOG_WARNING_SummarizationPlugin("Plugin already running");
+            LogWarning("Plugin already running");
             return;
         }
         
         // Initialize summary model and context first
         if (!InitializeSummaryModel()) {
-            LOG_ERROR_SummarizationPlugin("Failed to initialize summary model - plugin will not process summarizations");
+            LogError("Failed to initialize summary model - plugin will not process summarizations");
             return;
         }
         
         should_stop = false;
         processing_thread = std::make_unique<std::thread>(&SummarizationPlugin::ProcessingLoop, this);
-        LOG_SummarizationPlugin("SummarizationPlugin started with summary model ready");
+        LogInfo("SummarizationPlugin started with summary model ready");
     }
     
     /**
@@ -101,7 +117,7 @@ public:
         summary_context.reset();
         summary_model_ready = false;
         
-        LOG_SummarizationPlugin("SummarizationPlugin stopped");
+        LogInfo("SummarizationPlugin stopped");
     }
     
     /**
@@ -144,6 +160,79 @@ public:
             summary_model_ready.load(),
             model_path
         };
+    }
+    
+    /**
+     * Get plugin-specific log history for debugging
+     */
+    std::vector<std::string> GetLogHistory() const {
+        std::lock_guard<std::mutex> lock(debug_mutex);
+        return std::vector<std::string>(log_history.begin(), log_history.end());
+    }
+    
+    /**
+     * Get last generation info for debugging
+     */
+    struct LastGenerationInfo {
+        bool has_generation;
+        std::string input;
+        std::string output;
+        std::string context_id;
+        std::string timestamp;
+    };
+    
+    LastGenerationInfo GetLastGeneration() const {
+        std::lock_guard<std::mutex> lock(debug_mutex);
+        if (!last_generation.has_value()) {
+            return {false, "", "", "", ""};
+        }
+        
+        // Format timestamp
+        auto time_t = std::chrono::system_clock::to_time_t(last_generation->timestamp);
+        std::stringstream ss;
+        ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
+        
+        return {
+            true,
+            last_generation->input,
+            last_generation->output,
+            last_generation->context_id,
+            ss.str()
+        };
+    }
+    
+    /**
+     * Add a log entry to plugin-specific log history (for debugging)
+     */
+    void AddLogEntry(const std::string& log_message) {
+        std::lock_guard<std::mutex> lock(debug_mutex);
+        log_history.push_back(log_message);
+        
+        // Keep only the last MAX_LOG_HISTORY entries
+        while (log_history.size() > MAX_LOG_HISTORY) {
+            log_history.pop_front();
+        }
+    }
+    
+    // Helper methods for logging that also capture to debug history
+    void LogInfo(const std::string& message) {
+        LOG_SummarizationPlugin(message);
+        AddLogEntry("[INFO] " + message);
+    }
+    
+    void LogWarning(const std::string& message) {
+        LOG_WARNING_SummarizationPlugin(message);
+        AddLogEntry("[WARN] " + message);
+    }
+    
+    void LogError(const std::string& message) {
+        LOG_ERROR_SummarizationPlugin(message);
+        AddLogEntry("[ERROR] " + message);
+    }
+    
+    void LogDebug(const std::string& message) {
+        LOG_DEBUG_SummarizationPlugin(message);
+        AddLogEntry("[DEBUG] " + message);
     }
     
     /**
@@ -356,11 +445,11 @@ private:
      * Always summarizes 2 messages at a time (Q->A pairs) for maximum fidelity
      */
     void ProcessSummarizationBatch(const PrunedMessageBatch& batch) {
-        LOG_SummarizationPlugin("Processing batch for context: " + batch.context_id + 
+        LogInfo("Processing batch for context: " + batch.context_id + 
                                " (" + std::to_string(batch.pruned_messages.size()) + " messages)");
         
         if (!summary_model_ready.load() || !llama_manager) {
-            LOG_ERROR_SummarizationPlugin("Summary model not ready for processing batch");
+            LogError("Summary model not ready for processing batch");
             return;
         }
         
@@ -368,7 +457,7 @@ private:
             // Get the summary context
             auto* summary_ctx = llama_manager->GetContextInfo(summary_context_id);
             if (!summary_ctx) {
-                LOG_ERROR_SummarizationPlugin("Summary context not available");
+                LogError("Summary context not available");
                 return;
             }
             
@@ -400,10 +489,29 @@ private:
                 // Reset context for each pair to ensure independence
                 summary_ctx->ClearContext();
                 
-                std::string pair_summary = summary_ctx->HandleInput(pair_prompt, "user");
+                std::string pair_summary;
+                try {
+                    pair_summary = summary_ctx->HandleInput(pair_prompt, "user");
+                } catch (const std::exception& gen_e) {
+                    pair_summary = "Error: Exception during generation - " + std::string(gen_e.what());
+                    LOG_ERROR_SummarizationPlugin("Exception during pair generation: " + std::string(gen_e.what()));
+                }
                 
-                // Check if we got an error (likely context overflow)
-                if (pair_summary.empty() || pair_summary.find("Error: Failed to process prompt") == 0) {
+                // Always store generation for debugging (regardless of success/failure)
+                {
+                    std::lock_guard<std::mutex> lock(debug_mutex);
+                    last_generation = DebugGeneration{
+                        pair_prompt,
+                        pair_summary,
+                        batch.context_id,
+                        std::chrono::system_clock::now()
+                    };
+                }
+                
+                // Check if we got an error (likely context overflow or exception)
+                if (pair_summary.empty() || 
+                    pair_summary.find("Error: Failed to process prompt") == 0 || 
+                    pair_summary.find("Error: Exception during generation") == 0) {
                     LOG_WARNING_SummarizationPlugin("Failed to summarize pair " + std::to_string((i/2) + 1) + 
                         " - attempting context resize...");
                     
@@ -425,9 +533,27 @@ private:
                         summary_ctx = llama_manager->GetContextInfo(summary_context_id);
                         if (summary_ctx) {
                             summary_ctx->ClearContext();
-                            pair_summary = summary_ctx->HandleInput(pair_prompt, "user");
+                            try {
+                                pair_summary = summary_ctx->HandleInput(pair_prompt, "user");
+                            } catch (const std::exception& retry_e) {
+                                pair_summary = "Error: Exception during retry generation - " + std::string(retry_e.what());
+                                LOG_ERROR_SummarizationPlugin("Exception during retry generation: " + std::string(retry_e.what()));
+                            }
                             
-                            if (pair_summary.empty() || pair_summary.find("Error: Failed to process prompt") == 0) {
+                            // Update last_generation with retry result
+                            {
+                                std::lock_guard<std::mutex> lock(debug_mutex);
+                                last_generation = DebugGeneration{
+                                    pair_prompt,
+                                    pair_summary,
+                                    batch.context_id,
+                                    std::chrono::system_clock::now()
+                                };
+                            }
+                            
+                            if (pair_summary.empty() || 
+                                pair_summary.find("Error: Failed to process prompt") == 0 || 
+                                pair_summary.find("Error: Exception during") == 0) {
                                 LOG_WARNING_SummarizationPlugin("Pair " + std::to_string((i/2) + 1) + 
                                     " still failed after context resize - skipping");
                                 continue;

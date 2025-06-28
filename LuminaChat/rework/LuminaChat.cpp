@@ -148,6 +148,8 @@ private:
     wxTextCtrl* summary_model_path_text;
     wxButton* browse_summary_model_button;
     wxStaticText* summary_status_text;
+    wxTextCtrl* summary_log_output_text;
+    wxTextCtrl* summary_last_generation_text;
     wxTextCtrl* summary_system_prompt_text;
     
     // EmoTag Settings Panel
@@ -155,6 +157,8 @@ private:
     wxTextCtrl* emotag_model_path_text;
     wxButton* browse_emotag_model_button;
     wxStaticText* emotag_status_text;
+    wxTextCtrl* emotag_log_output_text;
+    wxTextCtrl* emotag_last_generation_text;
     wxTextCtrl* emotag_system_prompt_text;
     wxSlider* emotag_window_size_slider;
     wxStaticText* emotag_window_size_text;
@@ -216,6 +220,8 @@ private:
     void UpdateTemplateDisplay(const std::string& template_content);  // Update template inspection tab
     void UpdateSummaryPluginStatus(const std::string& status, const wxColour& color = wxNullColour);  // Update summary plugin status
     void UpdateEmoTagPluginStatus(const std::string& status, const wxColour& color = wxNullColour);  // Update emotag plugin status
+    void UpdateSummaryPluginDebugInfo();  // Update summary plugin debug textboxes
+    void UpdateEmoTagPluginDebugInfo();   // Update emotag plugin debug textboxes
     
     DECLARE_EVENT_TABLE()
 };
@@ -638,6 +644,24 @@ void LuminaChatFrame::CreateSummaryPanel() {
     summary_status_text->SetForegroundColour(wxColour(150, 100, 50));
     status_box->Add(summary_status_text, 0, wxALL, 5);
     
+    // Log Output debug display
+    status_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "Log Output:"), 0, wxLEFT | wxRIGHT | wxTOP, 5);
+    summary_log_output_text = new wxTextCtrl(scrolled_window, wxID_ANY, "Plugin logs will appear here...",
+                                            wxDefaultPosition, wxSize(-1, 120),
+                                            wxTE_READONLY | wxTE_MULTILINE | wxTE_WORDWRAP);
+    summary_log_output_text->SetFont(wxFont(8, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+    summary_log_output_text->SetBackgroundColour(wxColour(245, 245, 245));
+    status_box->Add(summary_log_output_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
+    
+    // Last Generation debug display
+    status_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "Last Generation:"), 0, wxLEFT | wxRIGHT | wxTOP, 5);
+    summary_last_generation_text = new wxTextCtrl(scrolled_window, wxID_ANY, "No generation data available yet...",
+                                                 wxDefaultPosition, wxSize(-1, 120),
+                                                 wxTE_READONLY | wxTE_MULTILINE | wxTE_WORDWRAP);
+    summary_last_generation_text->SetFont(wxFont(8, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+    summary_last_generation_text->SetBackgroundColour(wxColour(245, 245, 245));
+    status_box->Add(summary_last_generation_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
+    
     // Summary system prompt configuration group
     wxStaticBoxSizer* prompt_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Summary System Prompt");
     
@@ -728,6 +752,24 @@ void LuminaChatFrame::CreateEmoTagPanel() {
     emotag_status_text->SetFont(emotag_status_text->GetFont().Bold());
     emotag_status_text->SetForegroundColour(wxColour(150, 100, 50));
     status_box->Add(emotag_status_text, 0, wxALL, 5);
+    
+    // Log Output debug display
+    status_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "Log Output:"), 0, wxLEFT | wxRIGHT | wxTOP, 5);
+    emotag_log_output_text = new wxTextCtrl(scrolled_window, wxID_ANY, "Plugin logs will appear here...",
+                                           wxDefaultPosition, wxSize(-1, 120),
+                                           wxTE_READONLY | wxTE_MULTILINE | wxTE_WORDWRAP);
+    emotag_log_output_text->SetFont(wxFont(8, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+    emotag_log_output_text->SetBackgroundColour(wxColour(245, 245, 245));
+    status_box->Add(emotag_log_output_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
+    
+    // Last Generation debug display
+    status_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "Last Generation:"), 0, wxLEFT | wxRIGHT | wxTOP, 5);
+    emotag_last_generation_text = new wxTextCtrl(scrolled_window, wxID_ANY, "No generation data available yet...",
+                                                wxDefaultPosition, wxSize(-1, 120),
+                                                wxTE_READONLY | wxTE_MULTILINE | wxTE_WORDWRAP);
+    emotag_last_generation_text->SetFont(wxFont(8, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+    emotag_last_generation_text->SetBackgroundColour(wxColour(245, 245, 245));
+    status_box->Add(emotag_last_generation_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
     
     // Plugin configuration group
     wxStaticBoxSizer* config_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Analysis Configuration");
@@ -1640,6 +1682,15 @@ void LuminaChatFrame::OnTimer(wxTimerEvent& event) {
     if (running && orchestrator) {
         orchestrator->ProcessScheduledTasks();
         UpdateUI();
+        
+        // Update plugin debug info every 10 timer ticks (about once per second if timer is 100ms)
+        static int debug_update_counter = 0;
+        debug_update_counter++;
+        if (debug_update_counter >= 10) {
+            debug_update_counter = 0;
+            UpdateSummaryPluginDebugInfo();
+            UpdateEmoTagPluginDebugInfo();
+        }
     }
 }
 
@@ -1791,6 +1842,122 @@ void LuminaChatFrame::UpdateEmoTagPluginStatus(const std::string& status, const 
             emotag_status_text->SetForegroundColour(color);
         }
         emotag_status_text->GetParent()->Layout();  // Refresh the layout
+    }
+}
+
+void LuminaChatFrame::UpdateSummaryPluginDebugInfo() {
+    if (!summarization_plugin) return;
+    
+    // Update log output
+    if (summary_log_output_text) {
+        auto logs = summarization_plugin->GetLogHistory();
+        wxString log_content;
+        
+        // Show last 10 log entries (to fit in 5-line textbox)
+        size_t start_idx = logs.size() > 10 ? logs.size() - 10 : 0;
+        for (size_t i = start_idx; i < logs.size(); ++i) {
+            if (!log_content.IsEmpty()) log_content += "\n";
+            log_content += logs[i];
+        }
+        
+        if (log_content.IsEmpty()) {
+            log_content = "No log entries yet...";
+        }
+        
+        // Only update if content has changed
+        if (summary_log_output_text->GetValue() != log_content) {
+            summary_log_output_text->SetValue(log_content);
+        }
+    }
+    
+    // Update last generation
+    if (summary_last_generation_text) {
+        auto gen_info = summarization_plugin->GetLastGeneration();
+        wxString gen_content;
+        
+        if (gen_info.has_generation) {
+            gen_content = wxString::Format(
+                "Context: %s\nTime: %s\n\nINPUT:\n%s\n\nOUTPUT:\n%s",
+                gen_info.context_id,
+                gen_info.timestamp,
+                gen_info.input,
+                gen_info.output
+            );
+        } else {
+            gen_content = "No generation data available yet...";
+        }
+        
+        // Only update if content has changed to preserve scroll position
+        if (summary_last_generation_text->GetValue() != gen_content) {
+            // Store current scroll position
+            long insertion_point = summary_last_generation_text->GetInsertionPoint();
+            
+            summary_last_generation_text->SetValue(gen_content);
+            
+            // Restore scroll position if the content got longer (new generation)
+            // But if it's the same length or shorter, keep at top for readability
+            if (gen_content.length() > summary_last_generation_text->GetValue().length() && insertion_point > 0) {
+                summary_last_generation_text->SetInsertionPoint(insertion_point);
+            }
+        }
+    }
+}
+
+void LuminaChatFrame::UpdateEmoTagPluginDebugInfo() {
+    if (!emotag_plugin) return;
+    
+    // Update log output
+    if (emotag_log_output_text) {
+        auto logs = emotag_plugin->GetLogHistory();
+        wxString log_content;
+        
+        // Show last 10 log entries (to fit in 5-line textbox)
+        size_t start_idx = logs.size() > 10 ? logs.size() - 10 : 0;
+        for (size_t i = start_idx; i < logs.size(); ++i) {
+            if (!log_content.IsEmpty()) log_content += "\n";
+            log_content += logs[i];
+        }
+        
+        if (log_content.IsEmpty()) {
+            log_content = "No log entries yet...";
+        }
+        
+        // Only update if content has changed
+        if (emotag_log_output_text->GetValue() != log_content) {
+            emotag_log_output_text->SetValue(log_content);
+        }
+    }
+    
+    // Update last generation
+    if (emotag_last_generation_text) {
+        auto gen_info = emotag_plugin->GetLastGeneration();
+        wxString gen_content;
+        
+        if (gen_info.has_generation) {
+            gen_content = wxString::Format(
+                "Context: %s\nTime: %s\n\nINPUT:\n%s\n\nOUTPUT:\n%s",
+                gen_info.context_id,
+                gen_info.timestamp,
+                gen_info.input,
+                gen_info.output
+            );
+        } else {
+            gen_content = "No generation data available yet...";
+        }
+        
+        // Only update if content has changed to preserve scroll position
+        if (emotag_last_generation_text->GetValue() != gen_content) {
+            // Store current scroll position
+            long insertion_point = emotag_last_generation_text->GetInsertionPoint();
+            
+            emotag_last_generation_text->SetValue(gen_content);
+            
+            // Restore scroll position if the content got longer (new generation)
+            // But if it's the same length or shorter, keep at top for readability
+            if (gen_content.length() > emotag_last_generation_text->GetValue().length() && insertion_point > 0) {
+                emotag_last_generation_text->SetInsertionPoint(insertion_point);
+            }
+        }
     }
 }
 

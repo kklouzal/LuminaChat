@@ -11,6 +11,9 @@
 #include <thread>
 #include <memory>
 #include <deque>
+#include <optional>
+#include <sstream>
+#include <iomanip>
 
 namespace LuminaChat {
 
@@ -71,6 +74,19 @@ private:
     std::atomic<size_t> responses_analyzed{0};
     std::atomic<size_t> emotional_states_generated{0};
     std::atomic<size_t> contexts_updated{0};
+    
+    // Debugging features
+    struct DebugGeneration {
+        std::string input;
+        std::string output;
+        std::string context_id;
+        std::chrono::system_clock::time_point timestamp;
+    };
+    
+    mutable std::mutex debug_mutex;
+    std::deque<std::string> log_history; // Plugin-specific log history
+    static constexpr size_t MAX_LOG_HISTORY = 100; // Keep last 100 log entries
+    std::optional<DebugGeneration> last_generation; // Last generation for debugging
 
 public:
     explicit EmoTagPlugin(Orchestrator* orch) 
@@ -81,7 +97,7 @@ public:
             settings_manager = orchestrator->GetSettingsManager();
         }
         
-        LOG_EmoTagPlugin("EmoTagPlugin initialized");
+        LogInfo("EmoTagPlugin initialized");
     }
     
     ~EmoTagPlugin() {
@@ -93,19 +109,19 @@ public:
      */
     void Start() {
         if (processing_thread && processing_thread->joinable()) {
-            LOG_WARNING_EmoTagPlugin("Plugin already running");
+            LogWarning("Plugin already running");
             return;
         }
         
         // Initialize emotion analysis model and context first
         if (!InitializeEmotionModel()) {
-            LOG_ERROR_EmoTagPlugin("Failed to initialize emotion model - plugin will not process emotional analysis");
+            LogError("Failed to initialize emotion model - plugin will not process emotional analysis");
             return;
         }
         
         should_stop = false;
         processing_thread = std::make_unique<std::thread>(&EmoTagPlugin::ProcessingLoop, this);
-        LOG_EmoTagPlugin("EmoTagPlugin started with emotion model ready");
+        LogInfo("EmoTagPlugin started with emotion model ready");
     }
     
     /**
@@ -121,7 +137,7 @@ public:
         emotion_context.reset();
         emotion_model_ready = false;
         
-        LOG_EmoTagPlugin("EmoTagPlugin stopped");
+        LogInfo("EmoTagPlugin stopped");
     }
     
     /**
@@ -226,6 +242,79 @@ public:
             emotion_model_ready.load(),
             model_path
         };
+    }
+    
+    /**
+     * Get plugin-specific log history for debugging
+     */
+    std::vector<std::string> GetLogHistory() const {
+        std::lock_guard<std::mutex> lock(debug_mutex);
+        return std::vector<std::string>(log_history.begin(), log_history.end());
+    }
+    
+    /**
+     * Get last generation info for debugging
+     */
+    struct LastGenerationInfo {
+        bool has_generation;
+        std::string input;
+        std::string output;
+        std::string context_id;
+        std::string timestamp;
+    };
+    
+    LastGenerationInfo GetLastGeneration() const {
+        std::lock_guard<std::mutex> lock(debug_mutex);
+        if (!last_generation.has_value()) {
+            return {false, "", "", "", ""};
+        }
+        
+        // Format timestamp
+        auto time_t = std::chrono::system_clock::to_time_t(last_generation->timestamp);
+        std::stringstream ss;
+        ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
+        
+        return {
+            true,
+            last_generation->input,
+            last_generation->output,
+            last_generation->context_id,
+            ss.str()
+        };
+    }
+    
+    /**
+     * Add a log entry to plugin-specific log history (for debugging)
+     */
+    void AddLogEntry(const std::string& log_message) {
+        std::lock_guard<std::mutex> lock(debug_mutex);
+        log_history.push_back(log_message);
+        
+        // Keep only the last MAX_LOG_HISTORY entries
+        while (log_history.size() > MAX_LOG_HISTORY) {
+            log_history.pop_front();
+        }
+    }
+    
+    // Helper methods for logging that also capture to debug history
+    void LogInfo(const std::string& message) {
+        LOG_EmoTagPlugin(message);
+        AddLogEntry("[INFO] " + message);
+    }
+    
+    void LogWarning(const std::string& message) {
+        LOG_WARNING_EmoTagPlugin(message);
+        AddLogEntry("[WARN] " + message);
+    }
+    
+    void LogError(const std::string& message) {
+        LOG_ERROR_EmoTagPlugin(message);
+        AddLogEntry("[ERROR] " + message);
+    }
+    
+    void LogDebug(const std::string& message) {
+        LOG_DEBUG_EmoTagPlugin(message);
+        AddLogEntry("[DEBUG] " + message);
     }
 
 private:
@@ -397,11 +486,11 @@ private:
             return; // Nothing to analyze
         }
         
-        LOG_EmoTagPlugin("Processing emotional analysis for context: " + context_id + 
+        LogInfo("Processing emotional analysis for context: " + context_id + 
                         " (" + std::to_string(history.messages.size()) + " messages)");
         
         if (!emotion_model_ready.load() || !llama_manager) {
-            LOG_ERROR_EmoTagPlugin("Emotion model not ready for analysis");
+            LogError("Emotion model not ready for analysis");
             return;
         }
         
@@ -409,7 +498,7 @@ private:
             // Get the emotion context
             auto* emotion_ctx = llama_manager->GetContextInfo(emotion_context_id);
             if (!emotion_ctx) {
-                LOG_ERROR_EmoTagPlugin("Emotion context not available");
+                LogError("Emotion context not available");
                 return;
             }
             
@@ -442,16 +531,28 @@ private:
             std::string emotional_state;
             try {
                 emotional_state = emotion_ctx->HandleInput(analysis_prompt, "user");
-                LOG_EmoTagPlugin("Emotion analysis completed successfully for context: " + context_id);
+                LogInfo("Emotion analysis completed successfully for context: " + context_id);
+                
             } catch (const std::exception& analysis_e) {
                 LOG_ERROR_EmoTagPlugin("Exception during emotional analysis for context " + context_id + ": " + std::string(analysis_e.what()));
-                return;
+                emotional_state = "Error: Exception during analysis - " + std::string(analysis_e.what());
+            }
+            
+            // Always store generation for debugging (regardless of success/failure)
+            {
+                std::lock_guard<std::mutex> lock(debug_mutex);
+                last_generation = DebugGeneration{
+                    analysis_prompt,
+                    emotional_state,
+                    context_id,
+                    std::chrono::system_clock::now()
+                };
             }
             
             // Check if we got a valid response
-            if (emotional_state.empty() || emotional_state.find("Error: Failed to process prompt") == 0) {
-                LOG_WARNING_EmoTagPlugin("Failed to generate emotional analysis for context: " + context_id);
-                return;
+            if (emotional_state.empty() || emotional_state.find("Error: Failed to process prompt") == 0 || emotional_state.find("Error: Exception during analysis") == 0) {
+                LOG_WARNING_EmoTagPlugin("Failed to generate valid emotional analysis for context: " + context_id + " - Response: " + emotional_state);
+                return; // Still return early for invalid responses, but last_generation is already updated
             }
             
             // Sanitize emotional state before applying to prevent template token conflicts
