@@ -6,6 +6,7 @@
 #include "LlamaManager.hpp"
 #include "SettingsManager.hpp"
 #include "Logger.hpp"
+#include "Utilities.hpp"
 #include <chrono>
 #include <thread>
 #include <memory>

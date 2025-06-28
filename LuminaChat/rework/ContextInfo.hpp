@@ -4,6 +4,7 @@
 #include "ModelInfo.hpp"
 #include "TokenCache.hpp"
 #include "Logger.hpp"
+#include "Utilities.hpp"
 // llama.cpp includes
 #include "llama-cpp.h"
 #include <memory>
@@ -1078,6 +1079,9 @@ inline std::string ContextInfo::GenerateResponse(const std::string& prompt) {
         
         // Convert response tokens back to text
         std::string response = DetokenizeResponse(response_tokens);
+        
+        // Apply consistent cleanup to all AI responses
+        response = LuminaChat::Utilities::TrimString(response);
         
         LOG_DEBUG_ContextInfo("Generated response: " + std::to_string(response_tokens.size()) + 
                              " tokens -> " + response.substr(0, 100) + 
