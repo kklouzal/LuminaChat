@@ -165,8 +165,11 @@ public:
     // Constructor
     explicit ModelInfo(const std::string& id) 
         : model_id(id)
-        , token_cache(std::make_unique<TokenCache>(1024)) // Default cache size
+        , token_cache(std::make_unique<TokenCache>(1024, nullptr)) // Default cache size, vocab set after model load
     {
+        // NOTE: TokenCache is initialized with null vocab - vocab will be set via SetVocab() 
+        // after the model is successfully loaded. This ensures all tokenization operations
+        // use the correct vocabulary without requiring redundant vocab parameter passing.
         LOG_ModelInfo("ModelInfo created for: " + model_id);
     }
     
@@ -226,6 +229,11 @@ public:
                     state = ModelState::LOADED;
                     owns_model = false; // We don't own this model, so don't free it
                     UpdateMemoryUsage();
+                    
+                    // Set vocab on our TokenCache from the shared model
+                    if (model && token_cache) {
+                        token_cache->SetVocab(llama_model_get_vocab(model));
+                    }
                     
                     // Note: We don't register this path again since the existing model already has it registered
                     NotifyResourceEvent(ResourceEvent::MODEL_LOADED, "Shared model from existing instance: " + model_config.model_path);
@@ -288,6 +296,11 @@ public:
                 config = model_config;
                 state = ModelState::LOADED;
                 UpdateMemoryUsage();
+                
+                // Set vocab on TokenCache now that model is loaded
+                if (token_cache) {
+                    token_cache->SetVocab(llama_model_get_vocab(model));
+                }
             }
             
             LOG_ModelInfo("Model loaded successfully: " + model_config.model_path + 
@@ -376,6 +389,7 @@ public:
             
             if (token_cache) {
                 token_cache->ClearAll();
+                token_cache->SetVocab(nullptr); // Clear vocab reference when model is unloaded
                 LOG_ModelInfo("Token cache cleared for: " + model_id);
             }
         }
@@ -387,132 +401,6 @@ public:
         
         // Don't notify during cleanup to prevent use-after-free in destructor
         // NotifyResourceEvent(ResourceEvent::CLEANUP_COMPLETED, "Model resources cleaned up");
-    }
-    
-    // Tokenization methods
-    std::vector<llama_token> TokenizeText(const std::string& text, bool add_special = true) {
-        std::lock_guard<std::mutex> lock(model_mutex);
-        
-        if (state != ModelState::LOADED || !model) {
-            LOG_ERROR_ModelInfo("Model not loaded for tokenization");
-            return {};
-        }
-        
-        if (text.empty()) {
-            return {};
-        }
-        
-        // Get vocab pointer while holding lock
-        const llama_vocab* vocab = (state == ModelState::LOADED && model) ? llama_model_get_vocab(model) : nullptr;
-        if (!vocab) {
-            return {};
-        }
-        
-        // Check cache first
-        std::string cache_key = text + (add_special ? ":s" : ":n");
-        std::vector<int32_t> cached_tokens;
-        if (token_cache->GetTokens(cache_key, cached_tokens)) {
-            // Convert int32_t to llama_token
-            std::vector<llama_token> result;
-            result.reserve(cached_tokens.size());
-            for (int32_t token : cached_tokens) {
-                result.push_back(static_cast<llama_token>(token));
-            }
-            return result;
-        }
-        try {
-            // Get required buffer size
-            const int32_t n_tokens_required = -llama_tokenize(vocab, text.c_str(), text.size(), nullptr, 0, add_special, true);
-            if (n_tokens_required <= 0) {
-                return {};
-            }
-            
-            // Tokenize
-            std::vector<llama_token> tokens(n_tokens_required);
-            const int32_t n_tokens_actual = llama_tokenize(vocab, text.c_str(), text.size(),
-                                                          tokens.data(), tokens.size(), add_special, true);
-            
-            if (n_tokens_actual < 0 || n_tokens_actual != n_tokens_required) {
-                LOG_ERROR_ModelInfo("Tokenization failed - expected: " + std::to_string(n_tokens_required) + 
-                                   ", got: " + std::to_string(n_tokens_actual));
-                return {};
-            }
-            
-            // Cache result - convert llama_token to int32_t for storage
-            std::vector<int32_t> tokens_for_cache;
-            tokens_for_cache.reserve(tokens.size());
-            for (llama_token token : tokens) {
-                tokens_for_cache.push_back(static_cast<int32_t>(token));
-            }
-            token_cache->StoreTokens(cache_key, tokens_for_cache);
-            
-            return tokens;
-            
-        } catch (const std::exception& e) {
-            LOG_ERROR_ModelInfo("Exception during tokenization: " + std::string(e.what()));
-            return {};
-        }
-    }
-    
-    std::string DetokenizeTokens(const std::vector<llama_token>& tokens) {
-        std::lock_guard<std::mutex> lock(model_mutex);
-        
-        if (state != ModelState::LOADED || !model) {
-            LOG_ERROR_ModelInfo("Model not loaded for detokenization");
-            return "";
-        }
-        
-        if (tokens.empty()) {
-            return "";
-        }
-        
-        // Get vocab pointer while holding lock
-        const llama_vocab* vocab = (state == ModelState::LOADED && model) ? llama_model_get_vocab(model) : nullptr;
-        if (!vocab) {
-            return "";
-        }
-        
-        // Check cache first - convert llama_token to int32_t for hash lookup
-        std::vector<int32_t> tokens_for_cache;
-        tokens_for_cache.reserve(tokens.size());
-        for (llama_token token : tokens) {
-            tokens_for_cache.push_back(static_cast<int32_t>(token));
-        }
-        
-        std::string cached_text;
-        if (token_cache->GetText(tokens_for_cache, cached_text)) {
-            return cached_text;
-        }
-        
-        try {
-            std::string result;
-            result.reserve(tokens.size() * 4); // Rough estimate
-            
-            for (const auto& token : tokens) {
-                std::vector<char> buffer(32);
-                
-                int32_t result_length = llama_token_to_piece(vocab, token, buffer.data(), buffer.size(), 0, true);
-                
-                if (result_length < 0) {
-                    // Buffer too small, resize and retry
-                    buffer.resize(-result_length);
-                    result_length = llama_token_to_piece(vocab, token, buffer.data(), buffer.size(), 0, true);
-                }
-                
-                if (result_length > 0) {
-                    result.append(buffer.data(), result_length);
-                }
-            }
-            
-            // Cache result
-            token_cache->StoreText(tokens_for_cache, result);
-            
-            return result;
-            
-        } catch (const std::exception& e) {
-            LOG_ERROR_ModelInfo("Exception during detokenization: " + std::string(e.what()));
-            return "";
-        }
     }
     
     // Accessors

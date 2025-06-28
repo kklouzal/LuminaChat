@@ -291,10 +291,13 @@ public:
     std::string GetContextSummary() const;
     void SetContextSizeForTesting(size_t test_size); // For testing with smaller context sizes
     
-    // Template rendering and tokenization (made public for testing)
+    // Template rendering (made public for testing)
     std::string BuildFullPrompt();
-    std::vector<int32_t> TokenizePrompt(const std::string& prompt);
-    std::string DetokenizeResponse(const std::vector<int32_t>& tokens);
+    
+    // NOTE: TokenizePrompt and DetokenizeResponse methods removed for cleaner design.
+    // ContextInfo now directly calls token_cache->TokenizeText() and token_cache->DetokenizeTokens()
+    // with the vocab from parent_model->GetVocab(). This eliminates redundant validation
+    // and intermediate method calls for better performance and cleaner code.
     
     // Batch management methods - context-specific
     void clear_batch();
@@ -573,7 +576,7 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
         std::string full_prompt = BuildFullPrompt();
         
         // 4. Check context size - trigger summarization if needed
-        std::vector<int32_t> prompt_tokens = TokenizePrompt(full_prompt);
+        std::vector<int32_t> prompt_tokens = token_cache->TokenizeText(full_prompt, true);
         if (IsNearContextLimit(0.8f)) {
             LOG_ContextInfo("Context approaching limit, performing immediate pruning");
             
@@ -701,50 +704,6 @@ inline std::string ContextInfo::BuildFullPrompt() {
     return rendered_prompt;
 }
 
-inline std::vector<int32_t> ContextInfo::TokenizePrompt(const std::string& prompt) {
-    if (!parent_model || !parent_model->IsLoaded()) {
-        LOG_ERROR_ContextInfo("Parent model not available for tokenization");
-        return {};
-    }
-    
-    // Use ModelInfo's tokenization
-    std::vector<llama_token> llama_tokens = parent_model->TokenizeText(prompt, true);
-    
-    // Convert to int32_t
-    std::vector<int32_t> tokens;
-    tokens.reserve(llama_tokens.size());
-    for (llama_token token : llama_tokens) {
-        tokens.push_back(static_cast<int32_t>(token));
-    }
-    
-    current_tokens = tokens;
-    // CRITICAL FIX: Do NOT update stats here - let n_past be the single source of truth
-    // stats.current_context_tokens = tokens.size(); // REMOVED - causes desynchronization
-    
-    LOG_DEBUG_ContextInfo("Tokenized prompt: " + std::to_string(tokens.size()) + " tokens");
-    return tokens;
-}
-
-inline std::string ContextInfo::DetokenizeResponse(const std::vector<int32_t>& tokens) {
-    if (!parent_model || !parent_model->IsLoaded()) {
-        LOG_ERROR_ContextInfo("Parent model not available for detokenization");
-        return "";
-    }
-    
-    // Convert to llama_token
-    std::vector<llama_token> llama_tokens;
-    llama_tokens.reserve(tokens.size());
-    for (int32_t token : tokens) {
-        llama_tokens.push_back(static_cast<llama_token>(token));
-    }
-    
-    // Use ModelInfo's detokenization
-    std::string result = parent_model->DetokenizeTokens(llama_tokens);
-    
-    LOG_DEBUG_ContextInfo("Detokenized response: " + std::to_string(result.length()) + " characters");
-    return result;
-}
-
 // Batch management methods - context-specific
 inline void ContextInfo::clear_batch() {
     if (!batch_initialized) return;
@@ -795,7 +754,10 @@ inline void ContextInfo::RebuildContext_Full() {
     
     // Build and tokenize full prompt
     std::string full_prompt = BuildFullPrompt();
-    std::vector<int32_t> tokens = TokenizePrompt(full_prompt);
+    std::vector<int32_t> tokens = token_cache->TokenizeText(full_prompt, true);
+    
+    current_tokens = tokens;
+    // CRITICAL FIX: Do NOT update stats here - let n_past be the single source of truth
     
     if (!tokens.empty() && llama_ctx) {
         // Process tokens in batch
@@ -991,7 +953,8 @@ inline std::string ContextInfo::GenerateResponse(const std::string& prompt) {
     
     try {
         // Tokenize the prompt
-        std::vector<int32_t> prompt_tokens = TokenizePrompt(prompt);
+        std::vector<int32_t> prompt_tokens = token_cache->TokenizeText(prompt, true);
+        current_tokens = prompt_tokens;
         
         // Process prompt tokens
         if (!ProcessTokensBatch(prompt_tokens)) {
@@ -1078,7 +1041,7 @@ inline std::string ContextInfo::GenerateResponse(const std::string& prompt) {
         is_generating = false;
         
         // Convert response tokens back to text
-        std::string response = DetokenizeResponse(response_tokens);
+        std::string response = token_cache->DetokenizeTokens(response_tokens);
         
         // Apply consistent cleanup to all AI responses
         response = LuminaChat::Utilities::TrimString(response);
@@ -1370,7 +1333,8 @@ inline void ContextInfo::StartGenerationAsync(const std::string& prompt, const G
                     LOG_DEBUG_ContextInfo("Context needs rebuild before generation");
                     
                     // Tokenize the prompt
-                    std::vector<int32_t> prompt_tokens = TokenizePrompt(prompt);
+                    std::vector<int32_t> prompt_tokens = token_cache->TokenizeText(prompt, true);
+                    current_tokens = prompt_tokens;
                     
                     // Process prompt tokens
                     if (!ProcessTokensBatch(prompt_tokens)) {
@@ -1451,7 +1415,7 @@ inline void ContextInfo::StartGenerationAsync(const std::string& prompt, const G
                 
                 // Convert this token to text and stream it
                 std::vector<int32_t> single_token = {next_token};
-                std::string token_text = DetokenizeResponse(single_token);
+                std::string token_text = token_cache->DetokenizeTokens(single_token);
                 
                 // Call the streaming callback with the new token
                 if (callbacks.on_token && !token_text.empty()) {
