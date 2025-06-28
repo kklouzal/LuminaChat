@@ -437,7 +437,7 @@ private:
         settings_dirty = true;
     }
 
-    // Note: Default chat template is now handled by ChatTemplateManager::GetDefaultTemplate()
+    // Note: Default chat template is now handled directly by ChatTemplateManager
     // This method is kept only for the summary template
     std::string GetDefaultSummaryTemplate() {
         return R"({{- bos_token }}

@@ -293,8 +293,15 @@ inline void Orchestrator::InputReceived(const std::string& input, const std::str
     SetContextState(context_id, ProcessingState::NORMAL_PROCESSING);
     
     try {
-        // Route to appropriate context - provide explicit template name
-        auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", "default");
+        // Get default context size for main model
+        int32_t default_context_size = 8192; // Default fallback
+        auto* settings = GetSettingsManager();
+        if (settings) {
+            default_context_size = settings->GetInt("Models", "main_context_size", 8192);
+        }
+        
+        // Route to appropriate context
+        auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", default_context_size);
         if (!context) {
             LOG_Orchestrator("Failed to get/create context: " + context_id);
             SetContextState(context_id, ProcessingState::ERROR_STATE);
@@ -384,8 +391,15 @@ inline void Orchestrator::OnSummarizationComplete(const std::string& context_id,
     LOG_Orchestrator("Summarization complete for context: " + context_id);
     
     if (response.success) {
+        // Get default context size for main model
+        int32_t default_context_size = 8192; // Default fallback
+        auto* settings = GetSettingsManager();
+        if (settings) {
+            default_context_size = settings->GetInt("Models", "main_context_size", 8192);
+        }
+        
         // Apply summary to original context
-        auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", "default");
+        auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", default_context_size);
         if (context) {
             context->ApplyCompletedSummary(response.summary);
             LOG_Orchestrator("Summary applied to context: " + context_id);
@@ -492,9 +506,16 @@ inline void Orchestrator::ProcessSummarizationRequest(const SummarizationRequest
     LOG_Orchestrator("Processing summarization request for: " + request.original_context_id);
     
     try {
-        // Get or create summary context - use main model with summary template
+        // Get default context size for main model
+        int32_t default_context_size = 8192; // Default fallback
+        auto* settings = GetSettingsManager();
+        if (settings) {
+            default_context_size = settings->GetInt("Models", "main_context_size", 8192);
+        }
+        
+        // Get or create summary context
         auto* summary_context = llama_manager->GetOrCreateContextInfo(
-            request.summary_context_id, "main_model", "summary");
+            request.summary_context_id, "main_model", default_context_size);
         
         if (!summary_context) {
             callback(SummarizationResponse{
@@ -559,9 +580,16 @@ inline void Orchestrator::ProcessDiscordChannelRequest(const DiscordChannelReque
             }
             
             case DiscordChannelRequest::Type::CHANNEL_SETUP: {
-                // Setup new channel context - provide explicit template name
+                // Get default context size for main model
+                int32_t default_context_size = 8192; // Default fallback
+                auto* settings = GetSettingsManager();
+                if (settings) {
+                    default_context_size = settings->GetInt("Models", "main_context_size", 8192);
+                }
+                
+                // Setup new channel context
                 std::string context_id = "discord_" + request.channel_id;
-                auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", "default");
+                auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", default_context_size);
                 
                 if (context) {
                     context->UpdateEnvironment("Discord channel: " + request.channel_id);

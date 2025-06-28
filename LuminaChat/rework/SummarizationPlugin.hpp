@@ -145,6 +145,67 @@ public:
         };
     }
     
+    /**
+     * Dynamically resize summary context to handle larger message pairs
+     * @param needed_tokens The minimum tokens needed for processing
+     * @return true if resize was successful, false otherwise
+     */
+    bool ResizeSummaryContext(size_t needed_tokens) {
+        if (!llama_manager || !settings_manager) {
+            LOG_ERROR_SummarizationPlugin("LlamaManager or SettingsManager not available for context resize");
+            return false;
+        }
+        
+        // Get current summary context
+        auto* summary_ctx = llama_manager->GetContextInfo(summary_context_id);
+        if (!summary_ctx) {
+            LOG_ERROR_SummarizationPlugin("Summary context not available for resize");
+            return false;
+        }
+        
+        // Calculate new context size (needed tokens + 5% buffer)
+        size_t new_context_size = static_cast<size_t>(needed_tokens * 1.05f);
+        
+        // Get main model context size as hard limit
+        int main_context_size = settings_manager->GetInt("Models", "main_context_size", 4096);
+        if (new_context_size > static_cast<size_t>(main_context_size)) {
+            LOG_WARNING_SummarizationPlugin("Cannot resize summary context to " + std::to_string(new_context_size) + 
+                " tokens - would exceed main context limit of " + std::to_string(main_context_size));
+            return false;
+        }
+        
+        LOG_SummarizationPlugin("Resizing summary context from current size to " + std::to_string(new_context_size) + 
+            " tokens (needed: " + std::to_string(needed_tokens) + ")");
+        
+        try {
+            // Store system prompt before context destruction
+            std::string system_prompt = settings_manager->GetString("Summary", "system_prompt", "");
+            
+            // Remove the old context (this will free the llama context but keep the model loaded)
+            llama_manager->RemoveContext(summary_context_id);
+            
+            // Create new context with the larger size (model stays loaded)
+            auto* new_context_ptr = llama_manager->GetOrCreateContextInfo(summary_context_id, summary_model_id, static_cast<int32_t>(new_context_size));
+            if (!new_context_ptr) {
+                LOG_ERROR_SummarizationPlugin("Failed to create resized summary context");
+                return false;
+            }
+            
+            // Reapply system prompt
+            if (!system_prompt.empty()) {
+                new_context_ptr->UpdateSystemPrompt(system_prompt);
+                LOG_SummarizationPlugin("Reapplied system prompt to resized context");
+            }
+            
+            LOG_SummarizationPlugin("Successfully resized summary context to " + std::to_string(new_context_size) + " tokens");
+            return true;
+            
+        } catch (const std::exception& e) {
+            LOG_ERROR_SummarizationPlugin("Exception during context resize: " + std::string(e.what()));
+            return false;
+        }
+    }
+    
 private:
     /**
      * Initialize the summary model and context for the plugin
@@ -171,22 +232,16 @@ private:
         int main_context_size = settings_manager->GetInt("Models", "main_context_size", 4096);
         int main_gpu_layers = settings_manager->GetInt("Models", "main_gpu_layers", 999);
         
-        // CRITICAL FIX: Proper context size calculation that accounts for all overheads
-        // Calculate summary context size with proper overhead accounting:
-        // - Safety buffers (SAFETY_BUFFER_TOKENS = 64, GENERATION_BUFFER_TOKENS = 128)
-        // - System prompt overhead (~200 tokens)
-        // - Template overhead (~100 tokens) 
-        // - Response generation space (~300 tokens minimum)
-        // Total overhead: ~600 tokens
-        //
-        // Use 40% of main context size (instead of 20%) to ensure adequate space
-        // after all overheads are applied, with minimum 1200 to handle typical summarization workloads
-        int raw_summary_size = std::max(1200, (main_context_size * 40) / 100); // 40% with minimum 1200
-        int summary_context_size = std::min(raw_summary_size, main_context_size - 200); // Cap to ensure it's smaller than main
+        // Context size calculation for pairwise summarization
+        // Need enough space for: system prompt (~200 tokens) + 2 messages (up to 2000 tokens each) 
+        // + formatting overhead (~100 tokens) + response generation (~200 tokens)
+        // Total: ~4500 tokens minimum for large message pairs
+        // Use 50% of main context size with minimum 4500 tokens to handle large conversations
+        int summary_context_size = std::max(4500, (main_context_size * 50) / 100);
         
         LOG_SummarizationPlugin("Loading summary model: " + summary_model_path + 
                                " (context: " + std::to_string(summary_context_size) + 
-                               " [40% of main with overhead accounting], gpu_layers: " + std::to_string(main_gpu_layers) + ")");
+                               " [50% of main, optimized for large message pairs], gpu_layers: " + std::to_string(main_gpu_layers) + ")");
         
         if (status_callback) status_callback("Loading summary model: " + summary_model_path, false);
         
@@ -207,7 +262,7 @@ private:
             if (status_callback) status_callback("Creating summary context...", false);
             
             // Create summary context
-            auto* context_ptr = llama_manager->GetOrCreateContextInfo(summary_context_id, summary_model_id, "summary");
+            auto* context_ptr = llama_manager->GetOrCreateContextInfo(summary_context_id, summary_model_id, summary_context_size);
             if (!context_ptr) {
                 LOG_ERROR_SummarizationPlugin("Failed to create summary context");
                 if (status_callback) status_callback("Failed to create summary context", true);
@@ -244,6 +299,7 @@ private:
             return false;
         }
     }
+    
     
     /**
      * Main processing loop - runs in background thread
@@ -295,7 +351,8 @@ private:
     }
     
     /**
-     * Process a single batch of pruned messages
+     * Process a single batch of pruned messages using pairwise summarization
+     * Always summarizes 2 messages at a time (Q->A pairs) for maximum fidelity
      */
     void ProcessSummarizationBatch(const PrunedMessageBatch& batch) {
         LOG_SummarizationPlugin("Processing batch for context: " + batch.context_id + 
@@ -314,130 +371,122 @@ private:
                 return;
             }
             
-            // Convert message history to a summarization prompt
-            std::ostringstream prompt_stream;
-            prompt_stream << "Please summarize the following conversation history:\n\n";
+            size_t total_messages = batch.pruned_messages.size();
             
-            for (const auto& [role, content] : batch.pruned_messages) {
-                prompt_stream << role << ": " << content << "\n";
-            }
-            
-            prompt_stream << "\nProvide a concise summary that captures the key points and context:";
-            
-            std::string summarization_prompt = prompt_stream.str();
-            
-            LOG_SummarizationPlugin("Generating summary for " + std::to_string(batch.pruned_messages.size()) + " messages");
-            
-            // CRITICAL FIX: Validate content size before processing to prevent context overflow
-            // Rough estimation: ~4 characters per token
-            size_t estimated_tokens = summarization_prompt.length() / 4;
-            auto* model_info = llama_manager->GetModelInfo(summary_model_id);
-            if (!model_info) {
-                LOG_ERROR_SummarizationPlugin("Summary model info not available");
+            // Always use pairwise summarization - need at least 2 messages
+            if (total_messages < 2) {
+                LOG_SummarizationPlugin("Only " + std::to_string(total_messages) + 
+                    " message(s) in batch - leaving in context without summarization");
                 return;
             }
             
-            // Get actual available space (accounting for safety buffers and overheads)
-            int32_t available_space = model_info->n_ctx - 600; // Reserve 600 tokens for overheads and response
+            LOG_SummarizationPlugin("Using pairwise summarization for " + 
+                std::to_string(total_messages) + " messages (" + 
+                std::to_string(total_messages / 2) + " pairs)");
             
-            if (static_cast<int32_t>(estimated_tokens) > available_space) {
-                LOG_ERROR_SummarizationPlugin("Content size (" + std::to_string(estimated_tokens) + 
-                    " tokens) exceeds available context space (" + std::to_string(available_space) + 
-                    ") - implementing chunked processing");
+            std::vector<std::string> pair_summaries;
+            
+            // Process messages in pairs (Q->A), skip odd message at end
+            for (size_t i = 0; i + 1 < total_messages; i += 2) {
+                std::ostringstream pair_stream;
+                pair_stream << "Summarize this Q&A exchange in one clear sentence:\n\n";
+                pair_stream << batch.pruned_messages[i].first << ": " << batch.pruned_messages[i].second << "\n";
+                pair_stream << batch.pruned_messages[i + 1].first << ": " << batch.pruned_messages[i + 1].second << "\n";
+                pair_stream << "\nSummary:";
                 
-                // CHUNKED PROCESSING: Break large batches into smaller pieces
-                std::vector<std::string> chunk_summaries;
-                size_t messages_per_chunk = std::max(size_t(1), batch.pruned_messages.size() / 3); // Split into ~3 chunks
+                std::string pair_prompt = pair_stream.str();
                 
-                for (size_t i = 0; i < batch.pruned_messages.size(); i += messages_per_chunk) {
-                    size_t end_idx = std::min(i + messages_per_chunk, batch.pruned_messages.size());
+                // Reset context for each pair to ensure independence
+                summary_ctx->ClearContext();
+                
+                std::string pair_summary = summary_ctx->HandleInput(pair_prompt, "user");
+                
+                // Check if we got an error (likely context overflow)
+                if (pair_summary.empty() || pair_summary.find("Error: Failed to process prompt") == 0) {
+                    LOG_WARNING_SummarizationPlugin("Failed to summarize pair " + std::to_string((i/2) + 1) + 
+                        " - attempting context resize...");
                     
-                    std::ostringstream chunk_stream;
-                    chunk_stream << "Please summarize this conversation chunk:\n\n";
-                    for (size_t j = i; j < end_idx; ++j) {
-                        chunk_stream << batch.pruned_messages[j].first << ": " << batch.pruned_messages[j].second << "\n";
+                    // Extract needed token count from error message (if available)
+                    size_t needed_tokens = ExtractNeededTokensFromError(pair_summary);
+                    if (needed_tokens == 0) {
+                        // Estimate token count if we couldn't parse error message
+                        needed_tokens = pair_prompt.length() / 4; // Rough estimation: 4 chars per token
+                        LOG_SummarizationPlugin("Estimated needed tokens: " + std::to_string(needed_tokens));
+                    } else {
+                        LOG_SummarizationPlugin("Extracted needed tokens from error: " + std::to_string(needed_tokens));
                     }
-                    chunk_stream << "\nProvide a concise summary:";
                     
-                    std::string chunk_prompt = chunk_stream.str();
-                    size_t chunk_tokens = chunk_prompt.length() / 4;
-                    
-                    if (static_cast<int32_t>(chunk_tokens) <= available_space) {
-                        // CRITICAL FIX: Reset context state before each chunk to prevent accumulation
-                        summary_ctx->ClearContext();
+                    // Attempt to resize the summary context
+                    if (ResizeSummaryContext(needed_tokens)) {
+                        LOG_SummarizationPlugin("Context resize successful, retrying pair " + std::to_string((i/2) + 1));
                         
-                        std::string chunk_summary = summary_ctx->HandleInput(chunk_prompt, "user");
-                        if (!chunk_summary.empty()) {
-                            chunk_summaries.push_back(chunk_summary);
-                            LOG_SummarizationPlugin("Processed chunk " + std::to_string(chunk_summaries.size()) + 
-                                " (" + std::to_string(end_idx - i) + " messages)");
+                        // Get the resized context and retry
+                        summary_ctx = llama_manager->GetContextInfo(summary_context_id);
+                        if (summary_ctx) {
+                            summary_ctx->ClearContext();
+                            pair_summary = summary_ctx->HandleInput(pair_prompt, "user");
+                            
+                            if (pair_summary.empty() || pair_summary.find("Error: Failed to process prompt") == 0) {
+                                LOG_WARNING_SummarizationPlugin("Pair " + std::to_string((i/2) + 1) + 
+                                    " still failed after context resize - skipping");
+                                continue;
+                            } else {
+                                LOG_SummarizationPlugin("Pair " + std::to_string((i/2) + 1) + 
+                                    " succeeded after context resize");
+                            }
+                        } else {
+                            LOG_ERROR_SummarizationPlugin("Lost summary context after resize - skipping pair");
+                            continue;
                         }
                     } else {
-                        LOG_ERROR_SummarizationPlugin("Even chunked content too large - skipping this chunk");
+                        LOG_WARNING_SummarizationPlugin("Context resize failed for pair " + std::to_string((i/2) + 1) + 
+                            " - skipping (tokens too large or resize failed)");
+                        continue;
                     }
                 }
                 
-                // Combine chunk summaries into final summary
-                if (!chunk_summaries.empty()) {
-                    std::ostringstream final_stream;
-                    final_stream << "Please create a consolidated summary from these partial summaries:\n\n";
-                    for (size_t i = 0; i < chunk_summaries.size(); ++i) {
-                        final_stream << "Summary " << (i + 1) << ": " << chunk_summaries[i] << "\n\n";
-                    }
-                    final_stream << "Provide a single, coherent summary:";
-                    
-                    std::string final_prompt = final_stream.str();
-                    size_t final_tokens = final_prompt.length() / 4;
-                    
-                    if (static_cast<int32_t>(final_tokens) <= available_space) {
-                        summary_ctx->ClearContext();
-                        summarization_prompt = final_prompt; // Use the consolidated prompt
-                        LOG_SummarizationPlugin("Using chunked processing - combining " + 
-                            std::to_string(chunk_summaries.size()) + " chunk summaries");
-                    } else {
-                        // Fallback: use the first chunk summary
-                        LOG_WARNING_SummarizationPlugin("Final consolidation too large - using first chunk summary");
-                        std::string summary = chunk_summaries[0];
-                        ApplySummaryToContext(batch.context_id, summary);
-                        messages_summarized += batch.pruned_messages.size();
-                        summaries_applied++;
-                        return;
-                    }
-                } else {
-                    LOG_ERROR_SummarizationPlugin("All chunks failed processing - cannot summarize this batch");
-                    return;
+                if (!pair_summary.empty()) {
+                    pair_summaries.push_back(pair_summary);
+                    LOG_SummarizationPlugin("Summarized pair " + std::to_string((i/2) + 1) + ": " + 
+                        pair_summary.substr(0, 50) + (pair_summary.length() > 50 ? "..." : ""));
                 }
             }
             
-            // CRITICAL FIX: Validate context state before processing to prevent overflow
-            if (!summary_ctx->ValidateAndSyncContextState()) {
-                LOG_ERROR_SummarizationPlugin("Summary context state validation failed - resetting context");
-                summary_ctx->ClearContext();
+            // Handle odd message - leave it in original context
+            if (total_messages % 2 == 1) {
+                LOG_SummarizationPlugin("Leaving unpaired message in context: " + 
+                    batch.pruned_messages[total_messages - 1].first);
             }
             
-            // Generate summary using the summary context (synchronous for now)
-            // Use "user" role to ensure proper template formatting
-            std::string summary = summary_ctx->HandleInput(summarization_prompt, "user");
-            
-            // CRITICAL FIX: Always reset summary context after use to prevent accumulation
-            // Summary contexts should be stateless - each summarization is independent
-            summary_ctx->ClearContext();
-            
-            if (!summary.empty()) {
-                LOG_SummarizationPlugin("Generated summary: " + summary.substr(0, 100) + 
-                                       (summary.length() > 100 ? "..." : ""));
-                
-                // Apply the summary back to the original context
-                ApplySummaryToContext(batch.context_id, summary);
-                
-                messages_summarized += batch.pruned_messages.size();
-                summaries_applied++;
+            // Create final summary from pairs
+            std::string final_summary;
+            if (pair_summaries.empty()) {
+                LOG_ERROR_SummarizationPlugin("No pairs could be summarized - batch failed");
+                return;
+            } else if (pair_summaries.size() == 1) {
+                // Single pair - use directly
+                final_summary = "Summary: " + pair_summaries[0];
             } else {
-                LOG_ERROR_SummarizationPlugin("Failed to generate summary for batch");
+                // Multiple pairs - combine them
+                std::ostringstream final_stream;
+                final_stream << "Conversation summary:\n";
+                for (size_t i = 0; i < pair_summaries.size(); ++i) {
+                    final_stream << "• " << pair_summaries[i] << "\n";
+                }
+                final_summary = final_stream.str();
             }
+            
+            // Apply summary to original context
+            ApplySummaryToContext(batch.context_id, final_summary);
+            
+            messages_summarized += batch.pruned_messages.size();
+            summaries_applied++;
+            
+            LOG_SummarizationPlugin("Successfully processed batch: " + 
+                std::to_string(pair_summaries.size()) + " pairs summarized");
             
         } catch (const std::exception& e) {
-            LOG_ERROR_SummarizationPlugin("Exception processing summarization batch: " + std::string(e.what()));
+            LOG_ERROR_SummarizationPlugin("Exception processing batch: " + std::string(e.what()));
         }
     }
     
@@ -467,6 +516,55 @@ private:
             LOG_ERROR_SummarizationPlugin("Exception applying summary to context: " + std::string(e.what()));
         }
     }
+    
+private:
+    /**
+     * Extract needed token count from error message if available
+     */
+    size_t ExtractNeededTokensFromError(const std::string& error_message) {
+        if (error_message.empty()) {
+            return 0;
+        }
+        
+        // Look for patterns like "Error: Failed to process prompt" with token information
+        // Error messages from llama.cpp might contain token count information
+        std::string search_patterns[] = {
+            "needed ",
+            "require ",
+            "needs ",
+            "tokens:"
+        };
+        
+        for (const auto& pattern : search_patterns) {
+            size_t pos = error_message.find(pattern);
+            if (pos != std::string::npos) {
+                // Look for a number after the pattern
+                size_t start = pos + pattern.length();
+                while (start < error_message.length() && !std::isdigit(error_message[start])) {
+                    start++;
+                }
+                
+                if (start < error_message.length()) {
+                    // Extract the number
+                    size_t end = start;
+                    while (end < error_message.length() && std::isdigit(error_message[end])) {
+                        end++;
+                    }
+                    
+                    if (end > start) {
+                        try {
+                            return std::stoull(error_message.substr(start, end - start));
+                        } catch (...) {
+                            // Continue looking
+                        }
+                    }
+                }
+            }
+        }
+        
+        return 0; // No token count found
+    }
+
 };
 
 } // namespace LuminaChat

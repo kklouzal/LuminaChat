@@ -150,6 +150,9 @@ private:    // Core components
     ModelInfo* parent_model;
     TokenCache* token_cache;
     
+    // Context configuration
+    int32_t context_size;  // Individual context size (not tied to model)
+    
     // Context state
     std::string context_id;
     ContextState state;
@@ -196,12 +199,12 @@ private:    // Core components
     void UpdateTemplateWithAllSummaries();
     
 public:    // Constructor overloads
-    ContextInfo(const std::string& context_id, ModelInfo* model, const std::string& base_template = "");
-    ContextInfo(ModelInfo* model, const std::string& base_template = ""); // For testing with auto-generated context_id
+    ContextInfo(const std::string& context_id, ModelInfo* model, int32_t context_size);
+    ContextInfo(ModelInfo* model, int32_t context_size); // For testing with auto-generated context_id
     
     // Factory method for default template
-    static std::unique_ptr<ContextInfo> CreateWithDefaultTemplate(const std::string& context_id, ModelInfo* model);
-    static std::unique_ptr<ContextInfo> CreateWithDefaultTemplate(ModelInfo* model); // Auto-generated ID
+    static std::unique_ptr<ContextInfo> Create(const std::string& context_id, ModelInfo* model, int32_t context_size);
+    static std::unique_ptr<ContextInfo> Create(ModelInfo* model, int32_t context_size); // Auto-generated ID
     
     // Plugin interface for accessing pruning buffer
     static std::vector<PrunedMessageBatch> GetAndClearPruningBuffer();
@@ -279,6 +282,7 @@ public:
     
     // Advanced features
     void SetMaxContextTokens(size_t max_tokens);
+    int32_t GetContextSize() const { return context_size; }
     std::string GetCurrentPrompt() const;
     
     // Debug and testing helpers
@@ -394,13 +398,13 @@ namespace ContextUtils {
 }
 
 // Inline implementation of ContextInfo methods
-inline ContextInfo::ContextInfo(const std::string& context_id, ModelInfo* model, const std::string& base_template)
+inline ContextInfo::ContextInfo(const std::string& context_id, ModelInfo* model, int32_t context_size)
     : context_id(context_id)
     , parent_model(model)
     , token_cache(model ? &model->GetTokenCache() : nullptr)
+    , context_size(context_size)
     , state(ContextState::READY)
-    , template_manager(std::make_unique<ChatTemplateManager>(
-        base_template.empty() ? ChatTemplateManager::GetDefaultTemplate() : base_template))
+    , template_manager(std::make_unique<ChatTemplateManager>())
     , llama_ctx(nullptr)
     , context_needs_rebuild(true)
 {
@@ -416,24 +420,23 @@ inline ContextInfo::ContextInfo(const std::string& context_id, ModelInfo* model,
         return;
     }
     
-    // Initialize llama context from parent model
-    // Note: This would need actual llama.cpp integration
-    // For testing, we'll skip the actual llama context creation
-    
-    if (!template_manager->ValidateTemplate()) {
-        LOG_ERROR_ContextInfo("Invalid base template provided");
+    if (context_size <= 0) {
+        LOG_ERROR_ContextInfo("ContextInfo created with invalid context size: " + std::to_string(context_size));
         state = ContextState::ERROR_STATE;
         return;
     }
     
-    LOG_DEBUG_ContextInfo("ContextInfo created: " + context_id);
+    // Set max context tokens in stats to match our individual context size
+    stats.max_context_tokens = static_cast<size_t>(context_size);
+    
+    LOG_DEBUG_ContextInfo("ContextInfo created: " + context_id + " with context size: " + std::to_string(context_size));
     UpdateStats();
 }
 
-inline ContextInfo::ContextInfo(ModelInfo* model, const std::string& base_template)
-    : ContextInfo(GenerateContextId(), model, base_template) // Auto-generate context_id
+inline ContextInfo::ContextInfo(ModelInfo* model, int32_t context_size)
+    : ContextInfo(GenerateContextId(), model, context_size) // Auto-generate context_id
 {
-    LOG_DEBUG_ContextInfo("ContextInfo created with auto-generated ID: " + context_id);
+    LOG_DEBUG_ContextInfo("ContextInfo created with auto-generated ID: " + context_id + " and context size: " + std::to_string(context_size));
 }
 
 inline ContextInfo::~ContextInfo() {
@@ -483,8 +486,9 @@ inline bool ContextInfo::InitializeLlamaContext() {
     try {
         // Set up context parameters using model's settings
         llama_context_params ctx_params = llama_context_default_params();
-        ctx_params.n_ctx = parent_model->GetConfig().context_size;
-        ctx_params.n_batch = std::min(512, parent_model->GetConfig().context_size / 8);
+        // Initialize context parameters with this context's specific size
+        ctx_params.n_ctx = context_size;
+        ctx_params.n_batch = std::min(512, context_size / 8);
         ctx_params.n_threads = parent_model->GetConfig().threads > 0 ? 
                                parent_model->GetConfig().threads : 
                                std::max(1u, std::thread::hardware_concurrency());
@@ -1179,12 +1183,12 @@ inline std::string GenerateContextId() {
 }
 
 // Factory methods for creating contexts with default template
-inline std::unique_ptr<ContextInfo> ContextInfo::CreateWithDefaultTemplate(const std::string& context_id, ModelInfo* model) {
-    return std::make_unique<ContextInfo>(context_id, model, ""); // Empty string triggers default template
+inline std::unique_ptr<ContextInfo> ContextInfo::Create(const std::string& context_id, ModelInfo* model, int32_t context_size) {
+    return std::make_unique<ContextInfo>(context_id, model, context_size);
 }
 
-inline std::unique_ptr<ContextInfo> ContextInfo::CreateWithDefaultTemplate(ModelInfo* model) {
-    return std::make_unique<ContextInfo>(model, ""); // Empty string triggers default template
+inline std::unique_ptr<ContextInfo> ContextInfo::Create(ModelInfo* model, int32_t context_size) {
+    return std::make_unique<ContextInfo>(model, context_size);
 }
 
 inline bool ContextInfo::HandleInputAsync(const std::string& input, const GenerationCallbacks& callbacks, const std::string& username) {

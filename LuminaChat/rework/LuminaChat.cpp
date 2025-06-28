@@ -990,10 +990,13 @@ void LuminaChatFrame::LoadDefaultModels() {
     } else {
         AddLogMessage("Main model loaded successfully");
         
+        // Get main model context size from settings
+        int32_t main_context_size = settings_manager->GetInt("Models", "main_context_size", 4096);
+        
         // Create default context with main model
-        auto* context = llama_manager->GetOrCreateContextInfo("main_context", "main_model", "default");
+        auto* context = llama_manager->GetOrCreateContextInfo("main_context", "main_model", main_context_size);
         if (context) {
-            AddLogMessage("Main context created successfully");
+            AddLogMessage("Main context created successfully with context size: " + std::to_string(main_context_size));
             // Apply template settings from UI (identity directive and system prompt)
             ApplyTemplateSettingsToContext(context, "main_context");
         }
@@ -1238,8 +1241,13 @@ void LuminaChatFrame::OnLoadModel(wxCommandEvent& event) {
             
             LOG_DEBUG_LuminaChat("About to call GetOrCreateContextInfo");
             try {
-                LOG_DEBUG_LuminaChat("Calling GetOrCreateContextInfo with context_id=" + current_context_id + ", model_id=" + current_model_id);
-                auto* context_info = llama_manager->GetOrCreateContextInfo(current_context_id, current_model_id);
+                // Get main model context size from settings (architectural fix)
+                int32_t main_context_size = settings_manager->GetInt("Models", "main_context_size", 4096);
+                
+                LOG_DEBUG_LuminaChat("Calling GetOrCreateContextInfo with context_id=" + current_context_id + 
+                                   ", model_id=" + current_model_id + 
+                                   ", context_size=" + std::to_string(main_context_size));
+                auto* context_info = llama_manager->GetOrCreateContextInfo(current_context_id, current_model_id, main_context_size);
                 LOG_DEBUG_LuminaChat("GetOrCreateContextInfo call completed");
                 
                 if (context_info) {

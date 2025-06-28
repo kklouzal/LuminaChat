@@ -133,9 +133,9 @@ public:
     ModelInfo* GetModelInfo(const std::string& model_id) const;
     std::vector<std::string> GetLoadedModelIds() const;
     
-    // Context management
-    ContextInfo* GetOrCreateContextInfo(const std::string& context_id, const std::string& model_id, const std::string& template_name = "default");
-    bool CreateContextWithTemplate(const std::string& context_id, const std::string& model_id, const std::string& template_content);
+    // Context management - updated to include per-context context_size parameter (architectural fix)
+    ContextInfo* GetOrCreateContextInfo(const std::string& context_id, const std::string& model_id, int32_t context_size);
+    bool CreateContextWithTemplate(const std::string& context_id, const std::string& model_id, const std::string& template_content, int32_t context_size);
     bool RemoveContext(const std::string& context_id);
     ContextInfo* GetContextInfo(const std::string& context_id) const;
     std::vector<std::string> GetContextIds() const;
@@ -429,7 +429,7 @@ inline bool LlamaManager::LoadModelFromSettings(const std::string& model_id, con
 }
 
 // Context management methods
-inline ContextInfo* LlamaManager::GetOrCreateContextInfo(const std::string& context_id, const std::string& model_id, const std::string& template_name) {
+inline ContextInfo* LlamaManager::GetOrCreateContextInfo(const std::string& context_id, const std::string& model_id, int32_t context_size) {
     std::lock_guard<std::mutex> lock(manager_mutex);
     
     if (!ValidateContextId(context_id) || !ValidateModelId(model_id)) {
@@ -456,14 +456,11 @@ inline ContextInfo* LlamaManager::GetOrCreateContextInfo(const std::string& cont
         return nullptr;
     }
     
-    // Get template (internal call - mutex already held)
-    std::string template_content = GetTemplateInternal(template_name);
-    
-    LOG_LlamaManager("Creating new ContextInfo: " + context_id + " with model: " + model_id);
+    LOG_LlamaManager("Creating new ContextInfo: " + context_id + " with model: " + model_id + " and context size: " + std::to_string(context_size));
     
     try {
-        // Create ContextInfo - it will use default template if template_content is empty
-        auto context_info = std::make_unique<ContextInfo>(context_id, model_info, template_content);
+        // Create ContextInfo with specific context size
+        auto context_info = std::make_unique<ContextInfo>(context_id, model_info, context_size);
         
         ContextInfo* context_ptr = context_info.get();
         contexts[context_id] = std::move(context_info);
@@ -475,6 +472,37 @@ inline ContextInfo* LlamaManager::GetOrCreateContextInfo(const std::string& cont
     } catch (const std::exception& e) {
         LOG_ERROR_LlamaManager("Failed to create ContextInfo for " + context_id + ": " + std::string(e.what()));
         return nullptr;
+    }
+}
+
+// Context management methods - continued
+inline bool LlamaManager::RemoveContext(const std::string& context_id) {
+    std::lock_guard<std::mutex> lock(manager_mutex);
+    
+    if (!ValidateContextId(context_id)) {
+        LOG_ERROR_LlamaManager("Invalid context ID: " + context_id);
+        return false;
+    }
+    
+    auto it = contexts.find(context_id);
+    if (it == contexts.end()) {
+        LOG_WARNING_LlamaManager("Context not found for removal: " + context_id);
+        return false;
+    }
+    
+    LOG_LlamaManager("Removing context: " + context_id);
+    
+    try {
+        // The ContextInfo destructor will handle cleanup of llama_ctx and batch
+        contexts.erase(it);
+        
+        UpdateStats();
+        LOG_LlamaManager("Successfully removed context: " + context_id);
+        return true;
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR_LlamaManager("Exception removing context " + context_id + ": " + std::string(e.what()));
+        return false;
     }
 }
 

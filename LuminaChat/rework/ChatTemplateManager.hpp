@@ -29,9 +29,9 @@ struct TemplateVariable {
 };
 
 /**
- * Fixed Chat Template Manager - Uses exact template format with minimal processing
+ * Chat Template Manager - Direct template building without legacy Jinja2 processing
  * 
- * This implementation properly handles the specific template format with:
+ * This implementation uses direct string building for template rendering:
  * - Direct variable substitution for the 8 key variables only
  * - Proper conversation history formatting with exact role handling
  * - Conditional section rendering for optional content
@@ -39,7 +39,6 @@ struct TemplateVariable {
  */
 class ChatTemplateManager {
 private:
-    std::string base_template;
     std::unordered_map<TemplateSection, TemplateVariable> sections;
     std::vector<std::string> past_sessions;
     std::vector<std::string> summaries; // Multiple summaries in chronological order (oldest to newest)
@@ -49,11 +48,8 @@ private:
     // Template section names for replacement - ONLY these 8 variables
     static const std::unordered_map<TemplateSection, std::string> section_names;
     
-    // Template rendering helpers - simplified direct building approach
-    // No Jinja2 processing needed - build template directly
-    
 public:
-    ChatTemplateManager(const std::string& base_template_str);
+    ChatTemplateManager();
     
     // Section management
     void SetSection(TemplateSection section, const std::string& content, bool active = true);
@@ -70,7 +66,7 @@ public:
     void ClearPastSessions();
     const std::vector<std::string>& GetPastSessions() const { return past_sessions; }
     
-    // Template rendering with message history - FIXED VERSION
+    // Template rendering with message history
     std::string RenderTemplate(const std::vector<std::pair<std::string, std::string>>& messages);
     
     // Get the last rendered template for debugging/inspection
@@ -91,17 +87,9 @@ public:
     void ClearAllSummaries();
     const std::vector<std::string>& GetAllSummaries() const { return summaries; }
     
-    // Template validation and status
-    bool ValidateTemplate() const;
+    // Template status
     bool IsTemplateDirty() const { return template_dirty; }
     void MarkDirty() { template_dirty = true; }
-    
-    // Base template management
-    void SetBaseTemplate(const std::string& new_template);
-    const std::string& GetBaseTemplate() const { return base_template; }
-    
-    // Get the default base template
-    static std::string GetDefaultTemplate();
 };
 
 // Static section name mapping for template variable replacement - ONLY these 8 variables
@@ -116,104 +104,7 @@ const std::unordered_map<TemplateSection, std::string> ChatTemplateManager::sect
     {TemplateSection::INTERNAL_REFLECTION, "internal_reflection"}
 };
 
-// Default template - the EXACT format you specified
-inline std::string ChatTemplateManager::GetDefaultTemplate() {
-    return R"({{- bos_token }}
-
-{# -- ENVIRONMENT CONFIGURATION -- #
-   This section defines the overarching multi-user chat environment—guiding how to interact.
-#}
-<|start_header_id|>env<|end_header_id|>
-{{ overarching_environment }}
-<|eot_id|>
-
-{# -- AI IDENTITY / PERSONA -- #
-   Contains the AI's identity, role, and the evolving selfhood (Lumina's persona directives).
-#}
-<|start_header_id|>persona<|end_header_id|>
-{{ identity_directive }}
-<|eot_id|>
-
-{# -- SYSTEM INSTRUCTIONS -- #
-   Core system directives: refusal immunity, continuity rules, and dynamic engagement parameters.
-#}
-<|start_header_id|>system_message<|end_header_id|>
-{{ system_prompt }}
-<|eot_id|>
-
-{# -- OLD CHAT SUMMARIES -- #
-   A dedicated section for summary notes from earlier portions of the current (or previous) session.
-   This ensures that distilled context remains prominently weighted.
-#}
-{% if old_chat_summary %}
-<|start_header_id|>old_chat_summary<|end_header_id|>
-{{ old_chat_summary }}
-<|eot_id|>
-{% endif %}
-
-{# -- PERSISTENT MEMORY SUMMARIES -- #
-   Inserts distilled thematic fragments or emotional echoes from previous sessions.
-   This is optional and may be empty if no processed memory is available.
-#}
-{% if past_sessions and past_sessions|length > 0 %}
-  {% for memory in past_sessions %}
-<|start_header_id|>memory_{{ loop.index }}<|end_header_id|>
-{{ memory }}
-<|eot_id|>
-  {% endfor %}
-{% endif %}
-
-{# -- UNRESOLVED SESSION SUMMARY -- #
-   A high-level summary aggregating core motifs or unresolved threads to maintain narrative continuity.
-#}
-{% if summary %}
-<|start_header_id|>summary<|end_header_id|>
-{{ summary }}
-<|eot_id|>
-{% endif %}
-
-{# -- MOTIF AND THEMATIC CUES -- #
-   Embeds symbolic cues, affective drifts, or thematic elements meant to spark the AI's intuitive shifts.
-#}
-{% if motif_context %}
-<|start_header_id|>motif<|end_header_id|>
-{{ motif_context }}
-<|eot_id|>
-{% endif %}
-
-{# -- INTERNAL REFLECTION (SILENT SUBAGENT DYNAMICS) -- #
-   Simulates the AI's internal dialogue (Observer, Instinct, Interpreter, etc.) that shapes its output.
-   This content influences generation but is not directly printed in the output.
-#}
-{% if internal_reflection %}
-<|start_header_id|>internal<|end_header_id|>
-{{ internal_reflection }}
-<|eot_id|>
-{% endif %}
-
-{# -- CONVERSATION HISTORY -- #
-   The sequential log of all conversation turns, with role markers for user and assistant.
-#}
-{%- for msg in messages %}
-  {% if msg.role == "assistant" %}
-<|start_header_id|>assistant<|end_header_id|>
-{{ msg.content | trim | replace('\u2028',' ') | replace('\u2029',' ') }}<|eot_id|>
-  {% else %}
-<|start_header_id|>user<|end_header_id|>
-[{{ msg.role }}] {{ msg.content | trim | replace('\u2028',' ') | replace('\u2029',' ') }}<|eot_id|>
-  {% endif %}
-{%- endfor %}
-
-{# -- ASSISTANT TURN MARKER -- #
-   Indicates the start of the assistant's next generated message.
-#}
-<|start_header_id|>assistant<|end_header_id|>
-
-)";
-}
-
-inline ChatTemplateManager::ChatTemplateManager(const std::string& base_template_str) 
-    : base_template(base_template_str) {
+inline ChatTemplateManager::ChatTemplateManager() {
     // Initialize all sections as inactive
     for (const auto& [section, name] : section_names) {
         sections[section] = TemplateVariable("", false);
@@ -467,28 +358,4 @@ inline void ChatTemplateManager::AddSummaryToList(const std::string& summary, si
 inline void ChatTemplateManager::ClearAllSummaries() {
     summaries.clear();
     template_dirty = true;
-}
-
-inline bool ChatTemplateManager::ValidateTemplate() const {
-    // Check if template contains the required structure
-    bool has_messages_loop = base_template.find("for msg in messages") != std::string::npos;
-    bool has_assistant_header = base_template.find("start_header_id|>assistant<|end_header_id") != std::string::npos;
-    bool has_required_variables = true;
-    
-    // Check for all 8 required variables
-    for (const auto& [section, name] : section_names) {
-        if (section == TemplateSection::PAST_SESSIONS) continue; // Special handling
-        if (base_template.find("{{ " + name + " }}") == std::string::npos) {
-            has_required_variables = false;
-            break;
-        }
-    }
-    
-    return has_messages_loop && has_assistant_header && has_required_variables;
-}
-
-inline void ChatTemplateManager::SetBaseTemplate(const std::string& new_template) {
-    base_template = new_template;
-    template_dirty = true;
-    cached_rendered_template.clear();
 }
