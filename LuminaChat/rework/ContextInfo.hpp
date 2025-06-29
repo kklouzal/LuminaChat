@@ -209,7 +209,6 @@ private:    // Core components
     
     // Context size management
     bool IsNearContextLimit(float threshold = 0.8f) const;
-    void EmergencyPrune(); // Emergency fallback when plugin system unavailable
     void UpdateStats();
     
     // Summary management methods
@@ -1153,17 +1152,6 @@ inline bool ContextInfo::IsNearContextLimit(float threshold) const {
     return near_limit;
 }
 
-// Emergency fallback pruning for extreme situations (no plugin dependency)
-inline void ContextInfo::EmergencyPrune() {
-    LOG_ERROR_ContextInfo("EMERGENCY: Plugin system unavailable - performing emergency pruning for context: " + context_id);
-    
-    if (IsNearContextLimit(0.95f)) {
-        LOG_ContextInfo("Emergency pruning without summarization - context critically full");
-        PruneContextImmediate(3); // Very aggressive - keep only 3 most recent messages
-        LOG_ContextInfo("Emergency pruning completed");
-    }
-}
-
 inline void ContextInfo::UpdateStats() {
     stats.message_pairs = message_history.size();
     // CRITICAL FIX: Use n_past as the single source of truth for context size
@@ -1762,11 +1750,12 @@ inline void ContextInfo::RequestEmotionalAnalysis() {
     }
     
     if (!ai_responses.empty()) {
+        size_t response_count = ai_responses.size();  // Store size before move
         std::lock_guard<std::mutex> lock(emotional_analysis_buffer_mutex);
         global_emotional_analysis_buffer.emplace_back(context_id, std::move(ai_responses));
         
         LOG_ContextInfo("Requested emotional analysis for context " + context_id + 
-                       " with " + std::to_string(ai_responses.size()) + " AI responses");
+                       " with " + std::to_string(response_count) + " AI responses");
     } else {
         LOG_ContextInfo("No assistant messages found in " + std::to_string(message_history.size()) + " messages for context: " + context_id);
     }

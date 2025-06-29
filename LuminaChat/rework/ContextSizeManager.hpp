@@ -401,11 +401,11 @@ private:
     
     bool RequestSummarization(const std::string& context_id) {
         LOG_ContextSizeManager("Summarization request noted for context: " + context_id + 
-                              " (handled by plugin system, not via callbacks)");
+                              " (handled by plugin system polling global pruning buffer)");
         
-        // Note: In the new architecture, summarization is handled by plugins
-        // that poll the global pruning buffer. This method is kept for compatibility
-        // but does not trigger actual summarization via callbacks.
+        // In the current architecture, summarization is handled by plugins
+        // that poll the global pruning buffer. This method sets the state
+        // to indicate summarization is in progress.
         
         current_state = PruningState::SUMMARIZING;
         summarization_requests++;

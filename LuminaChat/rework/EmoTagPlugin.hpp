@@ -8,7 +8,6 @@
 #include "Logger.hpp"
 #include "Utilities.hpp"
 #include <chrono>
-#include <thread>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -19,25 +18,46 @@ namespace LuminaChat {
 // Callback type for status updates
 using StatusUpdateCallback = std::function<void(const std::string& status, bool is_error)>;
 
+// Request and response structures for the pipeline
+struct EmotionAnalysisRequest {
+    EmotionalAnalysisBatch batch;
+    std::string context_id;
+    RequestPriority priority = RequestPriority::NORMAL;
+    std::chrono::steady_clock::time_point queued_time;
+    
+    EmotionAnalysisRequest(EmotionalAnalysisBatch b, const std::string& ctx_id, RequestPriority prio = RequestPriority::NORMAL)
+        : batch(std::move(b)), context_id(ctx_id), priority(prio), queued_time(std::chrono::steady_clock::now()) {}
+};
+
+struct EmotionAnalysisResponse {
+    std::string emotional_state;
+    std::string context_id;
+    bool success;
+    size_t responses_analyzed;
+    std::string error_message;
+    
+    EmotionAnalysisResponse(const std::string& emotion, const std::string& ctx_id, bool succ, size_t resp_count, const std::string& err = "")
+        : emotional_state(emotion), context_id(ctx_id), success(succ), responses_analyzed(resp_count), error_message(err) {}
+};
+
 /**
- * EmoTag Plugin - Handles background emotional analysis of AI responses
+ * EmoTag Plugin - Provides emotional analysis processing capabilities
  * 
- * This plugin periodically checks for AI responses that need emotional analysis
- * and processes them through the emotional analysis pipeline.
+ * This plugin serves as a pure processor for the Orchestrator's emotion analysis pipeline.
+ * It handles model initialization, context management, and the actual emotional analysis work.
  * 
  * Architecture:
- * - Core handles immediate conversation flow (critical path)
- * - Plugin handles emotional analysis work (async/background)
- * - Emotional states are applied back to contexts when complete
+ * - Orchestrator coordinates workflow (scheduling, pipeline management)
+ * - Plugin provides processing capability (model management, emotional analysis logic)
+ * - Orchestrator calls plugin methods through its pipeline processor
+ * - Plugin applies results back to contexts when requested
  * 
  * Configuration:
  * - Analysis Window Size: Number of recent AI responses to analyze (default: 3)
  */
 class EmoTagPlugin {
 private:
-    std::unique_ptr<std::thread> processing_thread;
-    std::atomic<bool> should_stop{false};
-    std::chrono::milliseconds check_interval{2000}; // Check every 2 seconds
+    // No independent pipeline - Orchestrator coordinates workflow
     
     // Reference to orchestrator for context management
     Orchestrator* orchestrator = nullptr;
@@ -83,53 +103,28 @@ public:
             settings_manager = orchestrator->GetSettingsManager();
         }
         
-        LogInfo("EmoTagPlugin initialized");
+        LogInfo("EmoTagPlugin initialized as processor service");
     }
     
     ~EmoTagPlugin() {
-        Stop();
+        Shutdown();
     }
     
     /**
-     * Start the plugin's background processing thread
+     * Initialize the plugin (called by Orchestrator)
      */
-    void Start() {
-        if (processing_thread && processing_thread->joinable()) {
-            LogWarning("Plugin already running");
-            return;
-        }
-        
-        // Initialize emotion analysis model and context first
-        if (!InitializeEmotionModel()) {
-            LogError("Failed to initialize emotion model - plugin will not process emotional analysis");
-            return;
-        }
-        
-        should_stop = false;
-        processing_thread = std::make_unique<std::thread>(&EmoTagPlugin::ProcessingLoop, this);
-        LogInfo("EmoTagPlugin started with emotion model ready");
+    bool Initialize() {
+        return InitializeEmotionModel();
     }
     
     /**
-     * Stop the plugin and wait for thread completion
+     * Shutdown the plugin and clean up resources
      */
-    void Stop() {
-        should_stop = true;
-        if (processing_thread && processing_thread->joinable()) {
-            processing_thread->join();
-        }
-        
+    void Shutdown() {
         // Clean up emotion context and model
         emotion_model_ready = false;
         
-        LogInfo("EmoTagPlugin stopped");
-    }
-    
-    /**
-     * Set the check interval for processing emotional analysis
-     */
-    void SetCheckInterval(std::chrono::milliseconds interval) {
-        check_interval = interval;
+        LogInfo("EmoTagPlugin shutdown");
     }
     
     /**
@@ -147,6 +142,91 @@ public:
     }
     
     /**
+     * Process an emotion analysis request (called by Orchestrator pipeline)
+     * This is the main processing method used by the Orchestrator's pipeline
+     */
+    EmotionAnalysisResponse ProcessEmotionAnalysisRequest(const EmotionAnalysisRequest& request) {
+        try {
+            LogInfo("Processing emotion analysis for context: " + request.context_id + 
+                   " (" + std::to_string(request.batch.ai_responses.size()) + " responses)");
+            
+            if (!emotion_model_ready.load() || !llama_manager) {
+                std::string error_msg = "Emotion model not ready for processing batch";
+                LogError(error_msg);
+                return EmotionAnalysisResponse("", request.context_id, false, 0, error_msg);
+            }
+            
+            // Process the batch to generate emotional state (existing logic)
+            std::string emotional_state = ProcessEmotionalAnalysisBatch(request.batch);
+            
+            if (emotional_state.empty()) {
+                std::string error_msg = "Failed to generate emotional state for context: " + request.context_id;
+                LogError(error_msg);
+                return EmotionAnalysisResponse("", request.context_id, false, 0, error_msg);
+            }
+            
+            // Create success response with the generated emotional state
+            EmotionAnalysisResponse response{
+                emotional_state,
+                request.context_id,
+                true,
+                request.batch.ai_responses.size()
+            };
+            
+            LogInfo("Successfully generated emotional state for batch: " + request.context_id);
+            
+            // Update statistics
+            responses_analyzed += request.batch.ai_responses.size();
+            emotional_states_generated++;
+            batches_processed++;
+            
+            return response;
+            
+        } catch (const std::exception& e) {
+            std::string error_msg = "Exception processing emotion analysis: " + std::string(e.what());
+            LogError(error_msg);
+            return EmotionAnalysisResponse("", request.context_id, false, 0, error_msg);
+        }
+    }
+    
+    /**
+     * Apply an emotional state to a context (called by Orchestrator after successful processing)
+     */
+    bool ApplyEmotionalStateToContext(const std::string& context_id, const std::string& emotional_state) {
+        try {
+            if (!llama_manager) {
+                LogError("LlamaManager not available for applying emotional state");
+                return false;
+            }
+            
+            // Get the original context
+            auto* original_context = llama_manager->GetContextInfo(context_id);
+            if (!original_context) {
+                LogWarning("Original context not found for emotional state application: " + context_id);
+                return false;
+            }
+            
+            // Apply the emotional state to the context
+            if (emotional_state.empty()) {
+                LogWarning("Emotional state is empty - skipping update for context: " + context_id);
+                return false;
+            }
+            
+            // Apply the clean emotional state to the context
+            original_context->UpdateEmotionalState(emotional_state);
+            
+            contexts_updated++;
+            
+            LogInfo("Applied emotional state to context: " + context_id);
+            return true;
+            
+        } catch (const std::exception& e) {
+            LogError("Exception applying emotional state to context: " + std::string(e.what()));
+            return false;
+        }
+    }
+    
+    /**
      * Get plugin statistics
      */
     struct PluginStats {
@@ -155,7 +235,6 @@ public:
         size_t emotional_states_generated;
         size_t contexts_updated;
         size_t analysis_window_size;
-        bool is_running;
         bool emotion_model_ready;
         std::string emotion_model_path;
     };
@@ -172,10 +251,16 @@ public:
             emotional_states_generated.load(),
             contexts_updated.load(),
             analysis_window_size.load(),
-            !should_stop.load(),
             emotion_model_ready.load(),
             model_path
         };
+    }
+    
+    /**
+     * Check if the plugin is ready to process emotion analysis requests
+     */
+    bool IsReady() const {
+        return emotion_model_ready.load();
     }
     
     /**
@@ -404,60 +489,13 @@ private:
     }
     
     /**
-     * Main processing loop - runs in background thread
-     */
-    void ProcessingLoop() {
-        LogInfo("Processing loop started");
-        
-        while (!should_stop.load()) {
-            try {
-                ProcessPendingEmotionalAnalysis();
-                std::this_thread::sleep_for(check_interval);
-            } catch (const std::exception& e) {
-                LogError("Exception in processing loop: " + std::string(e.what()));
-                std::this_thread::sleep_for(check_interval * 5); // Back off on error
-            }
-        }
-        
-        LogInfo("Processing loop ended");
-    }
-    
-    /**
-     * Check for and process any pending emotional analysis requests
-     */
-    void ProcessPendingEmotionalAnalysis() {
-        // Skip processing if emotion model is not ready
-        if (!emotion_model_ready.load()) {
-            return;
-        }
-        
-        // Check if there are any AI responses waiting for emotional analysis
-        if (!ContextInfo::HasPendingEmotionalAnalysis()) {
-            return; // No work to do
-        }
-        
-        LogInfo("Found pending emotional analysis to process");
-        
-        // Get all pending emotional analysis batches
-        auto analysis_batches = ContextInfo::GetAndClearEmotionalAnalysisBuffer();
-        
-        for (const auto& batch : analysis_batches) {
-            ProcessEmotionalAnalysisBatch(batch);
-        }
-        
-        batches_processed += analysis_batches.size();
-    }
-    
-    /**
      * Process a single batch of AI responses for emotional analysis
+     * Returns the generated emotional state or empty string on failure
      */
-    void ProcessEmotionalAnalysisBatch(const EmotionalAnalysisBatch& batch) {
-        LogInfo("Processing emotional analysis for context: " + batch.context_id + 
-                               " (" + std::to_string(batch.ai_responses.size()) + " responses)");
-        
+    std::string ProcessEmotionalAnalysisBatch(const EmotionalAnalysisBatch& batch) {
         if (!emotion_model_ready.load() || !llama_manager) {
             LogError("Emotion model not ready for processing batch");
-            return;
+            return "";
         }
         
         try {
@@ -465,7 +503,7 @@ private:
             auto* emotion_ctx = llama_manager->GetContextInfo(emotion_context_id);
             if (!emotion_ctx) {
                 LogError("Emotion context not available");
-                return;
+                return "";
             }
             
             // Build analysis prompt from AI responses
@@ -473,10 +511,10 @@ private:
             analysis_stream << "Categorize my emotional state; identify the presence of any emotions present from the following.\n";
 
             for (size_t i = 0; i < batch.ai_responses.size(); ++i) {
-                analysis_stream << (i + 1) << ":\n" << batch.ai_responses[i] << "\n\n";
+                analysis_stream << (i + 1) << ": " << batch.ai_responses[i] << "\n";
             }
 
-            analysis_stream << "My emotional state:";
+            analysis_stream << "\nMy emotional state:";
             std::string analysis_prompt = analysis_stream.str();
 
             
@@ -555,18 +593,18 @@ private:
                             emotional_state.find("Error: Failed to process prompt") == 0 || 
                             emotional_state.find("Error: Exception during") == 0) {
                             LogWarning("Emotional analysis still failed after context resize - skipping context: " + batch.context_id);
-                            return;
+                            return "";
                         } else {
                             LogInfo("Emotional analysis succeeded after context resize for context: " + batch.context_id);
                         }
                     } else {
                         LogError("Lost emotion context after resize - skipping analysis");
-                        return;
+                        return "";
                     }
                 } else {
                     LogWarning("Context resize failed for emotional analysis - skipping context: " + batch.context_id + 
                         " (tokens too large or resize failed)");
-                    return;
+                    return "";
                 }
             }
             
@@ -575,59 +613,18 @@ private:
                 emotional_state.find("Error: Failed to process prompt") == 0 || 
                 emotional_state.find("Error: Exception during") == 0) {
                 LogWarning("Failed to generate valid emotional analysis for context: " + batch.context_id + " - Response: " + emotional_state);
-                return;
+                return "";
             }
             
-            // Apply emotional state to original context
-            ApplyEmotionalStateToContext(batch.context_id, emotional_state);
-            
-            responses_analyzed += batch.ai_responses.size();
-            emotional_states_generated++;
-            
             LogInfo("Successfully generated emotional analysis for context: " + batch.context_id + 
-                           " - " + emotional_state.substr(0, 100) + 
-                           (emotional_state.length() > 100 ? "..." : ""));
+                   " - " + emotional_state.substr(0, 100) + 
+                   (emotional_state.length() > 100 ? "..." : ""));
+            
+            return emotional_state;
             
         } catch (const std::exception& e) {
             LogError("Exception processing emotional analysis: " + std::string(e.what()));
-        }
-    }
-    
-    /**
-     * Apply generated emotional state back to the original context
-     */
-    void ApplyEmotionalStateToContext(const std::string& context_id, const std::string& emotional_state) {
-        if (!llama_manager) {
-            LogError("LlamaManager not available for applying emotional state");
-            return;
-        }
-        
-        try {
-            // Get the original context
-            auto* original_context = llama_manager->GetContextInfo(context_id);
-            if (!original_context) {
-                LogWarning("Original context not found for emotional state application: " + context_id);
-                return;
-            }
-            
-            // The emotional state should now be clean (no template tokens) thanks to ExtractCleanResponse
-            LogDebug("Emotional state (" + std::to_string(emotional_state.length()) + " chars): " + 
-                    emotional_state.substr(0, 200) + (emotional_state.length() > 200 ? "..." : ""));
-            
-            if (emotional_state.empty()) {
-                LogWarning("Emotional state is empty - skipping update for context: " + context_id);
-                return;
-            }
-            
-            // Apply the clean emotional state to the context
-            original_context->UpdateEmotionalState(emotional_state);
-            
-            contexts_updated++;
-            
-            LogInfo("Applied emotional state to context: " + context_id);
-            
-        } catch (const std::exception& e) {
-            LogError("Exception applying emotional state to context: " + std::string(e.what()));
+            return "";
         }
     }
     
@@ -680,3 +677,108 @@ private:
 };
 
 } // namespace LuminaChat
+
+// CRITICAL: These function definitions are placed here to combat circular dependencies
+inline void Orchestrator::RequestEmotionAnalysis(const EmotionalAnalysisBatch& batch, 
+                                                LuminaChat::RequestPriority priority) {
+    LOG_Orchestrator("Requesting emotion analysis for context: " + batch.context_id);
+    
+    // Create emotion analysis request using plugin structure
+    LuminaChat::EmotionAnalysisRequest request(batch, batch.context_id, priority);
+    
+    // Check pipeline state before queuing
+    LOG_Orchestrator("Pipeline state - IsProcessing: " + std::to_string(emotion_analysis_pipeline.IsProcessing()) + 
+                    ", IsIdle: " + std::to_string(emotion_analysis_pipeline.IsIdle()) + 
+                    ", IsShutdown: " + std::to_string(emotion_analysis_pipeline.IsShutdown()));
+    
+    // Log pipeline statistics before queuing
+    auto stats = emotion_analysis_pipeline.GetStats();
+    LOG_Orchestrator("Pipeline stats before queuing - Total: " + std::to_string(stats.total_requests.load()) + 
+                    ", Completed: " + std::to_string(stats.completed_requests.load()) + 
+                    ", Failed: " + std::to_string(stats.failed_requests.load()) + 
+                    ", Pending: " + std::to_string(stats.pending_requests.load()));
+    
+    // Queue the request to the pipeline for asynchronous processing
+    bool queued = emotion_analysis_pipeline.QueueRequest(request, priority, batch.context_id);
+    
+    if (queued) {
+        LOG_Orchestrator("Successfully queued emotion analysis request for context: " + batch.context_id);
+        
+        // Log statistics after queuing
+        auto stats_after = emotion_analysis_pipeline.GetStats();
+        LOG_Orchestrator("Pipeline stats after queuing - Total: " + std::to_string(stats_after.total_requests.load()) + 
+                        ", Pending: " + std::to_string(stats_after.pending_requests.load()));
+    } else {
+        LOG_ERROR_Orchestrator("Failed to queue emotion analysis request for context: " + batch.context_id + 
+                              " (pipeline may be shutdown or queue full)");
+    }
+}
+
+inline void Orchestrator::OnEmotionAnalysisComplete(const std::string& context_id, 
+                                                   const LuminaChat::EmotionAnalysisResponse& response) {
+    LOG_Orchestrator("Emotion analysis complete for context: " + context_id);
+    
+    if (response.success) {
+        LOG_Orchestrator("Successfully analyzed emotional state for context: " + context_id);
+        
+        // Apply emotional state to the context using EmoTagPlugin - plugin is required
+        if (!emotag_plugin) {
+            LOG_ERROR_Orchestrator("EmoTagPlugin not available - cannot apply emotional state for context: " + context_id);
+            return;
+        }
+        
+        if (!response.emotional_state.empty()) {
+            bool applied = emotag_plugin->ApplyEmotionalStateToContext(context_id, response.emotional_state);
+            if (applied) {
+                LOG_Orchestrator("Applied emotional state to context: " + context_id);
+            } else {
+                LOG_ERROR_Orchestrator("Failed to apply emotional state to context: " + context_id);
+            }
+        }
+        
+        // Update statistics
+        {
+            std::lock_guard<std::mutex> lock(stats_mutex);
+            stats.emotion_analyses_completed++;
+        }
+    } else {
+        LOG_ERROR_Orchestrator("Emotion analysis failed: " + response.error_message);
+    }
+}
+
+inline void Orchestrator::ProcessEmotionAnalysisRequest(const LuminaChat::EmotionAnalysisRequest& request,
+                                                       std::function<void(LuminaChat::EmotionAnalysisResponse)> callback) {
+    LOG_Orchestrator("Processing emotion analysis request for: " + request.context_id);
+    
+    try {
+        // Delegate to EmoTagPlugin - plugin is required
+        if (!emotag_plugin) {
+            LOG_ERROR_Orchestrator("EmoTagPlugin not available - emotion analysis requires plugin delegation");
+            
+            LuminaChat::EmotionAnalysisResponse error_response("", request.context_id, false, 0, 
+                                                              "EmoTagPlugin not available - emotion analysis requires plugin delegation");
+            
+            callback(error_response);
+            OnEmotionAnalysisComplete(request.context_id, error_response);
+            return;
+        }
+        
+        LOG_Orchestrator("Delegating emotion analysis to EmoTagPlugin for context: " + request.context_id + 
+                        " (analyzing " + std::to_string(request.batch.ai_responses.size()) + " AI responses)");
+        LuminaChat::EmotionAnalysisResponse response = emotag_plugin->ProcessEmotionAnalysisRequest(request);
+        
+        LOG_Orchestrator("EmoTagPlugin processing complete for context: " + request.context_id + 
+                        " (success: " + (response.success ? "true" : "false") + ")");
+        
+        callback(response);
+        
+        // Trigger completion callback for the original orchestrator workflow
+        OnEmotionAnalysisComplete(request.context_id, response);
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR_Orchestrator("Exception in ProcessEmotionAnalysisRequest: " + std::string(e.what()));
+        LuminaChat::EmotionAnalysisResponse error_response("", request.context_id, false, 0, e.what());
+        callback(error_response);
+        OnEmotionAnalysisComplete(request.context_id, error_response);
+    }
+}

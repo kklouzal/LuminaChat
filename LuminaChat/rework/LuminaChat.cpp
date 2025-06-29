@@ -948,6 +948,10 @@ void LuminaChatFrame::Start() {
         AddLogMessage("Llama Manager initialized with llama.cpp backend");
         
         orchestrator = std::make_unique<Orchestrator>(llama_manager.get());
+        if (!orchestrator->Initialize()) {
+            AddLogMessage("ERROR: Failed to initialize Orchestrator");
+            throw std::runtime_error("Orchestrator initialization failed");
+        }
         AddLogMessage("Orchestrator initialized");
         
         // Note: SummarizationPlugin initialization is now deferred until model loading
@@ -998,12 +1002,12 @@ void LuminaChatFrame::Stop() {
     
     // Clean shutdown in reverse dependency order
     if (emotag_plugin) {
-        emotag_plugin->Stop();
+        emotag_plugin->Shutdown();
         emotag_plugin.reset();
         AddLogMessage("EmoTagPlugin stopped");
     }
     if (summarization_plugin) {
-        summarization_plugin->Stop();
+        summarization_plugin->Shutdown();
         summarization_plugin.reset();
         AddLogMessage("SummarizationPlugin stopped");
     }
@@ -1240,26 +1244,39 @@ void LuminaChatFrame::InitializePlugins() {
             // });
         }
         
-        summarization_plugin->Start();
-        AddLogMessage("SummarizationPlugin initialized and started");
-        
-        // Update plugin status
-        UpdateSummaryPluginStatus("Initialized and ready", wxColour(0, 150, 0));
+        if (!summarization_plugin->Initialize()) {
+            AddLogMessage("Failed to initialize SummarizationPlugin");
+            UpdateSummaryPluginStatus("Initialization failed", wxColour(255, 0, 0));
+        } else {
+            AddLogMessage("SummarizationPlugin initialized successfully");
+            UpdateSummaryPluginStatus("Initialized and ready", wxColour(0, 150, 0));
+            
+            // Register the plugin with the Orchestrator for coordination
+            orchestrator->RegisterSummarizationPlugin(summarization_plugin.get());
+        }
         
         // Initialize and start EmoTagPlugin
         emotag_plugin = std::make_unique<LuminaChat::EmoTagPlugin>(orchestrator.get());
         
         // Register callback for plugin status updates
-        if (emotag_plugin) {
-            emotag_plugin->SetStatusCallback([this](const std::string& status, bool is_error) {
-                CallAfter([this, status, is_error]() {
-                    wxColour color = is_error ? wxColour(150, 50, 50) : wxColour(0, 150, 0);
-                    UpdateEmoTagPluginStatus(status, color);
-                });
+        if (emotag_plugin) {        emotag_plugin->SetStatusCallback([this](const std::string& status, bool is_error) {
+            CallAfter([this, status, is_error]() {
+                wxColour color = is_error ? wxColour(150, 50, 50) : wxColour(0, 150, 0);
+                UpdateEmoTagPluginStatus(status, color);
             });
-        }
-        
-        emotag_plugin->Start();
+        });
+    }
+    
+    // Initialize the plugin (replaces Start() in the new architecture)
+    bool initialized = emotag_plugin->Initialize();
+    if (!initialized) {
+        AddLogMessage("Failed to initialize EmoTagPlugin");
+        UpdateEmoTagPluginStatus("Initialization failed", wxColour(150, 50, 50));
+        return;
+    }
+    
+    // Register the plugin with the Orchestrator for coordination
+    orchestrator->RegisterEmoTagPlugin(emotag_plugin.get());
         
         // Configure plugin with current UI settings
         if (emotag_window_size_slider) {
@@ -1371,6 +1388,14 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
                             if (context) {
                                 context->RequestEmotionalAnalysis();
                                 AddLogMessage("Requested emotional analysis for context: " + current_context_id);
+                                
+                                // Immediately trigger processing of emotion analysis buffer
+                                // instead of waiting for scheduled task
+                                std::thread([this]() {
+                                    if (orchestrator) {
+                                        orchestrator->ProcessEmotionAnalysisBuffer();
+                                    }
+                                }).detach();
                             }
                         }
                     } else {

@@ -21,8 +21,12 @@
 #include <chrono>
 #include <string>
 #include <optional>
+#include "Logger.hpp"
 
 namespace LuminaChat {
+
+// Logging macro for ProcessingPipeline (only used for important events)
+#define LOG_ProcessingPipeline(message) LOG_INFO("ProcessingPipeline", message)
 
 // Forward declarations
 enum class PipelineState {
@@ -138,6 +142,8 @@ private:
     
     // Worker thread main loop
     void WorkerLoop() {
+        LOG_ProcessingPipeline("Pipeline '" + pipeline_name_ + "' worker thread started");
+        
         while (state_.load() != PipelineState::SHUTDOWN) {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             
@@ -163,6 +169,7 @@ private:
                 auto pipeline_request = request_queue_.top();
                 request_queue_.pop();
                 stats_.pending_requests--;
+                
                 lock.unlock();
                 
                 // Update state
@@ -181,12 +188,15 @@ private:
                 }
             }
         }
+        
+        LOG_ProcessingPipeline("Pipeline '" + pipeline_name_ + "' worker thread shutting down");
     }
     
     // Process a single request with error handling
     void ProcessRequest(PipelineRequest<RequestType> pipeline_request) {
         if (!processor_) {
             stats_.failed_requests++;
+            LOG_ERROR("ProcessingPipeline", "Pipeline '" + pipeline_name_ + "' processor is null!");
             return;
         }
         
@@ -200,19 +210,18 @@ private:
             // Error callback
             auto error_callback = [this, request_id = pipeline_request.request_id](const std::string& error) {
                 stats_.failed_requests++;
-                // Log error if logging is available
-                // Could be enhanced with retry logic in the future
+                LOG_ERROR("ProcessingPipeline", "Pipeline '" + pipeline_name_ + "' processing failed: " + error);
             };
             
             // Execute the processor
             processor_(pipeline_request.request, success_callback, error_callback);
             
-        } catch (const std::exception&) {
+        } catch (const std::exception& e) {
             stats_.failed_requests++;
-            // Could log exception details here
+            LOG_ERROR("ProcessingPipeline", "Pipeline '" + pipeline_name_ + "' exception: " + std::string(e.what()));
         } catch (...) {
             stats_.failed_requests++;
-            // Could log unknown exception here
+            LOG_ERROR("ProcessingPipeline", "Pipeline '" + pipeline_name_ + "' unknown exception");
         }
     }
 
@@ -226,8 +235,7 @@ public:
                                std::function<void(const RequestType&, std::function<void(ResultType)>, std::function<void(const std::string&)>)> processor = nullptr)
         : processor_(std::move(processor)), pipeline_name_(name) {
         
-        // Start worker thread
-        Start();
+        // Don't auto-start - let the caller start when ready
     }
     
     /**
@@ -299,6 +307,7 @@ public:
         
         // Check queue capacity
         if (request_queue_.size() >= max_queue_size_) {
+            LOG_ProcessingPipeline("Pipeline '" + pipeline_name_ + "' queue is full, rejecting request");
             return false;
         }
         
@@ -317,14 +326,25 @@ public:
      * Start the pipeline worker thread
      */
     void Start() {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
+        std::unique_lock<std::mutex> lock(queue_mutex_);
         
-        if (state_.load() == PipelineState::SHUTDOWN && worker_thread_ && worker_thread_->joinable()) {
+        // If we already have a running thread, don't start another one
+        if (worker_thread_ && state_.load() != PipelineState::SHUTDOWN) {
+            return; // Already started
+        }
+        
+        // Join any existing thread before creating a new one
+        if (worker_thread_ && worker_thread_->joinable()) {
+            // Temporarily release lock to avoid deadlock during join
+            lock.unlock();
             worker_thread_->join();
+            lock.lock();
         }
         
         state_ = PipelineState::IDLE;
         worker_thread_ = std::make_unique<std::thread>(&ProcessingPipeline::WorkerLoop, this);
+        
+        LOG_ProcessingPipeline("Pipeline '" + pipeline_name_ + "' started");
     }
     
     /**

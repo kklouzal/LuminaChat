@@ -15,19 +15,25 @@
 #include "ContextInfo.hpp"
 #include "Logger.hpp"
 
-// Forward declarations for plugin request/response types
-struct SummarizationRequest {
-    std::string original_context_id;
-    std::string summary_context_id;
-    std::string content_to_summarize;
-    std::string timestamp;
-};
+// Forward declarations
+namespace LuminaChat {
+    class SummarizationPlugin;
+    class EmoTagPlugin;
+    enum class RequestPriority;
+}
 
-struct SummarizationResponse {
-    std::string summary;
-    bool success;
-    std::string error_message;
-};
+// Use plugin structures directly instead of duplicating them
+namespace LuminaChat {
+    struct SummarizationRequest;
+    struct SummarizationResponse;
+    struct EmotionAnalysisRequest;
+    struct EmotionAnalysisResponse;
+}
+
+// Forward declarations for ContextInfo types
+struct PrunedMessageBatch;
+struct EmotionalAnalysisBatch;
+enum class ContextState;
 
 struct DiscordChannelRequest {
     enum class Type { INCOMING_MESSAGE, OUTGOING_MESSAGE, CHANNEL_SETUP };
@@ -67,7 +73,8 @@ enum class ScheduledTaskType {
     CACHE_CLEANUP,
     HEALTH_CHECK,
     DISCORD_PRESENCE_UPDATE,
-    PRUNING_BUFFER_PROCESSING  // New scheduled task for processing pruning buffer
+    PRUNING_BUFFER_PROCESSING,  // New scheduled task for processing pruning buffer
+    EMOTION_ANALYSIS_PROCESSING  // New scheduled task for processing emotion analysis buffer
 };
 
 struct ScheduledTask {
@@ -99,8 +106,13 @@ private:
     std::unique_ptr<Sanitizer> sanitizer;
     LlamaManager* llama_manager;
     
+    // Plugin references for delegation
+    LuminaChat::SummarizationPlugin* summarization_plugin = nullptr;
+    LuminaChat::EmoTagPlugin* emotag_plugin = nullptr;
+    
     // Processing pipelines for plugin architecture
-    LuminaChat::ProcessingPipeline<SummarizationRequest, SummarizationResponse> summarization_pipeline;
+    LuminaChat::ProcessingPipeline<LuminaChat::SummarizationRequest, LuminaChat::SummarizationResponse> summarization_pipeline;
+    LuminaChat::ProcessingPipeline<LuminaChat::EmotionAnalysisRequest, LuminaChat::EmotionAnalysisResponse> emotion_analysis_pipeline;
     LuminaChat::ProcessingPipeline<DiscordChannelRequest, DiscordChannelResponse> discord_channel_pipeline;
     
     // State tracking for contexts
@@ -116,8 +128,13 @@ private:
     std::function<void(std::string_view, InputSource)> output_callback;
     
     // Plugin processing functions
-    void ProcessSummarizationRequest(const SummarizationRequest& request, 
-                                   std::function<void(SummarizationResponse)> callback);
+    //
+    // CRITICAL: This function is defined at the END of SummarizationPlugin.hpp to combat circular dependencies
+    void ProcessSummarizationRequest(const LuminaChat::SummarizationRequest& request, 
+                                   std::function<void(LuminaChat::SummarizationResponse)> callback);
+    // CRITICAL: This function is defined at the END of EmoTagPlugin.hpp to combat circular dependencies
+    void ProcessEmotionAnalysisRequest(const LuminaChat::EmotionAnalysisRequest& request,
+                                     std::function<void(LuminaChat::EmotionAnalysisResponse)> callback);
     void ProcessDiscordChannelRequest(const DiscordChannelRequest& request,
                                     std::function<void(DiscordChannelResponse)> callback);
     
@@ -155,14 +172,25 @@ public:
                            const std::string& username);
     
     // Plugin workflow coordination
-    void RequestSummarization(const std::string& context_id, const std::string& content);
-    void OnSummarizationComplete(const std::string& context_id, const SummarizationResponse& response);
+    // CRITICAL: This function is defined at the END of SummarizationPlugin.hpp to combat circular dependencies
+    void RequestSummarization(const PrunedMessageBatch& batch);
+    // CRITICAL: This function is defined at the END of SummarizationPlugin.hpp to combat circular dependencies
+    void OnSummarizationComplete(const std::string& context_id, const LuminaChat::SummarizationResponse& response);
+
+    // CRITICAL: This function is defined at the END of EmoTagPlugin.hpp to combat circular dependencies
+    void RequestEmotionAnalysis(const EmotionalAnalysisBatch& batch, LuminaChat::RequestPriority priority = LuminaChat::RequestPriority::NORMAL);
+    // CRITICAL: This function is defined at the END of EmoTagPlugin.hpp to combat circular dependencies
+    void OnEmotionAnalysisComplete(const std::string& context_id, const LuminaChat::EmotionAnalysisResponse& response);
     
     // Scheduled task management
     void AddScheduledTask(ScheduledTaskType type, std::chrono::milliseconds interval,
                          std::function<void()> task_function);
     void RemoveScheduledTask(ScheduledTaskType type);
     void ProcessScheduledTasks();
+    
+    // Manual processing triggers (public for immediate processing)
+    void ProcessPruningBuffer();  // New method for processing pruning buffer
+    void ProcessEmotionAnalysisBuffer();  // New method for processing emotion analysis buffer
     
     // State queries
     bool IsContextAvailable(const std::string& context_id) const;
@@ -176,6 +204,10 @@ public:
     LlamaManager* GetLlamaManager() { return llama_manager; }
     const LlamaManager* GetLlamaManager() const { return llama_manager; }
     
+    // Plugin registration
+    void RegisterSummarizationPlugin(LuminaChat::SummarizationPlugin* plugin) { summarization_plugin = plugin; }
+    void RegisterEmoTagPlugin(LuminaChat::EmoTagPlugin* plugin) { emotag_plugin = plugin; }
+    
     // Get SettingsManager from LlamaManager (convenience method)
     SettingsManager* GetSettingsManager() { 
         return llama_manager ? llama_manager->GetSettingsManager() : nullptr; 
@@ -188,6 +220,7 @@ public:
     struct OrchestrationStats {
         size_t messages_processed = 0;
         size_t summarizations_completed = 0;
+        size_t emotion_analyses_completed = 0;
         size_t discord_messages_handled = 0;
         size_t scheduled_tasks_executed = 0;
         size_t sanitization_blocks = 0;
@@ -210,7 +243,6 @@ private:
     void PerformCacheCleanup();
     void PerformHealthCheck();
     void UpdateDiscordPresence();
-    void ProcessPruningBuffer();  // New method for processing pruning buffer
 };
 
 // Implementation
@@ -219,6 +251,7 @@ inline Orchestrator::Orchestrator(LlamaManager* llama_manager)
     : llama_manager(llama_manager)
     , sanitizer(std::make_unique<Sanitizer>())
     , summarization_pipeline("SummarizationPipeline")
+    , emotion_analysis_pipeline("EmotionAnalysisPipeline")
     , discord_channel_pipeline("DiscordChannelPipeline")
     , last_scheduled_run(std::chrono::steady_clock::now())
     , stats{} {
@@ -248,6 +281,11 @@ inline bool Orchestrator::Initialize() {
 
 inline void Orchestrator::Shutdown() {
     LOG_Orchestrator("Shutting down Orchestrator...");
+    
+    // Shutdown processing pipelines
+    summarization_pipeline.Shutdown();
+    emotion_analysis_pipeline.Shutdown();
+    discord_channel_pipeline.Shutdown();
     
     // Clear scheduled tasks
     {
@@ -293,24 +331,33 @@ inline void Orchestrator::InputReceived(const std::string& input, const std::str
     SetContextState(context_id, ProcessingState::NORMAL_PROCESSING);
     
     try {
-        // Get default context size for main model
-        int32_t default_context_size = 8192; // Default fallback
+        // Get context size for main model - settings manager is required
         auto* settings = GetSettingsManager();
-        if (settings) {
-            default_context_size = settings->GetInt("Models", "main_context_size", 8192);
+        if (!settings) {
+            LOG_ERROR_Orchestrator("SettingsManager not available for context creation: " + context_id);
+            SetContextState(context_id, ProcessingState::ERROR_STATE);
+            return;
+        }
+        
+        // No fallback values - settings must be properly configured
+        int32_t context_size = settings->GetInt("Models", "main_context_size", 0);
+        if (context_size <= 0) {
+            LOG_ERROR_Orchestrator("Invalid main_context_size configuration for context: " + context_id);
+            SetContextState(context_id, ProcessingState::ERROR_STATE);
+            return;
         }
         
         // Route to appropriate context
-        auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", default_context_size);
+        auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", context_size);
         if (!context) {
-            LOG_Orchestrator("Failed to get/create context: " + context_id);
+            LOG_ERROR_Orchestrator("Failed to get/create context: " + context_id);
             SetContextState(context_id, ProcessingState::ERROR_STATE);
             return;
         }
         
         // Check if context is in error state (template validation failed)
         if (context->GetState() == ContextState::ERROR_STATE) {
-            LOG_Orchestrator("Context is in error state: " + context_id);
+            LOG_ERROR_Orchestrator("Context is in error state: " + context_id);
             SetContextState(context_id, ProcessingState::ERROR_STATE);
             return;
         }
@@ -330,7 +377,7 @@ inline void Orchestrator::InputReceived(const std::string& input, const std::str
         }
         
     } catch (const std::exception& e) {
-        LOG_Orchestrator("Error processing input: " + std::string(e.what()));
+        LOG_ERROR_Orchestrator("Error processing input: " + std::string(e.what()));
         SetContextState(context_id, ProcessingState::ERROR_STATE);
     }
 }
@@ -361,63 +408,6 @@ inline void Orchestrator::OnRawDiscordMessage(const std::string& content,
     }
 }
 
-inline void Orchestrator::RequestSummarization(const std::string& context_id, const std::string& content) {
-    LOG_Orchestrator("Requesting summarization for context: " + context_id);
-    
-    // Check if context is already being summarized
-    if (GetContextState(context_id) == ProcessingState::AWAITING_SUMMARIZATION) {
-        LOG_Orchestrator("Context already awaiting summarization: " + context_id);
-        return;
-    }
-    
-    // Set state to awaiting summarization
-    SetContextState(context_id, ProcessingState::AWAITING_SUMMARIZATION);
-    
-    // Create summarization request
-    SummarizationRequest request{
-        .original_context_id = context_id,
-        .summary_context_id = "summary_" + context_id,
-        .content_to_summarize = content,
-        .timestamp = std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count())
-    };
-    
-    // Queue for processing
-    summarization_pipeline.QueueRequest(request);
-}
-
-inline void Orchestrator::OnSummarizationComplete(const std::string& context_id, 
-                                                 const SummarizationResponse& response) {
-    LOG_Orchestrator("Summarization complete for context: " + context_id);
-    
-    if (response.success) {
-        // Get default context size for main model
-        int32_t default_context_size = 8192; // Default fallback
-        auto* settings = GetSettingsManager();
-        if (settings) {
-            default_context_size = settings->GetInt("Models", "main_context_size", 8192);
-        }
-        
-        // Apply summary to original context
-        auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", default_context_size);
-        if (context) {
-            context->ApplyCompletedSummary(response.summary);
-            LOG_Orchestrator("Summary applied to context: " + context_id);
-        }
-        
-        // Update statistics
-        {
-            std::lock_guard<std::mutex> lock(stats_mutex);
-            stats.summarizations_completed++;
-        }
-    } else {
-        LOG_Orchestrator("Summarization failed: " + response.error_message);
-    }
-    
-    // Return context to normal processing
-    SetContextState(context_id, ProcessingState::NORMAL_PROCESSING);
-}
-
 inline void Orchestrator::ProcessScheduledTasks() {
     auto now = std::chrono::steady_clock::now();
     
@@ -426,6 +416,11 @@ inline void Orchestrator::ProcessScheduledTasks() {
     for (auto& task : scheduled_tasks) {
         if (task.active && now >= task.next_run) {
             try {
+                // Add debug logging to identify which task is running
+                if (task.type == ScheduledTaskType::EMOTION_ANALYSIS_PROCESSING) {
+                    LOG_Orchestrator("Executing emotion analysis processing scheduled task");
+                }
+                
                 task.task_function();
                 task.next_run = now + task.interval;
                 
@@ -436,7 +431,7 @@ inline void Orchestrator::ProcessScheduledTasks() {
                 }
                 
             } catch (const std::exception& e) {
-                LOG_Orchestrator("Scheduled task error: " + std::string(e.what()));
+                LOG_ERROR_Orchestrator("Scheduled task error: " + std::string(e.what()));
             }
         }
     }
@@ -474,14 +469,30 @@ inline void Orchestrator::RemoveScheduledTask(ScheduledTaskType type) {
 // Private implementation methods
 
 inline void Orchestrator::InitializePipelines() {
+    LOG_Orchestrator("Setting up pipeline processors...");
+    
     // Setup summarization pipeline processor
     summarization_pipeline.SetProcessor(
-        [this](const SummarizationRequest& request, 
-               std::function<void(SummarizationResponse)> success_callback,
+        [this](const LuminaChat::SummarizationRequest& request, 
+               std::function<void(LuminaChat::SummarizationResponse)> success_callback,
                std::function<void(const std::string&)> error_callback) {
             try {
                 ProcessSummarizationRequest(request, success_callback);
             } catch (const std::exception& e) {
+                error_callback(e.what());
+            }
+        });
+    
+    // Setup emotion analysis pipeline processor
+    emotion_analysis_pipeline.SetProcessor(
+        [this](const LuminaChat::EmotionAnalysisRequest& request,
+               std::function<void(LuminaChat::EmotionAnalysisResponse)> success_callback,
+               std::function<void(const std::string&)> error_callback) {
+            LOG_Orchestrator("Pipeline processor called for emotion analysis request");
+            try {
+                ProcessEmotionAnalysisRequest(request, success_callback);
+            } catch (const std::exception& e) {
+                LOG_ERROR_Orchestrator("Exception in emotion analysis pipeline processor: " + std::string(e.what()));
                 error_callback(e.what());
             }
         });
@@ -498,62 +509,14 @@ inline void Orchestrator::InitializePipelines() {
             }
         });
     
-    LOG_Orchestrator("Processing pipelines initialized");
-}
-
-inline void Orchestrator::ProcessSummarizationRequest(const SummarizationRequest& request, 
-                                                     std::function<void(SummarizationResponse)> callback) {
-    LOG_Orchestrator("Processing summarization request for: " + request.original_context_id);
+    LOG_Orchestrator("Pipeline processors configured, starting pipelines...");
     
-    try {
-        // Get default context size for main model
-        int32_t default_context_size = 8192; // Default fallback
-        auto* settings = GetSettingsManager();
-        if (settings) {
-            default_context_size = settings->GetInt("Models", "main_context_size", 8192);
-        }
-        
-        // Get or create summary context
-        auto* summary_context = llama_manager->GetOrCreateContextInfo(
-            request.summary_context_id, "main_model", default_context_size);
-        
-        if (!summary_context) {
-            callback(SummarizationResponse{
-                .summary = "",
-                .success = false,
-                .error_message = "Failed to create summary context"
-            });
-            return;
-        }
-        
-        // Generate summary using summary context
-        std::string summary = summary_context->HandleInput(
-            "Please provide a concise summary of the following conversation:\n\n" + 
-            request.content_to_summarize, "System");
-        
-        // Return successful response
-        callback(SummarizationResponse{
-            .summary = summary,
-            .success = true,
-            .error_message = ""
-        });
-        
-        // Trigger completion callback for the original orchestrator workflow
-        OnSummarizationComplete(request.original_context_id, SummarizationResponse{
-            .summary = summary,
-            .success = true,
-            .error_message = ""
-        });
-        
-    } catch (const std::exception& e) {
-        SummarizationResponse error_response{
-            .summary = "",
-            .success = false,
-            .error_message = e.what()
-        };
-        callback(error_response);
-        OnSummarizationComplete(request.original_context_id, error_response);
-    }
+    // Start all pipelines AFTER setting processors
+    summarization_pipeline.Start();
+    emotion_analysis_pipeline.Start();
+    discord_channel_pipeline.Start();
+    
+    LOG_Orchestrator("Processing pipelines initialized and started");
 }
 
 inline void Orchestrator::ProcessDiscordChannelRequest(const DiscordChannelRequest& request,
@@ -580,16 +543,35 @@ inline void Orchestrator::ProcessDiscordChannelRequest(const DiscordChannelReque
             }
             
             case DiscordChannelRequest::Type::CHANNEL_SETUP: {
-                // Get default context size for main model
-                int32_t default_context_size = 8192; // Default fallback
+                // Get context size for main model - settings manager is required
                 auto* settings = GetSettingsManager();
-                if (settings) {
-                    default_context_size = settings->GetInt("Models", "main_context_size", 8192);
+                if (!settings) {
+                    LOG_ERROR_Orchestrator("SettingsManager not available for Discord channel setup: " + request.channel_id);
+                    callback(DiscordChannelResponse{
+                        .should_respond = false,
+                        .response_content = "",
+                        .target_channel = request.channel_id,
+                        .error_message = "SettingsManager not available"
+                    });
+                    break;
+                }
+                
+                // No fallback values - settings must be properly configured
+                int32_t context_size = settings->GetInt("Models", "main_context_size", 0);
+                if (context_size <= 0) {
+                    LOG_ERROR_Orchestrator("Invalid main_context_size configuration for Discord channel: " + request.channel_id);
+                    callback(DiscordChannelResponse{
+                        .should_respond = false,
+                        .response_content = "",
+                        .target_channel = request.channel_id,
+                        .error_message = "Invalid main_context_size configuration"
+                    });
+                    break;
                 }
                 
                 // Setup new channel context
                 std::string context_id = "discord_" + request.channel_id;
-                auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", default_context_size);
+                auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", context_size);
                 
                 if (context) {
                     context->UpdateEnvironment("Discord channel: " + request.channel_id);
@@ -660,6 +642,11 @@ inline void Orchestrator::SetupDefaultScheduledTasks() {
     AddScheduledTask(ScheduledTaskType::PRUNING_BUFFER_PROCESSING,
                     std::chrono::minutes(2),
                     [this]() { ProcessPruningBuffer(); });
+    
+    // Emotion analysis processing every 2 seconds
+    AddScheduledTask(ScheduledTaskType::EMOTION_ANALYSIS_PROCESSING,
+                    std::chrono::seconds(2),
+                    [this]() { ProcessEmotionAnalysisBuffer(); });
     
     LOG_Orchestrator("Default scheduled tasks configured");
 }
@@ -773,7 +760,7 @@ inline void Orchestrator::ProcessPruningBuffer() {
     LOG_Orchestrator("Processing pruning buffer...");
     
     // Get all pending pruning batches
-    auto pruning_batches = ContextInfo::GetAndClearPruningBuffer();
+    /*auto pruning_batches = ContextInfo::GetAndClearPruningBuffer();
     
     LOG_Orchestrator("Found " + std::to_string(pruning_batches.size()) + " pruning batches to process");
     
@@ -783,19 +770,8 @@ inline void Orchestrator::ProcessPruningBuffer() {
             continue; // Skip batches that don't need summarization
         }
         
-        // Create summarization request
-        SummarizationRequest request;
-        request.original_context_id = batch.context_id;
-        request.summary_context_id = batch.context_id + "_summary";
-        
-        // Convert message history to content string
-        std::ostringstream content_stream;
-        for (const auto& msg : batch.pruned_messages) {
-            content_stream << msg.first << ": " << msg.second << "\n";
-        }
-        request.content_to_summarize = content_stream.str();
-        request.timestamp = std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
-            batch.pruned_at.time_since_epoch()).count());
+        // Create summarization request using plugin structure
+        LuminaChat::SummarizationRequest request(batch, batch.context_id);
         
         // Queue for pipeline processing
         bool queued = summarization_pipeline.QueueRequest(request, LuminaChat::RequestPriority::NORMAL, 
@@ -803,7 +779,7 @@ inline void Orchestrator::ProcessPruningBuffer() {
         
         if (queued) {
             LOG_Orchestrator("Queued summarization for context: " + batch.context_id + 
-                           " (content: " + std::to_string(request.content_to_summarize.length()) + " chars)");
+                           " (messages: " + std::to_string(batch.pruned_messages.size()) + ")");
         } else {
             LOG_ERROR_Orchestrator("Failed to queue summarization for context: " + batch.context_id);
         }
@@ -812,8 +788,34 @@ inline void Orchestrator::ProcessPruningBuffer() {
             std::lock_guard<std::mutex> lock(stats_mutex);
             stats.summarizations_completed++;
         }
+    }*/
+    
+    //LOG_Orchestrator("Pruning buffer processing complete - processed " + 
+    //                std::to_string(pruning_batches.size()) + " batches");
+}
+
+inline void Orchestrator::ProcessEmotionAnalysisBuffer() {
+    LOG_Orchestrator("ProcessEmotionAnalysisBuffer() called - checking for pending analysis...");
+    
+    // Check if there are any AI responses waiting for emotional analysis
+    if (!ContextInfo::HasPendingEmotionalAnalysis()) {
+        LOG_Orchestrator("No pending emotional analysis found");
+        return; // No work to do
     }
     
-    LOG_Orchestrator("Pruning buffer processing complete - processed " + 
-                    std::to_string(pruning_batches.size()) + " batches");
+    LOG_Orchestrator("Processing emotion analysis buffer...");
+    
+    // Get all pending emotional analysis batches
+    auto analysis_batches = ContextInfo::GetAndClearEmotionalAnalysisBuffer();
+    
+    if (!analysis_batches.empty()) {
+        LOG_Orchestrator("Found " + std::to_string(analysis_batches.size()) + " emotion analysis batches to process");
+        
+        // Process each batch through the emotion analysis pipeline
+        for (const auto& batch : analysis_batches) {
+            RequestEmotionAnalysis(batch, LuminaChat::RequestPriority::NORMAL);
+        }
+        
+        LOG_Orchestrator("Emotion analysis buffer processing complete");
+    }
 }

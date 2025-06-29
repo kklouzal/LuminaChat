@@ -19,22 +19,43 @@ namespace LuminaChat {
 // Callback type for status updates
 using StatusUpdateCallback = std::function<void(const std::string& status, bool is_error)>;
 
+// Request and response structures for the pipeline
+struct SummarizationRequest {
+    PrunedMessageBatch batch;
+    std::string context_id;
+    RequestPriority priority = RequestPriority::NORMAL;
+    std::chrono::steady_clock::time_point queued_time;
+    
+    SummarizationRequest(PrunedMessageBatch b, const std::string& ctx_id, RequestPriority prio = RequestPriority::NORMAL)
+        : batch(std::move(b)), context_id(ctx_id), priority(prio), queued_time(std::chrono::steady_clock::now()) {}
+};
+
+struct SummarizationResponse {
+    std::string summary;
+    std::string context_id;
+    bool success;
+    size_t messages_processed;
+    std::string error_message;
+    
+    SummarizationResponse(const std::string& sum, const std::string& ctx_id, bool succ, size_t msg_count, const std::string& err = "")
+        : summary(sum), context_id(ctx_id), success(succ), messages_processed(msg_count), error_message(err) {}
+};
+
 /**
- * Summarization Plugin - Handles background processing of pruned messages
+ * Summarization Plugin - Provides summarization processing capabilities
  * 
- * This plugin periodically checks the pruning buffer for messages that need
- * summarization and processes them through the summarization pipeline.
+ * This plugin serves as a pure processor for the Orchestrator's summarization pipeline.
+ * It handles model initialization, context management, and the actual summarization work.
  * 
  * Architecture:
- * - Core handles immediate context pruning (critical path)
- * - Plugin handles heavy summarization work (async/background)
- * - Summaries are applied back to contexts when complete
+ * - Orchestrator coordinates workflow (scheduling, pipeline management)
+ * - Plugin provides processing capability (model management, summarization logic)
+ * - Orchestrator calls plugin methods through its pipeline processor
+ * - Plugin applies results back to contexts when requested
  */
 class SummarizationPlugin {
 private:
-    std::unique_ptr<std::thread> processing_thread;
-    std::atomic<bool> should_stop{false};
-    std::chrono::milliseconds check_interval{1000}; // Check every second
+    // No independent pipeline - Orchestrator coordinates workflow
     
     // Reference to orchestrator for context management
     Orchestrator* orchestrator = nullptr;
@@ -77,54 +98,29 @@ public:
             settings_manager = orchestrator->GetSettingsManager();
         }
         
-        LogInfo("SummarizationPlugin initialized");
+        LogInfo("SummarizationPlugin initialized as processor service");
     }
     
     ~SummarizationPlugin() {
-        Stop();
+        Shutdown();
     }
     
     /**
-     * Start the plugin's background processing thread
+     * Initialize the plugin (called by Orchestrator)
      */
-    void Start() {
-        if (processing_thread && processing_thread->joinable()) {
-            LogWarning("Plugin already running");
-            return;
-        }
-        
-        // Initialize summary model and context first
-        if (!InitializeSummaryModel()) {
-            LogError("Failed to initialize summary model - plugin will not process summarizations");
-            return;
-        }
-        
-        should_stop = false;
-        processing_thread = std::make_unique<std::thread>(&SummarizationPlugin::ProcessingLoop, this);
-        LogInfo("SummarizationPlugin started with summary model ready");
+    bool Initialize() {
+        return InitializeSummaryModel();
     }
     
     /**
-     * Stop the plugin and wait for thread completion
+     * Shutdown the plugin and clean up resources
      */
-    void Stop() {
-        should_stop = true;
-        if (processing_thread && processing_thread->joinable()) {
-            processing_thread->join();
-        }
-        
+    void Shutdown() {
         // Clean up summary context and model
         summary_context.reset();
         summary_model_ready = false;
         
-        LogInfo("SummarizationPlugin stopped");
-    }
-    
-    /**
-     * Set the check interval for processing pruned messages
-     */
-    void SetCheckInterval(std::chrono::milliseconds interval) {
-        check_interval = interval;
+        LogInfo("SummarizationPlugin shutdown");
     }
     
     /**
@@ -135,13 +131,96 @@ public:
     }
     
     /**
-     * Get plugin statistics
+     * Process a summarization request (called by Orchestrator pipeline)
+     * This is the main processing method used by the Orchestrator's pipeline
+     */
+    SummarizationResponse ProcessSummarizationRequest(const SummarizationRequest& request) {
+        try {
+            LogInfo("Processing summarization for context: " + request.context_id + 
+                   " (" + std::to_string(request.batch.pruned_messages.size()) + " messages)");
+            
+            if (!summary_model_ready.load() || !llama_manager) {
+                std::string error_msg = "Summary model not ready for processing batch";
+                LogError(error_msg);
+                return SummarizationResponse("", request.context_id, false, 0, error_msg);
+            }
+            
+            // Process the batch to generate summary (existing logic)
+            std::string summary = ProcessSummarizationBatch(request.batch);
+            
+            if (summary.empty()) {
+                std::string error_msg = "Failed to generate summary for context: " + request.context_id;
+                LogError(error_msg);
+                return SummarizationResponse("", request.context_id, false, 0, error_msg);
+            }
+            
+            // Create success response with the generated summary
+            SummarizationResponse response{
+                summary,
+                request.context_id,
+                true,
+                request.batch.pruned_messages.size()
+            };
+            
+            LogInfo("Successfully generated summary for batch: " + request.context_id);
+            
+            // Update statistics
+            messages_summarized += request.batch.pruned_messages.size();
+            batches_processed++;
+            
+            return response;
+            
+        } catch (const std::exception& e) {
+            std::string error_msg = "Exception processing summarization: " + std::string(e.what());
+            LogError(error_msg);
+            return SummarizationResponse("", request.context_id, false, 0, error_msg);
+        }
+    }
+    
+    /**
+     * Apply a summary to a context (called by Orchestrator after successful processing)
+     */
+    bool ApplySummaryToContext(const std::string& context_id, const std::string& summary) {
+        try {
+            if (!llama_manager) {
+                LogError("LlamaManager not available for applying summary");
+                return false;
+            }
+            
+            // Get the original context
+            auto* original_context = llama_manager->GetContextInfo(context_id);
+            if (!original_context) {
+                LogWarning("Original context not found for summary application: " + context_id);
+                return false;
+            }
+            
+            // Apply the summary to the context
+            if (summary.empty()) {
+                LogWarning("Summary is empty - skipping update for context: " + context_id);
+                return false;
+            }
+            
+            // Apply the clean summary to the context
+            original_context->ApplyCompletedSummary(summary);
+            
+            summaries_applied++;
+            
+            LogInfo("Applied summary to context: " + context_id);
+            return true;
+            
+        } catch (const std::exception& e) {
+            LogError("Exception applying summary to context: " + std::string(e.what()));
+            return false;
+        }
+    }
+    
+    /**
+     * Get plugin statistics 
      */
     struct PluginStats {
         size_t batches_processed;
         size_t messages_summarized;
         size_t summaries_applied;
-        bool is_running;
         bool summary_model_ready;
         std::string summary_model_path;
     };
@@ -156,10 +235,16 @@ public:
             batches_processed.load(),
             messages_summarized.load(),
             summaries_applied.load(),
-            !should_stop.load(),
             summary_model_ready.load(),
             model_path
         };
+    }
+    
+    /**
+     * Check if the plugin is ready to process summarization requests
+     */
+    bool IsReady() const {
+        return summary_model_ready.load();
     }
     
     /**
@@ -390,67 +475,15 @@ private:
         }
     }
     
-    
-    /**
-     * Main processing loop - runs in background thread
-     */
-    void ProcessingLoop() {
-        LOG_SummarizationPlugin("Processing loop started");
-        
-        while (!should_stop.load()) {
-            try {
-                ProcessPendingSummarizations();
-                std::this_thread::sleep_for(check_interval);
-            } catch (const std::exception& e) {
-                LOG_ERROR_SummarizationPlugin("Exception in processing loop: " + std::string(e.what()));
-                std::this_thread::sleep_for(check_interval * 5); // Back off on error
-            }
-        }
-        
-        LOG_SummarizationPlugin("Processing loop ended");
-    }
-    
-    /**
-     * Check for and process any pending summarization requests
-     */
-    void ProcessPendingSummarizations() {
-        // Skip processing if summary model is not ready
-        if (!summary_model_ready.load()) {
-            return;
-        }
-        
-        // Check if there are any pruned messages waiting for summarization
-        if (!ContextInfo::HasPendingSummarization()) {
-            return; // No work to do
-        }
-        
-        LOG_SummarizationPlugin("Found pending summarizations to process");
-        
-        // Get all pending pruning batches
-        auto pruning_batches = ContextInfo::GetAndClearPruningBuffer();
-        
-        for (const auto& batch : pruning_batches) {
-            if (!batch.needs_summarization) {
-                continue; // Skip batches that don't need summarization
-            }
-            
-            ProcessSummarizationBatch(batch);
-        }
-        
-        batches_processed += pruning_batches.size();
-    }
-    
     /**
      * Process a single batch of pruned messages using pairwise summarization
      * Always summarizes 2 messages at a time (Q->A pairs) for maximum fidelity
+     * Returns the generated summary or empty string on failure
      */
-    void ProcessSummarizationBatch(const PrunedMessageBatch& batch) {
-        LogInfo("Processing batch for context: " + batch.context_id + 
-                               " (" + std::to_string(batch.pruned_messages.size()) + " messages)");
-        
+    std::string ProcessSummarizationBatch(const PrunedMessageBatch& batch) {
         if (!summary_model_ready.load() || !llama_manager) {
             LogError("Summary model not ready for processing batch");
-            return;
+            return "";
         }
         
         try {
@@ -458,7 +491,7 @@ private:
             auto* summary_ctx = llama_manager->GetContextInfo(summary_context_id);
             if (!summary_ctx) {
                 LogError("Summary context not available");
-                return;
+                return "";
             }
             
             size_t total_messages = batch.pruned_messages.size();
@@ -467,7 +500,7 @@ private:
             if (total_messages < 2) {
                 LOG_SummarizationPlugin("Only " + std::to_string(total_messages) + 
                     " message(s) in batch - leaving in context without summarization");
-                return;
+                return "";
             }
             
             LOG_SummarizationPlugin("Using pairwise summarization for " + 
@@ -589,7 +622,7 @@ private:
             std::string final_summary;
             if (pair_summaries.empty()) {
                 LOG_ERROR_SummarizationPlugin("No pairs could be summarized - batch failed");
-                return;
+                return "";
             } else if (pair_summaries.size() == 1) {
                 // Single pair - use directly
                 final_summary = "Summary: " + pair_summaries[0];
@@ -603,47 +636,17 @@ private:
                 final_summary = final_stream.str();
             }
             
-            // Apply summary to original context
-            ApplySummaryToContext(batch.context_id, final_summary);
-            
-            messages_summarized += batch.pruned_messages.size();
-            summaries_applied++;
-            
             LOG_SummarizationPlugin("Successfully processed batch: " + 
                 std::to_string(pair_summaries.size()) + " pairs summarized");
             
+            return final_summary;
+            
         } catch (const std::exception& e) {
             LOG_ERROR_SummarizationPlugin("Exception processing batch: " + std::string(e.what()));
+            return "";
         }
     }
-    
-    /**
-     * Apply a generated summary back to the original context
-     */
-    void ApplySummaryToContext(const std::string& context_id, const std::string& summary) {
-        if (!llama_manager) {
-            LOG_ERROR_SummarizationPlugin("LlamaManager not available for applying summary");
-            return;
-        }
-        
-        try {
-            // Get the original context that requested summarization
-            auto* original_context = llama_manager->GetContextInfo(context_id);
-            if (!original_context) {
-                LOG_WARNING_SummarizationPlugin("Original context not found for summary application: " + context_id);
-                return;
-            }
-            
-            // Apply the completed summary to the context
-            original_context->ApplyCompletedSummary(summary);
-            
-            LOG_SummarizationPlugin("Applied summary to context: " + context_id);
-            
-        } catch (const std::exception& e) {
-            LOG_ERROR_SummarizationPlugin("Exception applying summary to context: " + std::string(e.what()));
-        }
-    }
-    
+
 private:
     /**
      * Extract needed token count from error message if available
@@ -695,3 +698,96 @@ private:
 };
 
 } // namespace LuminaChat
+
+// CRITICAL: These function definitions are placed here to combat circular dependencies
+inline void Orchestrator::RequestSummarization(const PrunedMessageBatch& batch) {
+    LOG_Orchestrator("Requesting summarization for context: " + batch.context_id);
+    
+    // Check if context is already being summarized
+    if (GetContextState(batch.context_id) == ProcessingState::AWAITING_SUMMARIZATION) {
+        LOG_Orchestrator("Context already awaiting summarization: " + batch.context_id);
+        return;
+    }
+    
+    // Set state to awaiting summarization
+    SetContextState(batch.context_id, ProcessingState::AWAITING_SUMMARIZATION);
+    
+    // Create plugin's summarization request using the proper batch
+    LuminaChat::SummarizationRequest request(batch, batch.context_id);
+    
+    // Queue for processing
+    summarization_pipeline.QueueRequest(request);
+}
+
+inline void Orchestrator::OnSummarizationComplete(const std::string& context_id, 
+                                                 const LuminaChat::SummarizationResponse& response) {
+    LOG_Orchestrator("Summarization complete for context: " + context_id);
+    
+    if (response.success) {
+        // Get context size for main model - settings manager is required
+        auto* settings = GetSettingsManager();
+        if (!settings) {
+            LOG_ERROR_Orchestrator("SettingsManager not available for summarization completion: " + context_id);
+            SetContextState(context_id, ProcessingState::ERROR_STATE);
+            return;
+        }
+        
+        // No fallback values - settings must be properly configured
+        int32_t context_size = settings->GetInt("Models", "main_context_size", 0);
+        if (context_size <= 0) {
+            LOG_ERROR_Orchestrator("Invalid main_context_size configuration for summarization: " + context_id);
+            SetContextState(context_id, ProcessingState::ERROR_STATE);
+            return;
+        }
+        
+        // Apply summary to original context
+        auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", context_size);
+        if (context) {
+            context->ApplyCompletedSummary(response.summary);
+            LOG_Orchestrator("Summary applied to context: " + context_id);
+        }
+        
+        // Update statistics
+        {
+            std::lock_guard<std::mutex> lock(stats_mutex);
+            stats.summarizations_completed++;
+        }
+    } else {
+        LOG_ERROR_Orchestrator("Summarization failed: " + response.error_message);
+    }
+    
+    // Return context to normal processing
+    SetContextState(context_id, ProcessingState::NORMAL_PROCESSING);
+}
+
+inline void Orchestrator::ProcessSummarizationRequest(const LuminaChat::SummarizationRequest& request, 
+                                                     std::function<void(LuminaChat::SummarizationResponse)> callback) {
+    LOG_Orchestrator("Processing summarization request for: " + request.context_id);
+    
+    try {
+        // Delegate to SummarizationPlugin - plugin is required
+        if (!summarization_plugin) {
+            LOG_ERROR_Orchestrator("SummarizationPlugin not available - summarization requires plugin delegation");
+            
+            LuminaChat::SummarizationResponse error_response("", request.context_id, false, 0, 
+                                                            "SummarizationPlugin not available - summarization requires plugin delegation");
+            
+            callback(error_response);
+            OnSummarizationComplete(request.context_id, error_response);
+            return;
+        }
+        
+        LOG_Orchestrator("Delegating summarization to SummarizationPlugin for context: " + request.context_id);
+        LuminaChat::SummarizationResponse response = summarization_plugin->ProcessSummarizationRequest(request);
+        
+        callback(response);
+        
+        // Trigger completion callback for the original orchestrator workflow
+        OnSummarizationComplete(request.context_id, response);
+        
+    } catch (const std::exception& e) {
+        LuminaChat::SummarizationResponse error_response("", request.context_id, false, 0, e.what());
+        callback(error_response);
+        OnSummarizationComplete(request.context_id, error_response);
+    }
+}

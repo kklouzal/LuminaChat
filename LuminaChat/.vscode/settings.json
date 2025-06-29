@@ -89,6 +89,7 @@
         "cstdarg": "cpp",
         "execution": "cpp",
         "regex": "cpp",
-        "expected": "cpp"
+        "expected": "cpp",
+        "memory_resource": "cpp"
     }
 }
