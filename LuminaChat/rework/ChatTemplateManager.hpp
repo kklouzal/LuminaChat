@@ -209,7 +209,7 @@ inline std::string ChatTemplateManager::RenderTemplate(const std::vector<std::pa
     
     // Optional environment section - only add if we have content
     if (IsSectionActive(TemplateSection::OVERARCHING_ENVIRONMENT)) {
-        render_section("env", GetSection(TemplateSection::OVERARCHING_ENVIRONMENT));
+        render_section("environment", GetSection(TemplateSection::OVERARCHING_ENVIRONMENT));
     }
     
     // Optional persona section - only add if we have content
@@ -218,7 +218,7 @@ inline std::string ChatTemplateManager::RenderTemplate(const std::vector<std::pa
     }
     
     // Always add system message section (guaranteed to be supplied)
-    result += "<|start_header_id|>system_message<|end_header_id|>\n";
+    result += "<|start_header_id|>system<|end_header_id|>\n";
     if (IsSectionActive(TemplateSection::SYSTEM_PROMPT)) {
         result += GetSection(TemplateSection::SYSTEM_PROMPT);
     }

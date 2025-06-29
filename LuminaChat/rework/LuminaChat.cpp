@@ -811,9 +811,7 @@ void LuminaChatFrame::CreateEmoTagPanel() {
             settings_manager->SetBool("Emotion", "include_user_messages", value);
             settings_manager->SaveSettings();
         }
-        if (emotag_plugin) {
-            emotag_plugin->SetIncludeUserMessages(value);
-        }
+        // Note: SetIncludeUserMessages removed in simplified EmoTagPlugin
     });
     
     // Configuration note
@@ -1270,11 +1268,8 @@ void LuminaChatFrame::InitializePlugins() {
             AddLogMessage("Configured EmoTagPlugin analysis window size: " + std::to_string(window_size));
         }
         
-        if (emotag_include_user_checkbox) {
-            bool include_user = emotag_include_user_checkbox->GetValue();
-            emotag_plugin->SetIncludeUserMessages(include_user);
-            AddLogMessage("Configured EmoTagPlugin include user messages: " + std::string(include_user ? "enabled" : "disabled"));
-        }
+        // Note: SetIncludeUserMessages removed in simplified EmoTagPlugin
+        // Plugin now only analyzes AI responses for emotional state
         
         AddLogMessage("EmoTagPlugin initialized and started");
         
@@ -1337,12 +1332,6 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
         
         AddLogMessage("Processing message with context: " + current_context_id);
         
-        // Record user message in EmoTagPlugin if enabled
-        if (emotag_plugin) {
-            emotag_plugin->RecordUserMessage(current_context_id, input.ToStdString());
-            AddLogMessage("User message recorded in EmoTagPlugin for context: " + current_context_id);
-        }
-        
         // Get the finalized template for inspection BEFORE starting generation
         std::string finalized_template;
         try {
@@ -1376,10 +1365,13 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
                     if (success) {
                         AddLogMessage("Response generation completed successfully");
                         
-                        // Record AI response in EmoTagPlugin for emotional analysis
-                        if (emotag_plugin && !full_response.empty()) {
-                            emotag_plugin->RecordAIResponse(current_context_id, full_response);
-                            AddLogMessage("AI response recorded in EmoTagPlugin for emotional analysis");
+                        // Request emotional analysis for the context after AI response
+                        if (orchestrator) {
+                            auto* context = orchestrator->GetLlamaManager()->GetContextInfo(current_context_id);
+                            if (context) {
+                                context->RequestEmotionalAnalysis();
+                                AddLogMessage("Requested emotional analysis for context: " + current_context_id);
+                            }
                         }
                     } else {
                         AddLogMessage("Response generation was stopped or failed");

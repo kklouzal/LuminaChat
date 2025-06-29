@@ -20,6 +20,7 @@
 #include <atomic>
 #include <future>
 #include <condition_variable>
+#include <regex>
 
 // ContextInfo Configuration Constants
 namespace ContextConstants {
@@ -58,6 +59,18 @@ struct PrunedMessageBatch {
                        std::vector<std::pair<std::string, std::string>> messages)
         : context_id(id), pruned_messages(std::move(messages)), 
           pruned_at(std::chrono::steady_clock::now()) {}
+};
+
+// Emotional analysis buffer for plugin consumption
+struct EmotionalAnalysisBatch {
+    std::string context_id;
+    std::vector<std::string> ai_responses; // Recent AI responses for analysis
+    std::chrono::steady_clock::time_point requested_at;
+    
+    EmotionalAnalysisBatch(const std::string& id, 
+                          std::vector<std::string> responses)
+        : context_id(id), ai_responses(std::move(responses)), 
+          requested_at(std::chrono::steady_clock::now()) {}
 };
 
 enum class RebuildStrategy {
@@ -171,6 +184,10 @@ private:    // Core components
     static std::mutex pruning_buffer_mutex;
     static std::vector<PrunedMessageBatch> global_pruning_buffer;
     
+    // Static emotional analysis buffer for plugin consumption
+    static std::mutex emotional_analysis_buffer_mutex;
+    static std::vector<EmotionalAnalysisBatch> global_emotional_analysis_buffer;
+    
     // Llama context management
     llama_context* llama_ctx = nullptr;
     llama_batch batch;
@@ -210,6 +227,11 @@ public:    // Constructor overloads
     // Plugin interface for accessing pruning buffer
     static std::vector<PrunedMessageBatch> GetAndClearPruningBuffer();
     static bool HasPendingSummarization();
+    
+    // Plugin interface for accessing emotional analysis buffer
+    static std::vector<EmotionalAnalysisBatch> GetAndClearEmotionalAnalysisBuffer();
+    static bool HasPendingEmotionalAnalysis();
+    void RequestEmotionalAnalysis(); // Request analysis for this context
     
     // Core pruning method (immediate, critical path)
     void PruneContextImmediate(size_t keep_recent_messages = 5);
@@ -284,8 +306,11 @@ public:
     
     // Advanced features
     void SetMaxContextTokens(size_t max_tokens);
-    int32_t GetContextSize() const { return context_size; }
+    int32_t GetContextSize() const { return static_cast<int32_t>(stats.max_context_tokens); }
     std::string GetCurrentPrompt() const;
+    
+    // Response extraction helper - extract clean content from template-formatted output
+    std::string ExtractCleanResponse(const std::string& raw_response) const;
     
     // Debug and testing helpers
     void DumpContextInfo() const;
@@ -1048,10 +1073,10 @@ inline std::string ContextInfo::GenerateResponse(const std::string& prompt) {
         is_generating = false;
         
         // Convert response tokens back to text
-        std::string response = token_cache->DetokenizeTokens(response_tokens);
+        std::string raw_response = token_cache->DetokenizeTokens(response_tokens);
         
-        // Apply consistent cleanup to all AI responses
-        response = LuminaChat::Utilities::TrimString(response);
+        // Extract clean response content (remove template tokens)
+        std::string response = ExtractCleanResponse(raw_response);
         
         LOG_DEBUG_ContextInfo("Generated response: " + std::to_string(response_tokens.size()) + 
                              " tokens -> " + response.substr(0, 100) + 
@@ -1617,7 +1642,70 @@ inline void ContextInfo::ApplyCompletedSummary(const std::string& summary) {
     }
 }
 
-// Context threshold checking with simplified logic
+// Advanced features
+inline void ContextInfo::SetMaxContextTokens(size_t max_tokens) {
+    std::lock_guard<std::mutex> lock(context_mutex);
+    
+    // Update max context tokens in stats
+    stats.max_context_tokens = static_cast<size_t>(max_tokens);
+    
+    LOG_DEBUG_ContextInfo("Max context tokens set to: " + std::to_string(max_tokens));
+}
+
+inline std::string ContextInfo::GetCurrentPrompt() const {
+    // For const method, return a simple representation without modifying state
+    std::ostringstream prompt_stream;
+    prompt_stream << "Current context with " << message_history.size() << " messages";
+    return prompt_stream.str();
+}
+
+inline std::string ContextInfo::ExtractCleanResponse(const std::string& raw_response) const {
+    if (raw_response.empty()) {
+        return raw_response;
+    }
+    
+    std::string cleaned = raw_response;
+    
+    // Remove common template tokens that may appear in generated output
+    const std::vector<std::string> template_tokens = {
+        "<|start_header_id|>assistant<|end_header_id|>",
+        "<|start_header_id|>",
+        "<|end_header_id|>",
+        "<|eot_id|>",
+        "<|begin_of_text|>",
+        "<|end_of_text|>",
+        "<|im_start|>assistant",
+        "<|im_start|>",
+        "<|im_end|>",
+        "### Assistant:",
+        "Assistant:",
+        "<s>",
+        "</s>",
+        "[INST]",
+        "[/INST]"
+    };
+    
+    // Remove template tokens
+    for (const auto& token : template_tokens) {
+        size_t pos = 0;
+        while ((pos = cleaned.find(token, pos)) != std::string::npos) {
+            cleaned.erase(pos, token.length());
+            // Don't increment pos to catch consecutive occurrences
+        }
+    }
+    
+    // Clean up leading/trailing whitespace and normalize spacing
+    cleaned = LuminaChat::Utilities::TrimString(cleaned);
+    
+    // Remove excessive newlines (but preserve intentional paragraph breaks)
+    std::regex multiple_newlines(R"(\n\s*\n\s*\n+)");
+    cleaned = std::regex_replace(cleaned, multiple_newlines, "\n\n");
+    
+    LOG_DEBUG_ContextInfo("Response extraction: " + std::to_string(raw_response.length()) + 
+                         " chars -> " + std::to_string(cleaned.length()) + " chars (clean)");
+    
+    return cleaned;
+}
 
 // Static method implementations for pruning buffer plugin interface
 inline std::vector<PrunedMessageBatch> ContextInfo::GetAndClearPruningBuffer() {
@@ -1633,6 +1721,53 @@ inline bool ContextInfo::HasPendingSummarization() {
     std::lock_guard<std::mutex> lock(pruning_buffer_mutex);
     
     return !global_pruning_buffer.empty();
+}
+
+// Static method implementations for emotional analysis buffer plugin interface
+inline std::vector<EmotionalAnalysisBatch> ContextInfo::GetAndClearEmotionalAnalysisBuffer() {
+    std::lock_guard<std::mutex> lock(emotional_analysis_buffer_mutex);
+    
+    std::vector<EmotionalAnalysisBatch> result;
+    result.swap(global_emotional_analysis_buffer);
+    
+    return result;
+}
+
+inline bool ContextInfo::HasPendingEmotionalAnalysis() {
+    std::lock_guard<std::mutex> lock(emotional_analysis_buffer_mutex);
+    
+    return !global_emotional_analysis_buffer.empty();
+}
+
+inline void ContextInfo::RequestEmotionalAnalysis() {
+    if (message_history.empty()) {
+        LOG_ContextInfo("No messages in history for emotional analysis request - context: " + context_id);
+        return; // No messages to analyze
+    }
+    
+    // Extract recent AI responses for analysis
+    std::vector<std::string> ai_responses;
+    const size_t max_responses = 3; // Analyze last 3 AI responses
+    
+    LOG_ContextInfo("Searching for AI responses in " + std::to_string(message_history.size()) + " messages for context: " + context_id);
+    
+    // Walk backwards through message history to find AI responses
+    for (auto it = message_history.rbegin(); it != message_history.rend() && ai_responses.size() < max_responses; ++it) {
+        if (it->first == "assistant") {
+            ai_responses.insert(ai_responses.begin(), it->second); // Insert at beginning to maintain order
+            LOG_ContextInfo("Found assistant message (" + std::to_string(it->second.length()) + " chars) for emotional analysis");
+        }
+    }
+    
+    if (!ai_responses.empty()) {
+        std::lock_guard<std::mutex> lock(emotional_analysis_buffer_mutex);
+        global_emotional_analysis_buffer.emplace_back(context_id, std::move(ai_responses));
+        
+        LOG_ContextInfo("Requested emotional analysis for context " + context_id + 
+                       " with " + std::to_string(ai_responses.size()) + " AI responses");
+    } else {
+        LOG_ContextInfo("No assistant messages found in " + std::to_string(message_history.size()) + " messages for context: " + context_id);
+    }
 }
 
 inline void ContextInfo::PruneContextImmediate(size_t keep_recent_messages) {
@@ -1670,6 +1805,10 @@ inline void ContextInfo::PruneContextImmediate_Internal(size_t keep_recent_messa
 // Static member definitions for pruning buffer
 inline std::mutex ContextInfo::pruning_buffer_mutex;
 inline std::vector<PrunedMessageBatch> ContextInfo::global_pruning_buffer;
+
+// Static member definitions for emotional analysis buffer
+inline std::mutex ContextInfo::emotional_analysis_buffer_mutex;
+inline std::vector<EmotionalAnalysisBatch> ContextInfo::global_emotional_analysis_buffer;
 
 // Implementation of new summary management methods
 inline void ContextInfo::AddSummaryToList(const std::string& summary) {
