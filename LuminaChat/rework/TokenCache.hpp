@@ -20,11 +20,10 @@
 
 // TokenCache: High-performance bidirectional token caching system
 // - Unified storage for Text↔Tokens with single cache reservoir (no data duplication)
-// - Multiple eviction policies (LRU, LFU, FIFO) for optimal cache management
+// - GDSF (GreedyDual-Size-Frequency) eviction policy for optimal cache management
 // - Performance statistics tracking with memory usage monitoring
 // - Single instance per ModelInfo, shared across contexts
 // - Thread-safe operations with shared_mutex for better read performance
-// - Template caching for ChatTemplateManager performance
 // - Batch operations for bulk cache updates
 // - Memory compaction and sophisticated cleanup strategies
 //
@@ -41,8 +40,6 @@ struct CacheStats {
     std::atomic<size_t> text_to_token_misses{0};
     std::atomic<size_t> token_to_text_hits{0};
     std::atomic<size_t> token_to_text_misses{0};
-    std::atomic<size_t> template_cache_hits{0};
-    std::atomic<size_t> template_cache_misses{0};
     std::atomic<size_t> memory_usage_bytes{0};
     std::atomic<size_t> evictions{0};
     std::atomic<size_t> memory_reclaimed_bytes{0};
@@ -56,8 +53,6 @@ struct CacheStats {
         , text_to_token_misses{other.text_to_token_misses.load()}
         , token_to_text_hits{other.token_to_text_hits.load()}
         , token_to_text_misses{other.token_to_text_misses.load()}
-        , template_cache_hits{other.template_cache_hits.load()}
-        , template_cache_misses{other.template_cache_misses.load()}
         , memory_usage_bytes{other.memory_usage_bytes.load()}
         , evictions{other.evictions.load()}
         , memory_reclaimed_bytes{other.memory_reclaimed_bytes.load()} {}
@@ -69,8 +64,6 @@ struct CacheStats {
             text_to_token_misses = other.text_to_token_misses.load();
             token_to_text_hits = other.token_to_text_hits.load();
             token_to_text_misses = other.token_to_text_misses.load();
-            template_cache_hits = other.template_cache_hits.load();
-            template_cache_misses = other.template_cache_misses.load();
             memory_usage_bytes = other.memory_usage_bytes.load();
             evictions = other.evictions.load();
             memory_reclaimed_bytes = other.memory_reclaimed_bytes.load();
@@ -88,11 +81,6 @@ struct CacheStats {
         return total > 0 ? static_cast<float>(token_to_text_hits) / total : 0.0f;
     }
     
-    float GetTemplateHitRatio() const {
-        size_t total = template_cache_hits + template_cache_misses;
-        return total > 0 ? static_cast<float>(template_cache_hits) / total : 0.0f;
-    }
-    
     float GetOverallHitRatio() const {
         size_t total_hits = GetTotalHits();
         size_t total_requests = GetTotalRequests();
@@ -100,13 +88,12 @@ struct CacheStats {
     }
     
     size_t GetTotalHits() const {
-        return text_to_token_hits + token_to_text_hits + template_cache_hits;
+        return text_to_token_hits + token_to_text_hits;
     }
     
     size_t GetTotalRequests() const {
         return text_to_token_hits + text_to_token_misses + 
-               token_to_text_hits + token_to_text_misses +
-               template_cache_hits + template_cache_misses;
+               token_to_text_hits + token_to_text_misses;
     }
     
     float GetMemoryEfficiency() const {
@@ -122,39 +109,23 @@ struct UnifiedCacheEntry {
     mutable std::atomic<uint32_t> access_count{1};
     mutable std::chrono::steady_clock::time_point last_accessed;
     size_t memory_size;
+    mutable double gdsf_priority{0.0}; // GDSF priority value (H = L + F/S)
     
     UnifiedCacheEntry(std::string text_data, std::vector<int32_t> token_data) noexcept
         : text(std::move(text_data))
         , tokens(std::move(token_data))
         , last_accessed(std::chrono::steady_clock::now())
-        , memory_size(text.capacity() + tokens.capacity() * sizeof(int32_t) + sizeof(UnifiedCacheEntry)) {}
+        , memory_size(text.capacity() + tokens.capacity() * sizeof(int32_t) + sizeof(UnifiedCacheEntry))
+        , gdsf_priority(1.0 / memory_size) {} // Initial priority F/S where F=1, S=memory_size
     
     void UpdateAccess() const noexcept {
         last_accessed = std::chrono::steady_clock::now();
         access_count.fetch_add(1, std::memory_order_relaxed);
+        // GDSF priority will be recalculated during eviction based on current inflation factor
     }
 };
 
-// Template cache entry (separate from unified cache for specialized handling)
-struct TemplateCacheEntry {
-    std::vector<int32_t> tokens;
-    std::chrono::steady_clock::time_point last_accessed;
-    size_t access_count;
-    
-    TemplateCacheEntry() : last_accessed(std::chrono::steady_clock::now()), access_count(1) {}
-    TemplateCacheEntry(std::vector<int32_t> tok) : tokens(std::move(tok)), 
-        last_accessed(std::chrono::steady_clock::now()), access_count(1) {}
-};
-
 class TokenCache {
-public:
-    // Eviction policy options for optimal cache management
-    enum class EvictionPolicy : uint8_t {
-        LRU = 0,        // Least Recently Used (default)
-        LFU = 1,        // Least Frequently Used
-        FIFO = 2        // First In, First Out
-    };
-
 private:
     // Performance constants
     static constexpr float CACHE_PREEMPTIVE_THRESHOLD = 0.9f;
@@ -165,11 +136,9 @@ private:
     // Unified bidirectional cache storage - single source of truth
     mutable std::unordered_map<std::string, std::unique_ptr<UnifiedCacheEntry>> text_to_entry;  // text key -> entry
     mutable std::unordered_map<std::string, UnifiedCacheEntry*> token_hash_to_entry;           // token hash -> entry
-    mutable std::unordered_map<std::string, TemplateCacheEntry> template_cache;                // template hash -> tokens
     
-    // LRU tracking
-    mutable std::list<std::string> access_order;  // text keys in access order
-    mutable std::unordered_map<std::string, std::list<std::string>::iterator> access_iterators;
+    // GDSF eviction policy state
+    mutable double gdsf_inflation_factor{0.0}; // L value in GDSF algorithm
     
     // Vocab reference - stored during construction for direct tokenization/detokenization
     const llama_vocab* vocab;
@@ -183,7 +152,6 @@ private:
     // Cache management
     size_t max_cache_size;
     size_t cleanup_threshold;
-    EvictionPolicy eviction_policy;
     
     // Callback for cache invalidation notifications (optional)
     std::function<void(const std::string&)> invalidation_callback;
@@ -212,15 +180,13 @@ private:
         stats.memory_usage_bytes.fetch_add(delta, std::memory_order_relaxed);
     }
     
-    // Update access order for LRU tracking
-    void UpdateAccessOrder(const std::string& text_key, const UnifiedCacheEntry& entry) const noexcept {
+    // Update GDSF priority for accessed entry
+    void UpdateGDSFPriority(const UnifiedCacheEntry& entry) const noexcept {
         entry.UpdateAccess();
-        
-        if (eviction_policy == EvictionPolicy::LRU) [[likely]] {
-            if (const auto it = access_iterators.find(text_key); it != access_iterators.end()) [[likely]] {
-                access_order.splice(access_order.begin(), access_order, it->second);
-            }
-        }
+        // GDSF priority = L + F/S where L is inflation factor, F is frequency, S is size
+        entry.gdsf_priority = gdsf_inflation_factor + 
+                             static_cast<double>(entry.access_count.load(std::memory_order_relaxed)) / 
+                             static_cast<double>(entry.memory_size);
     }
     
     // Add unified entry to bidirectional cache
@@ -246,14 +212,13 @@ private:
             existing_it->second = std::move(entry);
             token_hash_to_entry[token_hash] = existing_it->second.get();
             UpdateMemoryUsage(memory_delta);
-            UpdateAccessOrder(existing_it->first, *existing_it->second);
+            UpdateGDSFPriority(*existing_it->second);
         } else [[likely]] {
             // Add new entry - this is the common path
             if (auto [inserted_it, was_inserted] = text_to_entry.emplace(std::move(text_key), std::move(entry)); was_inserted) [[likely]] {
                 token_hash_to_entry[token_hash] = inserted_it->second.get();
                 UpdateMemoryUsage(entry_memory);
-                access_order.push_front(inserted_it->first);
-                access_iterators[inserted_it->first] = access_order.begin();
+                UpdateGDSFPriority(*inserted_it->second);
             }
         }
     }
@@ -271,50 +236,38 @@ private:
         }
         
         while (text_to_entry.size() > target_size && !text_to_entry.empty()) {
-            std::string victim_key;
+            // GDSF Algorithm: Find entry with minimum priority value
+            // H = L + F/S where L = inflation factor, F = frequency, S = size
             
-            switch (eviction_policy) {
-                case EvictionPolicy::LRU:
-                case EvictionPolicy::FIFO:
-                    if (!access_order.empty()) [[likely]] {
-                        victim_key = access_order.back();
-                        access_order.pop_back();
-                    }
-                    break;
-                    
-                case EvictionPolicy::LFU: {
-                    const auto min_it = std::min_element(text_to_entry.begin(), text_to_entry.end(),
-                        [](const auto& a, const auto& b) noexcept {
-                            return a.second->access_count.load(std::memory_order_relaxed) < 
-                                   b.second->access_count.load(std::memory_order_relaxed);
-                        });
-                    if (min_it != text_to_entry.end()) [[likely]] {
-                        victim_key = min_it->first;
-                    }
-                    break;
-                }
+            // Update all priorities with current inflation factor before selection
+            for (auto& [key, entry] : text_to_entry) {
+                const uint32_t frequency = entry->access_count.load(std::memory_order_relaxed);
+                entry->gdsf_priority = gdsf_inflation_factor + 
+                                     static_cast<double>(frequency) / static_cast<double>(entry->memory_size);
             }
             
-            if (!victim_key.empty()) [[likely]] {
-                if (const auto it = text_to_entry.find(victim_key); it != text_to_entry.end()) [[likely]] {
-                    // Remove reverse mapping
-                    const auto token_hash = GenerateTokenHash(it->second->tokens);
-                    token_hash_to_entry.erase(token_hash);
-                    
-                    // Track memory reclaimed
-                    total_reclaimed += it->second->memory_size;
-                    UpdateMemoryUsage(-static_cast<int64_t>(it->second->memory_size));
-                    
-                    // Remove from access tracking
-                    if (const auto access_it = access_iterators.find(victim_key); access_it != access_iterators.end()) {
-                        access_order.erase(access_it->second);
-                        access_iterators.erase(access_it);
-                    }
-                    
-                    // Remove main entry
-                    text_to_entry.erase(it);
-                    stats.evictions.fetch_add(1, std::memory_order_relaxed);
-                }
+            // Find victim with minimum GDSF priority
+            auto victim_it = std::min_element(text_to_entry.begin(), text_to_entry.end(),
+                [](const auto& a, const auto& b) noexcept {
+                    return a.second->gdsf_priority < b.second->gdsf_priority;
+                });
+            
+            if (victim_it != text_to_entry.end()) [[likely]] {
+                // Update inflation factor to the priority of the evicted entry
+                // This ensures that subsequent entries need higher priority to avoid eviction
+                gdsf_inflation_factor = victim_it->second->gdsf_priority;
+                
+                // Remove reverse mapping
+                const auto token_hash = GenerateTokenHash(victim_it->second->tokens);
+                token_hash_to_entry.erase(token_hash);
+                
+                // Track memory reclaimed
+                total_reclaimed += victim_it->second->memory_size;
+                UpdateMemoryUsage(-static_cast<int64_t>(victim_it->second->memory_size));
+                
+                // Remove main entry
+                text_to_entry.erase(victim_it);
+                stats.evictions.fetch_add(1, std::memory_order_relaxed);
             } else [[unlikely]] {
                 LOG_DEBUG_TokenCache("Cache trim: No victim found, breaking");
                 break;
@@ -324,41 +277,28 @@ private:
         // Update reclaimed memory stats
         stats.memory_reclaimed_bytes.fetch_add(total_reclaimed, std::memory_order_relaxed);
         
-        // Cleanup template cache as well
-        auto template_cutoff = std::chrono::steady_clock::now() - std::chrono::hours(1);
-        for (auto it = template_cache.begin(); it != template_cache.end();) {
-            if (it->second.last_accessed < template_cutoff) {
-                it = template_cache.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        
         // Debug logging for trim results
         if (initial_size != text_to_entry.size()) {
-            LOG_TokenCache("Cache trim completed: " + 
+            LOG_TokenCache("GDSF cache trim completed: " + 
                      std::to_string(initial_size - text_to_entry.size()) + " entries removed, " +
-                     std::to_string(total_reclaimed) + " bytes reclaimed");
+                     std::to_string(total_reclaimed) + " bytes reclaimed, inflation factor: " +
+                     std::to_string(gdsf_inflation_factor));
         }
     }
     
 public:
     explicit TokenCache(size_t cache_size = DEFAULT_CACHE_SIZE, 
-                       const llama_vocab* vocab_ptr = nullptr,
-                       EvictionPolicy policy = EvictionPolicy::LRU) 
+                       const llama_vocab* vocab_ptr = nullptr) 
         : max_cache_size(cache_size)
         , cleanup_threshold(static_cast<size_t>(cache_size * 0.8)) // 80% of max size
-        , eviction_policy(policy)
         , vocab(vocab_ptr)
     {
         // Reserve initial capacity for better performance
         text_to_entry.reserve(INITIAL_RESERVE_SIZE);
         token_hash_to_entry.reserve(INITIAL_RESERVE_SIZE);
-        template_cache.reserve(INITIAL_RESERVE_SIZE);
-        access_iterators.reserve(INITIAL_RESERVE_SIZE);
         
         LOG_TokenCache("TokenCache initialized with max size: " + std::to_string(max_cache_size) + 
-                      ", policy: " + std::to_string(static_cast<int>(policy)) +
+                      ", using GDSF eviction policy" +
                       ", vocab: " + std::string(vocab ? "provided" : "null"));
     }
     
@@ -368,13 +308,6 @@ public:
             std::to_string(stats.GetTotalHits()) + " hits / " + 
             std::to_string(stats.GetTotalRequests()) + " requests (" +
             std::to_string(static_cast<int>(stats.GetOverallHitRatio() * 100)) + "% hit rate)");
-    }
-    
-    // Configure cache settings
-    void Configure(EvictionPolicy policy) {
-        std::unique_lock<std::shared_mutex> lock(cache_mutex);
-        eviction_policy = policy;
-        LOG_TokenCache("Cache policy updated to: " + std::to_string(static_cast<int>(policy)));
     }
     
     // Resize cache capacity
@@ -416,7 +349,7 @@ public:
         const std::string key_str(text_key);
         if (const auto it = text_to_entry.find(key_str); it != text_to_entry.end()) [[likely]] {
             stats.text_to_token_hits.fetch_add(1, std::memory_order_relaxed);
-            UpdateAccessOrder(it->first, *it->second);
+            UpdateGDSFPriority(*it->second);
             LOG_DEBUG_TokenCache("Cache hit for text (" + std::to_string(text_key.length()) + " chars)");
             return it->second->tokens;
         }
@@ -437,7 +370,7 @@ public:
             // Verify exact match (hash collision protection)
             if (entry.tokens == tokens) [[likely]] {
                 stats.token_to_text_hits.fetch_add(1, std::memory_order_relaxed);
-                entry.UpdateAccess();
+                UpdateGDSFPriority(entry);
                 LOG_DEBUG_TokenCache("Cache hit for tokens (" + std::to_string(tokens.size()) + " tokens)");
                 return entry.text;
             } else {
@@ -491,67 +424,7 @@ public:
         return false;
     }
     
-    // ================================================================
-    // LEGACY COMPATIBILITY METHODS (uses bidirectional cache internally)
-    // ================================================================
-    
-    // Text-to-token caching (legacy method - redirects to bidirectional cache)
-    bool GetTokens(const std::string& text, std::vector<int32_t>& tokens) {
-        if (auto cached_tokens = GetTokensFromText(text)) {
-            tokens = std::move(*cached_tokens);
-            return true;
-        }
-        return false;
-    }
-    
-    void StoreTokens(const std::string& text, const std::vector<int32_t>& tokens) {
-        StoreBidirectional(text, text, tokens);
-    }
-    
-    // Token-to-text caching (legacy method - redirects to bidirectional cache)
-    bool GetText(const std::vector<int32_t>& tokens, std::string& text) {
-        if (auto cached_text = GetTextFromTokens(tokens)) {
-            text = std::move(*cached_text);
-            return true;
-        }
-        return false;
-    }
-    
-    void StoreText(const std::vector<int32_t>& tokens, const std::string& text) {
-        StoreBidirectional(text, text, tokens);
-    }
-    
-    // Template caching for ChatTemplateManager (enhanced with proper locking)
-    bool GetTemplateTokens(const std::string& template_hash, std::vector<int32_t>& tokens) {
-        std::shared_lock<std::shared_mutex> lock(cache_mutex);
-        
-        auto it = template_cache.find(template_hash);
-        if (it != template_cache.end()) {
-            tokens = it->second.tokens;
-            it->second.last_accessed = std::chrono::steady_clock::now();
-            it->second.access_count++;
-            stats.template_cache_hits.fetch_add(1, std::memory_order_relaxed);
-            LOG_DEBUG_TokenCache("Template cache hit (" + template_hash.substr(0, 16) + "...)");
-            return true;
-        }
-        
-        stats.template_cache_misses.fetch_add(1, std::memory_order_relaxed);
-        LOG_DEBUG_TokenCache("Template cache miss (" + template_hash.substr(0, 16) + "...)");
-        return false;
-    }
-    
-    void StoreTemplateTokens(const std::string& template_hash, const std::vector<int32_t>& tokens) {
-        std::unique_lock<std::shared_mutex> lock(cache_mutex);
-        
-        // Check if cleanup needed
-        if (template_cache.size() > cleanup_threshold) {
-            CleanupOldEntries();
-        }
-        
-        template_cache[template_hash] = TemplateCacheEntry(tokens);
-        LOG_DEBUG_TokenCache("Stored template tokens (" + template_hash.substr(0, 16) + 
-            "... → " + std::to_string(tokens.size()) + " tokens)");
-    }
+
     
     // ================================================================
     // CACHE INVALIDATION AND MANAGEMENT
@@ -567,12 +440,6 @@ public:
             const auto token_hash = GenerateTokenHash(it->second->tokens);
             token_hash_to_entry.erase(token_hash);
             
-            // Remove from access tracking
-            if (const auto access_it = access_iterators.find(text); access_it != access_iterators.end()) {
-                access_order.erase(access_it->second);
-                access_iterators.erase(access_it);
-            }
-            
             // Update memory tracking
             UpdateMemoryUsage(-static_cast<int64_t>(it->second->memory_size));
             
@@ -585,31 +452,14 @@ public:
         }
     }
     
-    void InvalidateTemplate(const std::string& template_hash) {
-        std::unique_lock<std::shared_mutex> lock(cache_mutex);
-        
-        auto it = template_cache.find(template_hash);
-        if (it != template_cache.end()) {
-            template_cache.erase(it);
-            LOG_DEBUG_TokenCache("Invalidated template cache entry");
-            
-            if (invalidation_callback) {
-                invalidation_callback("template:" + template_hash);
-            }
-        }
-    }
-    
     void ClearAll() {
         std::unique_lock<std::shared_mutex> lock(cache_mutex);
         
-        size_t total_entries = text_to_entry.size() + template_cache.size();
+        size_t total_entries = text_to_entry.size();
         size_t memory_cleared = stats.memory_usage_bytes.load();
         
         text_to_entry.clear();
         token_hash_to_entry.clear();
-        template_cache.clear();
-        access_order.clear();
-        access_iterators.clear();
         
         // Reset memory tracking
         stats.memory_usage_bytes.store(0, std::memory_order_relaxed);
@@ -630,8 +480,6 @@ public:
         auto old_entries = std::move(text_to_entry);
         text_to_entry.clear();
         token_hash_to_entry.clear();
-        access_order.clear();
-        access_iterators.clear();
         
         text_to_entry.reserve(old_entries.size());
         token_hash_to_entry.reserve(old_entries.size());
@@ -640,10 +488,6 @@ public:
             const std::string token_hash = GenerateTokenHash(entry->tokens);
             text_to_entry[key] = std::move(entry);
             token_hash_to_entry[token_hash] = text_to_entry[key].get();
-            
-            // Rebuild access order
-            access_order.push_front(key);
-            access_iterators[key] = access_order.begin();
         }
         
         LOG_TokenCache("Memory compaction completed");
@@ -656,7 +500,6 @@ public:
     // Enhanced statistics with detailed breakdown
     struct DetailedCacheStats {
         size_t unified_entries;
-        size_t template_entries;
         size_t total_entries;
         size_t max_size;
         size_t memory_bytes;
@@ -671,8 +514,6 @@ public:
         size_t text_to_token_misses;
         size_t token_to_text_hits;
         size_t token_to_text_misses;
-        size_t template_hits;
-        size_t template_misses;
     };
     
     [[nodiscard]] DetailedCacheStats GetDetailedStats() const noexcept {
@@ -682,12 +523,10 @@ public:
         const auto total_requests = stats.GetTotalRequests();
         const auto memory_bytes = stats.memory_usage_bytes.load(std::memory_order_relaxed);
         const auto unified_entries = text_to_entry.size();
-        const auto template_entries = template_cache.size();
         
         return DetailedCacheStats{
             .unified_entries = unified_entries,
-            .template_entries = template_entries,
-            .total_entries = unified_entries + template_entries,
+            .total_entries = unified_entries,
             .max_size = max_cache_size,
             .memory_bytes = memory_bytes,
             .hit_ratio = (total_requests > 0) ? static_cast<float>(total_hits) / total_requests : 0.0f,
@@ -698,9 +537,7 @@ public:
             .text_to_token_hits = stats.text_to_token_hits.load(std::memory_order_relaxed),
             .text_to_token_misses = stats.text_to_token_misses.load(std::memory_order_relaxed),
             .token_to_text_hits = stats.token_to_text_hits.load(std::memory_order_relaxed),
-            .token_to_text_misses = stats.token_to_text_misses.load(std::memory_order_relaxed),
-            .template_hits = stats.template_cache_hits.load(std::memory_order_relaxed),
-            .template_misses = stats.template_cache_misses.load(std::memory_order_relaxed)
+            .token_to_text_misses = stats.token_to_text_misses.load(std::memory_order_relaxed)
         };
     }
     
@@ -712,7 +549,7 @@ public:
     
     size_t GetCacheSize() const {
         std::shared_lock<std::shared_mutex> lock(cache_mutex);
-        return text_to_entry.size() + template_cache.size();
+        return text_to_entry.size();
     }
     
     // Enhanced memory management
@@ -732,13 +569,6 @@ public:
             memory += entry.second->memory_size;
         }
         
-        // Template cache
-        for (const auto& entry : template_cache) {
-            memory += entry.first.capacity(); // Template hash
-            memory += entry.second.tokens.capacity() * sizeof(int32_t); // Token vector
-            memory += sizeof(TemplateCacheEntry);
-        }
-        
         return memory;
     }
     
@@ -746,8 +576,7 @@ public:
         auto detailed_stats = GetDetailedStats();
         
         LOG_TokenCache("=== Enhanced Cache Statistics ===");
-        LOG_TokenCache("Entries: " + std::to_string(detailed_stats.unified_entries) + " unified + " + 
-                      std::to_string(detailed_stats.template_entries) + " template = " + 
+        LOG_TokenCache("Entries: " + std::to_string(detailed_stats.unified_entries) + " unified = " + 
                       std::to_string(detailed_stats.total_entries) + " total");
         LOG_TokenCache("Capacity: " + std::to_string(detailed_stats.total_entries) + "/" + 
                       std::to_string(detailed_stats.max_size) + " (" + 
@@ -758,53 +587,15 @@ public:
             " hits, " + std::to_string(detailed_stats.text_to_token_misses) + " misses");
         LOG_TokenCache("Token→Text: " + std::to_string(detailed_stats.token_to_text_hits) + 
             " hits, " + std::to_string(detailed_stats.token_to_text_misses) + " misses");
-        LOG_TokenCache("Templates: " + std::to_string(detailed_stats.template_hits) + 
-            " hits, " + std::to_string(detailed_stats.template_misses) + " misses");
         LOG_TokenCache("Overall: " + std::to_string(static_cast<int>(detailed_stats.hit_ratio * 100)) + 
-                      "% hit rate (" + std::to_string(detailed_stats.text_to_token_hits + detailed_stats.token_to_text_hits + detailed_stats.template_hits) + 
+                      "% hit rate (" + std::to_string(detailed_stats.text_to_token_hits + detailed_stats.token_to_text_hits) + 
                       " total hits)");
         LOG_TokenCache("Evictions: " + std::to_string(detailed_stats.evictions) + 
                       " (" + std::to_string(detailed_stats.memory_reclaimed / 1024) + " KB reclaimed)");
-        LOG_TokenCache("Policy: " + std::to_string(static_cast<int>(eviction_policy)) + 
-                      " (0=LRU, 1=LFU, 2=FIFO)");
+        LOG_TokenCache("Policy: GDSF (GreedyDual-Size-Frequency)");
     }
     
-    // ================================================================
-    // WRAPPER METHODS FOR BACKWARD COMPATIBILITY
-    // ================================================================
-    
-    // Wrapper methods for consistent API (used by tests and legacy code)
-    std::optional<std::vector<int32_t>> GetCachedTokens(const std::string& text) {
-        return GetTokensFromText(text);
-    }
-    
-    void CacheTokens(const std::string& text, const std::vector<int32_t>& tokens) {
-        StoreBidirectional(text, text, tokens);
-    }
-    
-    std::optional<std::string> GetCachedText(const std::vector<int32_t>& tokens) {
-        return GetTextFromTokens(tokens);
-    }
-    
-    void CacheText(const std::vector<int32_t>& tokens, const std::string& text) {
-        StoreBidirectional(text, text, tokens);
-    }
-    
-    std::optional<std::vector<int32_t>> GetCachedTemplate(const std::string& template_key) {
-        std::vector<int32_t> tokens;
-        if (GetTemplateTokens(template_key, tokens)) {
-            return tokens;
-        }
-        return std::nullopt;
-    }
-    
-    void CacheTemplate(const std::string& template_key, const std::vector<int32_t>& tokens) {
-        StoreTemplateTokens(template_key, tokens);
-    }
-    
-    void InvalidateCache() {
-        ClearAll();
-    }
+
     
     // ================================================================
     // TOKENIZATION AND DETOKENIZATION WITH INTEGRATED CACHING
