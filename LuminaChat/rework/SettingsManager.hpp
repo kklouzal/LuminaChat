@@ -193,7 +193,7 @@ public:
 
         std::ofstream file(ini_file_path);
         if (!file.is_open()) {
-            LOG_ERROR("SettingsManager", "Failed to open settings file for writing: " + ini_file_path);
+            LOG_ERROR_SettingsManager("Failed to open settings file for writing: " + ini_file_path);
             return false;
         }
 
@@ -276,7 +276,7 @@ public:
             }
             return result;
         } catch (const std::exception&) {
-            LOG_WARNING("SettingsManager", "Failed to parse int value for [" + section + "]." + key + ": " + str_value);
+            LOG_WARNING_SettingsManager("Failed to parse int value for [" + section + "]." + key + ": " + str_value);
             return default_value;
         }
     }

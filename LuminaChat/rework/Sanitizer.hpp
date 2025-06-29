@@ -110,7 +110,7 @@ public:
             try {
                 filter_callback(original_input, allowed);
             } catch (const std::exception& e) {
-                LOG_WARNING("Sanitizer", "Filter callback error: " + std::string(e.what()));
+                LOG_WARNING_Sanitizer("Filter callback error: " + std::string(e.what()));
             }
         }
         
@@ -135,7 +135,7 @@ public:
             try {
                 filter_callback(response, allowed);
             } catch (const std::exception& e) {
-                LOG_WARNING("Sanitizer", "Filter callback error for assistant response: " + std::string(e.what()));
+                LOG_WARNING_Sanitizer("Filter callback error for assistant response: " + std::string(e.what()));
             }
         }
         
@@ -228,7 +228,7 @@ public:
             try {
                 callback_to_call(pattern);
             } catch (const std::exception& e) {
-                LOG_ERROR("Sanitizer", "Error during retroactive cleanup: " + std::string(e.what()));
+                LOG_ERROR_Sanitizer("Error during retroactive cleanup: " + std::string(e.what()));
             }
         }
         
@@ -323,7 +323,7 @@ private:
             
             return cleaned;
         } catch (const std::exception& e) {
-            LOG_WARNING("Sanitizer", "Discord formatting cleanup failed: " + std::string(e.what()));
+            LOG_WARNING_Sanitizer("Discord formatting cleanup failed: " + std::string(e.what()));
             return text;
         }
     }
@@ -391,7 +391,7 @@ private:
         
         // Debug logging for significant Unicode cleanup
         if (invalid_sequences > 0 || invalid_codepoints > 0) {
-            LOG_DEBUG("Sanitizer", "Unicode cleanup removed " + std::to_string(invalid_sequences) + 
+            LOG_DEBUG_Sanitizer("Unicode cleanup removed " + std::to_string(invalid_sequences) + 
                 " invalid sequences and " + std::to_string(invalid_codepoints) + " invalid codepoints");
         }
         
@@ -420,7 +420,7 @@ private:
             
             return normalized;
         } catch (const std::exception& e) {
-            LOG_WARNING("Sanitizer", "Whitespace normalization failed: " + std::string(e.what()));
+            LOG_WARNING_Sanitizer("Whitespace normalization failed: " + std::string(e.what()));
             // Fallback to basic trim
             const size_t start = text.find_first_not_of(" \t\n\r");
             if (start == std::string::npos) return "";
