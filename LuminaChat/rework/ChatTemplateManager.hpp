@@ -103,8 +103,11 @@ private:
         return false;
     }
     
-    // Compute hash for cache invalidation
+    // Compute hash for cache invalidation (template sections only)
     [[nodiscard]] std::size_t ComputeTemplateHash() const noexcept;
+    
+    // Compute complete hash including message history for caching
+    [[nodiscard]] std::size_t ComputeCompleteHash(const std::vector<std::pair<std::string, std::string>>& messages) const noexcept;
     
     // Optimized template building with pre-calculated sizes
     [[nodiscard]] std::string BuildTemplateInternal(const std::vector<std::pair<std::string, std::string>>& messages) const;
@@ -190,6 +193,20 @@ public:
         for (const auto& summary : summaries) {
             hash ^= std::hash<std::string>{}(summary) + hash_multiplier + (hash << 6) + (hash >> 2);
         }
+    }
+    
+    return hash;
+}
+
+// Compute complete hash including message history for caching
+[[nodiscard]] inline std::size_t ChatTemplateManager::ComputeCompleteHash(const std::vector<std::pair<std::string, std::string>>& messages) const noexcept {
+    std::size_t hash = ComputeTemplateHash(); // Start with template hash
+    constexpr std::size_t hash_multiplier = 0x9e3779b9;
+    
+    // Hash message history - this is the critical missing piece!
+    for (const auto& [role, content] : messages) {
+        hash ^= std::hash<std::string>{}(role) + hash_multiplier + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<std::string>{}(content) + hash_multiplier + (hash << 6) + (hash >> 2);
     }
     
     return hash;
@@ -326,6 +343,7 @@ public:
             result += content;
             result += "\n<|eot_id|>\n";
         } else {
+            // CRITICAL: ALL user input has [USERNAME] prefix; Prompts allow the AI to interpret properly here
             result += "<|start_header_id|>user<|end_header_id|>\n[";
             result += role;
             result += "] ";
@@ -451,16 +469,17 @@ inline void ChatTemplateManager::ClearPastSessions() noexcept {
     
     // Check if we can use cached result
     if (!template_dirty) [[likely]] {
-        const auto current_hash = ComputeTemplateHash();
+        const auto current_hash = ComputeCompleteHash(messages);
         if (current_hash == cached_template_hash && !cached_rendered_template.empty()) [[likely]] {
+            // Cache hit - return existing template
             return cached_rendered_template;
         }
         cached_template_hash = current_hash;
     }
     
-    // Build new template
+    // Build new template (cache miss or template dirty)
     cached_rendered_template = BuildTemplateInternal(messages);
-    cached_template_hash = ComputeTemplateHash();
+    cached_template_hash = ComputeCompleteHash(messages);
     template_dirty = false;
     
     return cached_rendered_template;

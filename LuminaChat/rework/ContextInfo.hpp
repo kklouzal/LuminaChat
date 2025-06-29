@@ -580,6 +580,7 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
     UpdateStats();
     
     try {
+        // CRITICAL: This MUST be sent as username, input NOT "user", input; Chat template handles roles dynamically and will allow the AI to interpret properly here.
         // 1. Add pure conversation pair to message history
         message_history.emplace_back(username, input);
         LOG_DEBUG_ContextInfo("Added user message to history: " + username + " -> " + 
@@ -1208,7 +1209,8 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
         
         try {
             state = ContextState::PROCESSING;
-            
+
+            // CRITICAL: This MUST be sent as username, input NOT "user", input; Chat template handles roles dynamically and will allow the AI to interpret properly here.
             // 1. Add user message to history
             message_history.emplace_back(username, input);
             context_needs_rebuild = true;
