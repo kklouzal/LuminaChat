@@ -470,17 +470,15 @@ private:
             
             // Build analysis prompt from AI responses
             std::ostringstream analysis_stream;
-            analysis_stream << "Analyze the emotional state of the AI assistant based on these recent responses:\n\n";
-            
+            analysis_stream << "Categorize my emotional state; identify the presence of any emotions present from the following.\n";
+
             for (size_t i = 0; i < batch.ai_responses.size(); ++i) {
-                analysis_stream << "Response " << (i + 1) << ":\n" << batch.ai_responses[i] << "\n\n";
+                analysis_stream << (i + 1) << ":\n" << batch.ai_responses[i] << "\n\n";
             }
-            
-            analysis_stream << "Provide a brief emotional state overview (2-3 sentences) describing the assistant's "
-                           << "emotional tone, confidence level, and overall demeanor based on these responses.\n\n"
-                           << "Emotional Analysis:";
-            
+
+            analysis_stream << "My emotional state:";
             std::string analysis_prompt = analysis_stream.str();
+
             
             LogInfo("Built analysis prompt (" + std::to_string(analysis_prompt.length()) + " chars) for context: " + batch.context_id);
             
