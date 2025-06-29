@@ -20,7 +20,10 @@
 #include <memory>
 #include <chrono>
 #include <string>
+#include <string_view>
 #include <optional>
+#include <bit>
+#include <utility>
 #include "Logger.hpp"
 
 namespace LuminaChat {
@@ -29,41 +32,120 @@ namespace LuminaChat {
 #define LOG_ProcessingPipeline(message) LOG_INFO("ProcessingPipeline", message)
 
 // Forward declarations
-enum class PipelineState {
-    IDLE,
-    PROCESSING,
-    PAUSED,
-    SHUTDOWN
+enum class PipelineState : uint8_t {
+    IDLE = 0,
+    PROCESSING = 1,
+    SHUTDOWN = 2
 };
 
-enum class RequestPriority {
+enum class RequestPriority : uint8_t {
     LOW = 0,
     NORMAL = 1,
     HIGH = 2,
     URGENT = 3
 };
 
-// Request wrapper for priority and metadata
+// Compile-time utilities for pipeline configuration
+namespace detail {
+    // Compile-time validation for queue sizes
+    consteval bool is_valid_queue_size(size_t size) noexcept {
+        return size > 0 && size <= 1000000; // Reasonable limits
+    }
+    
+    // Compile-time validation for processing delays
+    consteval bool is_valid_processing_delay_ms(int64_t ms) noexcept {
+        return ms >= 0 && ms <= 10000; // 0-10 seconds max
+    }
+    
+    // Compile-time priority validation
+    constexpr bool is_valid_priority(RequestPriority priority) noexcept {
+        return priority >= RequestPriority::LOW && priority <= RequestPriority::URGENT;
+    }
+    
+    // Compile-time state validation
+    constexpr bool is_valid_state(PipelineState state) noexcept {
+        return state >= PipelineState::IDLE && state <= PipelineState::SHUTDOWN;
+    }
+}
+
+// Compile-time constants - using constexpr (not constinit) for namespace constants
+namespace constants {
+    constexpr size_t default_max_queue_size = 1000;
+    constexpr int64_t default_processing_delay_ms = 10;
+    constexpr size_t cache_line_size = 64;
+}
+
+// Request wrapper for priority and metadata - optimized for performance
 template<typename RequestType>
-struct PipelineRequest {
+struct alignas(constants::cache_line_size) PipelineRequest {
     RequestType request;
     RequestPriority priority = RequestPriority::NORMAL;
     std::chrono::steady_clock::time_point queued_time;
     std::string request_id;
     
-    PipelineRequest(RequestType req, RequestPriority prio = RequestPriority::NORMAL, 
-                   const std::string& id = "") 
-        : request(std::move(req)), priority(prio), 
+    // Default constructor
+    constexpr PipelineRequest() noexcept = default;
+    
+    // Optimized constructor with perfect forwarding
+    template<typename ReqType>
+    PipelineRequest(ReqType&& req, RequestPriority prio = RequestPriority::NORMAL, 
+                   std::string_view id = "") noexcept
+        : request(std::forward<ReqType>(req)), priority(prio), 
           queued_time(std::chrono::steady_clock::now()), request_id(id) {}
+    
+    // Copy constructor  
+    PipelineRequest(const PipelineRequest& other) noexcept
+        : request(other.request), priority(other.priority),
+          queued_time(other.queued_time), request_id(other.request_id) {}
+    
+    // Move constructor
+    PipelineRequest(PipelineRequest&& other) noexcept
+        : request(std::move(other.request)), priority(other.priority),
+          queued_time(other.queued_time), request_id(std::move(other.request_id)) {}
+    
+    // Copy assignment
+    PipelineRequest& operator=(const PipelineRequest& other) noexcept {
+        if (this != &other) [[likely]] {
+            request = other.request;
+            priority = other.priority;
+            queued_time = other.queued_time;
+            request_id = other.request_id;
+        }
+        return *this;
+    }
+    
+    // Move assignment
+    PipelineRequest& operator=(PipelineRequest&& other) noexcept {
+        if (this != &other) [[likely]] {
+            request = std::move(other.request);
+            priority = other.priority;
+            queued_time = other.queued_time;
+            request_id = std::move(other.request_id);
+        }
+        return *this;
+    }
           
     // Priority comparison for queue ordering (higher priority = lower value for std::priority_queue)
-    bool operator<(const PipelineRequest& other) const {
-        return static_cast<int>(priority) < static_cast<int>(other.priority);
+    [[nodiscard]] constexpr bool operator<(const PipelineRequest& other) const noexcept {
+        return static_cast<uint8_t>(priority) < static_cast<uint8_t>(other.priority);
+    }
+    
+    // Utility functions for compile-time operations
+    [[nodiscard]] constexpr RequestPriority GetPriority() const noexcept {
+        return priority;
+    }
+    
+    [[nodiscard]] constexpr bool IsHighPriority() const noexcept {
+        return priority >= RequestPriority::HIGH;
+    }
+    
+    [[nodiscard]] constexpr bool IsUrgent() const noexcept {
+        return priority == RequestPriority::URGENT;
     }
 };
 
 // Statistics tracking for pipeline performance
-struct PipelineStats {
+struct alignas(constants::cache_line_size) PipelineStats {
     std::atomic<uint64_t> total_requests{0};
     std::atomic<uint64_t> completed_requests{0};
     std::atomic<uint64_t> failed_requests{0};
@@ -71,35 +153,89 @@ struct PipelineStats {
     std::chrono::steady_clock::time_point last_activity;
     
     // Default constructor
-    PipelineStats() : last_activity(std::chrono::steady_clock::now()) {}
+    inline PipelineStats() noexcept : last_activity(std::chrono::steady_clock::now()) {}
     
     // Copy constructor for atomic variables
-    PipelineStats(const PipelineStats& other) 
-        : total_requests(other.total_requests.load()),
-          completed_requests(other.completed_requests.load()),
-          failed_requests(other.failed_requests.load()),
-          pending_requests(other.pending_requests.load()),
+    inline PipelineStats(const PipelineStats& other) noexcept
+        : total_requests(other.total_requests.load(std::memory_order_relaxed)),
+          completed_requests(other.completed_requests.load(std::memory_order_relaxed)),
+          failed_requests(other.failed_requests.load(std::memory_order_relaxed)),
+          pending_requests(other.pending_requests.load(std::memory_order_relaxed)),
           last_activity(other.last_activity) {}
     
     // Copy assignment operator
-    PipelineStats& operator=(const PipelineStats& other) {
-        if (this != &other) {
-            total_requests.store(other.total_requests.load());
-            completed_requests.store(other.completed_requests.load());
-            failed_requests.store(other.failed_requests.load());
-            pending_requests.store(other.pending_requests.load());
+    inline PipelineStats& operator=(const PipelineStats& other) noexcept {
+        if (this != &other) [[likely]] {
+            total_requests.store(other.total_requests.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            completed_requests.store(other.completed_requests.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            failed_requests.store(other.failed_requests.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            pending_requests.store(other.pending_requests.load(std::memory_order_relaxed), std::memory_order_relaxed);
             last_activity = other.last_activity;
         }
         return *this;
     }
     
-    double GetCompletionRate() const noexcept {
-        uint64_t total = total_requests.load();
-        return total > 0 ? static_cast<double>(completed_requests.load()) / total : 0.0;
+    // Move constructor
+    inline PipelineStats(PipelineStats&& other) noexcept
+        : total_requests(other.total_requests.load(std::memory_order_relaxed)),
+          completed_requests(other.completed_requests.load(std::memory_order_relaxed)),
+          failed_requests(other.failed_requests.load(std::memory_order_relaxed)),
+          pending_requests(other.pending_requests.load(std::memory_order_relaxed)),
+          last_activity(other.last_activity) {
+        // Reset the moved-from object
+        other.total_requests.store(0, std::memory_order_relaxed);
+        other.completed_requests.store(0, std::memory_order_relaxed);
+        other.failed_requests.store(0, std::memory_order_relaxed);
+        other.pending_requests.store(0, std::memory_order_relaxed);
     }
     
-    uint64_t GetQueueDepth() const noexcept {
-        return pending_requests.load();
+    // Move assignment operator
+    inline PipelineStats& operator=(PipelineStats&& other) noexcept {
+        if (this != &other) [[likely]] {
+            total_requests.store(other.total_requests.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            completed_requests.store(other.completed_requests.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            failed_requests.store(other.failed_requests.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            pending_requests.store(other.pending_requests.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            last_activity = other.last_activity;
+            
+            // Reset the moved-from object
+            other.total_requests.store(0, std::memory_order_relaxed);
+            other.completed_requests.store(0, std::memory_order_relaxed);
+            other.failed_requests.store(0, std::memory_order_relaxed);
+            other.pending_requests.store(0, std::memory_order_relaxed);
+        }
+        return *this;
+    }
+    
+    [[nodiscard]] inline double GetCompletionRate() const noexcept {
+        const uint64_t total = total_requests.load(std::memory_order_relaxed);
+        if (total > 0) [[likely]] {
+            return static_cast<double>(completed_requests.load(std::memory_order_relaxed)) / total;
+        } else [[unlikely]] {
+            return 0.0;
+        }
+    }
+    
+    [[nodiscard]] inline uint64_t GetQueueDepth() const noexcept {
+        return pending_requests.load(std::memory_order_relaxed);
+    }
+    
+    // Additional utility methods
+    [[nodiscard]] inline bool HasRequests() const noexcept {
+        return total_requests.load(std::memory_order_relaxed) > 0;
+    }
+    
+    [[nodiscard]] inline bool IsEmpty() const noexcept {
+        return pending_requests.load(std::memory_order_relaxed) == 0;
+    }
+    
+    [[nodiscard]] inline double GetFailureRate() const noexcept {
+        const uint64_t total = total_requests.load(std::memory_order_relaxed);
+        if (total > 0) [[likely]] {
+            return static_cast<double>(failed_requests.load(std::memory_order_relaxed)) / total;
+        } else [[unlikely]] {
+            return 0.0;
+        }
     }
 };
 
@@ -122,69 +258,65 @@ struct PipelineStats {
 template<typename RequestType, typename ResultType>
 class ProcessingPipeline {
 private:
+    // Cache-aligned frequently accessed members for optimal performance
+    alignas(constants::cache_line_size) std::atomic<PipelineState> state_{PipelineState::IDLE};
+    alignas(constants::cache_line_size) PipelineStats stats_;
+    
     // Core processing components
     std::function<void(const RequestType&, std::function<void(ResultType)>, std::function<void(const std::string&)>)> processor_;
     std::priority_queue<PipelineRequest<RequestType>> request_queue_;
     std::unique_ptr<std::thread> worker_thread_;
     
-    // Thread synchronization
+    // Thread synchronization (grouped for cache efficiency)
     mutable std::mutex queue_mutex_;
     std::condition_variable queue_condition_;
-    std::atomic<PipelineState> state_{PipelineState::IDLE};
     
-    // Statistics and monitoring
-    PipelineStats stats_;
+    // Configuration and identification
     std::string pipeline_name_;
+    std::chrono::milliseconds processing_delay_{constants::default_processing_delay_ms}; // Minimum delay between requests
+    size_t max_queue_size_{constants::default_max_queue_size};
     
-    // Configuration
-    std::chrono::milliseconds processing_delay_{10}; // Minimum delay between requests
-    size_t max_queue_size_{1000};
-    
-    // Worker thread main loop
+    // Worker thread main loop - hot path for performance
     void WorkerLoop() {
         LOG_ProcessingPipeline("Pipeline '" + pipeline_name_ + "' worker thread started");
         
-        while (state_.load() != PipelineState::SHUTDOWN) {
+        while (state_.load(std::memory_order_acquire) != PipelineState::SHUTDOWN) [[likely]] {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             
             // Wait for requests or shutdown signal
-            queue_condition_.wait(lock, [this]() {
+            queue_condition_.wait(lock, [this]() noexcept {
                 return !request_queue_.empty() || 
-                       state_.load() == PipelineState::SHUTDOWN ||
-                       state_.load() == PipelineState::PAUSED;
+                       state_.load(std::memory_order_acquire) == PipelineState::SHUTDOWN;
             });
             
             // Check for shutdown
-            if (state_.load() == PipelineState::SHUTDOWN) {
+            if (state_.load(std::memory_order_acquire) == PipelineState::SHUTDOWN) [[unlikely]] {
                 break;
             }
             
-            // Check for pause
-            if (state_.load() == PipelineState::PAUSED) {
-                continue;
-            }
-            
             // Process next request if available
-            if (!request_queue_.empty()) {
-                auto pipeline_request = request_queue_.top();
+            if (!request_queue_.empty()) [[likely]] {
+                auto pipeline_request = std::move(const_cast<PipelineRequest<RequestType>&>(request_queue_.top()));
                 request_queue_.pop();
-                stats_.pending_requests--;
+                stats_.pending_requests.fetch_sub(1, std::memory_order_acq_rel);
                 
                 lock.unlock();
                 
-                // Update state
-                state_ = PipelineState::PROCESSING;
+                // Update state and stats atomically
+                state_.store(PipelineState::PROCESSING, std::memory_order_release);
                 stats_.last_activity = std::chrono::steady_clock::now();
                 
                 // Process the request
                 ProcessRequest(std::move(pipeline_request));
                 
-                // Brief delay to prevent CPU spinning
-                std::this_thread::sleep_for(processing_delay_);
+                // Brief delay to prevent CPU spinning - only if needed
+                if (processing_delay_.count() > 0) [[unlikely]] {
+                    std::this_thread::sleep_for(processing_delay_);
+                }
                 
                 // Return to idle if no more requests
-                if (GetQueueDepth() == 0) {
-                    state_ = PipelineState::IDLE;
+                if (stats_.pending_requests.load(std::memory_order_acquire) == 0) [[likely]] {
+                    state_.store(PipelineState::IDLE, std::memory_order_release);
                 }
             }
         }
@@ -192,35 +324,37 @@ private:
         LOG_ProcessingPipeline("Pipeline '" + pipeline_name_ + "' worker thread shutting down");
     }
     
-    // Process a single request with error handling
+    // Process a single request with error handling - hot path for performance
     void ProcessRequest(PipelineRequest<RequestType> pipeline_request) {
-        if (!processor_) {
-            stats_.failed_requests++;
+        if (!processor_) [[unlikely]] {
+            stats_.failed_requests.fetch_add(1, std::memory_order_relaxed);
             LOG_ERROR("ProcessingPipeline", "Pipeline '" + pipeline_name_ + "' processor is null!");
             return;
         }
         
         try {
-            // Success callback
+            // Success callback - most common execution path
             auto success_callback = [this](ResultType result) {
-                stats_.completed_requests++;
+                stats_.completed_requests.fetch_add(1, std::memory_order_relaxed);
                 // Result is handled by the processor's internal callback logic
             };
             
-            // Error callback
-            auto error_callback = [this, request_id = pipeline_request.request_id](const std::string& error) {
-                stats_.failed_requests++;
+            // Error callback with request_id capture for debugging - rare execution path
+            auto error_callback = [this, request_id = std::move(pipeline_request.request_id)](const std::string& error) {
+                stats_.failed_requests.fetch_add(1, std::memory_order_relaxed);
                 LOG_ERROR("ProcessingPipeline", "Pipeline '" + pipeline_name_ + "' processing failed: " + error);
             };
             
             // Execute the processor
-            processor_(pipeline_request.request, success_callback, error_callback);
+            processor_(pipeline_request.request, std::move(success_callback), std::move(error_callback));
             
-        } catch (const std::exception& e) {
-            stats_.failed_requests++;
+        } catch (const std::exception& [[maybe_unused]] e) {
+            // Exception handling - rare case
+            stats_.failed_requests.fetch_add(1, std::memory_order_relaxed);
             LOG_ERROR("ProcessingPipeline", "Pipeline '" + pipeline_name_ + "' exception: " + std::string(e.what()));
         } catch (...) {
-            stats_.failed_requests++;
+            // Unknown exception handling - very rare case
+            stats_.failed_requests.fetch_add(1, std::memory_order_relaxed);
             LOG_ERROR("ProcessingPipeline", "Pipeline '" + pipeline_name_ + "' unknown exception");
         }
     }
@@ -231,8 +365,8 @@ public:
      * @param name Pipeline identifier for logging and debugging
      * @param processor Function that processes requests: (request, success_callback, error_callback) -> void
      */
-    explicit ProcessingPipeline(const std::string& name = "UnnamedPipeline",
-                               std::function<void(const RequestType&, std::function<void(ResultType)>, std::function<void(const std::string&)>)> processor = nullptr)
+    explicit ProcessingPipeline(std::string_view name = "UnnamedPipeline",
+                               std::function<void(const RequestType&, std::function<void(ResultType)>, std::function<void(const std::string&)>)> processor = nullptr) noexcept
         : processor_(std::move(processor)), pipeline_name_(name) {
         
         // Don't auto-start - let the caller start when ready
@@ -241,7 +375,7 @@ public:
     /**
      * Destructor - ensures clean shutdown
      */
-    ~ProcessingPipeline() {
+    ~ProcessingPipeline() noexcept {
         Shutdown();
     }
     
@@ -254,26 +388,26 @@ public:
         : processor_(std::move(other.processor_)),
           request_queue_(std::move(other.request_queue_)),
           worker_thread_(std::move(other.worker_thread_)),
-          state_(other.state_.load()),
+          state_(other.state_.load(std::memory_order_relaxed)),
           stats_(std::move(other.stats_)),
           pipeline_name_(std::move(other.pipeline_name_)),
           processing_delay_(other.processing_delay_),
           max_queue_size_(other.max_queue_size_) {
-        other.state_ = PipelineState::SHUTDOWN;
+        other.state_.store(PipelineState::SHUTDOWN, std::memory_order_relaxed);
     }
     
     ProcessingPipeline& operator=(ProcessingPipeline&& other) noexcept {
-        if (this != &other) {
+        if (this != &other) [[likely]] {
             Shutdown();
             processor_ = std::move(other.processor_);
             request_queue_ = std::move(other.request_queue_);
             worker_thread_ = std::move(other.worker_thread_);
-            state_ = other.state_.load();
+            state_.store(other.state_.load(std::memory_order_relaxed), std::memory_order_relaxed);
             stats_ = std::move(other.stats_);
             pipeline_name_ = std::move(other.pipeline_name_);
             processing_delay_ = other.processing_delay_;
             max_queue_size_ = other.max_queue_size_;
-            other.state_ = PipelineState::SHUTDOWN;
+            other.state_.store(PipelineState::SHUTDOWN, std::memory_order_relaxed);
         }
         return *this;
     }
@@ -282,44 +416,79 @@ public:
      * Set the processor function
      * Thread-safe: Can be called while pipeline is running
      */
-    void SetProcessor(std::function<void(const RequestType&, std::function<void(ResultType)>, std::function<void(const std::string&)>)> processor) {
+    inline void SetProcessor(std::function<void(const RequestType&, std::function<void(ResultType)>, std::function<void(const std::string&)>)> processor) noexcept {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         processor_ = std::move(processor);
     }
     
     /**
-     * Queue a request for processing
+     * Queue a request for processing (const reference version)
      * @param request The request to process
      * @param priority Priority level for queue ordering
      * @param request_id Optional identifier for tracking
      * @return true if queued successfully, false if queue is full or pipeline is shutdown
      */
-    bool QueueRequest(const RequestType& request, 
+    [[nodiscard]] inline bool QueueRequest(const RequestType& request, 
                      RequestPriority priority = RequestPriority::NORMAL,
-                     const std::string& request_id = "") {
+                     std::string_view request_id = "") noexcept {
         
         std::lock_guard<std::mutex> lock(queue_mutex_);
         
         // Check if shutdown
-        if (state_.load() == PipelineState::SHUTDOWN) {
+        if (state_.load(std::memory_order_relaxed) == PipelineState::SHUTDOWN) [[unlikely]] {
             return false;
         }
         
         // Check queue capacity
-        if (request_queue_.size() >= max_queue_size_) {
+        if (request_queue_.size() >= max_queue_size_) [[unlikely]] {
             LOG_ProcessingPipeline("Pipeline '" + pipeline_name_ + "' queue is full, rejecting request");
             return false;
         }
         
-        // Add to queue
-        request_queue_.emplace(request, priority, request_id);
-        stats_.total_requests++;
-        stats_.pending_requests++;
+        // Add to queue (successful case - most common path)
+        request_queue_.emplace(request, priority, std::string(request_id));
+        stats_.total_requests.fetch_add(1, std::memory_order_relaxed);
+        stats_.pending_requests.fetch_add(1, std::memory_order_relaxed);
         
         // Notify worker thread
         queue_condition_.notify_one();
         
-        return true;
+        return true; // [[likely]] - most queue requests succeed
+    }
+    
+    /**
+     * Queue a request for processing (move version for optimal performance)
+     * @param request The request to process (will be moved)
+     * @param priority Priority level for queue ordering
+     * @param request_id Optional identifier for tracking
+     * @return true if queued successfully, false if queue is full or pipeline is shutdown
+     */
+    [[nodiscard]] inline bool QueueRequest(RequestType&& request, 
+                     RequestPriority priority = RequestPriority::NORMAL,
+                     std::string_view request_id = "") noexcept {
+        
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        
+        // Check if shutdown
+        if (state_.load(std::memory_order_relaxed) == PipelineState::SHUTDOWN) [[unlikely]] {
+            return false;
+        }
+        
+        // Check queue capacity
+        if (request_queue_.size() >= max_queue_size_) [[unlikely]] {
+            LOG_ProcessingPipeline("Pipeline '" + pipeline_name_ + "' queue is full, rejecting request");
+            return false;
+        }
+        
+        // Add to queue using move semantics (successful case - most common path)
+        request_queue_.emplace(std::move(request), priority, std::string(request_id));
+        stats_.total_requests.fetch_add(1, std::memory_order_relaxed);
+        stats_.pending_requests.fetch_add(1, std::memory_order_relaxed);
+        
+        // Notify worker thread
+        queue_condition_.notify_one();
+        
+        return true; // [[likely]] - most queue requests succeed
     }
     
     /**
@@ -329,41 +498,25 @@ public:
         std::unique_lock<std::mutex> lock(queue_mutex_);
         
         // If we already have a running thread, don't start another one
-        if (worker_thread_ && state_.load() != PipelineState::SHUTDOWN) {
+        if (worker_thread_ && state_.load(std::memory_order_relaxed) != PipelineState::SHUTDOWN) [[unlikely]] {
             return; // Already started
         }
         
         // Join any existing thread before creating a new one
-        if (worker_thread_ && worker_thread_->joinable()) {
+        if (worker_thread_ && worker_thread_->joinable()) [[unlikely]] {
             // Temporarily release lock to avoid deadlock during join
             lock.unlock();
             worker_thread_->join();
             lock.lock();
         }
         
-        state_ = PipelineState::IDLE;
+        state_.store(PipelineState::IDLE, std::memory_order_relaxed);
         worker_thread_ = std::make_unique<std::thread>(&ProcessingPipeline::WorkerLoop, this);
         
         LOG_ProcessingPipeline("Pipeline '" + pipeline_name_ + "' started");
     }
     
-    /**
-     * Pause processing (requests continue to queue but are not processed)
-     */
-    void Pause() {
-        state_ = PipelineState::PAUSED;
-        queue_condition_.notify_all();
-    }
-    
-    /**
-     * Resume processing from paused state
-     */
-    void Resume() {
-        if (state_.load() == PipelineState::PAUSED) {
-            state_ = PipelineState::IDLE;
-            queue_condition_.notify_all();
-        }
-    }
+
     
     /**
      * Shutdown the pipeline and wait for worker thread to complete
@@ -371,98 +524,98 @@ public:
     void Shutdown() {
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
-            state_ = PipelineState::SHUTDOWN;
+            state_.store(PipelineState::SHUTDOWN, std::memory_order_release);
         }
         queue_condition_.notify_all();
         
-        if (worker_thread_ && worker_thread_->joinable()) {
+        if (worker_thread_ && worker_thread_->joinable()) [[likely]] {
             worker_thread_->join();
         }
     }
     
     /**
-     * Clear all pending requests
-     */
-    void ClearQueue() {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        
-        size_t cleared_count = request_queue_.size();
-        while (!request_queue_.empty()) {
-            request_queue_.pop();
-        }
-        
-        stats_.pending_requests = 0;
-        // Note: We don't adjust total_requests since they were validly submitted
-    }
-    
-    /**
-     * Get current pipeline state
-     */
-    PipelineState GetState() const noexcept {
-        return state_.load();
-    }
-    
-    /**
-     * Get current queue depth
-     */
-    uint64_t GetQueueDepth() const noexcept {
-        return stats_.GetQueueDepth();
-    }
-    
-    /**
      * Get pipeline statistics
      */
-    PipelineStats GetStats() const noexcept {
+    [[nodiscard]] inline PipelineStats GetStats() const noexcept {
         return stats_;
     }
     
     /**
      * Get pipeline name
      */
-    const std::string& GetName() const noexcept {
+    [[nodiscard]] inline const std::string& GetPipelineName() const noexcept {
         return pipeline_name_;
     }
     
     /**
-     * Configure processing delay between requests
+     * Get processing delay
      */
-    void SetProcessingDelay(std::chrono::milliseconds delay) noexcept {
-        processing_delay_ = delay;
+    [[nodiscard]] inline std::chrono::milliseconds GetProcessingDelay() const noexcept {
+        return processing_delay_;
     }
     
     /**
-     * Configure maximum queue size
+     * Get maximum queue size
      */
-    void SetMaxQueueSize(size_t max_size) noexcept {
-        max_queue_size_ = max_size;
+    [[nodiscard]] inline size_t GetMaxQueueSize() const noexcept {
+        return max_queue_size_;
     }
     
     /**
      * Check if pipeline is actively processing
      */
-    bool IsProcessing() const noexcept {
-        return state_.load() == PipelineState::PROCESSING;
+    [[nodiscard]] inline bool IsProcessing() const noexcept {
+        return state_.load(std::memory_order_relaxed) == PipelineState::PROCESSING;
     }
     
     /**
      * Check if pipeline is idle (ready to process but no requests queued)
      */
-    bool IsIdle() const noexcept {
-        return state_.load() == PipelineState::IDLE;
-    }
-    
-    /**
-     * Check if pipeline is paused
-     */
-    bool IsPaused() const noexcept {
-        return state_.load() == PipelineState::PAUSED;
+    [[nodiscard]] inline bool IsIdle() const noexcept {
+        return state_.load(std::memory_order_relaxed) == PipelineState::IDLE;
     }
     
     /**
      * Check if pipeline is shutdown
      */
-    bool IsShutdown() const noexcept {
-        return state_.load() == PipelineState::SHUTDOWN;
+    [[nodiscard]] inline bool IsShutdown() const noexcept {
+        return state_.load(std::memory_order_relaxed) == PipelineState::SHUTDOWN;
+    }
+    
+    /**
+     * Check if processor is set
+     */
+    [[nodiscard]] inline bool HasProcessor() const noexcept {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        return static_cast<bool>(processor_);
+    }
+    
+    // Compile-time utility functions
+    
+    /**
+     * Validate pipeline configuration at compile time
+     */
+    consteval static bool ValidateConfiguration(size_t max_queue_size, int64_t processing_delay_ms) noexcept {
+        return detail::is_valid_queue_size(max_queue_size) && 
+               detail::is_valid_processing_delay_ms(processing_delay_ms);
+    }
+    
+    /**
+     * Get compile-time cache line size
+     */
+    [[nodiscard]] consteval static size_t GetCacheLineSize() noexcept {
+        return constants::cache_line_size;
+    }
+    
+    /**
+     * Get compile-time default values
+     */
+    [[nodiscard]] consteval static size_t GetDefaultMaxQueueSize() noexcept {
+        return constants::default_max_queue_size;
+    }
+    
+    [[nodiscard]] consteval static std::chrono::milliseconds GetDefaultProcessingDelay() noexcept {
+        return std::chrono::milliseconds{constants::default_processing_delay_ms};
     }
 };
 

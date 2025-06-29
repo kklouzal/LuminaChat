@@ -19,7 +19,7 @@
 namespace LuminaChat {
     class SummarizationPlugin;
     class EmoTagPlugin;
-    enum class RequestPriority;
+    enum class RequestPriority : uint8_t;
 }
 
 // Use plugin structures directly instead of duplicating them
