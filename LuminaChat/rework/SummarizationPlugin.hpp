@@ -716,7 +716,7 @@ inline void Orchestrator::RequestSummarization(const PrunedMessageBatch& batch) 
     LuminaChat::SummarizationRequest request(batch, batch.context_id);
     
     // Queue for processing
-    summarization_pipeline.QueueRequest(request);
+    [[maybe_unused]] auto queue_result = summarization_pipeline.QueueRequest(request);
 }
 
 inline void Orchestrator::OnSummarizationComplete(const std::string& context_id, 
@@ -747,11 +747,8 @@ inline void Orchestrator::OnSummarizationComplete(const std::string& context_id,
             LOG_Orchestrator("Summary applied to context: " + context_id);
         }
         
-        // Update statistics
-        {
-            std::lock_guard<std::mutex> lock(stats_mutex);
-            stats.summarizations_completed++;
-        }
+        // Update statistics using lock-free atomic increment
+        stats.summarizations_completed.fetch_add(1, std::memory_order_relaxed);
     } else {
         LOG_ERROR_Orchestrator("Summarization failed: " + response.error_message);
     }

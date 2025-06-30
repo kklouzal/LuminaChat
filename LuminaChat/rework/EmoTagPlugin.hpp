@@ -508,7 +508,7 @@ private:
             
             // Build analysis prompt from AI responses
             std::ostringstream analysis_stream;
-            analysis_stream << "Categorize my emotional state; identify the presence of any emotions present from the following.\n";
+            analysis_stream << "Categorize my emotional state in 1-3 short sentences; identify the presence of any emotions present from the following:\n\n";
 
             for (size_t i = 0; i < batch.ai_responses.size(); ++i) {
                 analysis_stream << (i + 1) << ": " << batch.ai_responses[i] << "\n";
@@ -737,10 +737,8 @@ inline void Orchestrator::OnEmotionAnalysisComplete(const std::string& context_i
         }
         
         // Update statistics
-        {
-            std::lock_guard<std::mutex> lock(stats_mutex);
-            stats.emotion_analyses_completed++;
-        }
+        // Update statistics using lock-free atomic increment
+        stats.emotion_analyses_completed.fetch_add(1, std::memory_order_relaxed);
     } else {
         LOG_ERROR_Orchestrator("Emotion analysis failed: " + response.error_message);
     }
