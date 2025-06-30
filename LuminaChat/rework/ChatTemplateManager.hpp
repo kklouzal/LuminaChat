@@ -332,10 +332,6 @@ public:
         render_section("internal", sections[7].content);
     }
     
-    if (sections[8].active) [[unlikely]] { // EMOTIONAL_STATE
-        render_section("emotion", sections[8].content);
-    }
-    
     // Add conversation history
     for (const auto& [role, content] : messages) {
         if (role == "assistant") [[likely]] { // Assistant messages more common in history
@@ -350,6 +346,10 @@ public:
             result += content;
             result += "\n<|eot_id|>\n";
         }
+    }
+    
+    if (sections[8].active) [[unlikely]] { // EMOTIONAL_STATE
+        render_section("emotion", sections[8].content);
     }
     
     // Add final assistant turn marker

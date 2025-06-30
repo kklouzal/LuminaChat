@@ -264,6 +264,7 @@ private:
     
     // Core processing components
     std::function<void(const RequestType&, std::function<void(ResultType)>, std::function<void(const std::string&)>)> processor_;
+    std::atomic<bool> has_processor_{false}; // Track processor availability without locking
     std::priority_queue<PipelineRequest<RequestType>> request_queue_;
     std::unique_ptr<std::thread> worker_thread_;
     
@@ -274,7 +275,7 @@ private:
     // Configuration and identification
     std::string pipeline_name_;
     std::chrono::milliseconds processing_delay_{constants::default_processing_delay_ms}; // Minimum delay between requests
-    size_t max_queue_size_{constants::default_max_queue_size};
+    std::atomic<size_t> max_queue_size_{constants::default_max_queue_size}; // Make atomic to avoid locking in queue size checks
     
     // Worker thread main loop - hot path for performance
     void WorkerLoop() {
@@ -326,7 +327,8 @@ private:
     
     // Process a single request with error handling - hot path for performance
     void ProcessRequest(PipelineRequest<RequestType> pipeline_request) {
-        if (!processor_) [[unlikely]] {
+        // Fast atomic check first before accessing processor_ under lock
+        if (!has_processor_.load(std::memory_order_acquire)) [[unlikely]] {
             stats_.failed_requests.fetch_add(1, std::memory_order_relaxed);
             LOG_ERROR("ProcessingPipeline", "Pipeline '" + pipeline_name_ + "' processor is null!");
             return;
@@ -369,6 +371,9 @@ public:
                                std::function<void(const RequestType&, std::function<void(ResultType)>, std::function<void(const std::string&)>)> processor = nullptr) noexcept
         : processor_(std::move(processor)), pipeline_name_(name) {
         
+        // Update atomic processor flag
+        has_processor_.store(static_cast<bool>(processor_), std::memory_order_relaxed);
+        
         // Don't auto-start - let the caller start when ready
     }
     
@@ -386,28 +391,32 @@ public:
     // Move constructor and assignment
     ProcessingPipeline(ProcessingPipeline&& other) noexcept
         : processor_(std::move(other.processor_)),
+          has_processor_(other.has_processor_.load(std::memory_order_relaxed)),
           request_queue_(std::move(other.request_queue_)),
           worker_thread_(std::move(other.worker_thread_)),
           state_(other.state_.load(std::memory_order_relaxed)),
           stats_(std::move(other.stats_)),
           pipeline_name_(std::move(other.pipeline_name_)),
           processing_delay_(other.processing_delay_),
-          max_queue_size_(other.max_queue_size_) {
+          max_queue_size_(other.max_queue_size_.load(std::memory_order_relaxed)) {
         other.state_.store(PipelineState::SHUTDOWN, std::memory_order_relaxed);
+        other.has_processor_.store(false, std::memory_order_relaxed);
     }
     
     ProcessingPipeline& operator=(ProcessingPipeline&& other) noexcept {
         if (this != &other) [[likely]] {
             Shutdown();
             processor_ = std::move(other.processor_);
+            has_processor_.store(other.has_processor_.load(std::memory_order_relaxed), std::memory_order_relaxed);
             request_queue_ = std::move(other.request_queue_);
             worker_thread_ = std::move(other.worker_thread_);
             state_.store(other.state_.load(std::memory_order_relaxed), std::memory_order_relaxed);
             stats_ = std::move(other.stats_);
             pipeline_name_ = std::move(other.pipeline_name_);
             processing_delay_ = other.processing_delay_;
-            max_queue_size_ = other.max_queue_size_;
+            max_queue_size_.store(other.max_queue_size_.load(std::memory_order_relaxed), std::memory_order_relaxed);
             other.state_.store(PipelineState::SHUTDOWN, std::memory_order_relaxed);
+            other.has_processor_.store(false, std::memory_order_relaxed);
         }
         return *this;
     }
@@ -419,6 +428,7 @@ public:
     inline void SetProcessor(std::function<void(const RequestType&, std::function<void(ResultType)>, std::function<void(const std::string&)>)> processor) noexcept {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         processor_ = std::move(processor);
+        has_processor_.store(static_cast<bool>(processor_), std::memory_order_release);
     }
     
     /**
@@ -439,8 +449,8 @@ public:
             return false;
         }
         
-        // Check queue capacity
-        if (request_queue_.size() >= max_queue_size_) [[unlikely]] {
+        // Check queue capacity (now lock-free)
+        if (request_queue_.size() >= max_queue_size_.load(std::memory_order_relaxed)) [[unlikely]] {
             LOG_ProcessingPipeline("Pipeline '" + pipeline_name_ + "' queue is full, rejecting request");
             return false;
         }
@@ -474,8 +484,8 @@ public:
             return false;
         }
         
-        // Check queue capacity
-        if (request_queue_.size() >= max_queue_size_) [[unlikely]] {
+        // Check queue capacity (now lock-free)
+        if (request_queue_.size() >= max_queue_size_.load(std::memory_order_relaxed)) [[unlikely]] {
             LOG_ProcessingPipeline("Pipeline '" + pipeline_name_ + "' queue is full, rejecting request");
             return false;
         }
@@ -558,7 +568,7 @@ public:
      * Get maximum queue size
      */
     [[nodiscard]] inline size_t GetMaxQueueSize() const noexcept {
-        return max_queue_size_;
+        return max_queue_size_.load(std::memory_order_relaxed);
     }
     
     /**
@@ -583,11 +593,19 @@ public:
     }
     
     /**
-     * Check if processor is set
+     * Check if processor is set (lock-free)
      */
     [[nodiscard]] inline bool HasProcessor() const noexcept {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        return static_cast<bool>(processor_);
+        return has_processor_.load(std::memory_order_acquire);
+    }
+    
+    /**
+     * Set maximum queue size atomically
+     */
+    inline void SetMaxQueueSize(size_t new_size) noexcept {
+        if (detail::is_valid_queue_size(new_size)) [[likely]] {
+            max_queue_size_.store(new_size, std::memory_order_relaxed);
+        }
     }
     
     // Compile-time utility functions
