@@ -173,11 +173,11 @@ private:
     std::unique_ptr<SettingsManager> settings_manager;
     std::unique_ptr<Sanitizer> sanitizer;
     std::unique_ptr<DiscordManager> discord_manager;
-    std::unique_ptr<ContextSizeManager> context_size_manager;
     std::unique_ptr<LlamaManager> llama_manager;
     std::unique_ptr<Orchestrator> orchestrator;
     std::unique_ptr<LuminaChat::SummarizationPlugin> summarization_plugin;
     std::unique_ptr<LuminaChat::EmoTagPlugin> emotag_plugin;
+    std::unique_ptr<LuminaChat::ContextSizeManagerPlugin> context_size_manager_plugin;
     
     // System state
     std::atomic<bool> running{false};
@@ -936,9 +936,6 @@ void LuminaChatFrame::Start() {
         discord_manager = std::make_unique<DiscordManager>();
         AddLogMessage("Discord Manager initialized");
         
-        context_size_manager = std::make_unique<ContextSizeManager>();
-        AddLogMessage("Context Size Manager initialized");
-        
         // Initialize LlamaManager with settings integration
         llama_manager = std::make_unique<LlamaManager>(settings_manager.get());
         if (!llama_manager->Initialize()) {
@@ -946,7 +943,7 @@ void LuminaChatFrame::Start() {
             throw std::runtime_error("LlamaManager initialization failed");
         }
         AddLogMessage("Llama Manager initialized with llama.cpp backend");
-        
+
         orchestrator = std::make_unique<Orchestrator>(llama_manager.get());
         if (!orchestrator->Initialize()) {
             AddLogMessage("ERROR: Failed to initialize Orchestrator");
@@ -1013,7 +1010,6 @@ void LuminaChatFrame::Stop() {
     }
     orchestrator.reset();
     llama_manager.reset();
-    context_size_manager.reset();
     discord_manager.reset();
     sanitizer.reset();
     settings_manager.reset();
@@ -1292,6 +1288,17 @@ void LuminaChatFrame::InitializePlugins() {
         
         // Update plugin status
         UpdateEmoTagPluginStatus("Initialized and ready", wxColour(0, 150, 0));
+        
+        // Initialize and start ContextSizeManagerPlugin
+        context_size_manager_plugin = std::make_unique<LuminaChat::ContextSizeManagerPlugin>(orchestrator.get());
+        
+        if (!context_size_manager_plugin->Initialize()) {
+            AddLogMessage("Failed to initialize ContextSizeManagerPlugin");
+        } else {
+            AddLogMessage("ContextSizeManagerPlugin initialized successfully");
+            // Note: Registration would be added to Orchestrator when the integration is implemented
+            // orchestrator->RegisterContextSizeManagerPlugin(context_size_manager_plugin.get());
+        }
         
         AddLogMessage("All plugins initialized successfully");
         

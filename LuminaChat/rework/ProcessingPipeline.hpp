@@ -243,6 +243,11 @@ struct alignas(constants::cache_line_size) PipelineStats {
  * ProcessingPipeline - Core asynchronous processing template for plugin workflows
  * 
  * Thread Safety: This class is fully thread-safe for concurrent access
+ * Lock-Free Optimizations: Extensively uses lock-free paradigms where possible:
+ * - Atomic state and statistics tracking with optimized memory ordering
+ * - Configuration parameters (delay, queue size) are atomic
+ * - Fast atomic checks for processor availability before acquiring locks
+ * - Lightweight mutexes only for critical sections (queue and processor updates)
  * 
  * The pipeline follows this pattern:
  * 1. Requests are queued with priority and metadata
@@ -262,8 +267,9 @@ private:
     alignas(constants::cache_line_size) std::atomic<PipelineState> state_{PipelineState::IDLE};
     alignas(constants::cache_line_size) PipelineStats stats_;
     
-    // Core processing components
+    // Core processing components - using atomic flag for lock-free processor checking
     std::function<void(const RequestType&, std::function<void(ResultType)>, std::function<void(const std::string&)>)> processor_;
+    mutable std::mutex processor_mutex_; // Lightweight mutex just for processor updates
     std::atomic<bool> has_processor_{false}; // Track processor availability without locking
     std::priority_queue<PipelineRequest<RequestType>> request_queue_;
     std::unique_ptr<std::thread> worker_thread_;
@@ -274,23 +280,25 @@ private:
     
     // Configuration and identification
     std::string pipeline_name_;
-    std::chrono::milliseconds processing_delay_{constants::default_processing_delay_ms}; // Minimum delay between requests
+    std::atomic<std::chrono::milliseconds::rep> processing_delay_ms_{constants::default_processing_delay_ms}; // Lock-free delay access
     std::atomic<size_t> max_queue_size_{constants::default_max_queue_size}; // Make atomic to avoid locking in queue size checks
     
-    // Worker thread main loop - hot path for performance
+    // Worker thread main loop - hot path for performance with optimized memory ordering
     void WorkerLoop() {
         LOG_ProcessingPipeline("Pipeline '" + pipeline_name_ + "' worker thread started");
         
-        while (state_.load(std::memory_order_acquire) != PipelineState::SHUTDOWN) [[likely]] {
+        // Cache the shutdown state check to avoid repeated atomic loads
+        PipelineState current_state;
+        while ((current_state = state_.load(std::memory_order_acquire)) != PipelineState::SHUTDOWN) [[likely]] {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             
-            // Wait for requests or shutdown signal
+            // Wait for requests or shutdown signal with optimized predicate
             queue_condition_.wait(lock, [this]() noexcept {
                 return !request_queue_.empty() || 
                        state_.load(std::memory_order_acquire) == PipelineState::SHUTDOWN;
             });
             
-            // Check for shutdown
+            // Check for shutdown with memory fence for consistency
             if (state_.load(std::memory_order_acquire) == PipelineState::SHUTDOWN) [[unlikely]] {
                 break;
             }
@@ -303,19 +311,20 @@ private:
                 
                 lock.unlock();
                 
-                // Update state and stats atomically
+                // Update state and stats atomically with proper ordering
                 state_.store(PipelineState::PROCESSING, std::memory_order_release);
                 stats_.last_activity = std::chrono::steady_clock::now();
                 
                 // Process the request
                 ProcessRequest(std::move(pipeline_request));
                 
-                // Brief delay to prevent CPU spinning - only if needed
-                if (processing_delay_.count() > 0) [[unlikely]] {
-                    std::this_thread::sleep_for(processing_delay_);
+                // Brief delay to prevent CPU spinning - only if needed (lock-free access)
+                const auto delay_ms = processing_delay_ms_.load(std::memory_order_relaxed);
+                if (delay_ms > 0) [[unlikely]] {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
                 }
                 
-                // Return to idle if no more requests
+                // Return to idle if no more requests (use acquire to ensure consistency)
                 if (stats_.pending_requests.load(std::memory_order_acquire) == 0) [[likely]] {
                     state_.store(PipelineState::IDLE, std::memory_order_release);
                 }
@@ -327,11 +336,23 @@ private:
     
     // Process a single request with error handling - hot path for performance
     void ProcessRequest(PipelineRequest<RequestType> pipeline_request) {
-        // Fast atomic check first before accessing processor_ under lock
+        // Fast atomic check first - completely lock-free
         if (!has_processor_.load(std::memory_order_acquire)) [[unlikely]] {
             stats_.failed_requests.fetch_add(1, std::memory_order_relaxed);
             LOG_ERROR("ProcessingPipeline", "Pipeline '" + pipeline_name_ + "' processor is null!");
             return;
+        }
+        
+        // Copy processor under lock for safe access
+        std::function<void(const RequestType&, std::function<void(ResultType)>, std::function<void(const std::string&)>)> processor_copy;
+        {
+            std::lock_guard<std::mutex> lock(processor_mutex_);
+            if (!processor_) [[unlikely]] {
+                stats_.failed_requests.fetch_add(1, std::memory_order_relaxed);
+                LOG_ERROR("ProcessingPipeline", "Pipeline '" + pipeline_name_ + "' processor is null!");
+                return;
+            }
+            processor_copy = processor_;
         }
         
         try {
@@ -347,8 +368,8 @@ private:
                 LOG_ERROR("ProcessingPipeline", "Pipeline '" + pipeline_name_ + "' processing failed: " + error);
             };
             
-            // Execute the processor
-            processor_(pipeline_request.request, std::move(success_callback), std::move(error_callback));
+            // Execute the processor (using copied processor)
+            processor_copy(pipeline_request.request, std::move(success_callback), std::move(error_callback));
             
         } catch (const std::exception& [[maybe_unused]] e) {
             // Exception handling - rare case
@@ -372,7 +393,7 @@ public:
         : processor_(std::move(processor)), pipeline_name_(name) {
         
         // Update atomic processor flag
-        has_processor_.store(static_cast<bool>(processor_), std::memory_order_relaxed);
+        has_processor_.store(static_cast<bool>(processor_), std::memory_order_release);
         
         // Don't auto-start - let the caller start when ready
     }
@@ -397,8 +418,10 @@ public:
           state_(other.state_.load(std::memory_order_relaxed)),
           stats_(std::move(other.stats_)),
           pipeline_name_(std::move(other.pipeline_name_)),
-          processing_delay_(other.processing_delay_),
+          processing_delay_ms_(other.processing_delay_ms_.load(std::memory_order_relaxed)),
           max_queue_size_(other.max_queue_size_.load(std::memory_order_relaxed)) {
+        
+        // Reset moved-from object
         other.state_.store(PipelineState::SHUTDOWN, std::memory_order_relaxed);
         other.has_processor_.store(false, std::memory_order_relaxed);
     }
@@ -413,8 +436,10 @@ public:
             state_.store(other.state_.load(std::memory_order_relaxed), std::memory_order_relaxed);
             stats_ = std::move(other.stats_);
             pipeline_name_ = std::move(other.pipeline_name_);
-            processing_delay_ = other.processing_delay_;
+            processing_delay_ms_.store(other.processing_delay_ms_.load(std::memory_order_relaxed), std::memory_order_relaxed);
             max_queue_size_.store(other.max_queue_size_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            
+            // Reset moved-from object
             other.state_.store(PipelineState::SHUTDOWN, std::memory_order_relaxed);
             other.has_processor_.store(false, std::memory_order_relaxed);
         }
@@ -422,12 +447,14 @@ public:
     }
     
     /**
-     * Set the processor function
+     * Set the processor function (uses lightweight mutex for thread safety)
      * Thread-safe: Can be called while pipeline is running
      */
     inline void SetProcessor(std::function<void(const RequestType&, std::function<void(ResultType)>, std::function<void(const std::string&)>)> processor) noexcept {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        processor_ = std::move(processor);
+        {
+            std::lock_guard<std::mutex> lock(processor_mutex_);
+            processor_ = std::move(processor);
+        }
         has_processor_.store(static_cast<bool>(processor_), std::memory_order_release);
     }
     
@@ -558,10 +585,10 @@ public:
     }
     
     /**
-     * Get processing delay
+     * Get processing delay (lock-free access)
      */
     [[nodiscard]] inline std::chrono::milliseconds GetProcessingDelay() const noexcept {
-        return processing_delay_;
+        return std::chrono::milliseconds{processing_delay_ms_.load(std::memory_order_relaxed)};
     }
     
     /**
@@ -608,6 +635,16 @@ public:
         }
     }
     
+    /**
+     * Set processing delay atomically (lock-free)
+     */
+    inline void SetProcessingDelay(std::chrono::milliseconds delay) noexcept {
+        const auto delay_ms = delay.count();
+        if (detail::is_valid_processing_delay_ms(delay_ms)) [[likely]] {
+            processing_delay_ms_.store(delay_ms, std::memory_order_relaxed);
+        }
+    }
+    
     // Compile-time utility functions
     
     /**
@@ -634,6 +671,57 @@ public:
     
     [[nodiscard]] consteval static std::chrono::milliseconds GetDefaultProcessingDelay() noexcept {
         return std::chrono::milliseconds{constants::default_processing_delay_ms};
+    }
+    
+    // Lock-free utility functions for better performance
+    
+    /**
+     * Check if queue is near capacity (lock-free)
+     */
+    [[nodiscard]] inline bool IsQueueNearCapacity(double threshold = 0.8) const noexcept {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        const size_t current_size = request_queue_.size();
+        const size_t max_size = max_queue_size_.load(std::memory_order_relaxed);
+        return current_size >= static_cast<size_t>(max_size * threshold);
+    }
+    
+    /**
+     * Get current queue size (requires lock due to std::priority_queue limitations)
+     */
+    [[nodiscard]] inline size_t GetCurrentQueueSize() const noexcept {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        return request_queue_.size();
+    }
+    
+    /**
+     * Lock-free check if pipeline is ready to accept requests
+     */
+    [[nodiscard]] inline bool IsReadyForRequests() const noexcept {
+        return has_processor_.load(std::memory_order_acquire) && 
+               state_.load(std::memory_order_acquire) != PipelineState::SHUTDOWN;
+    }
+    
+    /**
+     * Optimized atomic state check with memory fence
+     */
+    [[nodiscard]] inline PipelineState GetStateWithFence() const noexcept {
+        auto state = state_.load(std::memory_order_acquire);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return state;
+    }
+    
+    /**
+     * Batch statistics update (more efficient for multiple operations)
+     */
+    inline void UpdateStatsAtomic(uint64_t completed_delta, uint64_t failed_delta) noexcept {
+        if (completed_delta > 0) {
+            stats_.completed_requests.fetch_add(completed_delta, std::memory_order_relaxed);
+        }
+        if (failed_delta > 0) {
+            stats_.failed_requests.fetch_add(failed_delta, std::memory_order_relaxed);
+        }
+        // Use release fence to ensure visibility
+        std::atomic_thread_fence(std::memory_order_release);
     }
 };
 

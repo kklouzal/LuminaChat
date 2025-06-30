@@ -14,29 +14,11 @@
 #include <unordered_map>
 #include <string>
 #include <string_view>
-#include <deque>
-#include <optional>
-#include <vector>
 
 namespace LuminaChat {
 
 // Callback type for status updates
 using StatusUpdateCallback = std::function<void(const std::string& status, bool is_error)>;
-
-// Enums defined before they are used
-enum class PruningStrategy {
-    OLDEST_MESSAGES,      // Remove oldest conversation pairs
-    BALANCED,            // Mix of removal strategies
-    TEMPLATE_SECTIONS,   // Remove/compress template sections
-    EMERGENCY_CLEANUP    // Hard limit reached, aggressive cleanup
-};
-
-enum class PruningState {
-    NORMAL,              // Normal operation, no pruning needed
-    MONITORING,          // Approaching threshold, monitoring closely
-    PRUNING_REQUESTED,   // Pruning requested, waiting for completion
-    EMERGENCY_PRUNING    // Hard limit reached, emergency cleanup
-};
 
 // Request and response structures for the pipeline
 struct ContextSizePruningRequest {
@@ -98,6 +80,20 @@ struct ContextUsageStats {
         if (!NeedsPruning()) return 0;
         return total_tokens - GetTargetTokensAfterPruning(target);
     }
+};
+
+enum class PruningStrategy {
+    OLDEST_MESSAGES,      // Remove oldest conversation pairs
+    BALANCED,            // Mix of removal strategies
+    TEMPLATE_SECTIONS,   // Remove/compress template sections
+    EMERGENCY_CLEANUP    // Hard limit reached, aggressive cleanup
+};
+
+enum class PruningState {
+    NORMAL,              // Normal operation, no pruning needed
+    MONITORING,          // Approaching threshold, monitoring closely
+    PRUNING_REQUESTED,   // Pruning requested, waiting for completion
+    EMERGENCY_PRUNING    // Hard limit reached, emergency cleanup
 };
 
 /**
@@ -213,6 +209,12 @@ private:
 public:
     explicit ContextSizeManagerPlugin(Orchestrator* orch) 
         : orchestrator(orch) {
+        
+        if (orchestrator) {
+            llama_manager = orchestrator->GetLlamaManager();
+            settings_manager = orchestrator->GetSettingsManager();
+        }
+        
         LogInfo("ContextSizeManagerPlugin initialized as processor service");
     }
     
@@ -224,11 +226,6 @@ public:
      * Initialize the plugin (called by Orchestrator)
      */
     bool Initialize() {
-        if (orchestrator) {
-            llama_manager = orchestrator->GetLlamaManager();
-            settings_manager = orchestrator->GetSettingsManager();
-        }
-        
         LogInfo("ContextSizeManagerPlugin initialized");
         return true;
     }
