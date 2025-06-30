@@ -151,7 +151,7 @@
   <ItemGroup>
     <ClInclude Include="rework\ChatTemplateManager.hpp" />
     <ClInclude Include="rework\ContextInfo.hpp" />
-    <ClInclude Include="rework\ContextSizeManager.hpp" />
+    <ClInclude Include="rework\ContextPruningPlugin.hpp" />
     <ClInclude Include="rework\DiscordManager.hpp" />
     <ClInclude Include="rework\LlamaManager.hpp" />
     <ClInclude Include="rework\Logger.hpp" />

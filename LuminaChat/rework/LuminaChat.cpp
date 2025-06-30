@@ -8,7 +8,7 @@
 // 2. SettingsManager.hpp  
 // 3. Sanitizer.hpp
 // 4. DiscordManager.hpp
-// 5. ContextSizeManager.hpp
+// 5. ContextPruningPlugin.hpp
 // 6. TokenCache.hpp
 // 7. ModelInfo.hpp
 // 8. ChatTemplateManager.hpp
@@ -39,7 +39,7 @@
 #include "SettingsManager.hpp"
 #include "Sanitizer.hpp"
 #include "DiscordManager.hpp"
-#include "ContextSizeManager.hpp"
+#include "ContextPruningPlugin.hpp"
 #include "TokenCache.hpp"
 #include "ModelInfo.hpp"
 #include "ChatTemplateManager.hpp"
@@ -177,7 +177,7 @@ private:
     std::unique_ptr<Orchestrator> orchestrator;
     std::unique_ptr<LuminaChat::SummarizationPlugin> summarization_plugin;
     std::unique_ptr<LuminaChat::EmoTagPlugin> emotag_plugin;
-    std::unique_ptr<LuminaChat::ContextSizeManagerPlugin> context_size_manager_plugin;
+    std::unique_ptr<LuminaChat::ContextPruningPlugin> context_pruning_plugin;
     
     // System state
     std::atomic<bool> running{false};
@@ -1124,10 +1124,9 @@ void LuminaChatFrame::UpdateContextStatus() {
             return;
         }
         
-        // Get context usage information from stats
-        const auto& stats = context->GetStats();
-        int used_tokens = static_cast<int>(stats.current_context_tokens);
-        int max_tokens = static_cast<int>(stats.max_context_tokens);
+        // Get context usage information directly
+        int used_tokens = static_cast<int>(context->GetActualContextTokens());
+        int max_tokens = static_cast<int>(context->GetMaxContextTokens());
         
         // Format the status text
         wxString context_status = wxString::Format("Context: %d/%d", used_tokens, max_tokens);
@@ -1289,15 +1288,15 @@ void LuminaChatFrame::InitializePlugins() {
         // Update plugin status
         UpdateEmoTagPluginStatus("Initialized and ready", wxColour(0, 150, 0));
         
-        // Initialize and start ContextSizeManagerPlugin
-        context_size_manager_plugin = std::make_unique<LuminaChat::ContextSizeManagerPlugin>(orchestrator.get());
+        // Initialize and start ContextPruningPlugin
+        context_pruning_plugin = std::make_unique<LuminaChat::ContextPruningPlugin>(orchestrator.get());
         
-        if (!context_size_manager_plugin->Initialize()) {
-            AddLogMessage("Failed to initialize ContextSizeManagerPlugin");
+        if (!context_pruning_plugin->Initialize()) {
+            AddLogMessage("Failed to initialize ContextPruningPlugin");
         } else {
-            AddLogMessage("ContextSizeManagerPlugin initialized successfully");
+            AddLogMessage("ContextPruningPlugin initialized successfully");
             // Note: Registration would be added to Orchestrator when the integration is implemented
-            // orchestrator->RegisterContextSizeManagerPlugin(context_size_manager_plugin.get());
+            // orchestrator->RegisterContextPruningPlugin(context_pruning_plugin.get());
         }
         
         AddLogMessage("All plugins initialized successfully");

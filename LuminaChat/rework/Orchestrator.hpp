@@ -15,6 +15,7 @@
 #include "Sanitizer.hpp"
 #include "LlamaManager.hpp"
 #include "ContextInfo.hpp"
+#include "ContextStats.hpp"
 #include "Logger.hpp"
 
 // Performance constants and compile-time optimizations
@@ -63,6 +64,7 @@ namespace OrchestratorConstants {
 namespace LuminaChat {
     class SummarizationPlugin;
     class EmoTagPlugin;
+    class ContextPruningPlugin;
     enum class RequestPriority : uint8_t;
 }
 
@@ -72,6 +74,7 @@ namespace LuminaChat {
     struct SummarizationResponse;
     struct EmotionAnalysisRequest;
     struct EmotionAnalysisResponse;
+    struct ContextUsageStats;  // Forward declaration for ContextPruning
 }
 
 // Forward declarations for ContextInfo types
@@ -165,7 +168,8 @@ enum class ScheduledTaskType {
     HEALTH_CHECK,
     DISCORD_PRESENCE_UPDATE,
     PRUNING_BUFFER_PROCESSING,  // New scheduled task for processing pruning buffer
-    EMOTION_ANALYSIS_PROCESSING  // New scheduled task for processing emotion analysis buffer
+    EMOTION_ANALYSIS_PROCESSING,  // New scheduled task for processing emotion analysis buffer
+    CONTEXT_SIZE_MONITORING       // New scheduled task for monitoring context sizes
 };
 
 // Compile-time utility functions for ScheduledTaskType
@@ -176,12 +180,14 @@ enum class ScheduledTaskType {
 
 [[nodiscard]] constexpr bool IsProcessingTask(ScheduledTaskType type) noexcept {
     return type == ScheduledTaskType::PRUNING_BUFFER_PROCESSING || 
-           type == ScheduledTaskType::EMOTION_ANALYSIS_PROCESSING;
+           type == ScheduledTaskType::EMOTION_ANALYSIS_PROCESSING ||
+           type == ScheduledTaskType::CONTEXT_SIZE_MONITORING;
 }
 
 [[nodiscard]] constexpr bool IsHighFrequencyTask(ScheduledTaskType type) noexcept {
     return type == ScheduledTaskType::EMOTION_ANALYSIS_PROCESSING ||
-           type == ScheduledTaskType::DISCORD_PRESENCE_UPDATE;
+           type == ScheduledTaskType::DISCORD_PRESENCE_UPDATE ||
+           type == ScheduledTaskType::CONTEXT_SIZE_MONITORING;
 }
 
 struct ScheduledTask {
@@ -216,8 +222,10 @@ private:
     // Plugin references for delegation with atomic availability flags
     LuminaChat::SummarizationPlugin* summarization_plugin = nullptr;
     LuminaChat::EmoTagPlugin* emotag_plugin = nullptr;
+    LuminaChat::ContextPruningPlugin* context_pruning_plugin = nullptr;
     std::atomic<bool> summarization_plugin_available{false};
     std::atomic<bool> emotag_plugin_available{false};
+    std::atomic<bool> context_pruning_plugin_available{false};
     
     // Processing pipelines for plugin architecture
     LuminaChat::ProcessingPipeline<LuminaChat::SummarizationRequest, LuminaChat::SummarizationResponse> summarization_pipeline;
@@ -301,6 +309,8 @@ public:
     
     // Manual processing triggers (public for immediate processing)
     void ProcessEmotionAnalysisBuffer();  // Process emotion analysis buffer
+    // CRITICAL: This function is defined at the END of ContextPruningPlugin.hpp to combat circular dependencies
+    void MonitorAllContextSizes();        // Monitor all context sizes for pruning
     
     // Core component access for plugins
     [[nodiscard]] LlamaManager* GetLlamaManager() noexcept { return llama_manager; }
@@ -324,6 +334,9 @@ public:
     }
     [[nodiscard]] bool IsEmoTagPluginAvailable() const noexcept {
         return emotag_plugin_available.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool IsContextPruningPluginAvailable() const noexcept {
+        return context_pruning_plugin_available.load(std::memory_order_relaxed);
     }
     [[nodiscard]] bool IsOutputCallbackAvailable() const noexcept {
         return output_callback_registered.load(std::memory_order_relaxed);
@@ -353,6 +366,10 @@ public:
     void RegisterEmoTagPlugin(LuminaChat::EmoTagPlugin* plugin) noexcept { 
         emotag_plugin = plugin; 
         emotag_plugin_available.store(plugin != nullptr, std::memory_order_relaxed);
+    }
+    void RegisterContextPruningPlugin(LuminaChat::ContextPruningPlugin* plugin) noexcept { 
+        context_pruning_plugin = plugin; 
+        context_pruning_plugin_available.store(plugin != nullptr, std::memory_order_relaxed);
     }
     
     // Statistics and monitoring - cache-aligned for optimal performance
@@ -652,12 +669,7 @@ inline void Orchestrator::ProcessScheduledTasks() {
     // Process only tasks that are due, with minimal work in the loop
     for (auto& task : scheduled_tasks) [[likely]] {
         if (task.active && now >= task.next_run) [[likely]] {
-            try {
-                // Add debug logging to identify which task is running
-                if (task.type == ScheduledTaskType::EMOTION_ANALYSIS_PROCESSING) [[unlikely]] {
-                    LOG_Orchestrator("Executing emotion analysis processing scheduled task");
-                }
-                
+            try {                
                 task.task_function();
                 task.next_run = now + task.interval;
                 
@@ -897,6 +909,11 @@ inline void Orchestrator::SetupDefaultScheduledTasks() {
                     std::chrono::seconds(2),
                     [this]() { ProcessEmotionAnalysisBuffer(); });
     
+    // Context size monitoring every 10 seconds
+    AddScheduledTask(ScheduledTaskType::CONTEXT_SIZE_MONITORING,
+                    std::chrono::seconds(10),
+                    [this]() { MonitorAllContextSizes(); });
+    
     LOG_Orchestrator("Default scheduled tasks configured");
 }
 
@@ -999,7 +1016,7 @@ inline void Orchestrator::PerformContextMaintenance() {
     LOG_Orchestrator("Performing context maintenance...");
     
     // Check for contexts that need pruning
-    // This would integrate with ContextSizeManager in a full implementation
+    // This would integrate with ContextPruningPlugin in a full implementation
     
     // For now, just log that maintenance was performed
     LOG_Orchestrator("Context maintenance complete");
@@ -1060,11 +1077,9 @@ inline void Orchestrator::ProcessPruningBuffer() {
 }
 
 inline void Orchestrator::ProcessEmotionAnalysisBuffer() {
-    LOG_Orchestrator("ProcessEmotionAnalysisBuffer() called - checking for pending analysis...");
-    
+
     // Check if there are any AI responses waiting for emotional analysis
     if (!ContextInfo::HasPendingEmotionalAnalysis()) [[likely]] {
-        LOG_Orchestrator("No pending emotional analysis found");
         return; // No work to do
     }
     
@@ -1084,3 +1099,5 @@ inline void Orchestrator::ProcessEmotionAnalysisBuffer() {
         LOG_Orchestrator("Emotion analysis buffer processing complete");
     }
 }
+
+// CRITICAL: MonitorAllContextSizes is defined at the END of ContextPruningPlugin.hpp to combat circular dependencies

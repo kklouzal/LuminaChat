@@ -629,7 +629,6 @@ private:
             } else {
                 // Multiple pairs - combine them
                 std::ostringstream final_stream;
-                final_stream << "Conversation summary:\n";
                 for (size_t i = 0; i < pair_summaries.size(); ++i) {
                     final_stream << "• " << pair_summaries[i] << "\n";
                 }

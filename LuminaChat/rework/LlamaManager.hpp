@@ -139,6 +139,7 @@ public:
     bool RemoveContext(const std::string& context_id);
     ContextInfo* GetContextInfo(const std::string& context_id) const;
     std::vector<std::string> GetContextIds() const;
+    std::vector<ContextInfo*> GetAllActiveContexts() const; // For context size monitoring
     
     // Template management
     bool LoadTemplate(const std::string& template_name, const std::string& template_content);
@@ -684,6 +685,19 @@ inline std::vector<std::string> LlamaManager::GetContextIds() const {
     result.reserve(contexts.size());
     for (const auto& [id, context] : contexts) {
         result.push_back(id);
+    }
+    return result;
+}
+
+inline std::vector<ContextInfo*> LlamaManager::GetAllActiveContexts() const {
+    std::lock_guard<std::mutex> lock(manager_mutex);
+    std::vector<ContextInfo*> result;
+    result.reserve(contexts.size());
+    
+    for (const auto& [id, context] : contexts) {
+        if (context && context->GetState() != ContextState::ERROR_STATE) {
+            result.push_back(context.get());
+        }
     }
     return result;
 }
