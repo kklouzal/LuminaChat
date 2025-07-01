@@ -600,7 +600,7 @@ inline void LlamaManager::UpdateStats() {
     }
     
     for (const auto& [id, context] : contexts) {
-        if (context && context->GetState() == ContextState::READY) {
+        if (context && context->GetState() == ContextState::CONTEXT_IDLE) {
             stats.active_contexts++;
         }
     }

@@ -211,7 +211,7 @@ private:
         
         // Check context state
         ContextState state = context->GetState();
-        return state == ContextState::READY;
+        return state == ContextState::CONTEXT_IDLE;
     }
     
     ContextUsageStats BuildStatsFromContext(ContextInfo* context) {
@@ -450,9 +450,18 @@ public:
         LogInfo("Executing emergency pruning for context: " + context_id + 
                " (" + std::to_string(tokens_before) + " tokens)");
         
+        // Try to acquire plugin processing state for this context
+        if (!context->TryAcquirePluginProcessing("ContextPruningPlugin", std::chrono::milliseconds(2000))) {
+            LogWarning("Failed to acquire plugin processing state for emergency pruning: " + context_id);
+            return {};
+        }
+        
         // Execute emergency pruning and get the pruned messages
         std::vector<std::pair<std::string, std::string>> pruned_messages = 
             context->PruneContextImmediateWithExtraction(keep_messages);
+        
+        // Release plugin processing state
+        context->ReleasePluginProcessing("ContextPruningPlugin");
         
         // Coordinate with Orchestrator for summarization (plugin responsibility)
         if (!pruned_messages.empty() && orchestrator) {

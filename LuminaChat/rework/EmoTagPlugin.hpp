@@ -216,13 +216,29 @@ public:
                 return false;
             }
             
-            // Apply the clean emotional state to the context
-            original_context->UpdateEmotionalState(emotional_state);
+            // Try to acquire plugin processing lock for safe emotional state application
+            if (!original_context->TryAcquirePluginProcessing("EmoTagPlugin", std::chrono::milliseconds(5000))) {
+                LogWarning("Could not acquire plugin processing lock for context: " + context_id + " - context may be busy");
+                return false;
+            }
             
-            contexts_updated++;
-            
-            LogInfo("Applied emotional state to context: " + context_id);
-            return true;
+            try {
+                // Apply the clean emotional state to the context
+                original_context->UpdateEmotionalState(emotional_state);
+                
+                contexts_updated++;
+                
+                LogInfo("Applied emotional state to context: " + context_id);
+                
+                // Release plugin processing lock
+                original_context->ReleasePluginProcessing("EmoTagPlugin");
+                return true;
+                
+            } catch (const std::exception& inner_e) {
+                // Release plugin processing lock on exception
+                original_context->ReleasePluginProcessing("EmoTagPlugin");
+                throw; // Re-throw the exception
+            }
             
         } catch (const std::exception& e) {
             LogError("Exception applying emotional state to context: " + std::string(e.what()));
