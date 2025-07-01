@@ -159,17 +159,8 @@ public:    // Constructor overloads
     static std::unique_ptr<ContextInfo> Create(const std::string& context_id, ModelInfo* model, int32_t context_size);
     static std::unique_ptr<ContextInfo> Create(ModelInfo* model, int32_t context_size); // Auto-generated ID
     
-    // Core pruning method (immediate, critical path)
-    void PruneContextImmediate(size_t keep_recent_messages = 5);
-    
     // Enhanced pruning method that returns pruned messages for summarization coordination
     std::vector<std::pair<std::string, std::string>> PruneContextImmediateWithExtraction(size_t keep_recent_messages = 5);
-    
-private:
-    // Internal pruning method (assumes context_mutex is already held)
-    void PruneContextImmediate_Internal(size_t keep_recent_messages = 5);
-    
-public:
     
     // Plugin callback to apply completed summaries
     void ApplyCompletedSummary(const std::string& summary);
@@ -217,10 +208,6 @@ public:
         return ContextStateManager::IsAvailableForPluginProcessing() && !is_generating.load();
     }
     
-protected:
-    
-public:
-    
     size_t GetMaxContextTokens() const { return max_context_tokens; }
     const std::string& GetContextId() const { return context_id; }
     
@@ -258,14 +245,8 @@ public:
     // Validate and synchronize context state before batch processing
     bool ValidateAndSyncContextState();
     
-    // Synchronize stats with actual context state (n_past) - call after all context operations
-    void SyncStatsWithContextState();
-    
     // Query actual context usage from llama.cpp and sync our internal state
     void QueryAndSyncActualContextUsage();
-    
-    // Context pruning for summarization
-    void PruneMessageHistoryWithSummary(const std::string& summary, size_t keep_recent_messages = 5);
 };
 
 // Inline implementation of ContextInfo methods
@@ -437,12 +418,11 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
                              input.substr(0, 50) + (input.length() > 50 ? "..." : ""));
         
         // 2. Check if context needs rebuilding after adding message
-        if (context_needs_rebuild || template_manager->IsTemplateDirty()) {        if (!RebuildContext(RebuildStrategy::FULL)) {
-            (void)TrySetState(ContextState::ERROR_STATE);
-            return "Error: Failed to rebuild context";
-        }
-            // Sync stats after successful rebuild
-            SyncStatsWithContextState();
+        if (context_needs_rebuild || template_manager->IsTemplateDirty()) {
+            if (!RebuildContext(RebuildStrategy::FULL)) {
+                (void)TrySetState(ContextState::ERROR_STATE);
+                return "Error: Failed to rebuild context";
+            }
         }
         
         // 3. Render dynamic template with current message history
@@ -1042,8 +1022,6 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
                     }
                     return false;
                 }
-                // Sync stats after successful rebuild
-                SyncStatsWithContextState();
             }
             
             // 4. Final safety check after rebuild - trust plugin to handle all pruning
@@ -1372,20 +1350,8 @@ inline bool ContextInfo::ValidateAndSyncContextState() {
                                ") - this may indicate context state issues");
         return false;
     }
-    
-    // Sync stats with validated state
-    SyncStatsWithContextState();
-    return true;
-}
 
-inline void ContextInfo::SyncStatsWithContextState() {
-    // NOTE: context_mutex should already be held by caller
-    // CRITICAL FIX: This method is now simplified since we removed the ContextStats struct
-    // n_past is the single source of truth for context size
-    
-    LOG_DEBUG_ContextInfo("Context state synchronized: n_past=" + 
-                         std::to_string(n_past) + ", max_context_tokens=" + 
-                         std::to_string(max_context_tokens));
+    return true;
 }
 
 inline void ContextInfo::QueryAndSyncActualContextUsage() {
@@ -1436,30 +1402,6 @@ inline void ContextInfo::QueryAndSyncActualContextUsage() {
                          " (" + std::to_string(static_cast<int>(usage_ratio * 100)) + "%)");
 }
 
-inline void ContextInfo::PruneMessageHistoryWithSummary(const std::string& summary, size_t keep_recent_messages) {
-    std::lock_guard<std::mutex> lock(context_mutex);
-    
-    if (message_history.size() <= keep_recent_messages) {
-        LOG_DEBUG_ContextInfo("No pruning needed: only " + std::to_string(message_history.size()) + " messages");
-        return;
-    }
-    
-    // Extract messages to be pruned
-    size_t prune_count = message_history.size() - keep_recent_messages;
-    std::vector<std::pair<std::string, std::string>> pruned_messages;
-    pruned_messages.assign(message_history.begin(), message_history.begin() + prune_count);
-    
-    // REMOVED: Direct buffer management - plugins now handle this through orchestrator coordination
-    // Orchestrator monitors contexts and triggers plugins as needed
-    
-    // Immediately prune from active history
-    message_history.erase(message_history.begin(), message_history.begin() + prune_count);
-    context_needs_rebuild = true;
-    
-    LOG_ContextInfo("Pruned " + std::to_string(prune_count) + " messages from context (plugins handle summarization through orchestrator). " +
-                   "Keeping " + std::to_string(keep_recent_messages) + " recent messages.");
-}
-
 inline void ContextInfo::ApplyCompletedSummary(const std::string& summary) {
     std::lock_guard<std::mutex> lock(context_mutex);
     
@@ -1492,11 +1434,6 @@ inline std::string ContextInfo::GetCurrentPrompt() const {
     return prompt_stream.str();
 }
 
-inline void ContextInfo::PruneContextImmediate(size_t keep_recent_messages) {
-    std::lock_guard<std::mutex> lock(context_mutex);
-    PruneContextImmediate_Internal(keep_recent_messages);
-}
-
 inline std::vector<std::pair<std::string, std::string>> ContextInfo::PruneContextImmediateWithExtraction(size_t keep_recent_messages) {
     std::lock_guard<std::mutex> lock(context_mutex);
     
@@ -1517,28 +1454,6 @@ inline std::vector<std::pair<std::string, std::string>> ContextInfo::PruneContex
     LOG_ContextInfo("Pruned " + std::to_string(prune_count) + " messages from context - returning for orchestrator coordination");
     
     return pruned_messages; // Return extracted messages for summarization
-}
-
-inline void ContextInfo::PruneContextImmediate_Internal(size_t keep_recent_messages) {
-    // Note: context_mutex should already be held by caller
-    
-    if (message_history.size() <= keep_recent_messages) {
-        LOG_DEBUG_ContextInfo("No pruning needed: only " + std::to_string(message_history.size()) + " messages");
-        return;
-    }
-    
-    // Extract messages to be pruned for potential summarization
-    size_t prune_count = message_history.size() - keep_recent_messages;
-    std::vector<std::pair<std::string, std::string>> pruned_messages;
-    pruned_messages.assign(message_history.begin(), message_history.begin() + prune_count);
-    
-    // Immediately prune from active history
-    message_history.erase(message_history.begin(), message_history.begin() + prune_count);
-    context_needs_rebuild = true;
-    
-    LOG_ContextInfo("Pruned " + std::to_string(prune_count) + " messages from context - orchestrator will handle summarization");
-    
-    // Plugin coordination handles all summarization requests through the extraction method
 }
 
 // REMOVED: Static member definitions moved to respective plugins
