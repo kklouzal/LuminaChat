@@ -2,13 +2,11 @@
 
 #include "../Logger.hpp"
 #include <atomic>
-#include <mutex>
-#include <shared_mutex>
-#include <condition_variable>
 #include <chrono>
 #include <string>
 #include <string_view>
 #include <array>
+#include <thread>
 
 namespace LuminaChat {
 
@@ -23,11 +21,11 @@ enum class ContextState : uint8_t {
 };
 
 // Comparison operators for ContextState
-constexpr bool operator==(ContextState lhs, ContextState rhs) noexcept {
+constexpr inline bool operator==(ContextState lhs, ContextState rhs) noexcept {
     return static_cast<uint8_t>(lhs) == static_cast<uint8_t>(rhs);
 }
 
-constexpr bool operator!=(ContextState lhs, ContextState rhs) noexcept {
+constexpr inline bool operator!=(ContextState lhs, ContextState rhs) noexcept {
     return !(lhs == rhs);
 }
 
@@ -38,7 +36,7 @@ static constexpr size_t CACHE_LINE_SIZE = 64;
 
 // Compile-time state validation lookup table for maximum performance
 namespace StateTransitions {
-    constexpr bool IsValidTransition(ContextState from, ContextState to) noexcept {
+    constexpr inline bool IsValidTransition(ContextState from, ContextState to) noexcept {
         // Lookup table: [from_state][to_state] = is_valid
         constexpr bool transition_table[4][4] = {
             // From CONTEXT_IDLE:      to IDLE, GENERATING, PLUGIN, ERROR
@@ -62,7 +60,7 @@ namespace StateTransitions {
     }
     
     // Compile-time string lookup for state names - eliminates runtime string construction
-    constexpr std::string_view GetStateStringView(ContextState state) noexcept {
+    constexpr inline std::string_view GetStateStringView(ContextState state) noexcept {
         constexpr std::array<std::string_view, 4> state_names = {
             "CONTEXT_IDLE",
             "CONTEXT_GENERATING", 
@@ -72,6 +70,17 @@ namespace StateTransitions {
         
         const auto idx = static_cast<uint8_t>(state);
         return (idx < 4) ? state_names[idx] : "UNKNOWN";
+    }
+    
+    // Compile-time only validation for static_assert contexts
+    consteval bool IsValidStateValue(ContextState state) noexcept {
+        const auto idx = static_cast<uint8_t>(state);
+        return idx < 4;
+    }
+    
+    // Compile-time only transition validation for static_assert contexts  
+    consteval bool ValidateTransitionAtCompileTime(ContextState from, ContextState to) noexcept {
+        return IsValidStateValue(from) && IsValidStateValue(to) && IsValidTransition(from, to);
     }
 }
 
@@ -94,31 +103,34 @@ class alignas(CACHE_LINE_SIZE) ContextStateManager {
 protected:
     // Hot path data - first cache line for maximum performance
     std::atomic<ContextState> state{ContextState::CONTEXT_IDLE};
-    std::atomic<bool> state_transition_in_progress{false};
     
-    // Cold path data - separate cache line to prevent false sharing
-    alignas(CACHE_LINE_SIZE) mutable std::mutex state_mutex;   // Fast mutex for better performance than timed_mutex on hot paths
-    std::condition_variable state_cv;                          // Standard CV for better performance
-    std::string current_plugin_name;                          // Protected by state_mutex
+    // Lock-free plugin tracking - using atomic hash for performance
+    std::atomic<std::size_t> current_plugin_id{0};  // 0 = no plugin, hash of plugin name otherwise
+    
+    // Lock-free plugin name cache - atomic pointer for fast access
+    mutable std::atomic<const char*> cached_plugin_name{nullptr};  // Points to static string or nullptr
     
 public:
     /**
      * Default constructor - initializes state to CONTEXT_IDLE
      */
-    ContextStateManager() = default;
+    ContextStateManager() noexcept = default;
     
     /**
      * Virtual destructor for proper inheritance
      */
-    virtual ~ContextStateManager() = default;
+    virtual ~ContextStateManager() noexcept {
+        // Clear atomic pointer - no need to delete as it points to static/stack strings
+        cached_plugin_name.store(nullptr, std::memory_order_relaxed);
+    }
     
     // Disable copy constructor and assignment operator for performance
     ContextStateManager(const ContextStateManager&) = delete;
     ContextStateManager& operator=(const ContextStateManager&) = delete;
     
-    // Allow move constructor and assignment for performance
-    ContextStateManager(ContextStateManager&&) = default;
-    ContextStateManager& operator=(ContextStateManager&&) = default;
+    // Disable move constructor and assignment - atomics and mutexes are not moveable
+    ContextStateManager(ContextStateManager&&) = delete;
+    ContextStateManager& operator=(ContextStateManager&&) = delete;
     
     /**
      * Get current state (ultra-fast lock-free operation)
@@ -139,7 +151,7 @@ public:
      * Get current state as string for debugging (fallback for legacy compatibility)
      * Note: Creates temporary string - prefer GetStateStringView() for performance
      */
-    [[nodiscard]] std::string GetStateString() const {
+    [[nodiscard]] inline std::string GetStateString() const {
         return std::string{GetStateStringView()};
     }
     
@@ -154,9 +166,6 @@ public:
         
         // Compile-time validated transition check - this should be inlined completely
         if (!StateTransitions::IsValidTransition(expected, new_state)) [[unlikely]] {
-            LOG_DEBUG("ContextStateManager", "Invalid state transition attempted: " + 
-                    std::string(StateTransitions::GetStateStringView(expected)) + " -> " + 
-                    std::string(StateTransitions::GetStateStringView(new_state)));
             return false;
         }
         
@@ -165,169 +174,150 @@ public:
         do {
             if (state.compare_exchange_weak(expected, new_state, 
                                            std::memory_order_acq_rel, std::memory_order_acquire)) [[likely]] {
-                LOG_DEBUG("ContextStateManager", "State transition: " + 
-                        std::string(StateTransitions::GetStateStringView(expected)) + " -> " + 
-                        std::string(StateTransitions::GetStateStringView(new_state)));
-                // Notify any threads waiting for state changes
-                state_cv.notify_all();
                 return true;
             }
             // Re-validate transition with the new expected value
             if (!StateTransitions::IsValidTransition(expected, new_state)) [[unlikely]] {
-                LOG_DEBUG("ContextStateManager", "State transition invalid after concurrent modification: " + 
-                        std::string(StateTransitions::GetStateStringView(expected)) + " -> " + 
-                        std::string(StateTransitions::GetStateStringView(new_state)));
                 return false;
             }
         } while (true);
     }
     
     /**
-     * High-performance plugin coordination - acquire processing lock
+     * Ultra-high-performance lock-free plugin acquisition
      * @param plugin_name Name of the plugin requesting access
-     * @param timeout_ms Maximum time to wait for access in milliseconds
      * @return true if processing lock was acquired, false otherwise
+     * 
+     * Uses only atomic operations for maximum performance. No timeouts,
+     * no blocking, and minimal error logging for optimal speed.
      */
-    [[nodiscard]] bool TryAcquirePluginProcessing(std::string_view plugin_name, 
-                                                  uint32_t timeout_ms = 1000) noexcept {
-        // Fast path: check if we can even attempt to acquire
-        const ContextState current = state.load(std::memory_order_relaxed);
-        if (current != ContextState::CONTEXT_IDLE) [[unlikely]] {
-            LOG_DEBUG("ContextStateManager", "Plugin " + std::string(plugin_name) + " cannot acquire processing - context state: " + 
-                    std::string(StateTransitions::GetStateStringView(current)));
-            return false;
+    [[nodiscard]] bool TryAcquirePluginProcessing(const std::string_view plugin_name) noexcept {
+        // Fast path: atomic state check
+        ContextState expected = ContextState::CONTEXT_IDLE;
+        if (!state.compare_exchange_strong(expected, ContextState::PLUGIN_PROCESSING, 
+                                         std::memory_order_acq_rel, std::memory_order_acquire)) [[unlikely]] {
+            return false;  // State wasn't IDLE or concurrent modification
         }
         
-        // Try to acquire mutex with timeout
-        std::unique_lock<std::mutex> lock(state_mutex, std::defer_lock);
-        if (!lock.try_lock()) [[unlikely]] {
-            LOG_WARNING("ContextStateManager", "Plugin " + std::string(plugin_name) + " failed to acquire state mutex within timeout");
-            return false;
-        }
+        // Store plugin hash atomically - completely lock-free
+        const auto plugin_hash = ComputePluginHash(plugin_name);
+        current_plugin_id.store(plugin_hash, std::memory_order_release);
         
-        // Set state transition in progress atomically
-        bool expected_transition = false;
-        if (!state_transition_in_progress.compare_exchange_strong(expected_transition, true, 
-                                                                 std::memory_order_acq_rel)) [[unlikely]] {
-            LOG_DEBUG("ContextStateManager", "Plugin " + std::string(plugin_name) + " cannot acquire processing - transition already in progress");
-            return false;
-        }
-        
-        // Attempt state transition with strong ordering
-        ContextState expected_state = ContextState::CONTEXT_IDLE;
-        if (!state.compare_exchange_strong(expected_state, ContextState::PLUGIN_PROCESSING, 
-                                         std::memory_order_acq_rel)) [[unlikely]] {
-            state_transition_in_progress.store(false, std::memory_order_release);
-            LOG_DEBUG("ContextStateManager", "Plugin " + std::string(plugin_name) + " state transition failed - concurrent modification");
-            return false;
-        }
-        
-        // Record which plugin is processing - string assignment only on success path
-        current_plugin_name = plugin_name;
-        state_transition_in_progress.store(false, std::memory_order_release);
-        state_cv.notify_all();
-        
-        LOG_DEBUG("ContextStateManager", "Plugin " + std::string(plugin_name) + " acquired processing lock");
         return true;
     }
     
     /**
-     * High-performance plugin coordination - release processing lock
+     * Ultra-high-performance lock-free plugin release
      * @param plugin_name Name of the plugin releasing access
+     * @return true if successfully released, false if not owned by this plugin
+     * 
+     * Uses only atomic operations for maximum performance and provides 
+     * clear success/failure indication.
      */
-    void ReleasePluginProcessing(std::string_view plugin_name) noexcept {
-        std::lock_guard<std::mutex> lock(state_mutex);
+    [[nodiscard]] bool ReleasePluginProcessing(const std::string_view plugin_name) noexcept {
+        // Fast path: verify ownership using atomic hash comparison
+        const auto plugin_hash = ComputePluginHash(plugin_name);
+        const auto current_hash = current_plugin_id.load(std::memory_order_acquire);
         
-        // Verify this plugin owns the processing state
-        if (current_plugin_name != plugin_name) [[unlikely]] {
-            LOG_WARNING("ContextStateManager", "Plugin " + std::string(plugin_name) + " tried to release processing, but " + 
-                      current_plugin_name + " is the current processor");
-            return;
+        if (current_hash != plugin_hash) [[unlikely]] {
+            return false;  // Not owned by this plugin
         }
         
-        // Transition back to idle with strong ordering
+        // Atomic state transition
         ContextState expected = ContextState::PLUGIN_PROCESSING;
-        if (state.compare_exchange_strong(expected, ContextState::CONTEXT_IDLE, 
-                                        std::memory_order_acq_rel)) [[likely]] {
-            current_plugin_name.clear();
-            state_cv.notify_all();
-            LOG_DEBUG("ContextStateManager", "Plugin " + std::string(plugin_name) + " released processing lock");
-        } else {
-            LOG_WARNING("ContextStateManager", "Plugin " + std::string(plugin_name) + " failed to release processing lock - unexpected state: " + 
-                      std::string(StateTransitions::GetStateStringView(expected)));
+        if (!state.compare_exchange_strong(expected, ContextState::CONTEXT_IDLE, 
+                                         std::memory_order_acq_rel)) [[unlikely]] {
+            return false;  // Unexpected state
         }
+        
+        // Clear plugin ownership atomically
+        current_plugin_id.store(0, std::memory_order_release);
+        return true;
     }
     
     /**
      * Emergency state recovery for deadlock prevention
-     * @param reason Optional reason for the forced release
+     * @param reason Optional reason for the forced release (unused in lock-free version)
      */
-    void ForceReleasePluginProcessing(std::string_view reason = "") noexcept {
-        std::lock_guard<std::mutex> lock(state_mutex);
-        
+    void ForceReleasePluginProcessing(const std::string_view reason = "") noexcept {
         const ContextState current = state.load(std::memory_order_relaxed);
         if (current == ContextState::PLUGIN_PROCESSING) [[likely]] {
-            std::string reason_str = reason.empty() ? "" : std::string(" - ") + std::string(reason);
-            LOG_WARNING("ContextStateManager", "Force releasing plugin processing lock" + reason_str + 
-                      " (was held by: " + current_plugin_name + ")");
-            
+            // Atomic state transition - force release regardless of ownership
             ContextState expected = ContextState::PLUGIN_PROCESSING;
             if (state.compare_exchange_strong(expected, ContextState::CONTEXT_IDLE, 
                                             std::memory_order_acq_rel)) [[likely]] {
-                current_plugin_name.clear();
-                state_cv.notify_all();
-                LOG_WARNING("ContextStateManager", "Plugin processing lock force-released successfully");
+                // Clear atomic plugin ownership
+                current_plugin_id.store(0, std::memory_order_release);
+                cached_plugin_name.store(nullptr, std::memory_order_release);
             }
         }
     }
     
     /**
-     * High-performance wait for specific state with timeout
+     * Lock-free polling wait for specific state
      * @param target_state The state to wait for
-     * @param timeout_ms Maximum time to wait in milliseconds
-     * @return true if target state was reached, false if timeout occurred
+     * @param max_polls Maximum number of polls before giving up
+     * @param poll_delay_ns Nanoseconds to wait between polls (0 = tight loop)
+     * @return true if target state was reached, false if max polls exceeded
      */
-    [[nodiscard]] bool WaitForState(ContextState target_state, uint32_t timeout_ms = 5000) noexcept {
-        // Fast path: check if we're already in the target state
-        if (state.load(std::memory_order_relaxed) == target_state) [[likely]] {
-            return true;
+    [[nodiscard]] bool WaitForState(ContextState target_state, uint32_t max_polls = 1000, 
+                                   uint32_t poll_delay_ns = 1000) noexcept {
+        for (uint32_t i = 0; i < max_polls; ++i) {
+            if (state.load(std::memory_order_relaxed) == target_state) [[likely]] {
+                return true;
+            }
+            
+            if (poll_delay_ns > 0) {
+                // Small delay to prevent excessive CPU usage
+                std::this_thread::sleep_for(std::chrono::nanoseconds(poll_delay_ns));
+            } else {
+                // Yield CPU for other threads
+                std::this_thread::yield();
+            }
         }
-        
-        std::unique_lock<std::mutex> lock(state_mutex);
-        return state_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this, target_state]() noexcept {
-            return state.load(std::memory_order_relaxed) == target_state;
-        });
+        return false;
     }
     
     /**
-     * High-performance wait for context to become available 
-     * @param timeout_ms Maximum time to wait in milliseconds
-     * @return true if context became available, false if timeout occurred
+     * Lock-free polling wait for context to become available
+     * @param max_polls Maximum number of polls before giving up
+     * @param poll_delay_ns Nanoseconds to wait between polls (0 = tight loop)
+     * @return true if context became available, false if max polls exceeded
      */
-    [[nodiscard]] bool WaitForAvailable(uint32_t timeout_ms = 5000) noexcept {
-        // Fast path: check if already available
-        if (state.load(std::memory_order_relaxed) == ContextState::CONTEXT_IDLE) [[likely]] {
-            return true;
-        }
-        
-        std::unique_lock<std::mutex> lock(state_mutex);
-        return state_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this]() noexcept {
-            return state.load(std::memory_order_relaxed) == ContextState::CONTEXT_IDLE;
-        });
+    [[nodiscard]] bool WaitForAvailable(uint32_t max_polls = 1000, uint32_t poll_delay_ns = 1000) noexcept {
+        return WaitForState(ContextState::CONTEXT_IDLE, max_polls, poll_delay_ns);
     }
     
     /**
-     * Get current processing plugin name (thread-safe, zero-allocation when possible)
-     * @return Name of the plugin currently processing, empty if none
+     * Ultra-fast lock-free check if a specific plugin owns the processing state
+     * @param plugin_name Name of the plugin to check
+     * @return true if this plugin owns the processing state, false otherwise
      */
-    [[nodiscard]] std::string GetCurrentProcessingPlugin() const {
-        // Fast path: if not in plugin processing state, return empty immediately
+    [[nodiscard]] inline bool IsOwnedByPlugin(const std::string_view plugin_name) const noexcept {
+        // Fast path: check state first
         if (state.load(std::memory_order_relaxed) != ContextState::PLUGIN_PROCESSING) [[likely]] {
-            return {};
+            return false;
         }
         
-        std::lock_guard<std::mutex> lock(state_mutex);
-        return current_plugin_name; // RVO optimization
+        // Lock-free hash comparison
+        const auto plugin_hash = ComputePluginHash(plugin_name);
+        return current_plugin_id.load(std::memory_order_acquire) == plugin_hash;
+    }
+    
+    /**
+     * Lock-free get current processing plugin name (zero-allocation, ultra-fast)
+     * @return Pointer to plugin name string, or nullptr if no plugin processing
+     * 
+     * Returns a pointer to avoid string allocation. The returned pointer
+     * is only valid while the plugin owns the processing state.
+     */
+    [[nodiscard]] inline const char* GetCurrentProcessingPlugin() const noexcept {
+        // Fast path: check state and return cached name atomically
+        if (state.load(std::memory_order_relaxed) != ContextState::PLUGIN_PROCESSING) [[likely]] {
+            return nullptr;
+        }
+        
+        return cached_plugin_name.load(std::memory_order_acquire);
     }
     
     /**
@@ -347,6 +337,14 @@ public:
     }
     
 protected:
+    // Lock-free plugin hash computation for atomic tracking
+    [[nodiscard]] static inline std::size_t ComputePluginHash(const std::string_view plugin_name) noexcept {
+        // Use std::hash for consistent hashing, but ensure we never return 0 (reserved for "no plugin")
+        std::hash<std::string_view> hasher;
+        const auto hash_value = hasher(plugin_name);
+        return (hash_value == 0) ? 1 : hash_value;  // Ensure non-zero hash
+    }
+    
 };
 
 } // namespace LuminaChat

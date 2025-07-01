@@ -451,7 +451,7 @@ public:
                " (" + std::to_string(tokens_before) + " tokens)");
         
         // Try to acquire plugin processing state for this context
-        if (!context->TryAcquirePluginProcessing("ContextPruningPlugin", 2000)) {
+        if (!context->TryAcquirePluginProcessing("ContextPruningPlugin")) {
             LogWarning("Failed to acquire plugin processing state for emergency pruning: " + context_id);
             return {};
         }
@@ -461,7 +461,7 @@ public:
             context->PruneContextImmediateWithExtraction(keep_messages);
         
         // Release plugin processing state
-        context->ReleasePluginProcessing("ContextPruningPlugin");
+        [[maybe_unused]] bool released = context->ReleasePluginProcessing("ContextPruningPlugin");
         
         // Coordinate with Orchestrator for summarization (plugin responsibility)
         if (!pruned_messages.empty() && orchestrator) {

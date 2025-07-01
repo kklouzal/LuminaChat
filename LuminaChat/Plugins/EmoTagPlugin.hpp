@@ -217,7 +217,7 @@ public:
             }
             
             // Try to acquire plugin processing lock for safe emotional state application
-            if (!original_context->TryAcquirePluginProcessing("EmoTagPlugin", 5000)) {
+            if (!original_context->TryAcquirePluginProcessing("EmoTagPlugin")) {
                 LogWarning("Could not acquire plugin processing lock for context: " + context_id + " - context may be busy");
                 return false;
             }
@@ -231,12 +231,12 @@ public:
                 LogInfo("Applied emotional state to context: " + context_id);
                 
                 // Release plugin processing lock
-                original_context->ReleasePluginProcessing("EmoTagPlugin");
+                [[maybe_unused]] bool released = original_context->ReleasePluginProcessing("EmoTagPlugin");
                 return true;
                 
-            } catch (const std::exception& inner_e) {
+            } catch (const std::exception&) {
                 // Release plugin processing lock on exception
-                original_context->ReleasePluginProcessing("EmoTagPlugin");
+                [[maybe_unused]] bool released = original_context->ReleasePluginProcessing("EmoTagPlugin");
                 throw; // Re-throw the exception
             }
             
