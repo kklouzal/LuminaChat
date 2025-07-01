@@ -1,10 +1,11 @@
 #pragma once
 
-#include "ChatTemplateManager.hpp"
-#include "ModelInfo.hpp"
-#include "TokenCache.hpp"
-#include "Logger.hpp"
-#include "Utilities.hpp"
+#include "ContextState.hpp"
+#include "../ChatTemplateManager.hpp"
+#include "../ModelInfo.hpp"
+#include "../TokenCache.hpp"
+#include "../Logger.hpp"
+#include "../Utilities.hpp"
 // llama.cpp includes
 #include "llama-cpp.h"
 #include <memory>
@@ -19,6 +20,9 @@
 #include <thread>
 #include <atomic>
 #include <condition_variable>
+
+// Import ContextState enum into current namespace for easier use
+using LuminaChat::ContextState;
 
 // ContextInfo Configuration Constants
 namespace ContextConstants {
@@ -50,13 +54,6 @@ enum class RebuildStrategy {
     FULL,           // Complete rebuild including template re-rendering
     PARTIAL,        // Efficient append-only rebuild for new messages
     TEMPLATE_ONLY   // Only re-render template, keep existing tokens
-};
-
-enum class ContextState {
-    CONTEXT_IDLE,           // Idle, waiting for user input or plugin processing
-    CONTEXT_GENERATING,     // Context is generating output, plugins wait
-    PLUGIN_PROCESSING,      // A plugin is processing the context, other plugins wait
-    ERROR_STATE             // Error state - context unavailable
 };
 
 // Callback types for streaming generation
@@ -113,7 +110,7 @@ struct GenerationCallbacks {
  * - Per-Context Flexibility: Each context can have completely different template evolution
  * - Non-Blocking: Critical path stays fast, heavy work happens in background plugins
  */
-class ContextInfo {
+class ContextInfo : public LuminaChat::ContextStateManager {
 private:    // Core components
     std::unique_ptr<ChatTemplateManager> template_manager;
     ModelInfo* parent_model;
@@ -122,17 +119,10 @@ private:    // Core components
     // Context configuration
     int32_t context_size;  // Individual context size (not tied to model)
     
-    // Context state - atomic for thread-safe access
+    // Context identification and size management
     std::string context_id;
-    std::atomic<ContextState> state{ContextState::CONTEXT_IDLE};
     size_t max_context_tokens = 0;  // Maximum context size for this instance
     mutable std::mutex context_mutex;
-    
-    // Atomic state tracking for plugin coordination
-    std::atomic<bool> state_transition_in_progress{false};
-    std::string current_plugin_name;  // Name of plugin currently processing (protected by context_mutex)
-    mutable std::timed_mutex state_mutex;   // Dedicated timed mutex for state transitions with timeout support
-    std::condition_variable_any state_cv; // Condition variable for state change notifications (works with timed_mutex)
     
     // Message history - pure conversation only
     std::vector<std::pair<std::string, std::string>> message_history; // (role, content)
@@ -160,42 +150,6 @@ private:    // Core components
     // Context size management
     void AddSummaryToList(const std::string& summary);
     void UpdateTemplateWithAllSummaries();
-    
-    // State transition validation
-    bool IsValidStateTransition(ContextState from, ContextState to) const {
-        // Define valid state transitions
-        switch (from) {
-            case ContextState::CONTEXT_IDLE:
-                return to == ContextState::CONTEXT_GENERATING || 
-                       to == ContextState::PLUGIN_PROCESSING || 
-                       to == ContextState::ERROR_STATE;
-                       
-            case ContextState::CONTEXT_GENERATING:
-                return to == ContextState::CONTEXT_IDLE || 
-                       to == ContextState::ERROR_STATE;
-                       
-            case ContextState::PLUGIN_PROCESSING:
-                return to == ContextState::CONTEXT_IDLE || 
-                       to == ContextState::ERROR_STATE;
-                       
-            case ContextState::ERROR_STATE:
-                return to == ContextState::CONTEXT_IDLE; // Can recover from error
-                
-            default:
-                return false;
-        }
-    }
-    
-    // Helper method to convert state enum to string
-    std::string GetStateString(ContextState state_val) const {
-        switch (state_val) {
-            case ContextState::CONTEXT_IDLE: return "CONTEXT_IDLE";
-            case ContextState::CONTEXT_GENERATING: return "CONTEXT_GENERATING";
-            case ContextState::PLUGIN_PROCESSING: return "PLUGIN_PROCESSING";
-            case ContextState::ERROR_STATE: return "ERROR_STATE";
-            default: return "UNKNOWN";
-        }
-    }
     
 public:    // Constructor overloads
     ContextInfo(const std::string& context_id, ModelInfo* model, int32_t context_size);
@@ -254,157 +208,18 @@ public:
     void ClearContext();
     void ClearMessageHistory();
     
-    // Atomic state management
-    ContextState GetState() const { 
-        return state.load(); 
+    // Override base class methods to include generation state
+    [[nodiscard]] bool IsAvailableForGeneration() const noexcept override {
+        return ContextStateManager::IsAvailableForGeneration() && !is_generating.load();
     }
     
-    // Atomic state transition with validation
-    bool TrySetState(ContextState new_state) {
-        ContextState expected = state.load();
-        
-        // Validate transition
-        if (!IsValidStateTransition(expected, new_state)) {
-            LOG_DEBUG_ContextInfo("Invalid state transition attempted: " + GetStateString(expected) + " -> " + GetStateString(new_state));
-            return false;
-        }
-        
-        // Attempt atomic state change
-        bool success = state.compare_exchange_strong(expected, new_state);
-        if (success) {
-            LOG_DEBUG_ContextInfo("State transition: " + GetStateString(expected) + " -> " + GetStateString(new_state));
-            // Notify any threads waiting for state changes
-            state_cv.notify_all();
-        } else {
-            LOG_DEBUG_ContextInfo("State transition failed due to concurrent modification: " + GetStateString(expected) + " -> " + GetStateString(new_state));
-        }
-        return success;
+    [[nodiscard]] bool IsAvailableForPluginProcessing() const noexcept override {
+        return ContextStateManager::IsAvailableForPluginProcessing() && !is_generating.load();
     }
     
-    // Plugin coordination - acquire processing lock
-    bool TryAcquirePluginProcessing(const std::string& plugin_name, 
-                                   std::chrono::milliseconds timeout = std::chrono::milliseconds(1000)) {
-        std::unique_lock<std::timed_mutex> lock(state_mutex, std::defer_lock);
-        if (!lock.try_lock_for(timeout)) {
-            LOG_WARNING_ContextInfo("Plugin " + plugin_name + " failed to acquire state mutex within timeout");
-            return false;
-        }
-        
-        // Check if we can transition to plugin processing state
-        ContextState current = state.load();
-        if (current != ContextState::CONTEXT_IDLE) {
-            LOG_DEBUG_ContextInfo("Plugin " + plugin_name + " cannot acquire processing - context state: " + GetStateString(current));
-            return false;
-        }
-        
-        // Set state transition in progress to prevent other operations
-        if (state_transition_in_progress.exchange(true)) {
-            LOG_DEBUG_ContextInfo("Plugin " + plugin_name + " cannot acquire processing - transition already in progress");
-            return false; // Another transition is already in progress
-        }
-        
-        // Attempt state transition
-        if (!state.compare_exchange_strong(current, ContextState::PLUGIN_PROCESSING)) {
-            state_transition_in_progress = false;
-            LOG_DEBUG_ContextInfo("Plugin " + plugin_name + " state transition failed - concurrent modification");
-            return false;
-        }
-        
-        // Record which plugin is processing
-        current_plugin_name = plugin_name;
-        state_transition_in_progress = false;
-        state_cv.notify_all();
-        
-        LOG_DEBUG_ContextInfo("Plugin " + plugin_name + " acquired processing lock");
-        return true;
-    }
+protected:
     
-    // Plugin coordination - release processing lock
-    void ReleasePluginProcessing(const std::string& plugin_name) {
-        std::lock_guard<std::timed_mutex> lock(state_mutex);
-        
-        // Verify this plugin owns the processing state
-        if (current_plugin_name != plugin_name) {
-            LOG_WARNING_ContextInfo("Plugin " + plugin_name + " tried to release processing, but " + 
-                                   current_plugin_name + " is the current processor");
-            return;
-        }
-        
-        // Transition back to idle
-        ContextState expected = ContextState::PLUGIN_PROCESSING;
-        if (state.compare_exchange_strong(expected, ContextState::CONTEXT_IDLE)) {
-            current_plugin_name.clear();
-            state_cv.notify_all();
-            LOG_DEBUG_ContextInfo("Plugin " + plugin_name + " released processing lock");
-        } else {
-            LOG_WARNING_ContextInfo("Plugin " + plugin_name + " failed to release processing lock - unexpected state: " + 
-                                   GetStateString(expected));
-        }
-    }
-    
-    // Emergency state recovery for deadlock prevention
-    void ForceReleasePluginProcessing(const std::string& reason = "") {
-        std::lock_guard<std::timed_mutex> lock(state_mutex);
-        
-        ContextState current = state.load();
-        if (current == ContextState::PLUGIN_PROCESSING) {
-            LOG_WARNING_ContextInfo("Force releasing plugin processing lock" + 
-                                   (reason.empty() ? "" : " - " + reason) + 
-                                   " (was held by: " + current_plugin_name + ")");
-            
-            if (state.compare_exchange_strong(current, ContextState::CONTEXT_IDLE)) {
-                current_plugin_name.clear();
-                state_cv.notify_all();
-                LOG_WARNING_ContextInfo("Plugin processing lock force-released successfully");
-            }
-        }
-    }
-    
-    // Wait for specific state with timeout
-    bool WaitForState(ContextState target_state, 
-                     std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
-        std::unique_lock<std::timed_mutex> lock(state_mutex);
-        return state_cv.wait_for(lock, timeout, [this, target_state]() {
-            return state.load() == target_state;
-        });
-    }
-    
-    // Wait for context to become available (not generating or plugin processing)
-    bool WaitForAvailable(std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
-        std::unique_lock<std::timed_mutex> lock(state_mutex);
-        return state_cv.wait_for(lock, timeout, [this]() {
-            ContextState current = state.load();
-            return current == ContextState::CONTEXT_IDLE;
-        });
-    }
-    
-    // Get current processing plugin name (thread-safe)
-    std::string GetCurrentProcessingPlugin() const {
-        std::lock_guard<std::timed_mutex> lock(state_mutex);
-        return current_plugin_name;
-    }
-    
-    bool IsAvailableForGeneration() const {
-        ContextState current = state.load();
-        return current == ContextState::CONTEXT_IDLE && !is_generating.load();
-    }
-    
-    // Check if context is available for plugin operations (thread-safe)
-    bool IsAvailableForPluginProcessing() const {
-        ContextState current = state.load();
-        return current == ContextState::CONTEXT_IDLE && !is_generating.load();
-    }
-    
-    // Get current state as string for debugging
-    std::string GetStateString() const {
-        switch (state.load()) {
-            case ContextState::CONTEXT_IDLE: return "CONTEXT_IDLE";
-            case ContextState::CONTEXT_GENERATING: return "CONTEXT_GENERATING";
-            case ContextState::PLUGIN_PROCESSING: return "PLUGIN_PROCESSING";
-            case ContextState::ERROR_STATE: return "ERROR_STATE";
-            default: return "UNKNOWN";
-        }
-    }
+public:
     
     size_t GetMaxContextTokens() const { return max_context_tokens; }
     const std::string& GetContextId() const { return context_id; }
@@ -459,39 +274,38 @@ inline ContextInfo::ContextInfo(const std::string& context_id, ModelInfo* model,
     , parent_model(model)
     , token_cache(model ? &model->GetTokenCache() : nullptr)
     , context_size(context_size)
-    , state(ContextState::CONTEXT_IDLE)
     , template_manager(std::make_unique<ChatTemplateManager>())
     , llama_ctx(nullptr)
     , context_needs_rebuild(true)
 {
     if (!parent_model) {
-        LOG_ERROR_ContextInfo("ContextInfo created with null ModelInfo");
-        state.store(ContextState::ERROR_STATE);
+        LOG_ERROR("ContextInfo", "ContextInfo created with null ModelInfo");
+        (void)TrySetState(ContextState::ERROR_STATE);
         return;
     }
     
     if (!token_cache) {
-        LOG_ERROR_ContextInfo("ContextInfo created with null TokenCache");
-        state.store(ContextState::ERROR_STATE);
+        LOG_ERROR("ContextInfo", "ContextInfo created with null TokenCache");
+        (void)TrySetState(ContextState::ERROR_STATE);
         return;
     }
     
     if (context_size <= 0) {
-        LOG_ERROR_ContextInfo("ContextInfo created with invalid context size: " + std::to_string(context_size));
-        state.store(ContextState::ERROR_STATE);
+        LOG_ERROR("ContextInfo", "ContextInfo created with invalid context size: " + std::to_string(context_size));
+        (void)TrySetState(ContextState::ERROR_STATE);
         return;
     }
     
     // Set max context tokens to match our individual context size
     max_context_tokens = static_cast<size_t>(context_size);
     
-    LOG_DEBUG_ContextInfo("ContextInfo created: " + context_id + " with context size: " + std::to_string(context_size));
+    LOG_DEBUG("ContextInfo", "ContextInfo created: " + context_id + " with context size: " + std::to_string(context_size));
 }
 
 inline ContextInfo::ContextInfo(ModelInfo* model, int32_t context_size)
     : ContextInfo(GenerateContextId(), model, context_size) // Auto-generate context_id
 {
-    LOG_DEBUG_ContextInfo("ContextInfo created with auto-generated ID: " + context_id + " and context size: " + std::to_string(context_size));
+    LOG_DEBUG("ContextInfo", "ContextInfo created with auto-generated ID: " + context_id + " and context size: " + std::to_string(context_size));
 }
 
 inline ContextInfo::~ContextInfo() {
@@ -623,11 +437,10 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
                              input.substr(0, 50) + (input.length() > 50 ? "..." : ""));
         
         // 2. Check if context needs rebuilding after adding message
-        if (context_needs_rebuild || template_manager->IsTemplateDirty()) {
-            if (!RebuildContext(RebuildStrategy::FULL)) {
-                TrySetState(ContextState::ERROR_STATE);
-                return "Error: Failed to rebuild context";
-            }
+        if (context_needs_rebuild || template_manager->IsTemplateDirty()) {        if (!RebuildContext(RebuildStrategy::FULL)) {
+            (void)TrySetState(ContextState::ERROR_STATE);
+            return "Error: Failed to rebuild context";
+        }
             // Sync stats after successful rebuild
             SyncStatsWithContextState();
         }
@@ -659,16 +472,15 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
         // 6. Add assistant response to message history
         message_history.emplace_back("assistant", response);
         
-        TrySetState(ContextState::CONTEXT_IDLE);
-        
-        LOG_DEBUG_ContextInfo("Generated response: " + response.substr(0, 100) + 
-                             (response.length() > 100 ? "..." : ""));
+        (void)TrySetState(ContextState::CONTEXT_IDLE);
+          LOG_DEBUG("ContextInfo", "Generated response: " + response.substr(0, 100) + 
+                 (response.length() > 100 ? "..." : ""));
         
         return response;
         
     } catch (const std::exception& e) {
-        LOG_ERROR_ContextInfo("Exception in HandleInput: " + std::string(e.what()));
-        TrySetState(ContextState::ERROR_STATE);
+        LOG_ERROR("ContextInfo", "Exception in HandleInput: " + std::string(e.what()));
+        (void)TrySetState(ContextState::ERROR_STATE);
         return "Error: " + std::string(e.what());
     }
 }
@@ -1146,8 +958,6 @@ inline void ContextInfo::ClearMessageHistory() {
     LOG_DEBUG_ContextInfo("Message history cleared");
 }
 
-
-
 // Helper function to generate context IDs
 inline std::string GenerateContextId() {
     static std::atomic<size_t> counter{0};
@@ -1226,7 +1036,7 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
             // 3. Rebuild context with the new message
             if (context_needs_rebuild || template_manager->IsTemplateDirty()) {
                 if (!RebuildContext(RebuildStrategy::FULL)) {
-                    TrySetState(ContextState::ERROR_STATE);
+                    (void)TrySetState(ContextState::ERROR_STATE);
                     if (callbacks.on_error) {
                         callbacks.on_error("Failed to rebuild context");
                     }
@@ -1240,8 +1050,8 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
             // Note: Normal threshold monitoring is handled by ContextPruningPlugin
             size_t actual_tokens = static_cast<size_t>(std::max(0, n_past));
             if (max_context_tokens > 0 && actual_tokens >= max_context_tokens - ContextConstants::SAFETY_BUFFER_TOKENS) {
-                LOG_WARNING_ContextInfo("Context still near hard limit after rebuild - plugin intervention needed");
-                LOG_WARNING_ContextInfo("Actual tokens: " + std::to_string(actual_tokens) + "/" + std::to_string(max_context_tokens));
+                LOG_WARNING("ContextInfo", "Context still near hard limit after rebuild - plugin intervention needed");
+                LOG_WARNING("ContextInfo", "Actual tokens: " + std::to_string(actual_tokens) + "/" + std::to_string(max_context_tokens));
                 
                 // Log the problem but don't attempt emergency pruning - that's the plugin's responsibility
                 // The plugin should monitor and handle this through proper algorithms
@@ -1253,8 +1063,8 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
             preparation_success = true;
             
         } catch (const std::exception& e) {
-            LOG_ERROR_ContextInfo("Exception in HandleInputAsync preparation: " + std::string(e.what()));
-            TrySetState(ContextState::ERROR_STATE);
+            LOG_ERROR("ContextInfo", "Exception in HandleInputAsync preparation: " + std::string(e.what()));
+            (void)TrySetState(ContextState::ERROR_STATE);
             if (callbacks.on_error) {
                 callbacks.on_error("Exception: " + std::string(e.what()));
             }
@@ -1288,9 +1098,9 @@ inline void ContextInfo::StopGeneration() {
     
     std::lock_guard<std::mutex> lock(context_mutex);
     if (state.load() == ContextState::CONTEXT_GENERATING) {
-        TrySetState(ContextState::CONTEXT_IDLE);
+        (void)TrySetState(ContextState::CONTEXT_IDLE);
         is_generating = false;
-        LOG_DEBUG_ContextInfo("Generation stopped for context: " + context_id);
+        LOG_DEBUG("ContextInfo", "Generation stopped for context: " + context_id);
     }
 }
 
@@ -1336,19 +1146,19 @@ inline void ContextInfo::StartGenerationAsync(const std::string& prompt, const G
                 }
                 
                 if (!InitializeLlamaContext()) {
-                    LOG_ERROR_ContextInfo("Failed to initialize context for async generation");
+                    LOG_ERROR("ContextInfo", "Failed to initialize context for async generation");
                     if (callbacks.on_error) {
                         callbacks.on_error("Context initialization failed");
                     }
                     is_generating = false;
-                    TrySetState(ContextState::ERROR_STATE);
+                    (void)TrySetState(ContextState::ERROR_STATE);
                     return;
                 }
                 
                 // OPTIMIZATION: Skip tokenization and processing if context was just rebuilt
                 // The context should already contain all the prompt tokens from the rebuild
                 if (context_needs_rebuild) {
-                    LOG_DEBUG_ContextInfo("Context needs rebuild before generation");
+                    LOG_DEBUG("ContextInfo", "Context needs rebuild before generation");
                     
                     // Tokenize the prompt
                     std::vector<int32_t> prompt_tokens = token_cache->TokenizeText(prompt, true);
@@ -1360,12 +1170,11 @@ inline void ContextInfo::StartGenerationAsync(const std::string& prompt, const G
                             callbacks.on_error("Failed to process prompt");
                         }
                         is_generating = false;
-                        TrySetState(ContextState::ERROR_STATE);
+                        (void)TrySetState(ContextState::ERROR_STATE);
                         return;
                     }
-                } else {
-                    LOG_DEBUG_ContextInfo("Using already-processed context for generation (n_past=" + 
-                                         std::to_string(n_past) + ")");
+                } else {                    LOG_DEBUG("ContextInfo", "Using already-processed context for generation (n_past=" + 
+                             std::to_string(n_past) + ")");
                 }
             }
             
@@ -1490,22 +1299,21 @@ inline void ContextInfo::StartGenerationAsync(const std::string& prompt, const G
                     QueryAndSyncActualContextUsage();
                 }
                 
-                TrySetState(ContextState::CONTEXT_IDLE);
+                (void)TrySetState(ContextState::CONTEXT_IDLE);
                 is_generating = false;
             
             // Background context maintenance is now handled by ContextPruningPlugin monitoring
             // No need for direct pruning calls - plugin will handle this through its regular monitoring
             }
-            
-            LOG_DEBUG_ContextInfo("Async generation completed: " + std::to_string(response_tokens.size()) + 
-                                 " tokens -> " + full_response.substr(0, 100) + 
-                                 (full_response.length() > 100 ? "..." : ""));
+              LOG_DEBUG("ContextInfo", "Async generation completed: " + std::to_string(response_tokens.size()) + 
+                     " tokens -> " + full_response.substr(0, 100) + 
+                     (full_response.length() > 100 ? "..." : ""));
             
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lock(context_mutex);
             is_generating = false;
-            TrySetState(ContextState::ERROR_STATE);
-            LOG_ERROR_ContextInfo("Exception during async generation: " + std::string(e.what()));
+            (void)TrySetState(ContextState::ERROR_STATE);
+            LOG_ERROR("ContextInfo", "Exception during async generation: " + std::string(e.what()));
             
             if (callbacks.on_error) {
                 callbacks.on_error("Exception: " + std::string(e.what()));

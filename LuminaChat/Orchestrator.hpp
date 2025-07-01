@@ -14,7 +14,7 @@
 #include "ProcessingPipeline.hpp"
 #include "Sanitizer.hpp"
 #include "LlamaManager.hpp"
-#include "ContextInfo.hpp"
+#include "Context/ContextInfo.hpp"
 #include "Logger.hpp"
 
 // Pruning buffer for plugin consumption
@@ -104,7 +104,7 @@ namespace LuminaChat {
 // Forward declarations for ContextInfo types
 struct PrunedMessageBatch;
 struct EmotionalAnalysisBatch;
-enum class ContextState;
+enum class ContextState : uint8_t;
 
 // Optimized Discord request/response structures with cache alignment
 struct alignas(OrchestratorConstants::CACHE_LINE_SIZE) DiscordChannelRequest {

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ContextInfo.hpp"
+#include "Context/ContextInfo.hpp"
 #include "ProcessingPipeline.hpp"
 #include "Orchestrator.hpp"
 #include "LlamaManager.hpp"
@@ -205,7 +205,7 @@ public:
             }
             
             // Try to acquire plugin processing lock for safe summary application
-            if (!original_context->TryAcquirePluginProcessing("SummarizationPlugin", std::chrono::milliseconds(5000))) {
+            if (!original_context->TryAcquirePluginProcessing("SummarizationPlugin", 5000)) {
                 LogWarning("Could not acquire plugin processing lock for context: " + context_id + " - context may be busy");
                 return false;
             }

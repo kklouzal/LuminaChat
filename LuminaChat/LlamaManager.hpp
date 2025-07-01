@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ModelInfo.hpp"
-#include "ContextInfo.hpp"
+#include "Context/ContextInfo.hpp"
 #include "SettingsManager.hpp"
 #include "Logger.hpp"
 // llama.cpp includes

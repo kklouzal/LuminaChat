@@ -345,6 +345,7 @@ thread_local std::array<char, 1024> Logger::format_buffer{};
 #define LOG_SummarizationPlugin(message) LOG_INFO("SummarizationPlugin", message)
 #define LOG_EmoTagPlugin(message) LOG_INFO("EmoTagPlugin", message)
 #define LOG_LuminaChat(message) LOG_INFO("LuminaChat", message)
+#define LOG_ContextState(message) LOG_INFO("ContextState", message)
 
 #define LOG_DEBUG_Logger(message) LOG_DEBUG("Logger", message)
 #define LOG_DEBUG_SettingsManager(message) LOG_DEBUG("SettingsManager", message)
@@ -360,6 +361,7 @@ thread_local std::array<char, 1024> Logger::format_buffer{};
 #define LOG_DEBUG_SummarizationPlugin(message) LOG_DEBUG("SummarizationPlugin", message)
 #define LOG_DEBUG_EmoTagPlugin(message) LOG_DEBUG("EmoTagPlugin", message)
 #define LOG_DEBUG_LuminaChat(message) LOG_DEBUG("LuminaChat", message)
+#define LOG_DEBUG_ContextState(message) LOG_DEBUG("ContextState", message)
 
 #define LOG_ERROR_Logger(message) LOG_ERROR("Logger", message)
 #define LOG_ERROR_SettingsManager(message) LOG_ERROR("SettingsManager", message)
@@ -375,6 +377,7 @@ thread_local std::array<char, 1024> Logger::format_buffer{};
 #define LOG_ERROR_SummarizationPlugin(message) LOG_ERROR("SummarizationPlugin", message)
 #define LOG_ERROR_EmoTagPlugin(message) LOG_ERROR("EmoTagPlugin", message)
 #define LOG_ERROR_LuminaChat(message) LOG_ERROR("LuminaChat", message)
+#define LOG_ERROR_ContextState(message) LOG_ERROR("ContextState", message)
 
 #define LOG_WARNING_Logger(message) LOG_WARNING("Logger", message)
 #define LOG_WARNING_SettingsManager(message) LOG_WARNING("SettingsManager", message)
@@ -390,6 +393,7 @@ thread_local std::array<char, 1024> Logger::format_buffer{};
 #define LOG_WARNING_SummarizationPlugin(message) LOG_WARNING("SummarizationPlugin", message)
 #define LOG_WARNING_EmoTagPlugin(message) LOG_WARNING("EmoTagPlugin", message)
 #define LOG_WARNING_LuminaChat(message) LOG_WARNING("LuminaChat", message)
+#define LOG_WARNING_ContextState(message) LOG_WARNING("ContextState", message)
 
 // Legacy LogHandler compatibility macros (will be updated to use new Logger)
 #define LLAMA_LOG(message) LOG_INFO("LlamaManager", message)

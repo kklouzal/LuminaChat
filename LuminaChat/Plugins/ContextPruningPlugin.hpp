@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ContextInfo.hpp"
+#include "Context/ContextInfo.hpp"
 #include "ContextStats.hpp"
 #include "ProcessingPipeline.hpp"
 #include "Orchestrator.hpp"
@@ -451,7 +451,7 @@ public:
                " (" + std::to_string(tokens_before) + " tokens)");
         
         // Try to acquire plugin processing state for this context
-        if (!context->TryAcquirePluginProcessing("ContextPruningPlugin", std::chrono::milliseconds(2000))) {
+        if (!context->TryAcquirePluginProcessing("ContextPruningPlugin", 2000)) {
             LogWarning("Failed to acquire plugin processing state for emergency pruning: " + context_id);
             return {};
         }

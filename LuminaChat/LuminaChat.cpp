@@ -39,15 +39,15 @@
 #include "SettingsManager.hpp"
 #include "Sanitizer.hpp"
 #include "DiscordManager.hpp"
-#include "ContextPruningPlugin.hpp"
+#include "Plugins/ContextPruningPlugin.hpp"
 #include "TokenCache.hpp"
 #include "ModelInfo.hpp"
 #include "ChatTemplateManager.hpp"
-#include "ContextInfo.hpp"
+#include "Context/ContextInfo.hpp"
 #include "LlamaManager.hpp"
 #include "Orchestrator.hpp"
-#include "SummarizationPlugin.hpp"
-#include "EmoTagPlugin.hpp"
+#include "Plugins/SummarizationPlugin.hpp"
+#include "Plugins/EmoTagPlugin.hpp"
 
 #include <memory>
 #include <thread>
