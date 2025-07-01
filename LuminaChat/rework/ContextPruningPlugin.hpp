@@ -109,10 +109,10 @@ private:
     // Status callback for UI updates
     StatusUpdateCallback status_callback;
     
-    // Configuration - per plugin instance
-    float pruning_threshold = 0.80f;        // Trigger at 80%
+    // Configuration - per plugin instance  
+    float pruning_threshold = 0.75f;        // Trigger at 75% (more aggressive)
     float target_usage = 0.40f;             // Reduce to 40%
-    float emergency_threshold = 0.95f;      // Emergency pruning at 95%
+    float emergency_threshold = 0.90f;      // Emergency pruning at 90% (earlier intervention)
     int32_t min_buffer_tokens = 512;        // Minimum space reserved for AI response
     
     // Plugin-wide statistics
@@ -309,8 +309,8 @@ public:
         monitoring.last_stats = stats;
         monitoring.last_update = std::chrono::steady_clock::now();
         
-        // Log detailed stats if approaching limits
-        if (stats.GetUsagePercentage() > 0.70f) {
+        // Log detailed stats if approaching limits (more proactive monitoring)
+        if (stats.GetUsagePercentage() > 0.60f) {
             LogUsageStats(context_id, stats);
         }
         
@@ -424,15 +424,60 @@ public:
         return false;
     }
     
-    // Get debug information
-    std::vector<std::string> GetLogHistory() const {
-        std::lock_guard<std::mutex> lock(debug_mutex);
-        return std::vector<std::string>(log_history.begin(), log_history.end());
-    }
-    
-    std::optional<DebugPruningEvent> GetLastPruningEvent() const {
-        std::lock_guard<std::mutex> lock(debug_mutex);
-        return last_pruning_event;
+    /**
+     * Emergency pruning interface for ContextInfo to request immediate pruning
+     * This ensures all pruning goes through the plugin for proper coordination
+     */
+    std::vector<std::pair<std::string, std::string>> RequestEmergencyPruning(const std::string& context_id, size_t keep_messages = 3) {
+        LogWarning("Emergency pruning requested for context: " + context_id + " (keep " + std::to_string(keep_messages) + " messages)");
+        
+        if (!llama_manager) {
+            LogWarning("LlamaManager not available for emergency pruning: " + context_id);
+            return {};
+        }
+        
+        // Get the context directly
+        auto* context = GetContextInfo(context_id);
+        if (!context) {
+            LogWarning("Context not found for emergency pruning: " + context_id);
+            return {};
+        }
+        
+        // For emergency pruning, we bypass the availability check since this is critical
+        // Record tokens before pruning
+        int32_t tokens_before = static_cast<int32_t>(context->GetActualContextTokens());
+        
+        LogInfo("Executing emergency pruning for context: " + context_id + 
+               " (" + std::to_string(tokens_before) + " tokens)");
+        
+        // Execute emergency pruning and get the pruned messages
+        std::vector<std::pair<std::string, std::string>> pruned_messages = 
+            context->PruneContextImmediateWithExtraction(keep_messages);
+        
+        // Coordinate with Orchestrator for summarization (plugin responsibility)
+        if (!pruned_messages.empty() && orchestrator) {
+            orchestrator->RequestSummarizationForPrunedMessages(context_id, pruned_messages);
+            LogInfo("Requested summarization for " + std::to_string(pruned_messages.size()) + 
+                   " emergency pruned messages from context: " + context_id);
+        }
+        
+        // Update emergency statistics
+        emergency_prunings++;
+        
+        // Update monitoring state
+        {
+            std::lock_guard<std::mutex> lock(contexts_mutex);
+            auto& monitoring = monitored_contexts[context_id];
+            monitoring.state = PruningState::NORMAL; // Reset to normal after emergency pruning
+            monitoring.last_stats.total_tokens = static_cast<int32_t>(context->GetActualContextTokens());
+            monitoring.last_update = std::chrono::steady_clock::now();
+        }
+        
+        int32_t tokens_after = static_cast<int32_t>(context->GetActualContextTokens());
+        LogInfo("Emergency pruning completed for context: " + context_id + 
+               " (" + std::to_string(tokens_before) + " -> " + std::to_string(tokens_after) + " tokens)");
+        
+        return pruned_messages;
     }
     
     void LogStatistics() {
@@ -466,9 +511,9 @@ private:
                     std::to_string(static_cast<int>(usage_percentage * 100)) + "%)");
             }
             
-            // Check if enough time has passed since last pruning request (throttling)
+            // Check if enough time has passed since last pruning request (reduced throttling for faster response)
             auto now = std::chrono::steady_clock::now();
-            if (now - monitoring.last_pruning_request >= std::chrono::seconds(5)) {
+            if (now - monitoring.last_pruning_request >= std::chrono::seconds(2)) {
                 PruningStrategy strategy = DeterminePruningStrategy(context_id, monitoring.last_stats);
                 TriggerContextPruning(context_id, strategy);
                 
@@ -478,8 +523,8 @@ private:
                 pruning_requests++;
             }
             
-        } else if (usage_percentage < 0.60f) {
-            // Return to normal if usage drops significantly
+        } else if (usage_percentage < 0.50f) {
+            // Return to normal if usage drops significantly (more conservative threshold)
             if (monitoring.state == PruningState::MONITORING || monitoring.state == PruningState::PRUNING_REQUESTED) {
                 monitoring.state = PruningState::NORMAL;
             }
@@ -590,8 +635,17 @@ private:
         LogInfo("Pruning oldest messages: keeping " + std::to_string(keep_messages) + 
                " out of " + std::to_string(current_messages) + " messages");
         
-        // Use the existing PruneContextImmediate method
-        context->PruneContextImmediate(keep_messages);
+        // Perform the actual pruning operation and get the pruned messages
+        std::vector<std::pair<std::string, std::string>> pruned_messages = 
+            context->PruneContextImmediateWithExtraction(keep_messages);
+        
+        // Coordinate with Orchestrator for summarization (plugin responsibility)
+        if (!pruned_messages.empty() && orchestrator) {
+            orchestrator->RequestSummarizationForPrunedMessages(context->GetContextId(), pruned_messages);
+            LogInfo("Requested summarization for " + std::to_string(pruned_messages.size()) + 
+                   " pruned messages from context: " + context->GetContextId());
+        }
+        
         return true;
     }
     
@@ -608,7 +662,17 @@ private:
         LogInfo("Pruning with balanced strategy: keeping " + std::to_string(keep_messages) + 
                " out of " + std::to_string(current_messages) + " messages");
         
-        context->PruneContextImmediate(keep_messages);
+        // Perform the actual pruning operation and get the pruned messages
+        std::vector<std::pair<std::string, std::string>> pruned_messages = 
+            context->PruneContextImmediateWithExtraction(keep_messages);
+        
+        // Coordinate with Orchestrator for summarization (plugin responsibility)
+        if (!pruned_messages.empty() && orchestrator) {
+            orchestrator->RequestSummarizationForPrunedMessages(context->GetContextId(), pruned_messages);
+            LogInfo("Requested summarization for " + std::to_string(pruned_messages.size()) + 
+                   " pruned messages from context: " + context->GetContextId());
+        }
+        
         return true;
     }
     
@@ -622,7 +686,16 @@ private:
         LogInfo("Emergency pruning: keeping only " + std::to_string(keep_messages) + 
                " out of " + std::to_string(current_messages) + " messages");
         
-        context->PruneContextImmediate(keep_messages);
+        // Perform the actual pruning operation and get the pruned messages
+        std::vector<std::pair<std::string, std::string>> pruned_messages = 
+            context->PruneContextImmediateWithExtraction(keep_messages);
+        
+        // Coordinate with Orchestrator for summarization (plugin responsibility)
+        if (!pruned_messages.empty() && orchestrator) {
+            orchestrator->RequestSummarizationForPrunedMessages(context->GetContextId(), pruned_messages);
+            LogInfo("Requested summarization for " + std::to_string(pruned_messages.size()) + 
+                   " pruned messages from context: " + context->GetContextId());
+        }
         
         // Update emergency statistics
         emergency_prunings++;
@@ -638,6 +711,7 @@ private:
 inline void Orchestrator::MonitorAllContextSizes() {
     // Early exit if context pruning plugin is not available
     if (!context_pruning_plugin_available.load(std::memory_order_relaxed)) [[unlikely]] {
+        LOG_DEBUG_Orchestrator("Context pruning plugin not available, skipping monitoring");
         return;
     }
     
@@ -649,10 +723,11 @@ inline void Orchestrator::MonitorAllContextSizes() {
     // Get all active contexts
     auto contexts = llama_manager->GetAllActiveContexts();
     if (contexts.empty()) [[likely]] {
+        LOG_DEBUG_Orchestrator("No active contexts to monitor");
         return; // No contexts to monitor
     }
     
-    LOG_DEBUG_Orchestrator("Monitoring " + std::to_string(contexts.size()) + " contexts for size management");
+    LOG_Orchestrator("Monitoring " + std::to_string(contexts.size()) + " contexts for size management");
     
     // Monitor each context through the plugin
     for (auto* context : contexts) [[likely]] {
@@ -669,6 +744,18 @@ inline void Orchestrator::MonitorAllContextSizes() {
             
             // Let the plugin monitor and make decisions
             context_pruning_plugin->MonitorContext(context->GetContextId(), stats);
+            
+            // Log context usage for debugging - use INFO level for high usage
+            float usage_percentage = static_cast<float>(stats.total_tokens) / static_cast<float>(stats.max_tokens);
+            if (usage_percentage > 0.50f) {
+                LOG_Orchestrator("Context " + context->GetContextId() + " usage: " + 
+                                      std::to_string(stats.total_tokens) + "/" + std::to_string(stats.max_tokens) + 
+                                      " (" + std::to_string(static_cast<int>(usage_percentage * 100)) + "%)");
+            } else {
+                LOG_DEBUG_Orchestrator("Context " + context->GetContextId() + " usage: " + 
+                                      std::to_string(stats.total_tokens) + "/" + std::to_string(stats.max_tokens) + 
+                                      " (" + std::to_string(static_cast<int>(usage_percentage * 100)) + "%)");
+            }
             
         } catch (const std::exception& e) {
             LOG_WARNING_Orchestrator("Exception during context size monitoring for " + 

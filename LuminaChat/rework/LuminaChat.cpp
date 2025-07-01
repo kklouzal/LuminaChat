@@ -1295,8 +1295,15 @@ void LuminaChatFrame::InitializePlugins() {
             AddLogMessage("Failed to initialize ContextPruningPlugin");
         } else {
             AddLogMessage("ContextPruningPlugin initialized successfully");
-            // Note: Registration would be added to Orchestrator when the integration is implemented
-            // orchestrator->RegisterContextPruningPlugin(context_pruning_plugin.get());
+            
+            // Configure more aggressive thresholds for better context management
+            context_pruning_plugin->SetPruningThreshold(0.65f);  // Trigger at 65% instead of 75%
+            context_pruning_plugin->SetTargetUsage(0.35f);       // Reduce to 35% instead of 40%
+            context_pruning_plugin->SetEmergencyThreshold(0.85f); // Emergency at 85% instead of 90%
+            
+            // Register with Orchestrator for context monitoring
+            orchestrator->RegisterContextPruningPlugin(context_pruning_plugin.get());
+            AddLogMessage("ContextPruningPlugin registered with Orchestrator for monitoring");
         }
         
         AddLogMessage("All plugins initialized successfully");
@@ -1373,10 +1380,30 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
         GenerationCallbacks callbacks(
             // Token callback - called for each token as it's generated
             [this](const std::string& token_text) {
-                // Update UI on main thread
-                this->CallAfter([this, token_text]() {
-                    AppendToStreamingMessage(token_text);
-                });
+                // PERFORMANCE FIX: Batch UI updates to prevent hitch from rapid callbacks
+                static std::string token_buffer;
+                static auto last_ui_update = std::chrono::steady_clock::now();
+                static std::mutex buffer_mutex;
+                
+                {
+                    std::lock_guard<std::mutex> lock(buffer_mutex);
+                    token_buffer += token_text;
+                    
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_ui_update);
+                    
+                    // Only update UI every 16ms (~60fps) or when buffer gets large
+                    if (elapsed.count() >= 16 || token_buffer.length() >= 100) {
+                        std::string batch_text = std::move(token_buffer);
+                        token_buffer.clear();
+                        last_ui_update = now;
+                        
+                        // Update UI on main thread with batched tokens
+                        this->CallAfter([this, batch_text]() {
+                            AppendToStreamingMessage(batch_text);
+                        });
+                    }
+                }
             },
             
             // Completion callback - called when generation is done
@@ -1385,14 +1412,29 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
                     EndStreamingMessage();
                     SetGenerationUIState(false);  // Re-enable UI after generation
                     UpdateContextStatus();  // Update context usage in status bar
+                    
+                    // PERFORMANCE FIX: Delay context monitoring to avoid interference with generation cleanup
+                    if (orchestrator) {
+                        // Use a timer to delay monitoring by 1 second after generation completes
+                        auto timer = new wxTimer();
+                        timer->Bind(wxEVT_TIMER, [this, timer](wxTimerEvent&) {
+                            if (orchestrator) {
+                                orchestrator->MonitorAllContextSizes();
+                            }
+                            delete timer;
+                        });
+                        timer->StartOnce(1000); // 1 second delay
+                    }
+                    
                     if (success) {
                         AddLogMessage("Response generation completed successfully");
                         
                         // Request emotional analysis for the context after AI response
                         if (orchestrator) {
                             auto* context = orchestrator->GetLlamaManager()->GetContextInfo(current_context_id);
-                            if (context) {
-                                context->RequestEmotionalAnalysis();
+                            auto* emotag_plugin = orchestrator->GetEmoTagPlugin();
+                            if (context && emotag_plugin) {
+                                emotag_plugin->RequestEmotionalAnalysis(current_context_id, context->GetMessageHistory());
                                 AddLogMessage("Requested emotional analysis for context: " + current_context_id);
                                 
                                 // Immediately trigger processing of emotion analysis buffer
@@ -1421,6 +1463,12 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
                     }
                     SetGenerationUIState(false);  // Re-enable UI on error
                     UpdateContextStatus();  // Update context usage in status bar
+                    
+                    // Trigger context monitoring even on error to check size
+                    if (orchestrator) {
+                        orchestrator->MonitorAllContextSizes();
+                    }
+                    
                     AddLogMessage("Error generating response: " + error_message);
                     AddChatMessage("System", "Error: " + error_message, wxColour(150, 50, 50));
                 });

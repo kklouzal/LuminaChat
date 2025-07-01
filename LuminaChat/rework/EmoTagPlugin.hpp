@@ -81,6 +81,10 @@ private:
     std::atomic<size_t> emotional_states_generated{0};
     std::atomic<size_t> contexts_updated{0};
     
+    // Buffer management for emotional analysis (moved from ContextInfo)
+    mutable std::mutex emotional_analysis_buffer_mutex;
+    std::vector<EmotionalAnalysisBatch> emotional_analysis_buffer;
+    
     // Debugging features
     struct DebugGeneration {
         std::string input;
@@ -261,6 +265,69 @@ public:
      */
     bool IsReady() const {
         return emotion_model_ready.load();
+    }
+    
+    // Buffer management methods (moved from ContextInfo)
+    /**
+     * Get and clear all pending emotional analysis batches
+     */
+    std::vector<EmotionalAnalysisBatch> GetAndClearEmotionalAnalysisBuffer() {
+        std::lock_guard<std::mutex> lock(emotional_analysis_buffer_mutex);
+        
+        std::vector<EmotionalAnalysisBatch> result;
+        result.swap(emotional_analysis_buffer);
+        
+        return result;
+    }
+    
+    /**
+     * Check if there are pending AI responses waiting for emotional analysis
+     */
+    bool HasPendingEmotionalAnalysis() const {
+        std::lock_guard<std::mutex> lock(emotional_analysis_buffer_mutex);
+        return !emotional_analysis_buffer.empty();
+    }
+    
+    /**
+     * Add an emotional analysis batch to the buffer
+     */
+    void AddToEmotionalAnalysisBuffer(EmotionalAnalysisBatch&& batch) {
+        std::lock_guard<std::mutex> lock(emotional_analysis_buffer_mutex);
+        emotional_analysis_buffer.emplace_back(std::move(batch));
+    }
+    
+    /**
+     * Request emotional analysis for a specific context (moved from ContextInfo)
+     */
+    void RequestEmotionalAnalysis(const std::string& context_id, const std::vector<std::pair<std::string, std::string>>& message_history) {
+        if (message_history.empty()) {
+            LogInfo("No messages in history for emotional analysis request - context: " + context_id);
+            return;
+        }
+        
+        // Extract recent AI responses for analysis
+        std::vector<std::string> ai_responses;
+        const size_t max_responses = analysis_window_size.load();
+        
+        LogInfo("Searching for AI responses in " + std::to_string(message_history.size()) + " messages for context: " + context_id);
+        
+        // Walk backwards through message history to find AI responses
+        for (auto it = message_history.rbegin(); it != message_history.rend() && ai_responses.size() < max_responses; ++it) {
+            if (it->first == "assistant") {
+                ai_responses.insert(ai_responses.begin(), it->second); // Insert at beginning to maintain order
+                LogInfo("Found assistant message (" + std::to_string(it->second.length()) + " chars) for emotional analysis");
+            }
+        }
+        
+        if (!ai_responses.empty()) {
+            size_t response_count = ai_responses.size();  // Store size before move
+            AddToEmotionalAnalysisBuffer(EmotionalAnalysisBatch(context_id, std::move(ai_responses)));
+            
+            LogInfo("Requested emotional analysis for context " + context_id + 
+                   " with " + std::to_string(response_count) + " AI responses");
+        } else {
+            LogInfo("No assistant messages found in " + std::to_string(message_history.size()) + " messages for context: " + context_id);
+        }
     }
     
     /**
@@ -741,6 +808,30 @@ inline void Orchestrator::OnEmotionAnalysisComplete(const std::string& context_i
         stats.emotion_analyses_completed.fetch_add(1, std::memory_order_relaxed);
     } else {
         LOG_ERROR_Orchestrator("Emotion analysis failed: " + response.error_message);
+    }
+}
+
+// CRITICAL: Orchestrator method implementations moved here to combat circular dependencies
+inline void Orchestrator::ProcessEmotionAnalysisBuffer() {
+    // Check if emotion plugin has pending analysis requests
+    if (!emotag_plugin || !emotag_plugin->HasPendingEmotionalAnalysis()) [[likely]] {
+        return; // No work to do
+    }
+    
+    LOG_Orchestrator("Processing emotion analysis buffer...");
+    
+    // Get all pending emotional analysis batches from plugin
+    auto analysis_batches = emotag_plugin->GetAndClearEmotionalAnalysisBuffer();
+    
+    if (!analysis_batches.empty()) [[likely]] {
+        LOG_Orchestrator("Found " + std::to_string(analysis_batches.size()) + " emotion analysis batches to process");
+        
+        // Process each batch through the emotion analysis pipeline
+        for (const auto& batch : analysis_batches) [[likely]] {
+            RequestEmotionAnalysis(batch, LuminaChat::RequestPriority::NORMAL);
+        }
+        
+        LOG_Orchestrator("Emotion analysis buffer processing complete");
     }
 }
 

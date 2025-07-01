@@ -15,8 +15,32 @@
 #include "Sanitizer.hpp"
 #include "LlamaManager.hpp"
 #include "ContextInfo.hpp"
-#include "ContextStats.hpp"
 #include "Logger.hpp"
+
+// Pruning buffer for plugin consumption
+struct PrunedMessageBatch {
+    std::string context_id;
+    std::vector<std::pair<std::string, std::string>> pruned_messages;
+    std::chrono::steady_clock::time_point pruned_at;
+    bool needs_summarization = true;
+    
+    PrunedMessageBatch(const std::string& id, 
+                       std::vector<std::pair<std::string, std::string>> messages)
+        : context_id(id), pruned_messages(std::move(messages)), 
+          pruned_at(std::chrono::steady_clock::now()) {}
+};
+
+// Emotional analysis buffer for plugin consumption
+struct EmotionalAnalysisBatch {
+    std::string context_id;
+    std::vector<std::string> ai_responses; // Recent AI responses for analysis
+    std::chrono::steady_clock::time_point requested_at;
+    
+    EmotionalAnalysisBatch(const std::string& id, 
+                          std::vector<std::string> responses)
+        : context_id(id), ai_responses(std::move(responses)), 
+          requested_at(std::chrono::steady_clock::now()) {}
+};
 
 // Performance constants and compile-time optimizations
 namespace OrchestratorConstants {
@@ -308,13 +332,22 @@ public:
     void ProcessScheduledTasks();
     
     // Manual processing triggers (public for immediate processing)
+    // CRITICAL: This function is defined at the END of EmoTagPlugin.hpp to combat circular dependencies
     void ProcessEmotionAnalysisBuffer();  // Process emotion analysis buffer
     // CRITICAL: This function is defined at the END of ContextPruningPlugin.hpp to combat circular dependencies
     void MonitorAllContextSizes();        // Monitor all context sizes for pruning
     
+    // Plugin coordination helpers
+    // CRITICAL: This function is defined at the END of SummarizationPlugin.hpp to combat circular dependencies
+    void RequestSummarizationForPrunedMessages(const std::string& context_id, const std::vector<std::pair<std::string, std::string>>& pruned_messages);
+    
     // Core component access for plugins
     [[nodiscard]] LlamaManager* GetLlamaManager() noexcept { return llama_manager; }
     [[nodiscard]] const LlamaManager* GetLlamaManager() const noexcept { return llama_manager; }
+    [[nodiscard]] LuminaChat::EmoTagPlugin* GetEmoTagPlugin() noexcept { return emotag_plugin; }
+    [[nodiscard]] const LuminaChat::EmoTagPlugin* GetEmoTagPlugin() const noexcept { return emotag_plugin; }
+    [[nodiscard]] LuminaChat::SummarizationPlugin* GetSummarizationPlugin() noexcept { return summarization_plugin; }
+    [[nodiscard]] const LuminaChat::SummarizationPlugin* GetSummarizationPlugin() const noexcept { return summarization_plugin; }
     
     // Compile-time configuration queries
     [[nodiscard]] static constexpr size_t GetCacheLineSize() noexcept { return OrchestratorConstants::CACHE_LINE_SIZE; }
@@ -452,6 +485,7 @@ private:
     void PerformCacheCleanup();
     void PerformHealthCheck();
     void UpdateDiscordPresence();
+    // CRITICAL: This function is defined at the END of SummarizationPlugin.hpp to combat circular dependencies
     void ProcessPruningBuffer();
 };
 
@@ -616,12 +650,25 @@ inline void Orchestrator::InputReceived(std::string_view input, std::string_view
             return;
         }
         
-        // Process through context
-        std::string response = context->HandleInput(sanitized_input, std::string(username));
+        // Process through context using async interface (for consistency with new architecture)
+        // Note: For Discord/non-UI contexts, we can still use blocking behavior by providing simple callbacks
+        GenerationCallbacks callbacks;
+        callbacks.on_complete = [this, source](const std::string& response, bool success) {
+            if (success && IsOutputCallbackAvailable()) {
+                output_callback(response, source);
+            }
+        };
+        callbacks.on_error = [this, context_id](const std::string& error) {
+            LOG_ERROR_Orchestrator("Generation error for context " + std::string(context_id) + ": " + error);
+            SetContextState(context_id, ProcessingState::ERROR_STATE);
+        };
         
-        // Send response back through callback
-        if (IsOutputCallbackAvailable()) [[likely]] {
-            output_callback(response, source);
+        // Use async interface for consistency with new architecture
+        bool started = context->HandleInputAsync(sanitized_input, callbacks, std::string(username));
+        if (!started) [[unlikely]] {
+            LOG_ERROR_Orchestrator("Failed to start async processing for context: " + std::string(context_id));
+            SetContextState(context_id, ProcessingState::ERROR_STATE);
+            return;
         }
         
         // Update statistics - lock-free atomic increment
@@ -1032,72 +1079,16 @@ inline void Orchestrator::PerformCacheCleanup() {
 }
 
 inline void Orchestrator::PerformHealthCheck() {
-    LOG_Orchestrator("Performing health check...");
     
     // Check system health, memory usage, etc.
-    auto stats_snapshot = GetStats();
-    LOG_Orchestrator("Health check - Messages processed: " + std::to_string(stats_snapshot.messages_processed.load(std::memory_order_relaxed)) +
-                    ", Summarizations: " + std::to_string(stats_snapshot.summarizations_completed.load(std::memory_order_relaxed)));
+    //auto stats_snapshot = GetStats();
+    //LOG_Orchestrator("Health check - Messages processed: " + std::to_string(stats_snapshot.messages_processed.load(std::memory_order_relaxed)) +
+    //                ", Summarizations: " + std::to_string(stats_snapshot.summarizations_completed.load(std::memory_order_relaxed)));
 }
 
 inline void Orchestrator::UpdateDiscordPresence() {
     // Update Discord bot presence/status
     // This would integrate with Discord API
-    LOG_Orchestrator("Discord presence updated");
 }
 
-inline void Orchestrator::ProcessPruningBuffer() {
-    // Check if there are any pruned messages waiting for summarization
-    if (!ContextInfo::HasPendingSummarization()) [[likely]] {
-        return; // No work to do
-    }
-    
-    LOG_Orchestrator("Processing pruning buffer...");
-    
-    // Get all pending pruning batches
-    auto pruning_batches = ContextInfo::GetAndClearPruningBuffer();
-    
-    LOG_Orchestrator("Found " + std::to_string(pruning_batches.size()) + " pruning batches to process");
-    
-    // Process each batch through the summarization pipeline
-    for (const auto& batch : pruning_batches) [[likely]] {
-        if (!batch.needs_summarization) [[unlikely]] {
-            continue; // Skip batches that don't need summarization
-        }
-        
-        // Request summarization for this batch - most batches will need summarization
-        RequestSummarization(batch);
-        
-        // Update statistics using lock-free atomic increment
-        stats.summarizations_completed.fetch_add(1, std::memory_order_relaxed);
-    }
-    
-    LOG_Orchestrator("Pruning buffer processing complete - processed " + 
-                    std::to_string(pruning_batches.size()) + " batches");
-}
-
-inline void Orchestrator::ProcessEmotionAnalysisBuffer() {
-
-    // Check if there are any AI responses waiting for emotional analysis
-    if (!ContextInfo::HasPendingEmotionalAnalysis()) [[likely]] {
-        return; // No work to do
-    }
-    
-    LOG_Orchestrator("Processing emotion analysis buffer...");
-    
-    // Get all pending emotional analysis batches
-    auto analysis_batches = ContextInfo::GetAndClearEmotionalAnalysisBuffer();
-    
-    if (!analysis_batches.empty()) [[likely]] {
-        LOG_Orchestrator("Found " + std::to_string(analysis_batches.size()) + " emotion analysis batches to process");
-        
-        // Process each batch through the emotion analysis pipeline
-        for (const auto& batch : analysis_batches) [[likely]] {
-            RequestEmotionAnalysis(batch, LuminaChat::RequestPriority::NORMAL);
-        }
-        
-        LOG_Orchestrator("Emotion analysis buffer processing complete");
-    }
-}
-
-// CRITICAL: MonitorAllContextSizes is defined at the END of ContextPruningPlugin.hpp to combat circular dependencies
+// CRITICAL: Some method definitions are located at the BOTTOM of individual plugin files to combat circular dependencies.

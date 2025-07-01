@@ -76,6 +76,10 @@ private:
     std::atomic<size_t> messages_summarized{0};
     std::atomic<size_t> summaries_applied{0};
     
+    // Buffer management for pruned messages (moved from ContextInfo)
+    mutable std::mutex pruning_buffer_mutex;
+    std::vector<PrunedMessageBatch> pruning_buffer;
+    
     // Debugging features
     struct DebugGeneration {
         std::string input;
@@ -245,6 +249,55 @@ public:
      */
     bool IsReady() const {
         return summary_model_ready.load();
+    }
+    
+    // Buffer management methods (moved from ContextInfo)
+    /**
+     * Get and clear all pending pruned message batches for summarization
+     */
+    std::vector<PrunedMessageBatch> GetAndClearPruningBuffer() {
+        std::lock_guard<std::mutex> lock(pruning_buffer_mutex);
+        
+        std::vector<PrunedMessageBatch> result;
+        result.swap(pruning_buffer);
+        
+        return result;
+    }
+    
+    /**
+     * Check if there are pending messages waiting for summarization
+     */
+    bool HasPendingSummarization() const {
+        std::lock_guard<std::mutex> lock(pruning_buffer_mutex);
+        return !pruning_buffer.empty();
+    }
+    
+    /**
+     * Add a pruned message batch to the buffer for summarization
+     */
+    void AddToPruningBuffer(PrunedMessageBatch&& batch) {
+        std::lock_guard<std::mutex> lock(pruning_buffer_mutex);
+        pruning_buffer.emplace_back(std::move(batch));
+    }
+    
+    /**
+     * Request summarization for a specific context (following EmoTagPlugin pattern)
+     */
+    void RequestSummarization(const std::string& context_id, const std::vector<std::pair<std::string, std::string>>& pruned_messages) {
+        if (pruned_messages.empty()) {
+            LogInfo("No messages provided for summarization request - context: " + context_id);
+            return;
+        }
+        
+        LogInfo("Received summarization request for context " + context_id + 
+               " with " + std::to_string(pruned_messages.size()) + " pruned messages");
+        
+        // Create batch and add to buffer
+        PrunedMessageBatch batch(context_id, pruned_messages);
+        AddToPruningBuffer(std::move(batch));
+        
+        LogInfo("Queued summarization batch for context " + context_id + 
+               " - " + std::to_string(pruned_messages.size()) + " messages in buffer");
     }
     
     /**
@@ -786,4 +839,51 @@ inline void Orchestrator::ProcessSummarizationRequest(const LuminaChat::Summariz
         callback(error_response);
         OnSummarizationComplete(request.context_id, error_response);
     }
+}
+
+// CRITICAL: Orchestrator method implementations moved here to combat circular dependencies
+inline void Orchestrator::ProcessPruningBuffer() {
+    LOG_DEBUG_Orchestrator("ProcessPruningBuffer: Checking for pending summarization work...");
+    
+    // Check if summarization plugin has pending messages
+    if (!summarization_plugin || !summarization_plugin->HasPendingSummarization()) [[likely]] {
+        LOG_DEBUG_Orchestrator("ProcessPruningBuffer: No pending summarization work found");
+        return; // No work to do
+    }
+    
+    LOG_Orchestrator("Processing pruning buffer...");
+    
+    // Get all pending pruning batches from plugin
+    auto pruning_batches = summarization_plugin->GetAndClearPruningBuffer();
+    
+    LOG_Orchestrator("Found " + std::to_string(pruning_batches.size()) + " pruning batches to process");
+    
+    // Process each batch through the summarization pipeline
+    for (const auto& batch : pruning_batches) [[likely]] {
+        if (!batch.needs_summarization) [[unlikely]] {
+            continue; // Skip batches that don't need summarization
+        }
+        
+        // Request summarization for this batch - most batches will need summarization
+        RequestSummarization(batch);
+        
+        // Update statistics using lock-free atomic increment
+        stats.summarizations_completed.fetch_add(1, std::memory_order_relaxed);
+    }
+    
+    LOG_Orchestrator("Pruning buffer processing complete - processed " + 
+                    std::to_string(pruning_batches.size()) + " batches");
+}
+
+// Orchestrator helper method for requesting summarization (moved here to avoid circular dependencies)
+inline void Orchestrator::RequestSummarizationForPrunedMessages(const std::string& context_id, const std::vector<std::pair<std::string, std::string>>& pruned_messages) {
+    if (!summarization_plugin || !summarization_plugin_available.load()) {
+        LOG_WARNING_Orchestrator("SummarizationPlugin not available - pruned messages will be lost for context: " + context_id);
+        return;
+    }
+    
+    LOG_Orchestrator("Requesting summarization for " + std::to_string(pruned_messages.size()) + 
+                    " pruned messages from context: " + context_id);
+    
+    summarization_plugin->RequestSummarization(context_id, pruned_messages);
 }
