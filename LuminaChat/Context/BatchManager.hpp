@@ -33,41 +33,6 @@ namespace BatchManagerConstants {
     }
 }
 
-// Lock-free atomic statistics for BatchManager performance tracking
-struct alignas(BatchManagerConstants::CACHE_LINE_SIZE) BatchStats {
-    std::atomic<uint64_t> total_batches_processed{0};
-    std::atomic<uint64_t> total_tokens_processed{0};
-    std::atomic<uint64_t> batch_failures{0};
-    std::atomic<uint64_t> context_bound_violations{0};
-    std::atomic<uint64_t> memory_fence_operations{0};
-    
-    // High-performance atomic updates with relaxed ordering for hot paths
-    [[carries_dependency]] inline void RecordBatchProcessed(size_t token_count) noexcept {
-        total_batches_processed.fetch_add(1, std::memory_order_relaxed);
-        total_tokens_processed.fetch_add(token_count, std::memory_order_relaxed);
-    }
-    
-    [[carries_dependency]] inline void RecordBatchFailure() noexcept {
-        batch_failures.fetch_add(1, std::memory_order_relaxed);
-    }
-    
-    [[carries_dependency]] inline void RecordContextBoundViolation() noexcept {
-        context_bound_violations.fetch_add(1, std::memory_order_relaxed);
-    }
-    
-    [[carries_dependency]] inline void RecordMemoryFence() noexcept {
-        memory_fence_operations.fetch_add(1, std::memory_order_relaxed);
-    }
-    
-    // Lock-free ratio calculations
-    [[nodiscard]] double GetSuccessRate() const noexcept {
-        const uint64_t processed = total_batches_processed.load(std::memory_order_relaxed);
-        const uint64_t failed = batch_failures.load(std::memory_order_relaxed);
-        const uint64_t total = processed + failed;
-        return total > 0 ? static_cast<double>(processed) / total : 1.0;
-    }
-};
-
 /**
  * BatchManager: Handles all llama.cpp batch operations for token processing
  * 
@@ -101,9 +66,6 @@ private:
     alignas(16) mutable std::atomic<int32_t> cached_n_batch{0};           // Atomic cache batch size
     mutable std::atomic<int32_t> cached_safety_limit{0};      // Atomic cache safety limit
     mutable std::atomic<int32_t> cached_max_batch_tokens{0};  // Atomic cache maximum tokens per batch
-    
-    // Lock-free performance statistics - could potentially use [[no_unique_address]] for future optimizations
-    mutable BatchStats stats_;
     
     // Atomic error state tracking for lock-free error detection
     mutable std::atomic<bool> has_error_state{false};
@@ -157,8 +119,7 @@ public:
     [[nodiscard]] [[msvc::forceinline]] inline size_t GetBatchSize() const noexcept { return IsBatchInitialized() ? static_cast<size_t>(batch.n_tokens) : 0; }
     [[nodiscard]] [[msvc::forceinline]] inline int32_t GetCachedBatchSize() const noexcept { return cached_n_batch.load(std::memory_order_relaxed); }
     
-    // Lock-free performance statistics access
-    [[nodiscard]] inline const BatchStats& GetStats() const noexcept { return stats_; }
+    // Error state access
     [[nodiscard]] inline bool HasErrorState() const noexcept { return has_error_state.load(std::memory_order_relaxed); }
     [[nodiscard]] inline uint32_t GetLastErrorCode() const noexcept { return last_error_code.load(std::memory_order_relaxed); }
     
@@ -316,7 +277,6 @@ inline bool BatchManager::ProcessTokensBatch(const std::vector<int32_t>& tokens)
         const int32_t safety_limit = cached_safety_limit.load(std::memory_order_relaxed);
         if (chunk_start_position + static_cast<int32_t>(chunk_size) > safety_limit) [[unlikely]] {
             LOG_ERROR("BatchManager", "Chunk would exceed context bounds - stopping processing");
-            stats_.RecordContextBoundViolation();
             break;
         }
         
@@ -366,26 +326,18 @@ inline bool BatchManager::ProcessTokensBatch(const std::vector<int32_t>& tokens)
         // Execute batch decode with memory fence for large batches
         if (should_use_memory_fence(chunk_size)) {
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            stats_.RecordMemoryFence();
         }
         
         const int result = llama_decode(llama_ctx, batch);
         if (result != 0) [[unlikely]] {
             LOG_ERROR("BatchManager", "Batch decode failed with result: " + std::to_string(result));
-            stats_.RecordBatchFailure();
             has_error_state.store(true, std::memory_order_relaxed);
             last_error_code.store(static_cast<uint32_t>(result), std::memory_order_relaxed);
             return false;
         }
         
-        // Record successful batch processing
-        stats_.RecordBatchProcessed(chunk_size);
-        
         // Update position
         *n_past_ref += static_cast<int32_t>(chunk_size);
-        
-        // Record batch processing statistics
-        stats_.RecordBatchProcessed(chunk_size);
     }
     
     if constexpr (BatchManagerConstants::ENABLE_DEBUG_LOGGING) {
@@ -421,7 +373,6 @@ inline bool BatchManager::ProcessTokensBatch(std::vector<int32_t>&& tokens) noex
     // Ultra-fast bounds check using cached atomic limit
     const int32_t safety_limit = cached_safety_limit.load(std::memory_order_relaxed);
     if (current_position >= safety_limit) [[unlikely]] {
-        stats_.RecordContextBoundViolation();
         return false;
     }
     
@@ -437,10 +388,8 @@ inline bool BatchManager::ProcessTokensBatch(std::vector<int32_t>&& tokens) noex
     const int result = llama_decode(llama_ctx, batch);
     if (result == 0) [[likely]] {
         (*n_past_ref)++;
-        stats_.RecordBatchProcessed(1);
         return true;
     } else {
-        stats_.RecordBatchFailure();
         has_error_state.store(true, std::memory_order_relaxed);
         last_error_code.store(static_cast<uint32_t>(result), std::memory_order_relaxed);
     }
