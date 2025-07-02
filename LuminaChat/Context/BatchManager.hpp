@@ -9,7 +9,6 @@
 #include <cstring>      // For memset
 #include <algorithm>    // For std::min
 #include <immintrin.h>  // For memory prefetching
-#include <array>        // For std::array in template methods
 
 // Forward declarations
 struct llama_context;
@@ -83,22 +82,6 @@ public:
     [[nodiscard]] bool ProcessTokensBatch(const std::vector<int32_t>& tokens) noexcept;
     [[nodiscard]] bool ProcessTokensBatch(std::vector<int32_t>&& tokens) noexcept; // Move semantics overload
     [[nodiscard]] [[msvc::forceinline]] inline bool ProcessSingleTokenFast(int32_t token, bool generate_logits = true) noexcept;
-    [[nodiscard]] bool ProcessSingleToken(int32_t token, bool generate_logits = true) noexcept;
-    
-    // Batch building helpers - optimized for hot paths
-    [[nodiscard]] [[msvc::forceinline]] inline bool AddTokenToBatchUnchecked(int32_t token, int32_t position, bool generate_logits = false) noexcept;
-    [[nodiscard]] bool AddTokenToBatch(int32_t token, int32_t position, bool generate_logits = false) noexcept;
-    [[nodiscard]] bool ExecuteBatch() noexcept;
-    
-    // Ultra-fast specialized methods for specific use cases
-    template<bool CheckBounds = false>
-    [[nodiscard]] [[msvc::forceinline]] inline bool ProcessTokensBatchUltraFast(const std::vector<int32_t>& tokens) noexcept;
-    
-    template<bool CheckBounds = false>
-    [[nodiscard]] [[msvc::forceinline]] inline bool ProcessTokensBatchUltraFast(std::vector<int32_t>&& tokens) noexcept;
-    
-    template<size_t N>
-    [[nodiscard]] [[msvc::forceinline]] inline bool ProcessFixedTokens(const std::array<int32_t, N>& tokens) noexcept;
     
     // Context state management - optimized
     [[nodiscard]] bool ValidateContextState() const noexcept;
@@ -359,117 +342,6 @@ inline bool BatchManager::ProcessTokensBatch(std::vector<int32_t>&& tokens) noex
     return false;
 }
 
-// Standard single token processing with full error checking
-inline bool BatchManager::ProcessSingleToken(int32_t token, bool generate_logits) noexcept {
-    if (!ValidateBatchParametersInternal<true>()) [[unlikely]] {
-        return false;
-    }
-    
-    const int32_t current_position = *n_past_ref;
-    
-    // Validate bounds for single token - use full validation for safety
-    if (!ValidateContextBoundsInternal<true, true>(1, current_position)) [[unlikely]] {
-        return false;
-    }
-    
-    // Clear batch and add single token
-    batch.n_tokens = 1;
-    batch.token[0] = static_cast<llama_token>(token);
-    batch.pos[0] = current_position;
-    batch.n_seq_id[0] = 1;
-    batch.seq_id[0][0] = 0;
-    batch.logits[0] = generate_logits;
-    
-    if constexpr (BatchManagerConstants::ENABLE_DEBUG_LOGGING) {
-        LOG_DEBUG("BatchManager", "Processing single token at position " + std::to_string(current_position));
-    }
-    
-    // Execute decode
-    const int result = llama_decode(llama_ctx, batch);
-    if (result != 0) [[unlikely]] {
-        if constexpr (BatchManagerConstants::ENABLE_DEBUG_LOGGING) {
-            LOG_ERROR("BatchManager", "Single token decode failed with result: " + std::to_string(result));
-        }
-        return false;
-    }
-    
-    // Update position
-    (*n_past_ref)++;
-    return true;
-}
-
-// Ultra-fast unchecked token addition for hot paths
-[[nodiscard]] [[msvc::forceinline]] inline bool BatchManager::AddTokenToBatchUnchecked(int32_t token, int32_t position, bool generate_logits) noexcept {
-    // Assumes: batch_initialized=true, batch has space available
-    // Caller must ensure preconditions for maximum performance
-    
-    const int32_t idx = batch.n_tokens;
-    batch.token[idx] = static_cast<llama_token>(token);
-    batch.pos[idx] = position;
-    batch.n_seq_id[idx] = 1;
-    batch.seq_id[idx][0] = 0;
-    batch.logits[idx] = generate_logits;
-    batch.n_tokens++;
-    
-    return true;
-}
-
-// Standard token addition with full error checking
-inline bool BatchManager::AddTokenToBatch(int32_t token, int32_t position, bool generate_logits) noexcept {
-    if (!batch_initialized) [[unlikely]] {
-        if constexpr (BatchManagerConstants::ENABLE_DEBUG_LOGGING) {
-            LOG_ERROR("BatchManager", "Cannot add token - batch not initialized");
-        }
-        return false;
-    }
-    
-    if (batch.n_tokens >= cached_n_batch) [[unlikely]] {
-        if constexpr (BatchManagerConstants::ENABLE_DEBUG_LOGGING) {
-            LOG_ERROR("BatchManager", "Batch is full - cannot add more tokens");
-        }
-        return false;
-    }
-    
-    const int32_t idx = batch.n_tokens;
-    batch.token[idx] = static_cast<llama_token>(token);
-    batch.pos[idx] = position;
-    batch.n_seq_id[idx] = 1;
-    batch.seq_id[idx][0] = 0;
-    batch.logits[idx] = generate_logits;
-    batch.n_tokens++;
-    
-    return true;
-}
-
-inline bool BatchManager::ExecuteBatch() noexcept {
-    if (!ValidateBatchParametersInternal<false>()) [[unlikely]] {
-        return false;
-    }
-    
-    if (batch.n_tokens == 0) [[unlikely]] {
-        if constexpr (BatchManagerConstants::ENABLE_DEBUG_LOGGING) {
-            LOG_DEBUG("BatchManager", "No tokens in batch to execute");
-        }
-        return true;
-    }
-    
-    if constexpr (BatchManagerConstants::ENABLE_DEBUG_LOGGING) {
-        LOG_DEBUG("BatchManager", "Executing batch with " + std::to_string(batch.n_tokens) + " tokens");
-    }
-    
-    const int result = llama_decode(llama_ctx, batch);
-    if (result != 0) [[unlikely]] {
-        if constexpr (BatchManagerConstants::ENABLE_DEBUG_LOGGING) {
-            LOG_ERROR("BatchManager", "Batch execution failed with result: " + std::to_string(result));
-        }
-        return false;
-    }
-    
-    // Update position by batch size
-    *n_past_ref += batch.n_tokens;
-    return true;
-}
-
 inline bool BatchManager::ValidateContextState() const noexcept {
     if (!llama_ctx) [[unlikely]] {
         if constexpr (BatchManagerConstants::ENABLE_DEBUG_LOGGING) {
@@ -537,96 +409,4 @@ template<bool ValidatePointers>
     }
     
     return batch_initialized;
-}
-
-// Ultra-fast template specializations for maximum performance
-template<bool CheckBounds>
-[[nodiscard]] [[msvc::forceinline]] inline bool BatchManager::ProcessTokensBatchUltraFast(const std::vector<int32_t>& tokens) noexcept {
-    if (tokens.empty()) [[unlikely]] return true;
-    
-    // Assume all preconditions are met by caller for maximum performance
-    // No bounds checking if CheckBounds is false
-    if constexpr (CheckBounds) {
-        if (!ValidateContextBoundsInternal<false, false>(tokens.size(), *n_past_ref)) [[unlikely]] {
-            return false;
-        }
-    }
-    
-    const size_t total_tokens = tokens.size();
-    const size_t max_batch_size = static_cast<size_t>(cached_n_batch);
-    
-    // Process in optimal chunks without error checking (caller's responsibility)
-    for (size_t i = 0; i < total_tokens; i += max_batch_size) {
-        const size_t chunk_size = std::min(max_batch_size, total_tokens - i);
-        const int32_t* __restrict token_ptr = tokens.data() + i;
-        const int32_t batch_start_position = *n_past_ref;
-        
-        batch.n_tokens = static_cast<int32_t>(chunk_size);
-        
-        // Ultra-fast batch setup - no bounds checking
-        for (size_t j = 0; j < chunk_size; ++j) {
-            batch.token[j] = static_cast<llama_token>(token_ptr[j]);
-            batch.pos[j] = batch_start_position + static_cast<int32_t>(j);
-            batch.n_seq_id[j] = 1;
-            batch.seq_id[j][0] = 0;
-            batch.logits[j] = (j == chunk_size - 1);
-        }
-        
-        // Execute without error checking for maximum speed
-        llama_decode(llama_ctx, batch);
-        *n_past_ref += static_cast<int32_t>(chunk_size);
-    }
-    
-    return true;
-}
-
-// Move semantics overload for ProcessTokensBatchUltraFast
-template<bool CheckBounds>
-[[nodiscard]] [[msvc::forceinline]] inline bool BatchManager::ProcessTokensBatchUltraFast(std::vector<int32_t>&& tokens) noexcept {
-    // For move semantics, process the vector directly since caller doesn't need it
-    return ProcessTokensBatchUltraFast<CheckBounds>(static_cast<const std::vector<int32_t>&>(tokens));
-}
-
-template<size_t N>
-[[nodiscard]] [[msvc::forceinline]] inline bool BatchManager::ProcessFixedTokens(const std::array<int32_t, N>& tokens) noexcept {
-    if constexpr (N == 0) return true;
-    
-    // Compile-time optimization for fixed-size arrays
-    if constexpr (N <= static_cast<size_t>(cached_n_batch)) {
-        // Single batch processing for small fixed arrays
-        const int32_t batch_start_position = *n_past_ref;
-        batch.n_tokens = static_cast<int32_t>(N);
-        
-        // Loop unrolling for small arrays
-        if constexpr (N <= 4) {
-            // Explicit unrolling for very small arrays
-            for (size_t i = 0; i < N; ++i) {
-                batch.token[i] = static_cast<llama_token>(tokens[i]);
-                batch.pos[i] = batch_start_position + static_cast<int32_t>(i);
-                batch.n_seq_id[i] = 1;
-                batch.seq_id[i][0] = 0;
-                batch.logits[i] = (i == N - 1);
-            }
-        } else {
-            // Standard loop for larger fixed arrays
-            for (size_t i = 0; i < N; ++i) {
-                batch.token[i] = static_cast<llama_token>(tokens[i]);
-                batch.pos[i] = batch_start_position + static_cast<int32_t>(i);
-                batch.n_seq_id[i] = 1;
-                batch.seq_id[i][0] = 0;
-                batch.logits[i] = (i == N - 1);
-            }
-        }
-        
-        const int result = llama_decode(llama_ctx, batch);
-        if (result == 0) [[likely]] {
-            *n_past_ref += static_cast<int32_t>(N);
-            return true;
-        }
-    } else {
-        // Fall back to chunked processing for large fixed arrays
-        return ProcessTokensBatchUltraFast<false>(std::vector<int32_t>(tokens.begin(), tokens.end()));
-    }
-    
-    return false;
 }
