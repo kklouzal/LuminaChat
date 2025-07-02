@@ -69,23 +69,6 @@ private:
     template<bool ValidatePointers = true>
     [[nodiscard]] [[msvc::forceinline]] constexpr inline bool ValidateBatchParametersInternal() const noexcept;
     
-    // Legacy wrapper methods for backwards compatibility (will be optimized away)
-    [[nodiscard]] [[msvc::forceinline]] inline bool ValidateContextBoundsUnchecked(size_t token_count, int32_t current_position) const noexcept {
-        return ValidateContextBoundsInternal<false, false>(token_count, current_position);
-    }
-    
-    [[nodiscard]] [[msvc::forceinline]] inline bool ValidateBatchParametersUnchecked() const noexcept {
-        return ValidateBatchParametersInternal<false>();
-    }
-    
-    [[nodiscard]] bool ValidateContextBounds(size_t token_count, int32_t current_position) const {
-        return ValidateContextBoundsInternal<true, true>(token_count, current_position);
-    }
-    
-    [[nodiscard]] bool ValidateBatchParameters() const {
-        return ValidateBatchParametersInternal<true>();
-    }
-    
 public:
     // Constructor/Destructor
     BatchManager(llama_context* ctx, size_t max_tokens, int32_t& n_past_reference);
@@ -97,25 +80,29 @@ public:
     void FreeBatch() noexcept;
     
     // Core batch processing operations - ultra-high performance
-    [[nodiscard]] bool ProcessTokensBatch(const std::vector<int32_t>& tokens);
+    [[nodiscard]] bool ProcessTokensBatch(const std::vector<int32_t>& tokens) noexcept;
+    [[nodiscard]] bool ProcessTokensBatch(std::vector<int32_t>&& tokens) noexcept; // Move semantics overload
     [[nodiscard]] [[msvc::forceinline]] inline bool ProcessSingleTokenFast(int32_t token, bool generate_logits = true) noexcept;
-    [[nodiscard]] bool ProcessSingleToken(int32_t token, bool generate_logits = true);
+    [[nodiscard]] bool ProcessSingleToken(int32_t token, bool generate_logits = true) noexcept;
     
     // Batch building helpers - optimized for hot paths
     [[nodiscard]] [[msvc::forceinline]] inline bool AddTokenToBatchUnchecked(int32_t token, int32_t position, bool generate_logits = false) noexcept;
-    [[nodiscard]] bool AddTokenToBatch(int32_t token, int32_t position, bool generate_logits = false);
-    [[nodiscard]] bool ExecuteBatch();
+    [[nodiscard]] bool AddTokenToBatch(int32_t token, int32_t position, bool generate_logits = false) noexcept;
+    [[nodiscard]] bool ExecuteBatch() noexcept;
     
     // Ultra-fast specialized methods for specific use cases
     template<bool CheckBounds = false>
     [[nodiscard]] [[msvc::forceinline]] inline bool ProcessTokensBatchUltraFast(const std::vector<int32_t>& tokens) noexcept;
     
+    template<bool CheckBounds = false>
+    [[nodiscard]] [[msvc::forceinline]] inline bool ProcessTokensBatchUltraFast(std::vector<int32_t>&& tokens) noexcept;
+    
     template<size_t N>
     [[nodiscard]] [[msvc::forceinline]] inline bool ProcessFixedTokens(const std::array<int32_t, N>& tokens) noexcept;
     
     // Context state management - optimized
-    [[nodiscard]] bool ValidateContextState() const;
-    void UpdateContextBounds(size_t new_max_tokens) noexcept;
+    [[nodiscard]] bool ValidateContextState() const noexcept;
+    [[msvc::forceinline]] inline void UpdateContextBounds(size_t new_max_tokens) noexcept;
     
     // Getters for state inspection - force inline for performance
     [[nodiscard]] [[msvc::forceinline]] inline size_t GetMaxContextTokens() const noexcept { return max_context_tokens; }
@@ -218,21 +205,21 @@ inline void BatchManager::FreeBatch() noexcept {
     }
 }
 
-inline bool BatchManager::ProcessTokensBatch(const std::vector<int32_t>& tokens) {
+inline bool BatchManager::ProcessTokensBatch(const std::vector<int32_t>& tokens) noexcept {
     // Fast path for empty tokens
     if (tokens.empty()) [[unlikely]] {
         return true;
     }
     
-    // Pre-validate once to avoid repeated checks
-    if (!ValidateBatchParametersUnchecked()) [[unlikely]] {
+    // Pre-validate once to avoid repeated checks - use ultra-fast unchecked version
+    if (!ValidateBatchParametersInternal<false>()) [[unlikely]] {
         return false;
     }
     
     const int32_t current_position = *n_past_ref;
     
-    // Single context bounds check
-    if (!ValidateContextBoundsUnchecked(tokens.size(), current_position)) [[unlikely]] {
+    // Single context bounds check - use ultra-fast unchecked version
+    if (!ValidateContextBoundsInternal<false, false>(tokens.size(), current_position)) [[unlikely]] {
         return false;
     }
     
@@ -335,6 +322,13 @@ inline bool BatchManager::ProcessTokensBatch(const std::vector<int32_t>& tokens)
     return true;
 }
 
+// Move semantics overload for ProcessTokensBatch
+inline bool BatchManager::ProcessTokensBatch(std::vector<int32_t>&& tokens) noexcept {
+    // For move semantics, we can process the vector directly since caller doesn't need it
+    // This avoids any potential copy and provides the same performance as the const& version
+    return ProcessTokensBatch(static_cast<const std::vector<int32_t>&>(tokens));
+}
+
 // Ultra-fast single token processing for hot paths (generation loop)
 [[nodiscard]] [[msvc::forceinline]] inline bool BatchManager::ProcessSingleTokenFast(int32_t token, bool generate_logits) noexcept {
     // Assumes: batch_initialized=true, llama_ctx!=null, n_past_ref!=null, bounds are valid
@@ -366,15 +360,15 @@ inline bool BatchManager::ProcessTokensBatch(const std::vector<int32_t>& tokens)
 }
 
 // Standard single token processing with full error checking
-inline bool BatchManager::ProcessSingleToken(int32_t token, bool generate_logits) {
-    if (!ValidateBatchParameters()) [[unlikely]] {
+inline bool BatchManager::ProcessSingleToken(int32_t token, bool generate_logits) noexcept {
+    if (!ValidateBatchParametersInternal<true>()) [[unlikely]] {
         return false;
     }
     
     const int32_t current_position = *n_past_ref;
     
-    // Validate bounds for single token
-    if (!ValidateContextBounds(1, current_position)) [[unlikely]] {
+    // Validate bounds for single token - use full validation for safety
+    if (!ValidateContextBoundsInternal<true, true>(1, current_position)) [[unlikely]] {
         return false;
     }
     
@@ -393,7 +387,9 @@ inline bool BatchManager::ProcessSingleToken(int32_t token, bool generate_logits
     // Execute decode
     const int result = llama_decode(llama_ctx, batch);
     if (result != 0) [[unlikely]] {
-        LOG_ERROR("BatchManager", "Single token decode failed with result: " + std::to_string(result));
+        if constexpr (BatchManagerConstants::ENABLE_DEBUG_LOGGING) {
+            LOG_ERROR("BatchManager", "Single token decode failed with result: " + std::to_string(result));
+        }
         return false;
     }
     
@@ -419,14 +415,18 @@ inline bool BatchManager::ProcessSingleToken(int32_t token, bool generate_logits
 }
 
 // Standard token addition with full error checking
-inline bool BatchManager::AddTokenToBatch(int32_t token, int32_t position, bool generate_logits) {
+inline bool BatchManager::AddTokenToBatch(int32_t token, int32_t position, bool generate_logits) noexcept {
     if (!batch_initialized) [[unlikely]] {
-        LOG_ERROR("BatchManager", "Cannot add token - batch not initialized");
+        if constexpr (BatchManagerConstants::ENABLE_DEBUG_LOGGING) {
+            LOG_ERROR("BatchManager", "Cannot add token - batch not initialized");
+        }
         return false;
     }
     
     if (batch.n_tokens >= cached_n_batch) [[unlikely]] {
-        LOG_ERROR("BatchManager", "Batch is full - cannot add more tokens");
+        if constexpr (BatchManagerConstants::ENABLE_DEBUG_LOGGING) {
+            LOG_ERROR("BatchManager", "Batch is full - cannot add more tokens");
+        }
         return false;
     }
     
@@ -441,8 +441,8 @@ inline bool BatchManager::AddTokenToBatch(int32_t token, int32_t position, bool 
     return true;
 }
 
-inline bool BatchManager::ExecuteBatch() {
-    if (!ValidateBatchParametersUnchecked()) [[unlikely]] {
+inline bool BatchManager::ExecuteBatch() noexcept {
+    if (!ValidateBatchParametersInternal<false>()) [[unlikely]] {
         return false;
     }
     
@@ -459,7 +459,9 @@ inline bool BatchManager::ExecuteBatch() {
     
     const int result = llama_decode(llama_ctx, batch);
     if (result != 0) [[unlikely]] {
-        LOG_ERROR("BatchManager", "Batch execution failed with result: " + std::to_string(result));
+        if constexpr (BatchManagerConstants::ENABLE_DEBUG_LOGGING) {
+            LOG_ERROR("BatchManager", "Batch execution failed with result: " + std::to_string(result));
+        }
         return false;
     }
     
@@ -468,26 +470,34 @@ inline bool BatchManager::ExecuteBatch() {
     return true;
 }
 
-inline bool BatchManager::ValidateContextState() const {
+inline bool BatchManager::ValidateContextState() const noexcept {
     if (!llama_ctx) [[unlikely]] {
-        LOG_ERROR("BatchManager", "Llama context is null");
+        if constexpr (BatchManagerConstants::ENABLE_DEBUG_LOGGING) {
+            LOG_ERROR("BatchManager", "Llama context is null");
+        }
         return false;
     }
     
     if (!n_past_ref) [[unlikely]] {
-        LOG_ERROR("BatchManager", "n_past reference is null");
+        if constexpr (BatchManagerConstants::ENABLE_DEBUG_LOGGING) {
+            LOG_ERROR("BatchManager", "n_past reference is null");
+        }
         return false;
     }
     
     const int32_t current_position = *n_past_ref;
     if (current_position < 0) [[unlikely]] {
-        LOG_ERROR("BatchManager", "Invalid current position: " + std::to_string(current_position));
+        if constexpr (BatchManagerConstants::ENABLE_DEBUG_LOGGING) {
+            LOG_ERROR("BatchManager", "Invalid current position: " + std::to_string(current_position));
+        }
         return false;
     }
     
     if (max_context_tokens > 0 && current_position >= static_cast<int32_t>(max_context_tokens)) [[unlikely]] {
-        LOG_ERROR("BatchManager", "Current position (" + std::to_string(current_position) + 
-                 ") exceeds context size (" + std::to_string(max_context_tokens) + ")");
+        if constexpr (BatchManagerConstants::ENABLE_DEBUG_LOGGING) {
+            LOG_ERROR("BatchManager", "Current position (" + std::to_string(current_position) + 
+                     ") exceeds context size (" + std::to_string(max_context_tokens) + ")");
+        }
         return false;
     }
     
@@ -537,7 +547,7 @@ template<bool CheckBounds>
     // Assume all preconditions are met by caller for maximum performance
     // No bounds checking if CheckBounds is false
     if constexpr (CheckBounds) {
-        if (!ValidateContextBoundsUnchecked(tokens.size(), *n_past_ref)) [[unlikely]] {
+        if (!ValidateContextBoundsInternal<false, false>(tokens.size(), *n_past_ref)) [[unlikely]] {
             return false;
         }
     }
@@ -568,6 +578,13 @@ template<bool CheckBounds>
     }
     
     return true;
+}
+
+// Move semantics overload for ProcessTokensBatchUltraFast
+template<bool CheckBounds>
+[[nodiscard]] [[msvc::forceinline]] inline bool BatchManager::ProcessTokensBatchUltraFast(std::vector<int32_t>&& tokens) noexcept {
+    // For move semantics, process the vector directly since caller doesn't need it
+    return ProcessTokensBatchUltraFast<CheckBounds>(static_cast<const std::vector<int32_t>&>(tokens));
 }
 
 template<size_t N>

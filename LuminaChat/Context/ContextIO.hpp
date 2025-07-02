@@ -80,6 +80,7 @@ private:
     
     // Internal token processing (caller must hold io_mutex)
     bool ProcessPromptTokensInternal(const std::vector<int32_t>& tokens);
+    bool ProcessPromptTokensInternal(std::vector<int32_t>&& tokens); // Move semantics overload
     
 public:
     // Constructor/Destructor
@@ -196,6 +197,16 @@ inline bool ContextInputOutput::ProcessPromptTokensInternal(const std::vector<in
     return result;
 }
 
+// Move semantics overload for ProcessPromptTokensInternal
+inline bool ContextInputOutput::ProcessPromptTokensInternal(std::vector<int32_t>&& tokens) {
+    LOG_DEBUG("ContextInputOutput", "Processing " + std::to_string(tokens.size()) + " prompt tokens (internal, move semantics)");
+    
+    bool result = ProcessTokensBatch(std::move(tokens));
+    LOG_DEBUG("ContextInputOutput", "ProcessPromptTokensInternal - batch processing result: " + std::to_string(result));
+    
+    return result;
+}
+
 inline bool ContextInputOutput::ProcessPromptPhase(const std::string& prompt) {
     LOG_DEBUG("ContextInputOutput", "ProcessPromptPhase - starting with prompt length: " + std::to_string(prompt.length()));
     LOG_DEBUG("ContextInputOutput", "ProcessPromptPhase - initial n_past_ref: " + std::to_string(n_past_ref));
@@ -224,9 +235,9 @@ inline bool ContextInputOutput::ProcessPromptPhase(const std::string& prompt) {
     LOG_DEBUG("ContextInputOutput", "Prompt tokenized to " + std::to_string(prompt_tokens.size()) + " tokens");
     LOG_DEBUG("ContextInputOutput", "Current n_past_ref before processing: " + std::to_string(n_past_ref));
     
-    // Process prompt tokens through batch manager (internal version - caller must hold io_mutex)
-    LOG_DEBUG("ContextInputOutput", "ProcessPromptPhase - calling ProcessPromptTokensInternal");
-    bool result = ProcessPromptTokensInternal(prompt_tokens);
+    // Process prompt tokens through batch manager using move semantics (internal version - caller must hold io_mutex)
+    LOG_DEBUG("ContextInputOutput", "ProcessPromptPhase - calling ProcessPromptTokensInternal with move semantics");
+    bool result = ProcessPromptTokensInternal(std::move(prompt_tokens));
     LOG_DEBUG("ContextInputOutput", "ProcessPromptPhase - ProcessPromptTokensInternal returned: " + std::to_string(result));
     LOG_DEBUG("ContextInputOutput", "Current n_past_ref after processing: " + std::to_string(n_past_ref));
     
@@ -308,7 +319,9 @@ inline std::string ContextInputOutput::ExecuteGenerationPhase(const GenerationCa
             {
                 std::lock_guard<std::mutex> lock(io_mutex);
                 
-                if (!ProcessSingleToken(next_token, true)) {
+                // Use ultra-fast token processing in generation hot path
+                // Preconditions are guaranteed: batch initialized, context valid, bounds checked above
+                if (!ProcessSingleTokenFast(next_token, true)) {
                     LOG_ERROR("ContextInputOutput", "Failed to process generated token");
                     break;
                 }
