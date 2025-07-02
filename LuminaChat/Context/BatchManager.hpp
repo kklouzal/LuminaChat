@@ -5,7 +5,6 @@
 #include "../TokenCache.hpp"
 #include "llama-cpp.h"
 #include <vector>
-#include <mutex>
 #include <memory>
 
 // Forward declarations
@@ -25,6 +24,11 @@ namespace ContextConstants {
  * - Validate context bounds and safety margins
  * - Coordinate with llama.cpp decode operations
  * 
+ * Thread Safety:
+ * - BatchManager methods are NOT thread-safe by design
+ * - Synchronization must be handled by the calling class (e.g., ContextInputOutput)
+ * - This design assumes exclusive access control by the derived/containing class
+ * 
  * Used by ContextInputOutput for:
  * - Prompt token processing (input phase)
  * - Response token generation (output phase)
@@ -39,9 +43,6 @@ private:
     // Context bounds and safety
     size_t max_context_tokens = 0;
     int32_t* n_past_ref = nullptr;  // Reference to parent's n_past for coordination
-    
-    // Thread safety
-    mutable std::mutex batch_mutex;
     
     // Internal validation helpers
     bool ValidateContextBounds(size_t token_count, int32_t current_position) const;
@@ -102,14 +103,11 @@ inline BatchManager::BatchManager(llama_context* ctx, size_t max_tokens, int32_t
 }
 
 inline BatchManager::~BatchManager() {
-    std::lock_guard<std::mutex> lock(batch_mutex);
     FreeBatch();
     LOG_DEBUG("BatchManager", "BatchManager destroyed");
 }
 
 inline bool BatchManager::InitializeBatch() {
-    std::lock_guard<std::mutex> lock(batch_mutex);
-    
     if (!llama_ctx) {
         LOG_ERROR("BatchManager", "Cannot initialize batch - llama context is null");
         return false;
@@ -146,8 +144,6 @@ inline bool BatchManager::InitializeBatch() {
 }
 
 inline void BatchManager::ClearBatch() {
-    std::lock_guard<std::mutex> lock(batch_mutex);
-    
     if (!batch_initialized) {
         return;
     }
@@ -156,8 +152,6 @@ inline void BatchManager::ClearBatch() {
 }
 
 inline void BatchManager::FreeBatch() {
-    // Note: batch_mutex should already be held by caller
-    
     if (batch_initialized) {
         llama_batch_free(batch);
         batch_initialized = false;
@@ -215,8 +209,6 @@ inline bool BatchManager::ValidateBatchParameters() const {
 }
 
 inline bool BatchManager::ProcessTokensBatch(const std::vector<int32_t>& tokens) {
-    std::lock_guard<std::mutex> lock(batch_mutex);
-    
     if (!ValidateBatchParameters()) {
         return false;
     }
@@ -297,8 +289,6 @@ inline bool BatchManager::ProcessTokensBatch(const std::vector<int32_t>& tokens)
 }
 
 inline bool BatchManager::ProcessSingleToken(int32_t token, bool generate_logits) {
-    std::lock_guard<std::mutex> lock(batch_mutex);
-    
     if (!ValidateBatchParameters()) {
         return false;
     }
@@ -342,8 +332,6 @@ inline bool BatchManager::ProcessSingleToken(int32_t token, bool generate_logits
 }
 
 inline bool BatchManager::AddTokenToBatch(int32_t token, int32_t position, bool generate_logits) {
-    // Note: batch_mutex should already be held by caller
-    
     if (!batch_initialized) {
         LOG_ERROR("BatchManager", "Cannot add token - batch not initialized");
         return false;
@@ -366,8 +354,6 @@ inline bool BatchManager::AddTokenToBatch(int32_t token, int32_t position, bool 
 }
 
 inline bool BatchManager::ExecuteBatch() {
-    // Note: batch_mutex should already be held by caller
-    
     if (!ValidateBatchParameters()) {
         return false;
     }
@@ -398,8 +384,6 @@ inline bool BatchManager::ExecuteBatch() {
 }
 
 inline bool BatchManager::ValidateContextState() const {
-    std::lock_guard<std::mutex> lock(batch_mutex);
-    
     if (!llama_ctx) {
         LOG_ERROR("BatchManager", "Llama context is null");
         return false;
@@ -426,8 +410,6 @@ inline bool BatchManager::ValidateContextState() const {
 }
 
 inline void BatchManager::UpdateContextBounds(size_t new_max_tokens) {
-    std::lock_guard<std::mutex> lock(batch_mutex);
-    
     max_context_tokens = new_max_tokens;
     LOG_DEBUG("BatchManager", "Updated context bounds to: " + std::to_string(new_max_tokens));
 }

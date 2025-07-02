@@ -38,8 +38,8 @@ struct GenerationCallbacks {
  * 
  * Responsibilities:
  * - Coordinate the entire generation workflow from input to output
- * - Manage prompt processing (input phase) through BatchManager
- * - Handle response generation (output phase) through BatchManager
+ * - Manage prompt processing (input phase) through inherited BatchManager functionality
+ * - Handle response generation (output phase) through inherited BatchManager functionality
  * - Provide streaming and async generation capabilities
  * - Manage generation threads and callbacks
  * 
@@ -50,12 +50,11 @@ struct GenerationCallbacks {
  * 4. Finalization:   Detokenize and clean response
  * 
  * The complete "Generation Output" encompasses both input processing
- * and response generation, with BatchManager handling all token operations.
+ * and response generation, with inherited BatchManager handling all token operations.
  */
-class ContextInputOutput {
+class ContextInputOutput : public BatchManager {
 private:
     // Core components
-    std::unique_ptr<BatchManager> batch_manager;
     ModelInfo* parent_model = nullptr;
     TokenCache* token_cache = nullptr;
     llama_context* llama_ctx = nullptr;
@@ -79,6 +78,9 @@ private:
     std::string ExecuteGenerationPhase(const GenerationCallbacks& callbacks);
     bool ValidateGenerationState() const;
     
+    // Internal token processing (caller must hold io_mutex)
+    bool ProcessPromptTokensInternal(const std::vector<int32_t>& tokens);
+    
 public:
     // Constructor/Destructor
     ContextInputOutput(ModelInfo* model, TokenCache* cache, llama_context* ctx, 
@@ -101,7 +103,6 @@ public:
     // State access
     size_t GetMaxContextTokens() const { return max_context_tokens; }
     int32_t GetCurrentPosition() const { return n_past_ref; }
-    BatchManager* GetBatchManager() { return batch_manager.get(); }
     
     // Disable copy/move operations (manages complex state and threads)
     ContextInputOutput(const ContextInputOutput&) = delete;
@@ -113,7 +114,8 @@ public:
 // Inline implementation
 inline ContextInputOutput::ContextInputOutput(ModelInfo* model, TokenCache* cache, llama_context* ctx,
                                              int32_t& n_past_reference, size_t max_tokens)
-    : parent_model(model)
+    : BatchManager(ctx, max_tokens, n_past_reference)
+    , parent_model(model)
     , token_cache(cache)
     , llama_ctx(ctx)
     , n_past_ref(n_past_reference)
@@ -134,15 +136,6 @@ inline ContextInputOutput::ContextInputOutput(ModelInfo* model, TokenCache* cach
         return;
     }
     
-    // Create BatchManager for token operations
-    batch_manager = std::make_unique<BatchManager>(llama_ctx, max_tokens, n_past_ref);
-    
-    if (!batch_manager->InitializeBatch()) {
-        LOG_ERROR("ContextInputOutput", "Failed to initialize BatchManager");
-        batch_manager.reset();
-        return;
-    }
-    
     LOG_DEBUG("ContextInputOutput", "Created with max_tokens: " + std::to_string(max_tokens));
 }
 
@@ -158,9 +151,6 @@ inline ContextInputOutput::~ContextInputOutput() {
     
     std::lock_guard<std::mutex> lock(io_mutex);
     
-    // BatchManager destructor will handle cleanup automatically
-    batch_manager.reset();
-    
     LOG_DEBUG("ContextInputOutput", "Destroyed");
 }
 
@@ -172,14 +162,9 @@ inline bool ContextInputOutput::InitializeLlamaContext() {
         return false;
     }
     
-    if (!batch_manager) {
-        LOG_ERROR("ContextInputOutput", "BatchManager is null");
-        return false;
-    }
-    
     // Ensure batch is properly initialized
-    if (!batch_manager->IsBatchInitialized()) {
-        if (!batch_manager->InitializeBatch()) {
+    if (!IsBatchInitialized()) {
+        if (!InitializeBatch()) {
             LOG_ERROR("ContextInputOutput", "Failed to initialize batch");
             return false;
         }
@@ -189,41 +174,75 @@ inline bool ContextInputOutput::InitializeLlamaContext() {
 }
 
 inline bool ContextInputOutput::ProcessPromptTokens(const std::vector<int32_t>& tokens) {
+    LOG_DEBUG("ContextInputOutput", "ProcessPromptTokens - acquiring io_mutex");
     std::lock_guard<std::mutex> lock(io_mutex);
-    
-    if (!batch_manager) {
-        LOG_ERROR("ContextInputOutput", "BatchManager not available for prompt processing");
-        return false;
-    }
+    LOG_DEBUG("ContextInputOutput", "ProcessPromptTokens - acquired io_mutex");
     
     LOG_DEBUG("ContextInputOutput", "Processing " + std::to_string(tokens.size()) + " prompt tokens");
     
-    return batch_manager->ProcessTokensBatch(tokens);
+    bool result = ProcessTokensBatch(tokens);
+    LOG_DEBUG("ContextInputOutput", "ProcessPromptTokens - batch processing result: " + std::to_string(result));
+    
+    return result;
+}
+
+// Internal version that doesn't acquire mutex (caller must hold it)
+inline bool ContextInputOutput::ProcessPromptTokensInternal(const std::vector<int32_t>& tokens) {
+    LOG_DEBUG("ContextInputOutput", "Processing " + std::to_string(tokens.size()) + " prompt tokens (internal)");
+    
+    bool result = ProcessTokensBatch(tokens);
+    LOG_DEBUG("ContextInputOutput", "ProcessPromptTokensInternal - batch processing result: " + std::to_string(result));
+    
+    return result;
 }
 
 inline bool ContextInputOutput::ProcessPromptPhase(const std::string& prompt) {
+    LOG_DEBUG("ContextInputOutput", "ProcessPromptPhase - starting with prompt length: " + std::to_string(prompt.length()));
+    LOG_DEBUG("ContextInputOutput", "ProcessPromptPhase - initial n_past_ref: " + std::to_string(n_past_ref));
+    LOG_DEBUG("ContextInputOutput", "ProcessPromptPhase - prompt content: \"" + prompt.substr(0, 200) + 
+              (prompt.length() > 200 ? "..." : "") + "\"");
+    
     if (!token_cache) {
         LOG_ERROR("ContextInputOutput", "TokenCache not available for prompt processing");
         return false;
     }
     
+    // Ensure batch is initialized before processing tokens (caller must hold io_mutex)
+    if (!IsBatchInitialized()) {
+        LOG_DEBUG("ContextInputOutput", "ProcessPromptPhase - initializing batch");
+        if (!InitializeBatch()) {
+            LOG_ERROR("ContextInputOutput", "ProcessPromptPhase - failed to initialize batch");
+            return false;
+        }
+    }
+    
+    LOG_DEBUG("ContextInputOutput", "ProcessPromptPhase - tokenizing prompt");
+    
     // Tokenize the prompt
     std::vector<int32_t> prompt_tokens = token_cache->TokenizeText(prompt, true);
     
     LOG_DEBUG("ContextInputOutput", "Prompt tokenized to " + std::to_string(prompt_tokens.size()) + " tokens");
+    LOG_DEBUG("ContextInputOutput", "Current n_past_ref before processing: " + std::to_string(n_past_ref));
     
-    // Process prompt tokens through batch manager
-    return ProcessPromptTokens(prompt_tokens);
+    // Process prompt tokens through batch manager (internal version - caller must hold io_mutex)
+    LOG_DEBUG("ContextInputOutput", "ProcessPromptPhase - calling ProcessPromptTokensInternal");
+    bool result = ProcessPromptTokensInternal(prompt_tokens);
+    LOG_DEBUG("ContextInputOutput", "ProcessPromptPhase - ProcessPromptTokensInternal returned: " + std::to_string(result));
+    LOG_DEBUG("ContextInputOutput", "Current n_past_ref after processing: " + std::to_string(n_past_ref));
+    
+    return result;
 }
 
 inline std::string ContextInputOutput::ExecuteGenerationPhase(const GenerationCallbacks& callbacks) {
-    if (!batch_manager || !token_cache || !parent_model) {
+    LOG_DEBUG("ContextInputOutput", "ExecuteGenerationPhase - starting generation phase");
+    
+    if (!token_cache || !parent_model) {
         LOG_ERROR("ContextInputOutput", "Required components not available for generation");
         return "";
     }
     
     std::vector<int32_t> response_tokens;
-    std::string full_response;
+    std::string streamed_response; // For individual token streaming (may have artifacts)
     
     try {
         // Calculate generation limits with proper buffer management
@@ -238,10 +257,14 @@ inline std::string ContextInputOutput::ExecuteGenerationPhase(const GenerationCa
                  ", available_space=" + std::to_string(available_space) + 
                  ", current_position=" + std::to_string(n_past_ref));
         
+        LOG_DEBUG("ContextInputOutput", "ExecuteGenerationPhase - starting generation loop");
+        
         // Generate tokens one by one with streaming
         for (int i = 0; i < max_new_tokens && !should_stop_generation.load(); ++i) {
+            LOG_DEBUG("ContextInputOutput", "ExecuteGenerationPhase - generation loop iteration " + std::to_string(i));
+            
             // Get logits for next token prediction
-            float* logits = llama_get_logits_ith(llama_ctx, batch_manager->GetBatchSize() - 1);
+            float* logits = llama_get_logits_ith(llama_ctx, GetBatchSize() - 1);
             if (!logits) {
                 LOG_ERROR("ContextInputOutput", "Failed to get logits for token generation");
                 break;
@@ -275,30 +298,79 @@ inline std::string ContextInputOutput::ExecuteGenerationPhase(const GenerationCa
             
             response_tokens.push_back(next_token);
             
-            // Convert token to text for streaming
-            std::vector<int32_t> single_token = {next_token};
-            std::string token_text = token_cache->DetokenizeTokens(single_token);
-            
-            // Stream the token if callback is provided
-            if (callbacks.on_token && !token_text.empty()) {
-                callbacks.on_token(token_text);
+            // For streaming: Convert token to text (simple approach - may have minor encoding artifacts)
+            // The final response will use complete token sequence detokenization for accuracy
+            if (callbacks.on_token) {
+                std::vector<int32_t> single_token = {next_token};
+                std::string token_text = token_cache->DetokenizeTokens(single_token);
+                
+                if (!token_text.empty()) {
+                    callbacks.on_token(token_text);
+                    streamed_response += token_text;
+                }
             }
             
-            full_response += token_text;
-            
             // Process the generated token for next iteration
+            LOG_DEBUG("ContextInputOutput", "ExecuteGenerationPhase - acquiring io_mutex for token processing (iteration " + std::to_string(i) + ")");
             {
                 std::lock_guard<std::mutex> lock(io_mutex);
-                if (!batch_manager->ProcessSingleToken(next_token, true)) {
+                LOG_DEBUG("ContextInputOutput", "ExecuteGenerationPhase - acquired io_mutex for token processing (iteration " + std::to_string(i) + ")");
+                LOG_DEBUG("ContextInputOutput", "Current n_past_ref before token processing: " + std::to_string(n_past_ref));
+                
+                if (!ProcessSingleToken(next_token, true)) {
                     LOG_ERROR("ContextInputOutput", "Failed to process generated token");
                     break;
                 }
+                LOG_DEBUG("ContextInputOutput", "Current n_past_ref after token processing: " + std::to_string(n_past_ref));
+                LOG_DEBUG("ContextInputOutput", "ExecuteGenerationPhase - token processed successfully (iteration " + std::to_string(i) + ")");
+            }
+            LOG_DEBUG("ContextInputOutput", "ExecuteGenerationPhase - released io_mutex after token processing (iteration " + std::to_string(i) + ")");
+        }
+        
+        LOG_DEBUG("ContextInputOutput", "ExecuteGenerationPhase - generation loop completed");
+        
+        // CRITICAL FIX: Detokenize the complete token sequence for the final response
+        // This ensures proper character encoding and prevents truncation issues
+        std::string full_response;
+        if (!response_tokens.empty()) {
+            full_response = token_cache->DetokenizeTokens(response_tokens);
+            
+            // ADDITIONAL FIX: Verify that our context position matches the expected position
+            // This helps catch any position tracking issues that could cause character carryover
+            const int32_t expected_position = n_past_ref;
+            const int32_t actual_tokens_generated = static_cast<int32_t>(response_tokens.size());
+            
+            LOG_DEBUG("ContextInputOutput", "Context position validation - expected: " + std::to_string(expected_position) + 
+                     ", tokens generated: " + std::to_string(actual_tokens_generated));
+            
+            // Log the first and last few characters to help debug truncation issues
+            if (full_response.length() > 0) {
+                std::string response_start = full_response.substr(0, std::min<size_t>(20, full_response.length()));
+                std::string response_end = full_response.length() > 20 ? 
+                    full_response.substr(full_response.length() - 20) : full_response;
+                
+                LOG_DEBUG("ContextInputOutput", "Response boundaries - start: \"" + response_start + 
+                         "\", end: \"" + response_end + "\"");
             }
         }
+        
+        // Log final state after generation
+        LOG_DEBUG("ContextInputOutput", "Final generation state - n_past_ref: " + std::to_string(n_past_ref) + 
+                 ", generated " + std::to_string(response_tokens.size()) + " tokens");
+        
+        if (callbacks.on_token && !streamed_response.empty()) {
+            LOG_DEBUG("ContextInputOutput", "Streamed response length: " + std::to_string(streamed_response.length()) + 
+                     ", content: \"" + streamed_response + "\"");
+        }
+        
+        LOG_DEBUG("ContextInputOutput", "Full response length: " + std::to_string(full_response.length()) + 
+                 ", content: \"" + full_response + "\"");
         
         // Extract clean response content (remove any template artifacts)
         std::string clean_response = LuminaChat::Utilities::ExtractCleanResponse(full_response);
         
+        LOG_DEBUG("ContextInputOutput", "Clean response length: " + std::to_string(clean_response.length()) + 
+                 ", content: \"" + clean_response + "\"");
         LOG_DEBUG("ContextInputOutput", "Generated " + std::to_string(response_tokens.size()) + 
                  " tokens -> " + clean_response.substr(0, 100) + 
                  (clean_response.length() > 100 ? "..." : ""));
@@ -315,14 +387,20 @@ inline std::string ContextInputOutput::ExecuteGenerationPhase(const GenerationCa
 }
 
 inline bool ContextInputOutput::ValidateGenerationState() const {
-    if (!batch_manager || !token_cache || !parent_model || !llama_ctx) {
+    if (!token_cache || !parent_model || !llama_ctx) {
         LOG_ERROR("ContextInputOutput", "Required components not available");
         return false;
     }
     
-    if (!batch_manager->ValidateContextState()) {
+    if (!ValidateContextState()) {
         LOG_ERROR("ContextInputOutput", "BatchManager context state validation failed");
         return false;
+    }
+    
+    // Check if batch is initialized for generation
+    if (!IsBatchInitialized()) {
+        LOG_DEBUG("ContextInputOutput", "Batch not initialized during validation - will be initialized during processing");
+        // This is not an error - batch will be initialized when needed
     }
     
     return true;
@@ -331,8 +409,6 @@ inline bool ContextInputOutput::ValidateGenerationState() const {
 inline std::string ContextInputOutput::GenerateResponse(const std::string& prompt) {
     // DEPRECATED FOR UI CONTEXTS: This method blocks and should only be used for non-UI contexts
     // like Discord bot responses or batch processing. For UI contexts, use GenerateResponseAsync instead.
-    
-    std::lock_guard<std::mutex> lock(io_mutex);
     
     if (is_generating.load()) {
         LOG_WARNING("ContextInputOutput", "Generation already in progress");
@@ -348,13 +424,16 @@ inline std::string ContextInputOutput::GenerateResponse(const std::string& promp
     should_stop_generation = false;
     
     try {
-        // Phase 1: Process prompt tokens (Input Phase)
-        if (!ProcessPromptPhase(prompt)) {
-            is_generating = false;
-            return "Error: Failed to process prompt";
+        // Phase 1: Process prompt tokens (Input Phase) - acquire mutex only for this phase
+        {
+            std::lock_guard<std::mutex> lock(io_mutex);
+            if (!ProcessPromptPhase(prompt)) {
+                is_generating = false;
+                return "Error: Failed to process prompt";
+            }
         }
         
-        // Phase 2: Generate response tokens (Output Phase)
+        // Phase 2: Generate response tokens (Output Phase) - ExecuteGenerationPhase manages its own mutex
         GenerationCallbacks empty_callbacks; // No streaming for synchronous generation
         std::string response = ExecuteGenerationPhase(empty_callbacks);
         
@@ -369,54 +448,80 @@ inline std::string ContextInputOutput::GenerateResponse(const std::string& promp
 }
 
 inline bool ContextInputOutput::GenerateResponseAsync(const std::string& prompt, const GenerationCallbacks& callbacks) {
+    LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync called with prompt length: " + std::to_string(prompt.length()));
+    
     // Check if already generating
     if (is_generating.load()) {
+        LOG_WARNING("ContextInputOutput", "GenerateResponseAsync - already generating, rejecting request");
         if (callbacks.on_error) {
             callbacks.on_error("Generation already in progress");
         }
         return false;
     }
     
+    LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync - not currently generating, proceeding");
+    
     // Validate state before starting async operation
     if (!ValidateGenerationState()) {
+        LOG_ERROR("ContextInputOutput", "GenerateResponseAsync - validation failed");
         if (callbacks.on_error) {
             callbacks.on_error("Invalid generation state");
         }
         return false;
     }
     
+    LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync - state validation passed");
+    
     // Stop any existing generation thread
     if (generation_thread && generation_thread->joinable()) {
+        LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync - stopping existing generation thread");
         should_stop_generation = true;
         generation_cv.notify_all();
         generation_thread->join();
+        LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync - existing generation thread stopped");
     }
     
     // Reset generation state
     should_stop_generation = false;
     is_generating = true;
     
+    LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync - starting new generation thread");
+    
     // Start new generation thread
     generation_thread = std::make_unique<std::thread>([this, prompt, callbacks]() {
+        LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread started");
         std::string full_response;
         bool success = false;
         
         try {
+            LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - beginning Phase 1 (prompt processing)");
+            
             // Phase 1: Process prompt tokens (Input Phase)
             {
+                LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - acquiring io_mutex for prompt processing");
                 std::lock_guard<std::mutex> lock(io_mutex);
+                LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - acquired io_mutex for prompt processing");
+                
                 if (!ProcessPromptPhase(prompt)) {
+                    LOG_ERROR("ContextInputOutput", "GenerateResponseAsync thread - prompt processing failed");
                     if (callbacks.on_error) {
                         callbacks.on_error("Failed to process prompt");
                     }
                     is_generating = false;
+                    LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - exiting after prompt processing failure");
                     return;
                 }
+                LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - prompt processing completed");
             }
+            LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - released io_mutex after prompt processing");
+            
+            LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - beginning Phase 2 (response generation)");
             
             // Phase 2: Generate response tokens (Output Phase)
             full_response = ExecuteGenerationPhase(callbacks);
             success = !should_stop_generation.load() && !full_response.empty();
+            
+            LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - generation phase completed, success: " + std::to_string(success));
             
         } catch (const std::exception& e) {
             LOG_ERROR("ContextInputOutput", "Exception in async generation: " + std::string(e.what()));
@@ -427,13 +532,21 @@ inline bool ContextInputOutput::GenerateResponseAsync(const std::string& prompt,
         
         // Update state
         is_generating = false;
+        LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - set is_generating to false");
         
-        // Call completion callback
+        // Call completion callback with the FINAL, CLEAN response
+        // This should replace any streamed content in the UI to fix encoding artifacts
         if (callbacks.on_complete) {
+            LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - calling completion callback");
+            LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - final response: \"" + full_response + "\"");
             callbacks.on_complete(full_response, success);
+            LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - completion callback returned");
         }
+        
+        LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - thread ending");
     });
     
+    LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync - generation thread created and started");
     return true;
 }
 
@@ -461,9 +574,8 @@ inline void ContextInputOutput::UpdateContextBounds(size_t new_max_tokens) {
     
     max_context_tokens = new_max_tokens;
     
-    if (batch_manager) {
-        batch_manager->UpdateContextBounds(new_max_tokens);
-    }
+    // Update inherited BatchManager bounds
+    BatchManager::UpdateContextBounds(new_max_tokens);
     
     LOG_DEBUG("ContextInputOutput", "Updated context bounds to: " + std::to_string(new_max_tokens));
 }

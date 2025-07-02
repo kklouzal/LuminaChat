@@ -565,12 +565,12 @@ inline void ContextInfo::RebuildContext_Full() {
     std::string full_prompt = BuildFullPrompt();
     std::vector<int32_t> tokens = token_cache->TokenizeText(full_prompt, true);
     
-    if (!tokens.empty() && llama_ctx && io_manager) {
-        // Process tokens through IO manager
-        io_manager->ProcessPromptTokens(tokens);
-    }
+    // IMPORTANT: Since we're doing a full rebuild, we need to properly set n_past
+    // to reflect the tokens that will be processed. The generation phase will
+    // process these tokens and n_past will be updated accordingly.
+    // For now, we keep n_past at 0 since tokens will be processed fresh.
     
-    LOG_DEBUG_ContextInfo("Full rebuild completed: " + std::to_string(n_past) + " tokens processed");
+    LOG_DEBUG_ContextInfo("Full rebuild completed: context cleared, " + std::to_string(tokens.size()) + " tokens prepared for processing");
 }
 
 inline void ContextInfo::RebuildContext_Partial() {
@@ -597,6 +597,14 @@ inline std::string ContextInfo::GenerateResponse(const std::string& prompt) {
     // DEPRECATED FOR UI CONTEXTS: This method blocks and should only be used for non-UI contexts
     // like Discord bot responses or batch processing. For UI contexts, use GenerateResponseAsync instead.
     
+    std::lock_guard<std::mutex> lock(context_mutex);
+    
+    // Ensure context is initialized before checking io_manager
+    if (!InitializeLlamaContext()) {
+        LOG_ERROR_ContextInfo("Failed to initialize context for generation");
+        return "Error: Failed to initialize generation system";
+    }
+    
     if (!io_manager) {
         LOG_ERROR_ContextInfo("IO manager not available for generation");
         return "Error: Generation system not available";
@@ -606,6 +614,21 @@ inline std::string ContextInfo::GenerateResponse(const std::string& prompt) {
 }
 
 inline bool ContextInfo::GenerateResponseAsync(const std::string& prompt, const GenerationCallbacks& callbacks) {
+    LOG_DEBUG_ContextInfo("GenerateResponseAsync called - acquiring context_mutex");
+    
+    std::lock_guard<std::mutex> lock(context_mutex);
+    LOG_DEBUG_ContextInfo("GenerateResponseAsync acquired context_mutex");
+    
+    // Ensure context is initialized before checking io_manager
+    if (!InitializeLlamaContext()) {
+        LOG_ERROR_ContextInfo("Failed to initialize context for async generation");
+        if (callbacks.on_error) {
+            callbacks.on_error("Failed to initialize generation system");
+        }
+        return false;
+    }
+    LOG_DEBUG_ContextInfo("GenerateResponseAsync - context initialized successfully");
+    
     if (!io_manager) {
         LOG_ERROR_ContextInfo("IO manager not available for async generation");
         if (callbacks.on_error) {
@@ -613,8 +636,13 @@ inline bool ContextInfo::GenerateResponseAsync(const std::string& prompt, const 
         }
         return false;
     }
+    LOG_DEBUG_ContextInfo("GenerateResponseAsync - io_manager available");
     
-    return io_manager->GenerateResponseAsync(prompt, callbacks);
+    LOG_DEBUG_ContextInfo("GenerateResponseAsync calling io_manager->GenerateResponseAsync while holding context_mutex - POTENTIAL DEADLOCK POINT");
+    bool result = io_manager->GenerateResponseAsync(prompt, callbacks);
+    LOG_DEBUG_ContextInfo("GenerateResponseAsync - io_manager call completed, returning: " + std::to_string(result));
+    
+    return result;
 }
 
 inline void ContextInfo::StopGeneration() {
@@ -675,37 +703,77 @@ inline std::unique_ptr<ContextInfo> ContextInfo::Create(ModelInfo* model, int32_
 }
 
 inline bool ContextInfo::HandleInputAsync(const std::string& input, const GenerationCallbacks& callbacks, const std::string& username) {
-    // Check if generation system is available
-    if (!io_manager) {
-        if (callbacks.on_error) {
-            callbacks.on_error("Generation system not available");
-        }
-        return false;
-    }
-    
-    // Check if already generating
-    if (IsGenerating()) {
-        if (callbacks.on_error) {
-            callbacks.on_error("Generation already in progress");
-        }
-        return false;
-    }
+    LOG_DEBUG_ContextInfo("HandleInputAsync called for input: " + input.substr(0, 30) + "...");
     
     std::string full_prompt;
     bool preparation_success = false;
     
     // Critical section: prepare context for generation
     {
+        LOG_DEBUG_ContextInfo("HandleInputAsync acquiring context_mutex");
         std::lock_guard<std::mutex> lock(context_mutex);
+        LOG_DEBUG_ContextInfo("HandleInputAsync acquired context_mutex");
         
         try {
-            // Try to transition to generating state for processing
-            if (!TrySetState(ContextState::CONTEXT_GENERATING)) {
+            // Ensure context is initialized first
+            if (!InitializeLlamaContext()) {
+                LOG_ERROR_ContextInfo("HandleInputAsync - Failed to initialize context");
                 if (callbacks.on_error) {
-                    callbacks.on_error("Context not available for generation");
+                    callbacks.on_error("Failed to initialize context");
                 }
                 return false;
             }
+            LOG_DEBUG_ContextInfo("HandleInputAsync - context initialized");
+            
+            // Check if generation system is available
+            if (!io_manager) {
+                LOG_ERROR_ContextInfo("HandleInputAsync - Generation system not available");
+                if (callbacks.on_error) {
+                    callbacks.on_error("Generation system not available");
+                }
+                return false;
+            }
+            LOG_DEBUG_ContextInfo("HandleInputAsync - io_manager available");
+            
+            // Check if already generating
+            if (IsGenerating()) {
+                LOG_WARNING_ContextInfo("HandleInputAsync - Generation already in progress");
+                if (callbacks.on_error) {
+                    callbacks.on_error("Generation already in progress");
+                }
+                return false;
+            }
+            LOG_DEBUG_ContextInfo("HandleInputAsync - not currently generating");
+            
+            // Try to transition to generating state for processing
+            if (!TrySetState(ContextState::CONTEXT_GENERATING)) {
+                ContextState current_state = GetState();
+                LOG_WARNING_ContextInfo("HandleInputAsync - Context not available for generation. Current state: " + 
+                                       std::to_string(static_cast<int>(current_state)) + " (" + GetStateString() + ")");
+                
+                // If we're stuck in GENERATING state but not actually generating, force reset
+                if (current_state == ContextState::CONTEXT_GENERATING && !IsGenerating()) {
+                    LOG_WARNING_ContextInfo("HandleInputAsync - Context stuck in GENERATING state but not actually generating, forcing reset");
+                    ContextState previous_state = ForceResetToIdle("stuck in GENERATING state");
+                    LOG_WARNING_ContextInfo("HandleInputAsync - Forced reset from state " + std::to_string(static_cast<int>(previous_state)) + " to IDLE");
+                    
+                    // Try the transition again after reset
+                    if (!TrySetState(ContextState::CONTEXT_GENERATING)) {
+                        LOG_ERROR_ContextInfo("HandleInputAsync - Still cannot transition to GENERATING after force reset");
+                        if (callbacks.on_error) {
+                            callbacks.on_error("Context not available for generation after recovery attempt");
+                        }
+                        return false;
+                    }
+                    LOG_DEBUG_ContextInfo("HandleInputAsync - Successfully transitioned to GENERATING after force reset");
+                } else {
+                    if (callbacks.on_error) {
+                        callbacks.on_error("Context not available for generation");
+                    }
+                    return false;
+                }
+            }
+            LOG_DEBUG_ContextInfo("HandleInputAsync - state set to GENERATING");
 
             // 1. Add user message to history
             message_history.emplace_back(username, input);
@@ -729,13 +797,22 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
             
             // 3. Rebuild context with the new message
             if (context_needs_rebuild || template_manager->IsTemplateDirty()) {
+                LOG_DEBUG_ContextInfo("HandleInputAsync - rebuilding context");
                 if (!RebuildContext(RebuildStrategy::FULL)) {
-                    (void)TrySetState(ContextState::ERROR_STATE);
+                    LOG_ERROR_ContextInfo("HandleInputAsync - Failed to rebuild context");
+                    
+                    // CRITICAL: Reset state on rebuild failure to prevent stuck states
+                    if (!TrySetState(ContextState::CONTEXT_IDLE)) {
+                        LOG_WARNING_ContextInfo("HandleInputAsync rebuild failure - failed to reset to IDLE, forcing reset");
+                        ForceResetToIdle("rebuild failure recovery");
+                    }
+                    
                     if (callbacks.on_error) {
                         callbacks.on_error("Failed to rebuild context");
                     }
                     return false;
                 }
+                LOG_DEBUG_ContextInfo("HandleInputAsync - context rebuilt successfully");
             }
             
             // 4. Final safety check after rebuild
@@ -748,40 +825,84 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
             // 5. Prepare for generation
             full_prompt = BuildFullPrompt();
             preparation_success = true;
+            LOG_DEBUG_ContextInfo("HandleInputAsync - preparation completed successfully");
             
         } catch (const std::exception& e) {
             LOG_ERROR("ContextInfo", "Exception in HandleInputAsync preparation: " + std::string(e.what()));
-            (void)TrySetState(ContextState::ERROR_STATE);
+            
+            // CRITICAL: Always reset state on exceptions to prevent stuck states
+            if (!TrySetState(ContextState::CONTEXT_IDLE)) {
+                LOG_WARNING_ContextInfo("HandleInputAsync exception handler - failed to reset to IDLE, forcing reset");
+                ForceResetToIdle("HandleInputAsync exception recovery");
+            }
+            
             if (callbacks.on_error) {
                 callbacks.on_error("Exception: " + std::string(e.what()));
             }
             return false;
         }
     } // Release context_mutex here
+    LOG_DEBUG_ContextInfo("HandleInputAsync released context_mutex");
     
     // Start async generation OUTSIDE the critical section to avoid deadlock
     if (preparation_success) {
+        LOG_DEBUG_ContextInfo("HandleInputAsync - starting async generation outside critical section");
+        
         // Create properly structured callbacks for ContextInputOutput
         GenerationCallbacks io_callbacks;
         io_callbacks.on_token = callbacks.on_token;
         io_callbacks.on_error = callbacks.on_error;
         io_callbacks.on_complete = [this, callbacks](const std::string& response, bool success) {
+            LOG_DEBUG_ContextInfo("Generation completion callback called - success: " + std::to_string(success));
+            
             // Add assistant response to message history upon completion
             if (success && !response.empty()) {
-                std::lock_guard<std::mutex> lock(context_mutex);
-                message_history.emplace_back("assistant", response);
-                (void)TrySetState(ContextState::CONTEXT_IDLE);
+                LOG_DEBUG_ContextInfo("Completion callback attempting to acquire context_mutex for success handling");
+                auto start_time = std::chrono::steady_clock::now();
+                {
+                    std::lock_guard<std::mutex> lock(context_mutex);
+                    auto end_time = std::chrono::steady_clock::now();
+                    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+                    LOG_DEBUG_ContextInfo("Completion callback acquired context_mutex for success handling (took " + std::to_string(duration.count()) + "ms)");
+                    
+                    message_history.emplace_back("assistant", response);
+                    (void)TrySetState(ContextState::CONTEXT_IDLE);
+                    LOG_DEBUG_ContextInfo("Completion callback - success handling complete, state set to IDLE");
+                }
+                LOG_DEBUG_ContextInfo("Completion callback released context_mutex after success handling");
+            } else {
+                // Also reset state on failure - CRITICAL: Always reset to IDLE on failure
+                LOG_DEBUG_ContextInfo("Completion callback attempting to acquire context_mutex for error handling");
+                auto start_time = std::chrono::steady_clock::now();
+                {
+                    std::lock_guard<std::mutex> lock(context_mutex);
+                    auto end_time = std::chrono::steady_clock::now();
+                    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+                    LOG_DEBUG_ContextInfo("Completion callback acquired context_mutex for error handling (took " + std::to_string(duration.count()) + "ms)");
+                    
+                    // On failure, try to go to IDLE first, then ERROR_STATE if needed
+                    if (!TrySetState(ContextState::CONTEXT_IDLE)) {
+                        LOG_WARNING_ContextInfo("Completion callback - failed to set IDLE state, forcing reset");
+                        ForceResetToIdle("generation failure recovery");
+                    }
+                    LOG_DEBUG_ContextInfo("Completion callback - error handling complete, state reset to IDLE");
+                }
+                LOG_DEBUG_ContextInfo("Completion callback released context_mutex after error handling");
             }
             
             // Forward to original callback
+            LOG_DEBUG_ContextInfo("Completion callback forwarding to original callback");
             if (callbacks.on_complete) {
                 callbacks.on_complete(response, success);
             }
+            LOG_DEBUG_ContextInfo("Completion callback finished");
         };
         
+        LOG_DEBUG_ContextInfo("HandleInputAsync calling io_manager->GenerateResponseAsync");
         return io_manager->GenerateResponseAsync(full_prompt, io_callbacks);
     }
     
+    LOG_ERROR_ContextInfo("HandleInputAsync - preparation failed, returning false");
     return false;
 }
 

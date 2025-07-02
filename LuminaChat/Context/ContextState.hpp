@@ -254,6 +254,23 @@ public:
     }
     
     /**
+     * Emergency state recovery - force reset to CONTEXT_IDLE
+     * @param reason Reason for the forced reset (for logging)
+     * @return Previous state that was overridden
+     */
+    ContextState ForceResetToIdle(const std::string_view reason = "emergency recovery") noexcept {
+        ContextState previous_state = state.exchange(ContextState::CONTEXT_IDLE, std::memory_order_acq_rel);
+        
+        // Clear plugin ownership if we were in plugin processing state
+        if (previous_state == ContextState::PLUGIN_PROCESSING) {
+            current_plugin_id.store(0, std::memory_order_release);
+            cached_plugin_name.store(nullptr, std::memory_order_release);
+        }
+        
+        return previous_state;
+    }
+
+    /**
      * Lock-free polling wait for specific state
      * @param target_state The state to wait for
      * @param max_polls Maximum number of polls before giving up
