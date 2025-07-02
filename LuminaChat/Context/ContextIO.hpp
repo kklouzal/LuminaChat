@@ -242,7 +242,6 @@ inline std::string ContextInputOutput::ExecuteGenerationPhase(const GenerationCa
     }
     
     std::vector<int32_t> response_tokens;
-    std::string streamed_response; // For individual token streaming (may have artifacts)
     
     try {
         // Calculate generation limits with proper buffer management
@@ -257,11 +256,8 @@ inline std::string ContextInputOutput::ExecuteGenerationPhase(const GenerationCa
                  ", available_space=" + std::to_string(available_space) + 
                  ", current_position=" + std::to_string(n_past_ref));
         
-        LOG_DEBUG("ContextInputOutput", "ExecuteGenerationPhase - starting generation loop");
-        
         // Generate tokens one by one with streaming
         for (int i = 0; i < max_new_tokens && !should_stop_generation.load(); ++i) {
-            LOG_DEBUG("ContextInputOutput", "ExecuteGenerationPhase - generation loop iteration " + std::to_string(i));
             
             // Get logits for next token prediction
             float* logits = llama_get_logits_ith(llama_ctx, GetBatchSize() - 1);
@@ -298,82 +294,39 @@ inline std::string ContextInputOutput::ExecuteGenerationPhase(const GenerationCa
             
             response_tokens.push_back(next_token);
             
-            // For streaming: Convert token to text (simple approach - may have minor encoding artifacts)
-            // The final response will use complete token sequence detokenization for accuracy
+            // Stream only the new token text to prevent exponential duplication
             if (callbacks.on_token) {
                 std::vector<int32_t> single_token = {next_token};
-                std::string token_text = token_cache->DetokenizeTokens(single_token);
+                std::string new_token_text = token_cache->DetokenizeTokens(single_token);
                 
-                if (!token_text.empty()) {
-                    callbacks.on_token(token_text);
-                    streamed_response += token_text;
+                if (!new_token_text.empty()) {
+                    callbacks.on_token(new_token_text);
                 }
             }
             
             // Process the generated token for next iteration
-            LOG_DEBUG("ContextInputOutput", "ExecuteGenerationPhase - acquiring io_mutex for token processing (iteration " + std::to_string(i) + ")");
             {
                 std::lock_guard<std::mutex> lock(io_mutex);
-                LOG_DEBUG("ContextInputOutput", "ExecuteGenerationPhase - acquired io_mutex for token processing (iteration " + std::to_string(i) + ")");
-                LOG_DEBUG("ContextInputOutput", "Current n_past_ref before token processing: " + std::to_string(n_past_ref));
                 
                 if (!ProcessSingleToken(next_token, true)) {
                     LOG_ERROR("ContextInputOutput", "Failed to process generated token");
                     break;
                 }
-                LOG_DEBUG("ContextInputOutput", "Current n_past_ref after token processing: " + std::to_string(n_past_ref));
-                LOG_DEBUG("ContextInputOutput", "ExecuteGenerationPhase - token processed successfully (iteration " + std::to_string(i) + ")");
             }
-            LOG_DEBUG("ContextInputOutput", "ExecuteGenerationPhase - released io_mutex after token processing (iteration " + std::to_string(i) + ")");
         }
         
-        LOG_DEBUG("ContextInputOutput", "ExecuteGenerationPhase - generation loop completed");
-        
-        // CRITICAL FIX: Detokenize the complete token sequence for the final response
+        // Detokenize the complete token sequence for the final response
         // This ensures proper character encoding and prevents truncation issues
         std::string full_response;
         if (!response_tokens.empty()) {
             full_response = token_cache->DetokenizeTokens(response_tokens);
-            
-            // ADDITIONAL FIX: Verify that our context position matches the expected position
-            // This helps catch any position tracking issues that could cause character carryover
-            const int32_t expected_position = n_past_ref;
-            const int32_t actual_tokens_generated = static_cast<int32_t>(response_tokens.size());
-            
-            LOG_DEBUG("ContextInputOutput", "Context position validation - expected: " + std::to_string(expected_position) + 
-                     ", tokens generated: " + std::to_string(actual_tokens_generated));
-            
-            // Log the first and last few characters to help debug truncation issues
-            if (full_response.length() > 0) {
-                std::string response_start = full_response.substr(0, std::min<size_t>(20, full_response.length()));
-                std::string response_end = full_response.length() > 20 ? 
-                    full_response.substr(full_response.length() - 20) : full_response;
-                
-                LOG_DEBUG("ContextInputOutput", "Response boundaries - start: \"" + response_start + 
-                         "\", end: \"" + response_end + "\"");
-            }
         }
-        
-        // Log final state after generation
-        LOG_DEBUG("ContextInputOutput", "Final generation state - n_past_ref: " + std::to_string(n_past_ref) + 
-                 ", generated " + std::to_string(response_tokens.size()) + " tokens");
-        
-        if (callbacks.on_token && !streamed_response.empty()) {
-            LOG_DEBUG("ContextInputOutput", "Streamed response length: " + std::to_string(streamed_response.length()) + 
-                     ", content: \"" + streamed_response + "\"");
-        }
-        
-        LOG_DEBUG("ContextInputOutput", "Full response length: " + std::to_string(full_response.length()) + 
-                 ", content: \"" + full_response + "\"");
         
         // Extract clean response content (remove any template artifacts)
         std::string clean_response = LuminaChat::Utilities::ExtractCleanResponse(full_response);
         
-        LOG_DEBUG("ContextInputOutput", "Clean response length: " + std::to_string(clean_response.length()) + 
-                 ", content: \"" + clean_response + "\"");
         LOG_DEBUG("ContextInputOutput", "Generated " + std::to_string(response_tokens.size()) + 
-                 " tokens -> " + clean_response.substr(0, 100) + 
-                 (clean_response.length() > 100 ? "..." : ""));
+                 " tokens, final response length: " + std::to_string(clean_response.length()));
         
         return clean_response;
         
@@ -448,80 +401,58 @@ inline std::string ContextInputOutput::GenerateResponse(const std::string& promp
 }
 
 inline bool ContextInputOutput::GenerateResponseAsync(const std::string& prompt, const GenerationCallbacks& callbacks) {
-    LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync called with prompt length: " + std::to_string(prompt.length()));
-    
     // Check if already generating
     if (is_generating.load()) {
-        LOG_WARNING("ContextInputOutput", "GenerateResponseAsync - already generating, rejecting request");
+        LOG_WARNING("ContextInputOutput", "Generation already in progress");
         if (callbacks.on_error) {
             callbacks.on_error("Generation already in progress");
         }
         return false;
     }
     
-    LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync - not currently generating, proceeding");
-    
     // Validate state before starting async operation
     if (!ValidateGenerationState()) {
-        LOG_ERROR("ContextInputOutput", "GenerateResponseAsync - validation failed");
+        LOG_ERROR("ContextInputOutput", "Generation state validation failed");
         if (callbacks.on_error) {
             callbacks.on_error("Invalid generation state");
         }
         return false;
     }
     
-    LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync - state validation passed");
-    
     // Stop any existing generation thread
     if (generation_thread && generation_thread->joinable()) {
-        LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync - stopping existing generation thread");
         should_stop_generation = true;
         generation_cv.notify_all();
         generation_thread->join();
-        LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync - existing generation thread stopped");
     }
     
     // Reset generation state
     should_stop_generation = false;
     is_generating = true;
     
-    LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync - starting new generation thread");
-    
     // Start new generation thread
     generation_thread = std::make_unique<std::thread>([this, prompt, callbacks]() {
-        LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread started");
         std::string full_response;
         bool success = false;
         
         try {
-            LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - beginning Phase 1 (prompt processing)");
-            
             // Phase 1: Process prompt tokens (Input Phase)
             {
-                LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - acquiring io_mutex for prompt processing");
                 std::lock_guard<std::mutex> lock(io_mutex);
-                LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - acquired io_mutex for prompt processing");
                 
                 if (!ProcessPromptPhase(prompt)) {
-                    LOG_ERROR("ContextInputOutput", "GenerateResponseAsync thread - prompt processing failed");
+                    LOG_ERROR("ContextInputOutput", "Prompt processing failed");
                     if (callbacks.on_error) {
                         callbacks.on_error("Failed to process prompt");
                     }
                     is_generating = false;
-                    LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - exiting after prompt processing failure");
                     return;
                 }
-                LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - prompt processing completed");
             }
-            LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - released io_mutex after prompt processing");
-            
-            LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - beginning Phase 2 (response generation)");
             
             // Phase 2: Generate response tokens (Output Phase)
             full_response = ExecuteGenerationPhase(callbacks);
             success = !should_stop_generation.load() && !full_response.empty();
-            
-            LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - generation phase completed, success: " + std::to_string(success));
             
         } catch (const std::exception& e) {
             LOG_ERROR("ContextInputOutput", "Exception in async generation: " + std::string(e.what()));
@@ -532,21 +463,13 @@ inline bool ContextInputOutput::GenerateResponseAsync(const std::string& prompt,
         
         // Update state
         is_generating = false;
-        LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - set is_generating to false");
         
-        // Call completion callback with the FINAL, CLEAN response
-        // This should replace any streamed content in the UI to fix encoding artifacts
+        // Call completion callback with the final, clean response
         if (callbacks.on_complete) {
-            LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - calling completion callback");
-            LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - final response: \"" + full_response + "\"");
             callbacks.on_complete(full_response, success);
-            LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - completion callback returned");
         }
-        
-        LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync thread - thread ending");
     });
     
-    LOG_DEBUG("ContextInputOutput", "GenerateResponseAsync - generation thread created and started");
     return true;
 }
 

@@ -214,6 +214,7 @@ private:
     void AddChatMessage(const std::string& sender, const std::string& message, const wxColour& color = wxNullColour);
     void StartStreamingMessage(const std::string& sender, const wxColour& color = wxNullColour);
     void AppendToStreamingMessage(const std::string& text);
+    void ReplaceStreamingMessage(const std::string& text);  // Replace entire streaming content
     void EndStreamingMessage();
     void SetGenerationUIState(bool generating);  // Enable/disable UI during generation
     void AddLogMessage(const std::string& message);
@@ -1379,31 +1380,11 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
         // Create callbacks for streaming response
         GenerationCallbacks callbacks(
             // Token callback - called for each token as it's generated
-            [this](const std::string& token_text) {
-                // PERFORMANCE FIX: Batch UI updates to prevent hitch from rapid callbacks
-                static std::string token_buffer;
-                static auto last_ui_update = std::chrono::steady_clock::now();
-                static std::mutex buffer_mutex;
-                
-                {
-                    std::lock_guard<std::mutex> lock(buffer_mutex);
-                    token_buffer += token_text;
-                    
-                    auto now = std::chrono::steady_clock::now();
-                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_ui_update);
-                    
-                    // Only update UI every 16ms (~60fps) or when buffer gets large
-                    if (elapsed.count() >= 16 || token_buffer.length() >= 100) {
-                        std::string batch_text = std::move(token_buffer);
-                        token_buffer.clear();
-                        last_ui_update = now;
-                        
-                        // Update UI on main thread with batched tokens
-                        this->CallAfter([this, batch_text]() {
-                            AppendToStreamingMessage(batch_text);
-                        });
-                    }
-                }
+            [this](const std::string& complete_response) {
+                // Since we now receive the complete response each time, replace the content
+                this->CallAfter([this, complete_response]() {
+                    ReplaceStreamingMessage(complete_response);
+                });
             },
             
             // Completion callback - called when generation is done
@@ -1811,6 +1792,32 @@ void LuminaChatFrame::AppendToStreamingMessage(const std::string& text) {
     chat_display->WriteText(text);
     chat_display->EndSuppressUndo();
     chat_display->ScrollIntoView(chat_display->GetLastPosition(), WXK_DOWN);
+}
+
+void LuminaChatFrame::ReplaceStreamingMessage(const std::string& text) {
+    if (!is_streaming) {
+        return;
+    }
+    
+    // Calculate the range of the current streaming message
+    if (assistant_message_start_pos == -1) {
+        // No streaming message started yet, just append
+        AppendToStreamingMessage(text);
+        return;
+    }
+    
+    chat_display->BeginSuppressUndo();
+    
+    // Select and replace the current streaming message content
+    long current_end = chat_display->GetLastPosition();
+    chat_display->SetSelection(assistant_message_start_pos, current_end);
+    chat_display->WriteText(text);
+    
+    chat_display->EndSuppressUndo();
+    chat_display->ScrollIntoView(chat_display->GetLastPosition(), WXK_DOWN);
+    
+    // Update the cached message content
+    current_assistant_message = text;
 }
 
 void LuminaChatFrame::EndStreamingMessage() {
