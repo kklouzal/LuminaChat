@@ -24,8 +24,8 @@ using LuminaChat::ContextState;
 
 // ContextInfo Configuration Constants
 namespace ContextConstants {
-    constexpr int32_t SAFETY_BUFFER_TOKENS = 64;      // Safety margin for all context operations
-    constexpr int32_t GENERATION_BUFFER_TOKENS = 128; // Buffer for response generation (larger to account for responses)
+    constinit const int32_t SAFETY_BUFFER_TOKENS = 64;      // Safety margin for all context operations
+    constinit const int32_t GENERATION_BUFFER_TOKENS = 128; // Buffer for response generation (larger to account for responses)
 }
 
 // ContextInfo: Individual conversation context management
