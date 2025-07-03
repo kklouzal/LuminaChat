@@ -122,8 +122,9 @@ private:    // Core components - optimized memory layout for cache efficiency
     static constexpr size_t MAX_SUMMARIES = 5;
     
     // Context size management
-    void AddSummaryToList(const std::string& summary);
-    void UpdateTemplateWithAllSummaries();
+    void AddSummaryToList(const std::string& summary) noexcept;
+    void AddSummaryToList(std::string&& summary) noexcept;
+    void UpdateTemplateWithAllSummaries() noexcept;
     
 public:    // Constructor overloads
     ContextInfo(const std::string& context_id, ModelInfo* model, int32_t context_size);
@@ -134,10 +135,11 @@ public:    // Constructor overloads
     static std::unique_ptr<ContextInfo> Create(ModelInfo* model, int32_t context_size); // Auto-generated ID
     
     // Enhanced pruning method that returns pruned messages for summarization coordination
-    std::vector<std::pair<std::string, std::string>> PruneContextImmediateWithExtraction(size_t keep_recent_messages = 5);
+    [[nodiscard]] std::vector<std::pair<std::string, std::string>> PruneContextImmediateWithExtraction(size_t keep_recent_messages = 5) noexcept;
     
     // Plugin callback to apply completed summaries
-    void ApplyCompletedSummary(const std::string& summary);
+    void ApplyCompletedSummary(const std::string& summary) noexcept;
+    void ApplyCompletedSummary(std::string&& summary) noexcept;
     
     // Destructor
     ~ContextInfo();
@@ -164,20 +166,29 @@ public:    // Constructor overloads
     }
     
     // Template section management - direct access to ChatTemplateManager
-    void UpdateEnvironment(const std::string& env);
-    void UpdateIdentity(const std::string& identity);
-    void UpdateSystemPrompt(const std::string& system_msg);
-    void ApplySummary(const std::string& summary);  // Updates template's summary section
-    void UpdateOldChatSummary(const std::string& old_summary); // For context pruning
-    void UpdateMotifContext(const std::string& motif);
-    void UpdateInternalReflection(const std::string& reflection);
-    void UpdateEmotionalState(const std::string& emotional_state);
-    void AddPastSessionMemory(const std::string& memory);
+    void UpdateEnvironment(const std::string& env) noexcept;
+    void UpdateEnvironment(std::string&& env) noexcept;
+    void UpdateIdentity(const std::string& identity) noexcept;
+    void UpdateIdentity(std::string&& identity) noexcept;
+    void UpdateSystemPrompt(const std::string& system_msg) noexcept;
+    void UpdateSystemPrompt(std::string&& system_msg) noexcept;
+    void ApplySummary(const std::string& summary) noexcept;  // Updates template's summary section
+    void ApplySummary(std::string&& summary) noexcept;
+    void UpdateOldChatSummary(const std::string& old_summary) noexcept; // For context pruning
+    void UpdateOldChatSummary(std::string&& old_summary) noexcept;
+    void UpdateMotifContext(const std::string& motif) noexcept;
+    void UpdateMotifContext(std::string&& motif) noexcept;
+    void UpdateInternalReflection(const std::string& reflection) noexcept;
+    void UpdateInternalReflection(std::string&& reflection) noexcept;
+    void UpdateEmotionalState(const std::string& emotional_state) noexcept;
+    void UpdateEmotionalState(std::string&& emotional_state) noexcept;
+    void AddPastSessionMemory(const std::string& memory) noexcept;
+    void AddPastSessionMemory(std::string&& memory) noexcept;
     
     // Context management
     bool RebuildContext(RebuildStrategy strategy = RebuildStrategy::FULL);
-    void ClearContext();
-    void ClearMessageHistory();
+    void ClearContext() noexcept;
+    void ClearMessageHistory() noexcept;
     
     // Override base class methods to include generation state
     [[nodiscard]] [[msvc::forceinline]] bool IsAvailableForGeneration() const noexcept override {
@@ -206,7 +217,7 @@ public:    // Constructor overloads
     std::string GetCurrentPrompt() const;
     
     // Template rendering (made public for testing)
-    std::string BuildFullPrompt();
+    [[msvc::forceinline]] std::string BuildFullPrompt() noexcept;
     
     // Context rebuilding helpers (made public for testing)
     void RebuildContext_Full();
@@ -418,7 +429,7 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
     }
 }
 
-inline void ContextInfo::AddHistoricalMessage(const std::string& role, const std::string& content) {
+[[msvc::forceinline]] inline void ContextInfo::AddHistoricalMessage(const std::string& role, const std::string& content) {
     std::lock_guard<std::mutex> lock(context_mutex);
     
     message_history.emplace_back(role, content);
@@ -429,25 +440,43 @@ inline void ContextInfo::AddHistoricalMessage(const std::string& role, const std
 }
 
 // Template section management methods - optimized for minimal lock contention
-inline void ContextInfo::UpdateEnvironment(const std::string& env) {
+[[msvc::forceinline]] inline void ContextInfo::UpdateEnvironment(const std::string& env) noexcept {
     template_manager->UpdateEnvironment(env);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated environment section");
 }
 
-inline void ContextInfo::UpdateIdentity(const std::string& identity) {
+[[msvc::forceinline]] inline void ContextInfo::UpdateEnvironment(std::string&& env) noexcept {
+    template_manager->UpdateEnvironment(std::move(env));
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
+    LOG_DEBUG_ContextInfo("Updated environment section (moved)");
+}
+
+[[msvc::forceinline]] inline void ContextInfo::UpdateIdentity(const std::string& identity) noexcept {
     template_manager->UpdateIdentity(identity);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated identity section");
 }
 
-inline void ContextInfo::UpdateSystemPrompt(const std::string& system_msg) {
+[[msvc::forceinline]] inline void ContextInfo::UpdateIdentity(std::string&& identity) noexcept {
+    template_manager->UpdateIdentity(std::move(identity));
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
+    LOG_DEBUG_ContextInfo("Updated identity section (moved)");
+}
+
+[[msvc::forceinline]] inline void ContextInfo::UpdateSystemPrompt(const std::string& system_msg) noexcept {
     template_manager->UpdateSystemPrompt(system_msg);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated system prompt section");
 }
 
-inline void ContextInfo::ApplySummary(const std::string& summary) {
+[[msvc::forceinline]] inline void ContextInfo::UpdateSystemPrompt(std::string&& system_msg) noexcept {
+    template_manager->UpdateSystemPrompt(std::move(system_msg));
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
+    LOG_DEBUG_ContextInfo("Updated system prompt section (moved)");
+}
+
+[[msvc::forceinline]] inline void ContextInfo::ApplySummary(const std::string& summary) noexcept {
     template_manager->UpdateSummary(summary);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_ContextInfo("Applied summary to template: " + summary.substr(0, 100) + 
@@ -471,38 +500,93 @@ inline void ContextInfo::ApplySummary(const std::string& summary) {
     }
 }
 
-inline void ContextInfo::UpdateOldChatSummary(const std::string& old_summary) {
+[[msvc::forceinline]] inline void ContextInfo::ApplySummary(std::string&& summary) noexcept {
+    const std::string summary_ref = summary; // Create reference for logging before move
+    template_manager->UpdateSummary(std::move(summary));
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
+    LOG_ContextInfo("Applied summary to template (moved): " + summary_ref.substr(0, 100) + 
+                   (summary_ref.length() > 100 ? "..." : ""));
+    
+    // Automatically prune message history when a summary is applied
+    // This prevents the context from growing indefinitely
+    if (message_history.size() > 10) [[likely]] { // Only prune if we have substantial history
+        LOG_ContextInfo("Auto-pruning message history due to summary application");
+        
+        // Keep only the most recent 5 message pairs (10 messages total)
+        constexpr size_t keep_messages = 10;
+        const size_t start_idx = message_history.size() - keep_messages;
+        std::vector<std::pair<std::string, std::string>> recent_messages;
+        recent_messages.assign(message_history.begin() + start_idx, message_history.end());
+        
+        LOG_ContextInfo("Pruning message history: keeping " + std::to_string(keep_messages) + 
+                       " recent messages out of " + std::to_string(message_history.size()) + " total");
+        
+        message_history = std::move(recent_messages);
+    }
+}
+
+[[msvc::forceinline]] inline void ContextInfo::UpdateOldChatSummary(const std::string& old_summary) noexcept {
     template_manager->UpdateOldChatSummary(old_summary);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated old chat summary");
 }
 
-inline void ContextInfo::UpdateMotifContext(const std::string& motif) {
+[[msvc::forceinline]] inline void ContextInfo::UpdateOldChatSummary(std::string&& old_summary) noexcept {
+    template_manager->UpdateOldChatSummary(std::move(old_summary));
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
+    LOG_DEBUG_ContextInfo("Updated old chat summary (moved)");
+}
+
+[[msvc::forceinline]] inline void ContextInfo::UpdateMotifContext(const std::string& motif) noexcept {
     template_manager->UpdateMotifContext(motif);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated motif context");
 }
 
-inline void ContextInfo::UpdateInternalReflection(const std::string& reflection) {
+[[msvc::forceinline]] inline void ContextInfo::UpdateMotifContext(std::string&& motif) noexcept {
+    template_manager->UpdateMotifContext(std::move(motif));
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
+    LOG_DEBUG_ContextInfo("Updated motif context (moved)");
+}
+
+[[msvc::forceinline]] inline void ContextInfo::UpdateInternalReflection(const std::string& reflection) noexcept {
     template_manager->UpdateInternalReflection(reflection);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated internal reflection");
 }
 
-inline void ContextInfo::UpdateEmotionalState(const std::string& emotional_state) {
+[[msvc::forceinline]] inline void ContextInfo::UpdateInternalReflection(std::string&& reflection) noexcept {
+    template_manager->UpdateInternalReflection(std::move(reflection));
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
+    LOG_DEBUG_ContextInfo("Updated internal reflection (moved)");
+}
+
+[[msvc::forceinline]] inline void ContextInfo::UpdateEmotionalState(const std::string& emotional_state) noexcept {
     template_manager->UpdateEmotionalState(emotional_state);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated emotional state");
 }
 
-inline void ContextInfo::AddPastSessionMemory(const std::string& memory) {
+[[msvc::forceinline]] inline void ContextInfo::UpdateEmotionalState(std::string&& emotional_state) noexcept {
+    template_manager->UpdateEmotionalState(std::move(emotional_state));
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
+    LOG_DEBUG_ContextInfo("Updated emotional state (moved)");
+}
+
+[[msvc::forceinline]] inline void ContextInfo::AddPastSessionMemory(const std::string& memory) noexcept {
     template_manager->AddPastSession(memory);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Added past session memory");
 }
 
-inline std::string ContextInfo::BuildFullPrompt() {
-    if (!template_manager) {
+[[msvc::forceinline]] inline void ContextInfo::AddPastSessionMemory(std::string&& memory) noexcept {
+    template_manager->AddPastSession(std::move(memory));
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
+    LOG_DEBUG_ContextInfo("Added past session memory (moved)");
+}
+
+[[msvc::forceinline]] inline std::string ContextInfo::BuildFullPrompt() noexcept {
+    if (!template_manager) [[unlikely]] {
         LOG_ERROR_ContextInfo("Template manager not available");
         return "";
     }
@@ -585,7 +669,7 @@ inline void ContextInfo::RebuildContext_TemplateOnly() {
 
 // Token processing is now handled by ContextInputOutput
 
-inline void ContextInfo::ClearContext() {
+[[msvc::forceinline]] inline void ContextInfo::ClearContext() noexcept {
     std::lock_guard<std::mutex> lock(context_mutex);
     
     if (llama_ctx) [[likely]] {
@@ -598,7 +682,7 @@ inline void ContextInfo::ClearContext() {
     LOG_DEBUG_ContextInfo("Context cleared and state reset");
 }
 
-inline void ContextInfo::ClearMessageHistory() {
+[[msvc::forceinline]] inline void ContextInfo::ClearMessageHistory() noexcept {
     std::lock_guard<std::mutex> lock(context_mutex);
     
     message_history.clear();
@@ -824,18 +908,32 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
 
 // ContextInputOutput handles all generation operations
 
-inline void ContextInfo::ApplyCompletedSummary(const std::string& summary) {
+[[msvc::forceinline]] inline void ContextInfo::ApplyCompletedSummary(const std::string& summary) noexcept {
     std::lock_guard<std::mutex> lock(context_mutex);
     
     if (!summary.empty()) {
         // Add summary to chronological list and update template with all summaries
         AddSummaryToList(summary);
         UpdateTemplateWithAllSummaries();
-        context_needs_rebuild = true;
+        context_needs_rebuild.store(true, std::memory_order_relaxed);
         
         LOG_ContextInfo("Added new summary to chronological list (total: " + 
                        std::to_string(summaries.size()) + "/" + std::to_string(MAX_SUMMARIES) + "): " + 
                        summary.substr(0, 100) + (summary.length() > 100 ? "..." : ""));
+    }
+}
+
+[[msvc::forceinline]] inline void ContextInfo::ApplyCompletedSummary(std::string&& summary) noexcept {
+    std::lock_guard<std::mutex> lock(context_mutex);
+    
+    if (!summary.empty()) {
+        // Add summary to chronological list and update template with all summaries
+        AddSummaryToList(std::move(summary));
+        UpdateTemplateWithAllSummaries();
+        context_needs_rebuild.store(true, std::memory_order_relaxed);
+        
+        LOG_ContextInfo("Added new summary to chronological list (total: " + 
+                       std::to_string(summaries.size()) + "/" + std::to_string(MAX_SUMMARIES) + ") (moved)");
     }
 }
 
@@ -861,10 +959,10 @@ inline std::string ContextInfo::GetCurrentPrompt() const {
     return prompt_stream.str();
 }
 
-inline std::vector<std::pair<std::string, std::string>> ContextInfo::PruneContextImmediateWithExtraction(size_t keep_recent_messages) {
+[[msvc::forceinline]] inline std::vector<std::pair<std::string, std::string>> ContextInfo::PruneContextImmediateWithExtraction(size_t keep_recent_messages) noexcept {
     std::lock_guard<std::mutex> lock(context_mutex);
     
-    if (message_history.size() <= keep_recent_messages) {
+    if (message_history.size() <= keep_recent_messages) [[likely]] {
         LOG_DEBUG_ContextInfo("No pruning needed: only " + std::to_string(message_history.size()) + " messages");
         return {}; // Return empty vector
     }
@@ -872,11 +970,12 @@ inline std::vector<std::pair<std::string, std::string>> ContextInfo::PruneContex
     // Extract messages to be pruned for potential summarization
     size_t prune_count = message_history.size() - keep_recent_messages;
     std::vector<std::pair<std::string, std::string>> pruned_messages;
+    pruned_messages.reserve(prune_count); // Pre-allocate for performance
     pruned_messages.assign(message_history.begin(), message_history.begin() + prune_count);
     
     // Immediately prune from active history
     message_history.erase(message_history.begin(), message_history.begin() + prune_count);
-    context_needs_rebuild = true;
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
     
     LOG_ContextInfo("Pruned " + std::to_string(prune_count) + " messages from context - returning for orchestrator coordination");
     
@@ -888,14 +987,14 @@ inline std::vector<std::pair<std::string, std::string>> ContextInfo::PruneContex
 // - emotional_analysis_buffer_mutex, global_emotional_analysis_buffer moved to EmoTagPlugin
 
 // Implementation of new summary management methods
-inline void ContextInfo::AddSummaryToList(const std::string& summary) {
-    if (summary.empty()) return;
+[[msvc::forceinline]] inline void ContextInfo::AddSummaryToList(const std::string& summary) noexcept {
+    if (summary.empty()) [[unlikely]] return;
     
     // Add new summary to the end (newest)
     summaries.push_back(summary);
     
     // Enforce maximum limit by removing oldest summary if needed
-    if (summaries.size() > MAX_SUMMARIES) {
+    if (summaries.size() > MAX_SUMMARIES) [[unlikely]] {
         summaries.erase(summaries.begin()); // Remove oldest (first) summary
         LOG_ContextInfo("Removed oldest summary to maintain maximum of " + 
                        std::to_string(MAX_SUMMARIES) + " summaries");
@@ -905,8 +1004,25 @@ inline void ContextInfo::AddSummaryToList(const std::string& summary) {
                    " summaries in chronological order");
 }
 
-inline void ContextInfo::UpdateTemplateWithAllSummaries() {
-    if (template_manager) {
+[[msvc::forceinline]] inline void ContextInfo::AddSummaryToList(std::string&& summary) noexcept {
+    if (summary.empty()) [[unlikely]] return;
+    
+    // Add new summary to the end (newest)
+    summaries.push_back(std::move(summary));
+    
+    // Enforce maximum limit by removing oldest summary if needed
+    if (summaries.size() > MAX_SUMMARIES) [[unlikely]] {
+        summaries.erase(summaries.begin()); // Remove oldest (first) summary
+        LOG_ContextInfo("Removed oldest summary to maintain maximum of " + 
+                       std::to_string(MAX_SUMMARIES) + " summaries");
+    }
+    
+    LOG_ContextInfo("Summary list updated (moved): " + std::to_string(summaries.size()) + 
+                   " summaries in chronological order");
+}
+
+[[msvc::forceinline]] inline void ContextInfo::UpdateTemplateWithAllSummaries() noexcept {
+    if (template_manager) [[likely]] {
         template_manager->UpdateMultipleSummaries(summaries);
         LOG_ContextInfo("Updated template with " + std::to_string(summaries.size()) + 
                        " summaries in chronological order");
