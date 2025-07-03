@@ -26,6 +26,12 @@ using LuminaChat::ContextState;
 namespace ContextConstants {
     constinit const int32_t SAFETY_BUFFER_TOKENS = 64;      // Safety margin for all context operations
     constinit const int32_t GENERATION_BUFFER_TOKENS = 128; // Buffer for response generation (larger to account for responses)
+    
+    // Additional compile-time constants for performance optimization
+    [[nodiscard]] constexpr size_t DefaultMessageHistoryCapacity() noexcept { return 32; }
+    [[nodiscard]] constexpr size_t DefaultContextThreads() noexcept { return 1; }
+    [[nodiscard]] constexpr int32_t DefaultBatchSize() noexcept { return 512; }
+    [[nodiscard]] constexpr double CharToTokenEstimateRatio() noexcept { return 4.0; }
 }
 
 // ContextInfo: Individual conversation context management
@@ -44,6 +50,21 @@ struct llama_context;
 
 // Helper function declarations
 std::string GenerateContextId();
+
+// Compile-time helper functions for optimization
+namespace ContextHelpers {
+    [[nodiscard]] constexpr size_t CalculateReserveSize(size_t base_size, size_t growth_factor = 2) noexcept {
+        return base_size * growth_factor;
+    }
+    
+    [[nodiscard]] constexpr bool IsValidContextSize(int32_t size) noexcept {
+        return size > 0 && size <= (1 << 20); // Max 1M tokens
+    }
+    
+    [[nodiscard]] constexpr size_t AlignToCache(size_t size) noexcept {
+        return (size + 63) & ~63; // Align to 64-byte cache line
+    }
+}
 
 // Forward declaration for ModelInfo
 class ModelInfo;
@@ -106,6 +127,15 @@ private:    // Core components - optimized memory layout for cache efficiency
     // State flags - cache-aligned atomic for lock-free access
     alignas(16) mutable std::atomic<bool> context_needs_rebuild{true};
     
+    // Lock-free counters for performance monitoring (cache-aligned)
+    alignas(16) mutable std::atomic<size_t> message_count{0};
+    mutable std::atomic<size_t> generation_count{0};
+    mutable std::atomic<size_t> rebuild_count{0};
+    
+    // Lock-free flags for hot path optimization
+    mutable std::atomic<bool> template_dirty{false};
+    mutable std::atomic<bool> io_manager_available{false};
+    
     // Managers - second cache line
     alignas(64) std::unique_ptr<ChatTemplateManager> template_manager;
     std::unique_ptr<ContextInputOutput> io_manager;
@@ -120,6 +150,9 @@ private:    // Core components - optimized memory layout for cache efficiency
     // Summary storage - maintains up to 5 summaries in chronological order (oldest to newest)
     std::vector<std::string> summaries;
     static constexpr size_t MAX_SUMMARIES = 5;
+    
+    // Compile-time helper for summary management
+    [[nodiscard]] static constexpr size_t GetMaxSummaries() noexcept { return MAX_SUMMARIES; }
     
     // Context size management
     void AddSummaryToList(const std::string& summary) noexcept;
@@ -157,12 +190,18 @@ public:    // Constructor overloads
     [[nodiscard]] [[msvc::forceinline]] const ContextInputOutput* GetIOManager() const noexcept { return io_manager.get(); }
     
     // Minimal accessors needed by plugins and UI (delegates to specialized classes)
-    [[nodiscard]] [[msvc::forceinline]] bool IsGenerating() const noexcept { return io_manager ? io_manager->IsGenerating() : false; }
-    [[msvc::forceinline]] void StopGeneration() noexcept { if (io_manager) [[likely]] io_manager->StopGeneration(); }
+    [[nodiscard]] [[msvc::forceinline]] bool IsGenerating() const noexcept { 
+        return io_manager_available.load(std::memory_order_relaxed) && io_manager && io_manager->IsGenerating(); 
+    }
+    [[msvc::forceinline]] void StopGeneration() noexcept { 
+        if (io_manager_available.load(std::memory_order_relaxed) && io_manager) [[likely]] 
+            io_manager->StopGeneration(); 
+    }
     
     // Context usage monitoring (delegates to BatchManager via IOManager)
     [[nodiscard]] [[msvc::forceinline]] size_t GetActualContextTokens() const noexcept { 
-        return io_manager ? static_cast<size_t>(io_manager->GetCurrentPosition()) : 0; 
+        return io_manager_available.load(std::memory_order_relaxed) && io_manager ? 
+               static_cast<size_t>(io_manager->GetCurrentPosition()) : 0; 
     }
     
     // Template section management - direct access to ChatTemplateManager
@@ -193,11 +232,11 @@ public:    // Constructor overloads
     // Override base class methods to include generation state
     [[nodiscard]] [[msvc::forceinline]] bool IsAvailableForGeneration() const noexcept override {
         return ContextStateManager::IsAvailableForGeneration() && 
-               (!io_manager || !io_manager->IsGenerating());
+               (!io_manager_available.load(std::memory_order_relaxed) || !io_manager || !io_manager->IsGenerating());
     }
     [[nodiscard]] [[msvc::forceinline]] bool IsAvailableForPluginProcessing() const noexcept override {
         return ContextStateManager::IsAvailableForPluginProcessing() && 
-               (!io_manager || !io_manager->IsGenerating());
+               (!io_manager_available.load(std::memory_order_relaxed) || !io_manager || !io_manager->IsGenerating());
     }
     
     [[nodiscard]] [[msvc::forceinline]] size_t GetMaxContextTokens() const noexcept { return max_context_tokens; }
@@ -205,7 +244,19 @@ public:    // Constructor overloads
     
     // Message history access - ultra-fast inline accessors
     [[nodiscard]] [[msvc::forceinline]] const std::vector<std::pair<std::string, std::string>>& GetMessageHistory() const noexcept { return message_history; }
-    [[nodiscard]] [[msvc::forceinline]] size_t GetMessageCount() const noexcept { return message_history.size(); }
+    [[nodiscard]] [[msvc::forceinline]] size_t GetMessageCount() const noexcept { return message_count.load(std::memory_order_relaxed); }
+    
+    // Lock-free performance counters for ultimate performance monitoring
+    [[nodiscard]] [[msvc::forceinline]] size_t GetGenerationCount() const noexcept { return generation_count.load(std::memory_order_relaxed); }
+    [[nodiscard]] [[msvc::forceinline]] size_t GetRebuildCount() const noexcept { return rebuild_count.load(std::memory_order_relaxed); }
+    [[nodiscard]] [[msvc::forceinline]] bool IsTemplateDirty() const noexcept { return template_dirty.load(std::memory_order_relaxed); }
+    [[nodiscard]] [[msvc::forceinline]] bool IsIOManagerAvailable() const noexcept { return io_manager_available.load(std::memory_order_relaxed); }
+    
+    // Compile-time helper accessors
+    [[nodiscard]] [[msvc::forceinline]] static constexpr size_t GetMaxSummariesCount() noexcept { return MAX_SUMMARIES; }
+    [[nodiscard]] [[msvc::forceinline]] bool IsMessageHistoryEmpty() const noexcept { return message_count.load(std::memory_order_relaxed) == 0; }
+    [[nodiscard]] [[msvc::forceinline]] bool IsSummaryListFull() const noexcept { return summaries.size() >= MAX_SUMMARIES; }
+    [[nodiscard]] [[msvc::forceinline]] bool NeedsRebuild() const noexcept { return context_needs_rebuild.load(std::memory_order_relaxed); }
     
     // Template access - force inlined for performance
     [[nodiscard]] [[msvc::forceinline]] ChatTemplateManager& GetTemplateManager() noexcept { return *template_manager; }
@@ -214,7 +265,7 @@ public:    // Constructor overloads
     // Advanced features - optimized setters
     void SetMaxContextTokens(size_t max_tokens) noexcept;
     [[nodiscard]] [[msvc::forceinline]] int32_t GetContextSize() const noexcept { return context_size; }
-    std::string GetCurrentPrompt() const;
+    [[nodiscard]] std::string GetCurrentPrompt() const;
     
     // Template rendering (made public for testing)
     [[msvc::forceinline]] std::string BuildFullPrompt() noexcept;
@@ -235,6 +286,11 @@ inline ContextInfo::ContextInfo(const std::string& context_id, ModelInfo* model,
     , context_size(context_size)
     , max_context_tokens(static_cast<size_t>(context_size))
     , context_needs_rebuild(true)
+    , message_count(0)
+    , generation_count(0)
+    , rebuild_count(0)
+    , template_dirty(false)
+    , io_manager_available(false)
     , template_manager(std::make_unique<ChatTemplateManager>())
     , io_manager(nullptr)  // Will be initialized later
     , context_id(context_id)
@@ -258,7 +314,7 @@ inline ContextInfo::ContextInfo(const std::string& context_id, ModelInfo* model,
     }
     
     // Pre-reserve capacity for message history to reduce allocations
-    message_history.reserve(32);  // Reserve space for typical conversation length
+    message_history.reserve(ContextConstants::DefaultMessageHistoryCapacity());  // Reserve space for typical conversation length
     summaries.reserve(MAX_SUMMARIES);  // Reserve space for all summaries
     
     LOG_DEBUG("ContextInfo", "ContextInfo created: " + context_id + " with context size: " + std::to_string(context_size));
@@ -275,6 +331,10 @@ inline ContextInfo::~ContextInfo() {
     if (io_manager) {
         io_manager->StopGeneration();
     }
+    
+    // Clear atomic flags
+    io_manager_available.store(false, std::memory_order_relaxed);
+    template_dirty.store(false, std::memory_order_relaxed);
     
     std::lock_guard<std::mutex> lock(context_mutex);
     
@@ -311,10 +371,11 @@ inline bool ContextInfo::InitializeLlamaContext() {
         llama_context_params ctx_params = llama_context_default_params();
         // Initialize context parameters with this context's specific size
         ctx_params.n_ctx = context_size;
-        ctx_params.n_batch = std::min(512, context_size / 8);
+        ctx_params.n_batch = std::min(ContextConstants::DefaultBatchSize(), context_size / 8);
         ctx_params.n_threads = parent_model->GetConfig().threads > 0 ? 
-                               parent_model->GetConfig().threads : 
-                               std::max(1u, std::thread::hardware_concurrency());
+                               static_cast<unsigned int>(parent_model->GetConfig().threads) : 
+                               std::max(static_cast<unsigned int>(ContextConstants::DefaultContextThreads()), 
+                                       std::thread::hardware_concurrency());
         ctx_params.n_threads_batch = ctx_params.n_threads;
         
         // Performance optimizations
@@ -349,8 +410,11 @@ inline bool ContextInfo::InitializeLlamaContext() {
             LOG_ERROR_ContextInfo("Failed to create ContextInputOutput manager");
             llama_free(llama_ctx);
             llama_ctx = nullptr;
+            io_manager_available.store(false, std::memory_order_relaxed);
             return false;
         }
+        
+        io_manager_available.store(true, std::memory_order_relaxed);
         
         LOG_ContextInfo("Llama context initialized successfully for: " + context_id);
         return true;
@@ -385,11 +449,12 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
         // CRITICAL: This MUST be sent as username, input NOT "user", input; Chat template handles roles dynamically and will allow the AI to interpret properly here.
         // 1. Add pure conversation pair to message history
         message_history.emplace_back(username, input);
+        message_count.fetch_add(1, std::memory_order_relaxed);
         LOG_DEBUG_ContextInfo("Added user message to history: " + username + " -> " + 
                              input.substr(0, 50) + (input.length() > 50 ? "..." : ""));
         
         // 2. Check if context needs rebuilding after adding message
-        if (context_needs_rebuild || template_manager->IsTemplateDirty()) {
+        if (context_needs_rebuild || template_dirty.load(std::memory_order_relaxed)) {
             if (!RebuildContext(RebuildStrategy::FULL)) {
                 (void)TrySetState(ContextState::ERROR_STATE);
                 return "Error: Failed to rebuild context";
@@ -415,6 +480,7 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
         
         // 6. Add assistant response to message history
         message_history.emplace_back("assistant", response);
+        message_count.fetch_add(1, std::memory_order_relaxed);
         
         (void)TrySetState(ContextState::CONTEXT_IDLE);
           LOG_DEBUG("ContextInfo", "Generated response: " + response.substr(0, 100) + 
@@ -433,6 +499,7 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
     std::lock_guard<std::mutex> lock(context_mutex);
     
     message_history.emplace_back(role, content);
+    message_count.fetch_add(1, std::memory_order_relaxed);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
     
     LOG_DEBUG_ContextInfo("Added historical message: " + role + " -> " + 
@@ -443,42 +510,49 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
 [[msvc::forceinline]] inline void ContextInfo::UpdateEnvironment(const std::string& env) noexcept {
     template_manager->UpdateEnvironment(env);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated environment section");
 }
 
 [[msvc::forceinline]] inline void ContextInfo::UpdateEnvironment(std::string&& env) noexcept {
     template_manager->UpdateEnvironment(std::move(env));
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated environment section (moved)");
 }
 
 [[msvc::forceinline]] inline void ContextInfo::UpdateIdentity(const std::string& identity) noexcept {
     template_manager->UpdateIdentity(identity);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated identity section");
 }
 
 [[msvc::forceinline]] inline void ContextInfo::UpdateIdentity(std::string&& identity) noexcept {
     template_manager->UpdateIdentity(std::move(identity));
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated identity section (moved)");
 }
 
 [[msvc::forceinline]] inline void ContextInfo::UpdateSystemPrompt(const std::string& system_msg) noexcept {
     template_manager->UpdateSystemPrompt(system_msg);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated system prompt section");
 }
 
 [[msvc::forceinline]] inline void ContextInfo::UpdateSystemPrompt(std::string&& system_msg) noexcept {
     template_manager->UpdateSystemPrompt(std::move(system_msg));
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated system prompt section (moved)");
 }
 
 [[msvc::forceinline]] inline void ContextInfo::ApplySummary(const std::string& summary) noexcept {
     template_manager->UpdateSummary(summary);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_ContextInfo("Applied summary to template: " + summary.substr(0, 100) + 
                    (summary.length() > 100 ? "..." : ""));
     
@@ -497,6 +571,7 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
                        " recent messages out of " + std::to_string(message_history.size()) + " total");
         
         message_history = std::move(recent_messages);
+        message_count.store(keep_messages, std::memory_order_relaxed);
     }
 }
 
@@ -504,6 +579,7 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
     const std::string summary_ref = summary; // Create reference for logging before move
     template_manager->UpdateSummary(std::move(summary));
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_ContextInfo("Applied summary to template (moved): " + summary_ref.substr(0, 100) + 
                    (summary_ref.length() > 100 ? "..." : ""));
     
@@ -522,66 +598,77 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
                        " recent messages out of " + std::to_string(message_history.size()) + " total");
         
         message_history = std::move(recent_messages);
+        message_count.store(keep_messages, std::memory_order_relaxed);
     }
 }
 
 [[msvc::forceinline]] inline void ContextInfo::UpdateOldChatSummary(const std::string& old_summary) noexcept {
     template_manager->UpdateOldChatSummary(old_summary);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated old chat summary");
 }
 
 [[msvc::forceinline]] inline void ContextInfo::UpdateOldChatSummary(std::string&& old_summary) noexcept {
     template_manager->UpdateOldChatSummary(std::move(old_summary));
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated old chat summary (moved)");
 }
 
 [[msvc::forceinline]] inline void ContextInfo::UpdateMotifContext(const std::string& motif) noexcept {
     template_manager->UpdateMotifContext(motif);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated motif context");
 }
 
 [[msvc::forceinline]] inline void ContextInfo::UpdateMotifContext(std::string&& motif) noexcept {
     template_manager->UpdateMotifContext(std::move(motif));
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated motif context (moved)");
 }
 
 [[msvc::forceinline]] inline void ContextInfo::UpdateInternalReflection(const std::string& reflection) noexcept {
     template_manager->UpdateInternalReflection(reflection);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated internal reflection");
 }
 
 [[msvc::forceinline]] inline void ContextInfo::UpdateInternalReflection(std::string&& reflection) noexcept {
     template_manager->UpdateInternalReflection(std::move(reflection));
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated internal reflection (moved)");
 }
 
 [[msvc::forceinline]] inline void ContextInfo::UpdateEmotionalState(const std::string& emotional_state) noexcept {
     template_manager->UpdateEmotionalState(emotional_state);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated emotional state");
 }
 
 [[msvc::forceinline]] inline void ContextInfo::UpdateEmotionalState(std::string&& emotional_state) noexcept {
     template_manager->UpdateEmotionalState(std::move(emotional_state));
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated emotional state (moved)");
 }
 
 [[msvc::forceinline]] inline void ContextInfo::AddPastSessionMemory(const std::string& memory) noexcept {
     template_manager->AddPastSession(memory);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Added past session memory");
 }
 
 [[msvc::forceinline]] inline void ContextInfo::AddPastSessionMemory(std::string&& memory) noexcept {
     template_manager->AddPastSession(std::move(memory));
     context_needs_rebuild.store(true, std::memory_order_relaxed);
+    template_dirty.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Added past session memory (moved)");
 }
 
@@ -620,6 +707,8 @@ inline bool ContextInfo::RebuildContext(RebuildStrategy strategy) {
         }
         
         context_needs_rebuild.store(false, std::memory_order_relaxed);
+        template_dirty.store(false, std::memory_order_relaxed);
+        rebuild_count.fetch_add(1, std::memory_order_relaxed);
         return true;
         
     } catch (const std::exception& e) {
@@ -641,6 +730,7 @@ inline void ContextInfo::RebuildContext_Full() {
     
     // Ensure all rebuild flags are cleared
     context_needs_rebuild.store(false, std::memory_order_relaxed);
+    template_dirty.store(false, std::memory_order_relaxed);
     
     // Build full prompt - actual token processing will be handled by ContextInputOutput during generation
     std::string full_prompt = BuildFullPrompt();
@@ -686,6 +776,7 @@ inline void ContextInfo::RebuildContext_TemplateOnly() {
     std::lock_guard<std::mutex> lock(context_mutex);
     
     message_history.clear();
+    message_count.store(0, std::memory_order_relaxed);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
     
     LOG_DEBUG_ContextInfo("Message history cleared");
@@ -697,6 +788,12 @@ inline std::string GenerateContextId() {
     auto now = std::chrono::system_clock::now();
     auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     return "ctx_" + std::to_string(timestamp) + "_" + std::to_string(counter++);
+}
+
+// Compile-time string generation helpers
+namespace ContextStringHelpers {
+    [[nodiscard]] constexpr const char* GetContextPrefix() noexcept { return "ctx_"; }
+    [[nodiscard]] constexpr size_t GetContextPrefixLength() noexcept { return 4; } // strlen("ctx_")
 }
 
 // Factory methods for creating contexts with default template
@@ -783,6 +880,7 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
 
             // 1. Add user message to history
             message_history.emplace_back(username, input);
+            message_count.fetch_add(1, std::memory_order_relaxed);
             context_needs_rebuild.store(true, std::memory_order_relaxed);
             
             LOG_DEBUG_ContextInfo("Processing async input: " + username + " -> " + 
@@ -795,12 +893,12 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
             LOG_DEBUG_ContextInfo("Estimated prompt length: " + std::to_string(estimated_length) + " characters");
         
             // Check if we're approaching the limit with the new message
-            if (max_context_tokens > 0 && estimated_length > max_context_tokens * 4) [[unlikely]] { // Rough char-to-token estimate
+            if (max_context_tokens > 0 && estimated_length > max_context_tokens * ContextConstants::CharToTokenEstimateRatio()) [[unlikely]] { // Compile-time char-to-token estimate
                 LOG_WARNING_ContextInfo("Context approaching length limit - plugin monitoring should handle this");
             }
             
             // 3. Rebuild context with the new message
-            if (context_needs_rebuild.load(std::memory_order_relaxed) || template_manager->IsTemplateDirty()) [[likely]] {
+            if (context_needs_rebuild.load(std::memory_order_relaxed) || template_dirty.load(std::memory_order_relaxed)) [[likely]] {
                 LOG_DEBUG_ContextInfo("HandleInputAsync - rebuilding context");
                 if (!RebuildContext(RebuildStrategy::FULL)) [[unlikely]] {
                     LOG_ERROR_ContextInfo("HandleInputAsync - Failed to rebuild context");
@@ -866,6 +964,8 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
                     LOG_DEBUG_ContextInfo("Completion callback acquired context_mutex for success handling (took " + std::to_string(duration.count()) + "ms)");
                     
                     message_history.emplace_back("assistant", response);
+                    message_count.fetch_add(1, std::memory_order_relaxed);
+                    generation_count.fetch_add(1, std::memory_order_relaxed);
                     (void)TrySetState(ContextState::CONTEXT_IDLE);
                     LOG_DEBUG_ContextInfo("Completion callback - success handling complete, state set to IDLE");
                 }
@@ -955,7 +1055,7 @@ inline void ContextInfo::SetMaxContextTokens(size_t max_tokens) noexcept {
 inline std::string ContextInfo::GetCurrentPrompt() const {
     // For const method, return a simple representation without modifying state
     std::ostringstream prompt_stream;
-    prompt_stream << "Current context with " << message_history.size() << " messages";
+    prompt_stream << "Current context with " << message_count.load(std::memory_order_relaxed) << " messages";
     return prompt_stream.str();
 }
 
@@ -975,6 +1075,7 @@ inline std::string ContextInfo::GetCurrentPrompt() const {
     
     // Immediately prune from active history
     message_history.erase(message_history.begin(), message_history.begin() + prune_count);
+    message_count.store(keep_recent_messages, std::memory_order_relaxed);
     context_needs_rebuild.store(true, std::memory_order_relaxed);
     
     LOG_ContextInfo("Pruned " + std::to_string(prune_count) + " messages from context - returning for orchestrator coordination");
