@@ -124,7 +124,7 @@ public:
     [[nodiscard]] inline uint32_t GetLastErrorCode() const noexcept { return last_error_code.load(std::memory_order_relaxed); }
     
     // Atomic state management
-    [[carries_dependency]] inline void ClearErrorState() noexcept { 
+    inline void ClearErrorState() noexcept { 
         has_error_state.store(false, std::memory_order_relaxed);
         last_error_code.store(0, std::memory_order_relaxed);
     }
@@ -287,8 +287,6 @@ inline bool BatchManager::ProcessTokensBatch(const std::vector<int32_t>& tokens)
         const int32_t* __restrict token_ptr = tokens.data() + i;
         const int32_t batch_start_position = *n_past_ref;
         
-        // Add compiler hint for loop optimization
-        #pragma unroll 4
         // Vectorized batch setup with manual loop unrolling for small chunks
         if (chunk_size <= 4) [[likely]] {
             // Unrolled loop for common small chunk sizes

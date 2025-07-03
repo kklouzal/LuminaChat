@@ -94,31 +94,32 @@ enum class RebuildStrategy {
  * - Non-Blocking: Critical path stays fast, heavy work happens in background plugins
  */
 class ContextInfo : public LuminaChat::ContextStateManager {
-private:    // Core components
-    std::unique_ptr<ChatTemplateManager> template_manager;
-    std::unique_ptr<ContextInputOutput> io_manager;
-    ModelInfo* parent_model;
+private:    // Core components - optimized memory layout for cache efficiency
+    // Hot path data - frequently accessed together (first cache line)
+    alignas(64) ModelInfo* parent_model;
     TokenCache* token_cache;
-    
-    // Context configuration
+    llama_context* llama_ctx = nullptr;
+    int32_t n_past = 0;  // Number of tokens processed in context
     int32_t context_size;  // Individual context size (not tied to model)
-    
-    // Context identification and size management
-    std::string context_id;
     size_t max_context_tokens = 0;  // Maximum context size for this instance
+    
+    // State flags - cache-aligned atomic for lock-free access
+    alignas(16) mutable std::atomic<bool> context_needs_rebuild{true};
+    
+    // Managers - second cache line
+    alignas(64) std::unique_ptr<ChatTemplateManager> template_manager;
+    std::unique_ptr<ContextInputOutput> io_manager;
+    
+    // Context identification - rarely accessed, separate cache line
+    alignas(64) std::string context_id;
     mutable std::mutex context_mutex;
     
-    // Message history - pure conversation only
+    // Message history - pure conversation only (optimized with reserved capacity)
     std::vector<std::pair<std::string, std::string>> message_history; // (role, content)
     
     // Summary storage - maintains up to 5 summaries in chronological order (oldest to newest)
     std::vector<std::string> summaries;
     static constexpr size_t MAX_SUMMARIES = 5;
-    
-    // Llama context management
-    llama_context* llama_ctx = nullptr;
-    int32_t n_past = 0;  // Number of tokens processed in context
-    bool context_needs_rebuild = true;
     
     // Context size management
     void AddSummaryToList(const std::string& summary);
@@ -146,14 +147,21 @@ public:    // Constructor overloads
     bool HandleInputAsync(const std::string& input, const GenerationCallbacks& callbacks, const std::string& username = "user");
     void AddHistoricalMessage(const std::string& role, const std::string& content);
     
-    // Generation control
-    void StopGeneration();
-    bool IsGenerating() const;
-    
     // Llama.cpp integration methods
     bool InitializeLlamaContext();
-    std::string GenerateResponse(const std::string& prompt);
-    bool GenerateResponseAsync(const std::string& prompt, const GenerationCallbacks& callbacks);
+    
+    // Direct access to IO manager for generation operations
+    [[nodiscard]] [[msvc::forceinline]] ContextInputOutput* GetIOManager() noexcept { return io_manager.get(); }
+    [[nodiscard]] [[msvc::forceinline]] const ContextInputOutput* GetIOManager() const noexcept { return io_manager.get(); }
+    
+    // Minimal accessors needed by plugins and UI (delegates to specialized classes)
+    [[nodiscard]] [[msvc::forceinline]] bool IsGenerating() const noexcept { return io_manager ? io_manager->IsGenerating() : false; }
+    [[msvc::forceinline]] void StopGeneration() noexcept { if (io_manager) [[likely]] io_manager->StopGeneration(); }
+    
+    // Context usage monitoring (delegates to BatchManager via IOManager)
+    [[nodiscard]] [[msvc::forceinline]] size_t GetActualContextTokens() const noexcept { 
+        return io_manager ? static_cast<size_t>(io_manager->GetCurrentPosition()) : 0; 
+    }
     
     // Template section management - direct access to ChatTemplateManager
     void UpdateEnvironment(const std::string& env);
@@ -172,30 +180,29 @@ public:    // Constructor overloads
     void ClearMessageHistory();
     
     // Override base class methods to include generation state
-    [[nodiscard]] bool IsAvailableForGeneration() const noexcept override;
-    [[nodiscard]] bool IsAvailableForPluginProcessing() const noexcept override;
-    
-    size_t GetMaxContextTokens() const { return max_context_tokens; }
-    const std::string& GetContextId() const { return context_id; }
-    
-    // Get actual context usage based on n_past (single source of truth)
-    size_t GetActualContextTokens() const { return static_cast<size_t>(std::max(0, n_past)); }
-    float GetActualContextUsageRatio() const {
-        return max_context_tokens > 0 ? 
-            static_cast<float>(GetActualContextTokens()) / max_context_tokens : 0.0f;
+    [[nodiscard]] [[msvc::forceinline]] bool IsAvailableForGeneration() const noexcept override {
+        return ContextStateManager::IsAvailableForGeneration() && 
+               (!io_manager || !io_manager->IsGenerating());
+    }
+    [[nodiscard]] [[msvc::forceinline]] bool IsAvailableForPluginProcessing() const noexcept override {
+        return ContextStateManager::IsAvailableForPluginProcessing() && 
+               (!io_manager || !io_manager->IsGenerating());
     }
     
-    // Message history access
-    const std::vector<std::pair<std::string, std::string>>& GetMessageHistory() const { return message_history; }
-    size_t GetMessageCount() const { return message_history.size(); }
+    [[nodiscard]] [[msvc::forceinline]] size_t GetMaxContextTokens() const noexcept { return max_context_tokens; }
+    [[nodiscard]] [[msvc::forceinline]] const std::string& GetContextId() const noexcept { return context_id; }
     
-    // Template access
-    ChatTemplateManager& GetTemplateManager() { return *template_manager; }
-    const ChatTemplateManager& GetTemplateManager() const { return *template_manager; }
+    // Message history access - ultra-fast inline accessors
+    [[nodiscard]] [[msvc::forceinline]] const std::vector<std::pair<std::string, std::string>>& GetMessageHistory() const noexcept { return message_history; }
+    [[nodiscard]] [[msvc::forceinline]] size_t GetMessageCount() const noexcept { return message_history.size(); }
     
-    // Advanced features
-    void SetMaxContextTokens(size_t max_tokens);
-    int32_t GetContextSize() const { return static_cast<int32_t>(max_context_tokens); }
+    // Template access - force inlined for performance
+    [[nodiscard]] [[msvc::forceinline]] ChatTemplateManager& GetTemplateManager() noexcept { return *template_manager; }
+    [[nodiscard]] [[msvc::forceinline]] const ChatTemplateManager& GetTemplateManager() const noexcept { return *template_manager; }
+    
+    // Advanced features - optimized setters
+    void SetMaxContextTokens(size_t max_tokens) noexcept;
+    [[nodiscard]] [[msvc::forceinline]] int32_t GetContextSize() const noexcept { return context_size; }
     std::string GetCurrentPrompt() const;
     
     // Template rendering (made public for testing)
@@ -209,34 +216,39 @@ public:    // Constructor overloads
 
 // Inline implementation of ContextInfo methods
 inline ContextInfo::ContextInfo(const std::string& context_id, ModelInfo* model, int32_t context_size)
-    : context_id(context_id)
+    : ContextStateManager()  // Initialize base class first
     , parent_model(model)
     , token_cache(model ? &model->GetTokenCache() : nullptr)
-    , context_size(context_size)
-    , template_manager(std::make_unique<ChatTemplateManager>())
     , llama_ctx(nullptr)
+    , n_past(0)
+    , context_size(context_size)
+    , max_context_tokens(static_cast<size_t>(context_size))
     , context_needs_rebuild(true)
+    , template_manager(std::make_unique<ChatTemplateManager>())
+    , io_manager(nullptr)  // Will be initialized later
+    , context_id(context_id)
 {
-    if (!parent_model) {
+    if (!parent_model) [[unlikely]] {
         LOG_ERROR("ContextInfo", "ContextInfo created with null ModelInfo");
         (void)TrySetState(ContextState::ERROR_STATE);
         return;
     }
     
-    if (!token_cache) {
+    if (!token_cache) [[unlikely]] {
         LOG_ERROR("ContextInfo", "ContextInfo created with null TokenCache");
         (void)TrySetState(ContextState::ERROR_STATE);
         return;
     }
     
-    if (context_size <= 0) {
+    if (context_size <= 0) [[unlikely]] {
         LOG_ERROR("ContextInfo", "ContextInfo created with invalid context size: " + std::to_string(context_size));
         (void)TrySetState(ContextState::ERROR_STATE);
         return;
     }
     
-    // Set max context tokens to match our individual context size
-    max_context_tokens = static_cast<size_t>(context_size);
+    // Pre-reserve capacity for message history to reduce allocations
+    message_history.reserve(32);  // Reserve space for typical conversation length
+    summaries.reserve(MAX_SUMMARIES);  // Reserve space for all summaries
     
     LOG_DEBUG("ContextInfo", "ContextInfo created: " + context_id + " with context size: " + std::to_string(context_size));
 }
@@ -257,7 +269,7 @@ inline ContextInfo::~ContextInfo() {
     
     LOG_DEBUG_ContextInfo("ContextInfo destructor called for: " + context_id);
     
-    // Clean up IO manager (handles generation threads and batch cleanup)
+    // Clean up IO manager (handles generation threads and batch cleanup automatically)
     io_manager.reset();
     
     // Clean up llama context
@@ -273,12 +285,12 @@ inline ContextInfo::~ContextInfo() {
 inline bool ContextInfo::InitializeLlamaContext() {
     // Note: context_mutex should already be held by caller
     
-    if (!parent_model || !parent_model->IsLoaded()) {
+    if (!parent_model || !parent_model->IsLoaded()) [[unlikely]] {
         LOG_ERROR_ContextInfo("Parent model not loaded for context initialization");
         return false;
     }
     
-    if (llama_ctx) {
+    if (llama_ctx) [[likely]] {
         LOG_DEBUG_ContextInfo("Llama context already initialized");
         return true;
     }
@@ -305,13 +317,13 @@ inline bool ContextInfo::InitializeLlamaContext() {
         
         // Create context
         llama_ctx = llama_init_from_model(parent_model->GetModel(), ctx_params);
-        if (!llama_ctx) {
+        if (!llama_ctx) [[unlikely]] {
             LOG_ERROR_ContextInfo("Failed to create llama context");
             return false;
         }
         
         // Verify that the actual allocated context size matches what we requested
-        if (ctx_params.n_ctx != context_size) {
+        if (ctx_params.n_ctx != context_size) [[unlikely]] {
             LOG_WARNING_ContextInfo("Allocated context size (" + std::to_string(ctx_params.n_ctx) + 
                                    ") differs from requested size (" + std::to_string(context_size) + ")");
         }
@@ -322,7 +334,7 @@ inline bool ContextInfo::InitializeLlamaContext() {
         
         // Create IO manager for generation operations
         io_manager = std::make_unique<ContextInputOutput>(parent_model, token_cache, llama_ctx, n_past, max_context_tokens);
-        if (!io_manager) {
+        if (!io_manager) [[unlikely]] {
             LOG_ERROR_ContextInfo("Failed to create ContextInputOutput manager");
             llama_free(llama_ctx);
             llama_ctx = nullptr;
@@ -334,7 +346,7 @@ inline bool ContextInfo::InitializeLlamaContext() {
         
     } catch (const std::exception& e) {
         LOG_ERROR_ContextInfo("Exception during llama context initialization: " + std::string(e.what()));
-        if (llama_ctx) {
+        if (llama_ctx) [[unlikely]] {
             llama_free(llama_ctx);
             llama_ctx = nullptr;
         }
@@ -376,22 +388,8 @@ inline std::string ContextInfo::HandleInput(const std::string& input, const std:
         // 3. Render dynamic template with current message history
         std::string full_prompt = BuildFullPrompt();
         
-        // 4. Check context size - delegate to ContextPruningPlugin for intelligent pruning decisions
-        // Note: Removed inline threshold checking - ContextPruningPlugin handles this through scheduled monitoring
-        std::vector<int32_t> prompt_tokens = token_cache->TokenizeText(full_prompt, true);
-        
-        // Only check for emergency situations that require immediate action
-        size_t estimated_tokens = static_cast<size_t>(prompt_tokens.size());
-        // Use estimated_tokens directly since full_prompt already includes everything
-        // n_past would be double counting since it's from previous context state
-        size_t total_estimated = estimated_tokens;
-        if (max_context_tokens > 0 && total_estimated >= max_context_tokens - ContextConstants::SAFETY_BUFFER_TOKENS) {
-            LOG_WARNING_ContextInfo("Context approaching hard limit - plugin intervention needed");
-            LOG_WARNING_ContextInfo("Estimated tokens: " + std::to_string(total_estimated) + "/" + std::to_string(max_context_tokens));
-            
-            // Trust the plugin to handle this through its monitoring
-            // No direct emergency pruning - maintain clean architecture
-        }
+        // 4. Context size checking is handled by ContextInputOutput and plugins
+        // No need for inline threshold checking here - maintain clean architecture
 
         
         // 5. Generate LLM response using ContextInputOutput
@@ -424,47 +422,46 @@ inline void ContextInfo::AddHistoricalMessage(const std::string& role, const std
     std::lock_guard<std::mutex> lock(context_mutex);
     
     message_history.emplace_back(role, content);
-    context_needs_rebuild = true;
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
     
     LOG_DEBUG_ContextInfo("Added historical message: " + role + " -> " + 
                          content.substr(0, 50) + (content.length() > 50 ? "..." : ""));
-    context_needs_rebuild = true;
 }
 
-// Template section management methods
+// Template section management methods - optimized for minimal lock contention
 inline void ContextInfo::UpdateEnvironment(const std::string& env) {
     template_manager->UpdateEnvironment(env);
-    context_needs_rebuild = true;
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated environment section");
 }
 
 inline void ContextInfo::UpdateIdentity(const std::string& identity) {
     template_manager->UpdateIdentity(identity);
-    context_needs_rebuild = true;
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated identity section");
 }
 
 inline void ContextInfo::UpdateSystemPrompt(const std::string& system_msg) {
     template_manager->UpdateSystemPrompt(system_msg);
-    context_needs_rebuild = true;
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated system prompt section");
 }
 
 inline void ContextInfo::ApplySummary(const std::string& summary) {
     template_manager->UpdateSummary(summary);
-    context_needs_rebuild = true;
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_ContextInfo("Applied summary to template: " + summary.substr(0, 100) + 
                    (summary.length() > 100 ? "..." : ""));
     
     // Automatically prune message history when a summary is applied
     // This prevents the context from growing indefinitely
-    if (message_history.size() > 10) { // Only prune if we have substantial history
+    if (message_history.size() > 10) [[likely]] { // Only prune if we have substantial history
         LOG_ContextInfo("Auto-pruning message history due to summary application");
         
         // Keep only the most recent 5 message pairs (10 messages total)
-        size_t keep_messages = 10;
+        constexpr size_t keep_messages = 10;
+        const size_t start_idx = message_history.size() - keep_messages;
         std::vector<std::pair<std::string, std::string>> recent_messages;
-        size_t start_idx = message_history.size() - keep_messages;
         recent_messages.assign(message_history.begin() + start_idx, message_history.end());
         
         LOG_ContextInfo("Pruning message history: keeping " + std::to_string(keep_messages) + 
@@ -476,31 +473,31 @@ inline void ContextInfo::ApplySummary(const std::string& summary) {
 
 inline void ContextInfo::UpdateOldChatSummary(const std::string& old_summary) {
     template_manager->UpdateOldChatSummary(old_summary);
-    context_needs_rebuild = true;
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated old chat summary");
 }
 
 inline void ContextInfo::UpdateMotifContext(const std::string& motif) {
     template_manager->UpdateMotifContext(motif);
-    context_needs_rebuild = true;
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated motif context");
 }
 
 inline void ContextInfo::UpdateInternalReflection(const std::string& reflection) {
     template_manager->UpdateInternalReflection(reflection);
-    context_needs_rebuild = true;
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated internal reflection");
 }
 
 inline void ContextInfo::UpdateEmotionalState(const std::string& emotional_state) {
     template_manager->UpdateEmotionalState(emotional_state);
-    context_needs_rebuild = true;
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Updated emotional state");
 }
 
 inline void ContextInfo::AddPastSessionMemory(const std::string& memory) {
     template_manager->AddPastSession(memory);
-    context_needs_rebuild = true;
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
     LOG_DEBUG_ContextInfo("Added past session memory");
 }
 
@@ -520,7 +517,7 @@ inline std::string ContextInfo::BuildFullPrompt() {
 // Batch management is now handled by ContextInputOutput
 
 inline bool ContextInfo::RebuildContext(RebuildStrategy strategy) {
-    if (!InitializeLlamaContext()) {
+    if (!InitializeLlamaContext()) [[unlikely]] {
         LOG_ERROR_ContextInfo("Failed to initialize llama context for rebuild");
         return false;
     }
@@ -538,7 +535,7 @@ inline bool ContextInfo::RebuildContext(RebuildStrategy strategy) {
                 break;
         }
         
-        context_needs_rebuild = false;
+        context_needs_rebuild.store(false, std::memory_order_relaxed);
         return true;
         
     } catch (const std::exception& e) {
@@ -553,24 +550,19 @@ inline void ContextInfo::RebuildContext_Full() {
     LOG_DEBUG_ContextInfo("Performing full context rebuild");
     
     // Clear current context and reset state
-    if (llama_ctx) {
+    if (llama_ctx) [[likely]] {
         llama_memory_clear(llama_get_memory(llama_ctx), true);
         n_past = 0;
     }
     
     // Ensure all rebuild flags are cleared
-    context_needs_rebuild = false;
+    context_needs_rebuild.store(false, std::memory_order_relaxed);
     
-    // Build and tokenize full prompt
+    // Build full prompt - actual token processing will be handled by ContextInputOutput during generation
     std::string full_prompt = BuildFullPrompt();
-    std::vector<int32_t> tokens = token_cache->TokenizeText(full_prompt, true);
     
-    // IMPORTANT: Since we're doing a full rebuild, we need to properly set n_past
-    // to reflect the tokens that will be processed. The generation phase will
-    // process these tokens and n_past will be updated accordingly.
-    // For now, we keep n_past at 0 since tokens will be processed fresh.
-    
-    LOG_DEBUG_ContextInfo("Full rebuild completed: context cleared, " + std::to_string(tokens.size()) + " tokens prepared for processing");
+    LOG_DEBUG_ContextInfo("Full rebuild completed: context cleared, prompt built (" + 
+                         std::to_string(full_prompt.length()) + " characters)");
 }
 
 inline void ContextInfo::RebuildContext_Partial() {
@@ -593,85 +585,15 @@ inline void ContextInfo::RebuildContext_TemplateOnly() {
 
 // Token processing is now handled by ContextInputOutput
 
-inline std::string ContextInfo::GenerateResponse(const std::string& prompt) {
-    // DEPRECATED FOR UI CONTEXTS: This method blocks and should only be used for non-UI contexts
-    // like Discord bot responses or batch processing. For UI contexts, use GenerateResponseAsync instead.
-    
-    std::lock_guard<std::mutex> lock(context_mutex);
-    
-    // Ensure context is initialized before checking io_manager
-    if (!InitializeLlamaContext()) {
-        LOG_ERROR_ContextInfo("Failed to initialize context for generation");
-        return "Error: Failed to initialize generation system";
-    }
-    
-    if (!io_manager) {
-        LOG_ERROR_ContextInfo("IO manager not available for generation");
-        return "Error: Generation system not available";
-    }
-    
-    return io_manager->GenerateResponse(prompt);
-}
-
-inline bool ContextInfo::GenerateResponseAsync(const std::string& prompt, const GenerationCallbacks& callbacks) {
-    LOG_DEBUG_ContextInfo("GenerateResponseAsync called - acquiring context_mutex");
-    
-    std::lock_guard<std::mutex> lock(context_mutex);
-    LOG_DEBUG_ContextInfo("GenerateResponseAsync acquired context_mutex");
-    
-    // Ensure context is initialized before checking io_manager
-    if (!InitializeLlamaContext()) {
-        LOG_ERROR_ContextInfo("Failed to initialize context for async generation");
-        if (callbacks.on_error) {
-            callbacks.on_error("Failed to initialize generation system");
-        }
-        return false;
-    }
-    LOG_DEBUG_ContextInfo("GenerateResponseAsync - context initialized successfully");
-    
-    if (!io_manager) {
-        LOG_ERROR_ContextInfo("IO manager not available for async generation");
-        if (callbacks.on_error) {
-            callbacks.on_error("Generation system not available");
-        }
-        return false;
-    }
-    LOG_DEBUG_ContextInfo("GenerateResponseAsync - io_manager available");
-    
-    LOG_DEBUG_ContextInfo("GenerateResponseAsync calling io_manager->GenerateResponseAsync while holding context_mutex - POTENTIAL DEADLOCK POINT");
-    bool result = io_manager->GenerateResponseAsync(prompt, callbacks);
-    LOG_DEBUG_ContextInfo("GenerateResponseAsync - io_manager call completed, returning: " + std::to_string(result));
-    
-    return result;
-}
-
-inline void ContextInfo::StopGeneration() {
-    if (io_manager) {
-        io_manager->StopGeneration();
-    }
-}
-
-inline bool ContextInfo::IsGenerating() const {
-    return io_manager ? io_manager->IsGenerating() : false;
-}
-
-inline bool ContextInfo::IsAvailableForGeneration() const noexcept {
-    return ContextStateManager::IsAvailableForGeneration() && !IsGenerating();
-}
-
-inline bool ContextInfo::IsAvailableForPluginProcessing() const noexcept {
-    return ContextStateManager::IsAvailableForPluginProcessing() && !IsGenerating();
-}
-
 inline void ContextInfo::ClearContext() {
     std::lock_guard<std::mutex> lock(context_mutex);
     
-    if (llama_ctx) {
+    if (llama_ctx) [[likely]] {
         llama_memory_clear(llama_get_memory(llama_ctx), true);
         n_past = 0;
     }
     
-    context_needs_rebuild = false;  // Clear rebuild flag
+    context_needs_rebuild.store(false, std::memory_order_relaxed);  // Clear rebuild flag
     
     LOG_DEBUG_ContextInfo("Context cleared and state reset");
 }
@@ -680,7 +602,7 @@ inline void ContextInfo::ClearMessageHistory() {
     std::lock_guard<std::mutex> lock(context_mutex);
     
     message_history.clear();
-    context_needs_rebuild = true;
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
     
     LOG_DEBUG_ContextInfo("Message history cleared");
 }
@@ -716,9 +638,9 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
         
         try {
             // Ensure context is initialized first
-            if (!InitializeLlamaContext()) {
+            if (!InitializeLlamaContext()) [[unlikely]] {
                 LOG_ERROR_ContextInfo("HandleInputAsync - Failed to initialize context");
-                if (callbacks.on_error) {
+                if (callbacks.on_error) [[likely]] {
                     callbacks.on_error("Failed to initialize context");
                 }
                 return false;
@@ -726,9 +648,9 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
             LOG_DEBUG_ContextInfo("HandleInputAsync - context initialized");
             
             // Check if generation system is available
-            if (!io_manager) {
+            if (!io_manager) [[unlikely]] {
                 LOG_ERROR_ContextInfo("HandleInputAsync - Generation system not available");
-                if (callbacks.on_error) {
+                if (callbacks.on_error) [[likely]] {
                     callbacks.on_error("Generation system not available");
                 }
                 return false;
@@ -736,9 +658,9 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
             LOG_DEBUG_ContextInfo("HandleInputAsync - io_manager available");
             
             // Check if already generating
-            if (IsGenerating()) {
+            if (io_manager && io_manager->IsGenerating()) [[unlikely]] {
                 LOG_WARNING_ContextInfo("HandleInputAsync - Generation already in progress");
-                if (callbacks.on_error) {
+                if (callbacks.on_error) [[likely]] {
                     callbacks.on_error("Generation already in progress");
                 }
                 return false;
@@ -746,28 +668,28 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
             LOG_DEBUG_ContextInfo("HandleInputAsync - not currently generating");
             
             // Try to transition to generating state for processing
-            if (!TrySetState(ContextState::CONTEXT_GENERATING)) {
+            if (!TrySetState(ContextState::CONTEXT_GENERATING)) [[unlikely]] {
                 ContextState current_state = GetState();
                 LOG_WARNING_ContextInfo("HandleInputAsync - Context not available for generation. Current state: " + 
                                        std::to_string(static_cast<int>(current_state)) + " (" + GetStateString() + ")");
                 
                 // If we're stuck in GENERATING state but not actually generating, force reset
-                if (current_state == ContextState::CONTEXT_GENERATING && !IsGenerating()) {
+                if (current_state == ContextState::CONTEXT_GENERATING && (!io_manager || !io_manager->IsGenerating())) [[unlikely]] {
                     LOG_WARNING_ContextInfo("HandleInputAsync - Context stuck in GENERATING state but not actually generating, forcing reset");
                     ContextState previous_state = ForceResetToIdle("stuck in GENERATING state");
                     LOG_WARNING_ContextInfo("HandleInputAsync - Forced reset from state " + std::to_string(static_cast<int>(previous_state)) + " to IDLE");
                     
                     // Try the transition again after reset
-                    if (!TrySetState(ContextState::CONTEXT_GENERATING)) {
+                    if (!TrySetState(ContextState::CONTEXT_GENERATING)) [[unlikely]] {
                         LOG_ERROR_ContextInfo("HandleInputAsync - Still cannot transition to GENERATING after force reset");
-                        if (callbacks.on_error) {
+                        if (callbacks.on_error) [[likely]] {
                             callbacks.on_error("Context not available for generation after recovery attempt");
                         }
                         return false;
                     }
                     LOG_DEBUG_ContextInfo("HandleInputAsync - Successfully transitioned to GENERATING after force reset");
                 } else {
-                    if (callbacks.on_error) {
+                    if (callbacks.on_error) [[likely]] {
                         callbacks.on_error("Context not available for generation");
                     }
                     return false;
@@ -777,37 +699,35 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
 
             // 1. Add user message to history
             message_history.emplace_back(username, input);
-            context_needs_rebuild = true;
+            context_needs_rebuild.store(true, std::memory_order_relaxed);
             
             LOG_DEBUG_ContextInfo("Processing async input: " + username + " -> " + 
                                  input.substr(0, 50) + (input.length() > 50 ? "..." : ""));
             
-            // 2. Check context size BEFORE rebuilding
+            // 2. Check context size - delegate to plugins for monitoring
+            // Basic size estimation for logging purposes only
             std::string estimated_prompt = BuildFullPrompt();
-            size_t estimated_tokens = LuminaChat::Utilities::EstimateTokenCount(estimated_prompt);
-            LOG_DEBUG_ContextInfo("Estimated prompt tokens: " + std::to_string(estimated_tokens) + 
-                         " (current context: " + std::to_string(GetActualContextTokens()) + 
-                         "/" + std::to_string(max_context_tokens) + ")");
+            size_t estimated_length = estimated_prompt.length();
+            LOG_DEBUG_ContextInfo("Estimated prompt length: " + std::to_string(estimated_length) + " characters");
         
             // Check if we're approaching the limit with the new message
-            if (max_context_tokens > 0 && estimated_tokens >= max_context_tokens - ContextConstants::SAFETY_BUFFER_TOKENS) {
-                LOG_WARNING_ContextInfo("Context approaching hard limit during message addition - plugin monitoring may need adjustment");
-                LOG_WARNING_ContextInfo("Current tokens: " + std::to_string(estimated_tokens) + "/" + std::to_string(max_context_tokens));
+            if (max_context_tokens > 0 && estimated_length > max_context_tokens * 4) [[unlikely]] { // Rough char-to-token estimate
+                LOG_WARNING_ContextInfo("Context approaching length limit - plugin monitoring should handle this");
             }
             
             // 3. Rebuild context with the new message
-            if (context_needs_rebuild || template_manager->IsTemplateDirty()) {
+            if (context_needs_rebuild.load(std::memory_order_relaxed) || template_manager->IsTemplateDirty()) [[likely]] {
                 LOG_DEBUG_ContextInfo("HandleInputAsync - rebuilding context");
-                if (!RebuildContext(RebuildStrategy::FULL)) {
+                if (!RebuildContext(RebuildStrategy::FULL)) [[unlikely]] {
                     LOG_ERROR_ContextInfo("HandleInputAsync - Failed to rebuild context");
                     
                     // CRITICAL: Reset state on rebuild failure to prevent stuck states
-                    if (!TrySetState(ContextState::CONTEXT_IDLE)) {
+                    if (!TrySetState(ContextState::CONTEXT_IDLE)) [[unlikely]] {
                         LOG_WARNING_ContextInfo("HandleInputAsync rebuild failure - failed to reset to IDLE, forcing reset");
                         ForceResetToIdle("rebuild failure recovery");
                     }
                     
-                    if (callbacks.on_error) {
+                    if (callbacks.on_error) [[likely]] {
                         callbacks.on_error("Failed to rebuild context");
                     }
                     return false;
@@ -815,12 +735,8 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
                 LOG_DEBUG_ContextInfo("HandleInputAsync - context rebuilt successfully");
             }
             
-            // 4. Final safety check after rebuild
-            size_t actual_tokens = GetActualContextTokens();
-            if (max_context_tokens > 0 && actual_tokens >= max_context_tokens - ContextConstants::SAFETY_BUFFER_TOKENS) {
-                LOG_WARNING("ContextInfo", "Context still near hard limit after rebuild - plugin intervention needed");
-                LOG_WARNING("ContextInfo", "Actual tokens: " + std::to_string(actual_tokens) + "/" + std::to_string(max_context_tokens));
-            }
+            // 4. Final safety check after rebuild - delegate to plugins
+            // ContextInputOutput will handle actual token validation during generation
             
             // 5. Prepare for generation
             full_prompt = BuildFullPrompt();
@@ -831,12 +747,12 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
             LOG_ERROR("ContextInfo", "Exception in HandleInputAsync preparation: " + std::string(e.what()));
             
             // CRITICAL: Always reset state on exceptions to prevent stuck states
-            if (!TrySetState(ContextState::CONTEXT_IDLE)) {
+            if (!TrySetState(ContextState::CONTEXT_IDLE)) [[unlikely]] {
                 LOG_WARNING_ContextInfo("HandleInputAsync exception handler - failed to reset to IDLE, forcing reset");
                 ForceResetToIdle("HandleInputAsync exception recovery");
             }
             
-            if (callbacks.on_error) {
+            if (callbacks.on_error) [[likely]] {
                 callbacks.on_error("Exception: " + std::string(e.what()));
             }
             return false;
@@ -845,7 +761,7 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
     LOG_DEBUG_ContextInfo("HandleInputAsync released context_mutex");
     
     // Start async generation OUTSIDE the critical section to avoid deadlock
-    if (preparation_success) {
+    if (preparation_success) [[likely]] {
         LOG_DEBUG_ContextInfo("HandleInputAsync - starting async generation outside critical section");
         
         // Create properly structured callbacks for ContextInputOutput
@@ -856,7 +772,7 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
             LOG_DEBUG_ContextInfo("Generation completion callback called - success: " + std::to_string(success));
             
             // Add assistant response to message history upon completion
-            if (success && !response.empty()) {
+            if (success && !response.empty()) [[likely]] {
                 LOG_DEBUG_ContextInfo("Completion callback attempting to acquire context_mutex for success handling");
                 auto start_time = std::chrono::steady_clock::now();
                 {
@@ -881,7 +797,7 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
                     LOG_DEBUG_ContextInfo("Completion callback acquired context_mutex for error handling (took " + std::to_string(duration.count()) + "ms)");
                     
                     // On failure, try to go to IDLE first, then ERROR_STATE if needed
-                    if (!TrySetState(ContextState::CONTEXT_IDLE)) {
+                    if (!TrySetState(ContextState::CONTEXT_IDLE)) [[unlikely]] {
                         LOG_WARNING_ContextInfo("Completion callback - failed to set IDLE state, forcing reset");
                         ForceResetToIdle("generation failure recovery");
                     }
@@ -892,7 +808,7 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
             
             // Forward to original callback
             LOG_DEBUG_ContextInfo("Completion callback forwarding to original callback");
-            if (callbacks.on_complete) {
+            if (callbacks.on_complete) [[likely]] {
                 callbacks.on_complete(response, success);
             }
             LOG_DEBUG_ContextInfo("Completion callback finished");
@@ -906,13 +822,7 @@ inline bool ContextInfo::HandleInputAsync(const std::string& input, const Genera
     return false;
 }
 
-// Generation control methods now handled by ContextInputOutput
-
-// StartGenerationAsync is now handled by ContextInputOutput
-
-// Context state validation is now handled by BatchManager
-
-// Context usage tracking is now handled by BatchManager
+// ContextInputOutput handles all generation operations
 
 inline void ContextInfo::ApplyCompletedSummary(const std::string& summary) {
     std::lock_guard<std::mutex> lock(context_mutex);
@@ -930,11 +840,16 @@ inline void ContextInfo::ApplyCompletedSummary(const std::string& summary) {
 }
 
 // Advanced features
-inline void ContextInfo::SetMaxContextTokens(size_t max_tokens) {
+inline void ContextInfo::SetMaxContextTokens(size_t max_tokens) noexcept {
     std::lock_guard<std::mutex> lock(context_mutex);
     
     // Update max context tokens
     max_context_tokens = max_tokens;
+    
+    // Update IO manager bounds if it exists
+    if (io_manager) [[likely]] {
+        io_manager->UpdateContextBounds(max_tokens);
+    }
     
     LOG_DEBUG_ContextInfo("Max context tokens set to: " + std::to_string(max_tokens));
 }

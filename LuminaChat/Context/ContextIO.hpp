@@ -340,7 +340,7 @@ inline bool ContextInputOutput::ProcessPromptTokens(const std::vector<int32_t>& 
     
     // Unrolled loop for bulk processing
     for (int32_t i = 1; i < unrolled_end; i += unroll_count) {
-        #pragma unroll 8
+        // Manual unrolling for better performance across compilers
         for (int32_t j = 0; j < unroll_count; ++j) {
             const int32_t idx = i + j;
             if (logits[idx] > max_logit) [[unlikely]] {
