@@ -324,8 +324,9 @@ public:
         // Extract recent AI responses for analysis
         std::vector<std::string> ai_responses;
         const size_t max_responses = analysis_window_size.load();
+        const size_t history_size = message_history.size();
         
-        LogInfo("Searching for AI responses in " + std::to_string(message_history.size()) + " messages for context: " + context_id);
+        LogInfo("Searching for AI responses in " + std::to_string(history_size) + " messages for context: " + context_id);
         
         // Walk backwards through message history to find AI responses
         for (auto it = message_history.rbegin(); it != message_history.rend() && ai_responses.size() < max_responses; ++it) {
@@ -342,7 +343,7 @@ public:
             LogInfo("Requested emotional analysis for context " + context_id + 
                    " with " + std::to_string(response_count) + " AI responses");
         } else {
-            LogInfo("No assistant messages found in " + std::to_string(message_history.size()) + " messages for context: " + context_id);
+            LogInfo("No assistant messages found in " + std::to_string(history_size) + " messages for context: " + context_id);
         }
     }
     
