@@ -149,19 +149,23 @@
     <ClCompile Include="LuminaChat.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="Blacklist.hpp" />
-    <ClInclude Include="common_utils.hpp" />
-    <ClInclude Include="ContextSizeManager.hpp" />
-    <ClInclude Include="DiscordHistoryLoader.hpp" />
+    <ClInclude Include="ChatTemplateManager.hpp" />
+    <ClInclude Include="Context\ContextInfo.hpp" />
+    <ClInclude Include="Context\ContextState.hpp" />
+    <ClInclude Include="ContextStats.hpp" />
     <ClInclude Include="DiscordManager.hpp" />
-    <ClInclude Include="LlamaContext.hpp" />
     <ClInclude Include="LlamaManager.hpp" />
-    <ClInclude Include="LlamaResponse.hpp" />
-    <ClInclude Include="LlamaSummarizer.hpp" />
-    <ClInclude Include="LogHandler.hpp" />
+    <ClInclude Include="Logger.hpp" />
+    <ClInclude Include="ModelInfo.hpp" />
+    <ClInclude Include="Orchestrator.hpp" />
+    <ClInclude Include="Plugins\ContextPruningPlugin.hpp" />
+    <ClInclude Include="Plugins\EmoTagPlugin.hpp" />
+    <ClInclude Include="Plugins\SummarizationPlugin.hpp" />
+    <ClInclude Include="ProcessingPipeline.hpp" />
     <ClInclude Include="Sanitizer.hpp" />
     <ClInclude Include="SettingsManager.hpp" />
     <ClInclude Include="TokenCache.hpp" />
+    <ClInclude Include="Utilities.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

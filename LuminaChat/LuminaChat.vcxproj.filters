@@ -15,48 +15,45 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="LuminaChat.cpp">
+    <ClCompile Include="rework\LuminaChat.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="LlamaManager.hpp">
+    <ClInclude Include="rework\ChatTemplateManager.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="DiscordManager.hpp">
+    <ClInclude Include="rework\ContextInfo.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="SettingsManager.hpp">
+    <ClInclude Include="rework\ContextPruningPlugin.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="DiscordHistoryLoader.hpp">
+    <ClInclude Include="rework\DiscordManager.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="LogHandler.hpp">
+    <ClInclude Include="rework\LlamaManager.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="TokenCache.hpp">
+    <ClInclude Include="rework\Logger.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="common_utils.hpp">
+    <ClInclude Include="rework\ModelInfo.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="LlamaContext.hpp">
+    <ClInclude Include="rework\Orchestrator.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="LlamaResponse.hpp">
+    <ClInclude Include="rework\ProcessingPipeline.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="LlamaSummarizer.hpp">
+    <ClInclude Include="rework\Sanitizer.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="Blacklist.hpp">
+    <ClInclude Include="rework\SettingsManager.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="ContextSizeManager.hpp">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="Sanitizer.hpp">
+    <ClInclude Include="rework\TokenCache.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

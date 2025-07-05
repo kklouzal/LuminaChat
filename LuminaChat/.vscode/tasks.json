@@ -7,7 +7,7 @@
 			"command": "msbuild",
 			"args": [
 				"LuminaChat.vcxproj",
-				"/p:Configuration=Debug",
+				"/p:Configuration=Release",
 				"/p:Platform=x64"
 			],
 			"group": "build",
