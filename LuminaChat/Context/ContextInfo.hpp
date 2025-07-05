@@ -343,7 +343,9 @@ inline bool ContextInfo::InitializeLlamaContext() {
         
         // Performance optimizations
         ctx_params.flash_attn = true;
+        ctx_params.op_offload = true;
         ctx_params.offload_kqv = true;
+        ctx_params.defrag_thold = 0.33f;
         
         LOG_DEBUG_ContextInfo("Creating llama context with params: n_ctx=" + 
                              std::to_string(ctx_params.n_ctx) + 

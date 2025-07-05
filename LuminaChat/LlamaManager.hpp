@@ -86,12 +86,12 @@ private:
     // Statistics and monitoring
     LlamaManagerStats stats;
     
-    // Default templates (loaded from settings)
-    std::unordered_map<std::string, std::string> default_templates;
-    
     // Resource monitoring
     std::function<void(std::string, std::string)> resource_callback;
     
+    // Optional progress callback for UI updates
+    std::function<void(const std::string&, float)> progress_callback;
+
     // llama.cpp initialization state
     static std::atomic<bool> llama_backend_initialized;
     static std::mutex backend_init_mutex;
@@ -99,8 +99,6 @@ private:
     // Helper methods
     void UpdateStats();
     void NotifyResourceEvent(const std::string& event, const std::string& details);
-    std::string LoadTemplateFromSettings(const std::string& template_name);
-    std::string GetTemplateInternal(const std::string& template_name); // Internal version - no mutex
     bool ValidateModelId(const std::string& model_id) const;
     bool ValidateContextId(const std::string& context_id) const;
     bool EnsureBackendInitialized();
@@ -141,12 +139,6 @@ public:
     std::vector<std::string> GetContextIds() const;
     std::vector<ContextInfo*> GetAllActiveContexts() const; // For context size monitoring
     
-    // Template management
-    bool LoadTemplate(const std::string& template_name, const std::string& template_content);
-    bool LoadTemplateFromFile(const std::string& template_name, const std::string& file_path);
-    std::string GetTemplate(const std::string& template_name) const;
-    std::vector<std::string> GetTemplateNames() const;
-    
     // State and statistics
     LlamaManagerState GetState() const { return state; }
     const LlamaManagerStats& GetStats() const { return stats; }
@@ -156,7 +148,6 @@ public:
     void SetSettingsManager(SettingsManager* settings);
     SettingsManager* GetSettingsManager() { return settings_manager; }
     const SettingsManager* GetSettingsManager() const { return settings_manager; }
-    bool LoadDefaultTemplatesFromSettings();
     bool SaveStatsToSettings() const;
     
     // Resource monitoring
@@ -172,6 +163,15 @@ public:
     // Debugging and diagnostics
     void DumpManagerState() const;
     std::string GetDetailedReport() const;
+    
+    // Progress callback registration for model loading UI updates
+    void RegisterProgressCallback(std::function<void(const std::string&, float)> callback);
+    
+    // Clear progress callback
+    void ClearProgressCallback();
+
+    // Internal progress callback for forwarding to UI
+    bool InternalProgressCallback(const std::string& model_id, float progress);
 };
 
 // Helper functions for LlamaManager integration
@@ -179,10 +179,6 @@ namespace LlamaManagerHelpers {
     // Generate unique IDs
     std::string GenerateModelId(const std::string& base_name = "model");
     std::string GenerateContextId(const std::string& base_name = "context");
-    
-    // Template utilities
-    bool IsValidTemplate(const std::string& template_content);
-    std::string SanitizeTemplateContent(const std::string& template_content);
     
     // Resource management utilities
     size_t EstimateModelMemoryUsage(const ModelConfig& config);
@@ -258,11 +254,6 @@ inline bool LlamaManager::Initialize() {
             return false;
         }
         
-        // Load default templates from settings if available
-        if (settings_manager) {
-            LoadDefaultTemplatesFromSettings();
-        }
-        
         state = LlamaManagerState::READY;
         stats.startup_time = std::chrono::steady_clock::now();
         
@@ -333,6 +324,13 @@ inline ModelInfo* LlamaManager::GetOrCreateModelInfo(const std::string& model_id
                 std::string event_name = "MODEL_" + std::to_string(static_cast<int>(event));
                 std::string message = "Model " + id + ": " + msg;
                 NotifyResourceEvent(event_name, message);
+            });
+        }
+        
+        // Register progress callback if we have one
+        if (progress_callback) {
+            model_info->RegisterProgressCallback([this, model_id](float progress, void* user_data) -> bool {
+                return InternalProgressCallback(model_id, progress);
             });
         }
         
@@ -507,48 +505,6 @@ inline bool LlamaManager::RemoveContext(const std::string& context_id) {
     }
 }
 
-// Template management
-inline bool LlamaManager::LoadTemplate(const std::string& template_name, const std::string& template_content) {
-    std::lock_guard<std::mutex> lock(manager_mutex);
-    
-    if (template_name.empty() || template_content.empty()) {
-        LOG_ERROR_LlamaManager("Empty template name or content");
-        return false;
-    }
-    
-    default_templates[template_name] = template_content;
-    
-    // Save to settings if available
-    if (settings_manager) {
-        settings_manager->SetString("Templates", template_name, template_content);
-    }
-    
-    LOG_LlamaManager("Loaded template: " + template_name + " (" + std::to_string(template_content.length()) + " chars)");
-    return true;
-}
-
-inline std::string LlamaManager::GetTemplate(const std::string& template_name) const {
-    std::lock_guard<std::mutex> lock(manager_mutex);
-    
-    auto it = default_templates.find(template_name);
-    if (it != default_templates.end()) {
-        return it->second;
-    }
-    
-    // Try to load from settings if available
-    if (settings_manager) {
-        std::string template_content = settings_manager->GetString("Templates", template_name, "");
-        if (!template_content.empty()) {
-            // Cache it for future use
-            const_cast<LlamaManager*>(this)->default_templates[template_name] = template_content;
-            return template_content;
-        }
-    }
-    
-    LOG_DEBUG_LlamaManager("Template not found: " + template_name);
-    return "";
-}
-
 // Cleanup
 inline void LlamaManager::Cleanup() {
     std::lock_guard<std::mutex> lock(manager_mutex);
@@ -566,9 +522,6 @@ inline void LlamaManager::Cleanup() {
         // Clear models
         models.clear();
         LOG_LlamaManager("All models cleared");
-        
-        // Clear templates
-        default_templates.clear();
         
         stats.Reset();
         state = LlamaManagerState::UNINITIALIZED;
@@ -634,27 +587,6 @@ inline bool LlamaManager::ValidateContextId(const std::string& context_id) const
            });
 }
 
-inline bool LlamaManager::LoadDefaultTemplatesFromSettings() {
-    if (!settings_manager) {
-        return false;
-    }
-    
-    LOG_LlamaManager("Loading default templates from settings");
-    
-    // Load basic templates
-    std::vector<std::string> template_names = {"default", "chat", "summary", "system"};
-    
-    for (const std::string& name : template_names) {
-        std::string content = settings_manager->GetString("Templates", name, "");
-        if (!content.empty()) {
-            default_templates[name] = content;
-            LOG_LlamaManager("Loaded template from settings: " + name);
-        }
-    }
-    
-    return true;
-}
-
 // Accessors
 inline ModelInfo* LlamaManager::GetModelInfo(const std::string& model_id) const {
     std::lock_guard<std::mutex> lock(manager_mutex);
@@ -708,24 +640,39 @@ inline void LlamaManager::RegisterResourceCallback(std::function<void(std::strin
     LOG_LlamaManager("Resource callback registered");
 }
 
-// Internal template getter - assumes mutex is already held
-inline std::string LlamaManager::GetTemplateInternal(const std::string& template_name) {
-    // Note: This method assumes manager_mutex is already acquired by the caller
-    auto it = default_templates.find(template_name);
-    if (it != default_templates.end()) {
-        return it->second;
+inline void LlamaManager::RegisterProgressCallback(std::function<void(const std::string&, float)> callback) {
+    std::lock_guard<std::mutex> lock(manager_mutex);
+    // Register the progress callback
+    progress_callback = std::move(callback);
+    LOG_LlamaManager("Progress callback registered for UI updates");
+}
+
+inline void LlamaManager::ClearProgressCallback() {
+    std::lock_guard<std::mutex> lock(manager_mutex);
+    // Clear the progress callback
+    progress_callback = nullptr;
+    LOG_LlamaManager("Progress callback cleared");
+}
+
+// Internal progress callback for forwarding to UI
+inline bool LlamaManager::InternalProgressCallback(const std::string& model_id, float progress) {
+    // Copy the callback to avoid holding lock while calling it
+    std::function<void(const std::string&, float)> callback_copy;
+    {
+        std::lock_guard<std::mutex> lock(manager_mutex);
+        callback_copy = progress_callback;
     }
     
-    // Try to load from settings if available
-    if (settings_manager) {
-        std::string template_content = settings_manager->GetString("Templates", template_name, "");
-        if (!template_content.empty()) {
-            // Cache it for future use
-            default_templates[template_name] = template_content;
-            return template_content;
+    if (callback_copy) {
+        try {
+            callback_copy(model_id, progress);
+            return true;
+        } catch (const std::exception& e) {
+            LOG_ERROR_LlamaManager("Exception in progress callback: " + std::string(e.what()));
+        } catch (...) {
+            LOG_ERROR_LlamaManager("Unknown exception in progress callback");
         }
     }
-    
-    LOG_DEBUG_LlamaManager("Template not found: " + template_name);
-    return "";
+    return true; // Always return true to continue loading
 }
+

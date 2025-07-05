@@ -48,10 +48,58 @@
 #include "Orchestrator.hpp"
 #include "Plugins/SummarizationPlugin.hpp"
 #include "Plugins/EmoTagPlugin.hpp"
+#include "Plugins/SummarizationPlugin_UI.hpp"
+#include "Plugins/EmoTagPlugin_UI.hpp"
+#include "Plugins/ContextPruningPlugin_UI.hpp"
+#include "Settings_UI.hpp"
 
 #include <memory>
 #include <thread>
 #include <atomic>
+
+// Configuration constants
+namespace LuminaChatConstants {
+    // Timer and update intervals
+    static constexpr int DEBUG_UPDATE_INTERVAL = 10;  // Timer ticks between debug updates
+    static constexpr int TIMER_INTERVAL_MS = 100;     // Main timer interval in milliseconds
+    
+    // UI layout constants
+    static constexpr int DEFAULT_WINDOW_WIDTH = 800;
+    static constexpr int DEFAULT_WINDOW_HEIGHT = 600;
+    static constexpr int CONTROL_SPACING = 5;
+    static constexpr int PANEL_BORDER = 10;
+    
+    // Model configuration defaults
+    static constexpr int DEFAULT_CONTEXT_SIZE = 4096;
+    static constexpr int MIN_CONTEXT_SIZE = 512;
+    static constexpr int MAX_CONTEXT_SIZE = 32768;
+    static constexpr int DEFAULT_GPU_LAYERS = 999;
+    static constexpr int MIN_GPU_LAYERS = 0;
+    static constexpr int MAX_GPU_LAYERS = 999;
+    
+    // Discord configuration
+    static constexpr int DEFAULT_BACKFILL_LIMIT = 100;
+    
+    // Chat display formatting
+    static constexpr int TIMESTAMP_FORMAT_LENGTH = 8;  // "[HH:MM:SS]"
+    
+    // Plugin monitoring intervals
+    static constexpr int EMOTION_ANALYSIS_DELAY_MS = 1000;  // Delay after generation for emotion analysis
+    static constexpr int CONTEXT_MONITORING_DELAY_MS = 1000; // Delay after generation for context monitoring
+}
+
+// UI Color constants
+namespace LuminaChatColors {
+    static const wxColour SUCCESS_GREEN{0, 150, 0};
+    static const wxColour ERROR_RED{150, 50, 50};
+    static const wxColour WARNING_ORANGE{150, 100, 50};
+    static const wxColour INFO_BLUE{50, 50, 150};
+    static const wxColour DISCORD_BLUE{114, 137, 218};
+    static const wxColour NEUTRAL_GRAY{100, 100, 100};
+    static const wxColour BACKGROUND_LIGHT{248, 249, 250};
+    static const wxColour TIMESTAMP_GRAY{128, 128, 128};
+    static const wxColour TEMPLATE_BACKGROUND{250, 250, 250};
+}
 
 // wxWidgets application class
 class LuminaChatApp : public wxApp {
@@ -70,16 +118,16 @@ public:
     void OnAbout(wxCommandEvent& event);
     void OnSendMessage(wxCommandEvent& event);
     void OnStopGeneration(wxCommandEvent& event);
-    void OnLoadModel(wxCommandEvent& event);
     void OnConnectDiscord(wxCommandEvent& event);
     void OnTimer(wxTimerEvent& event);
     void OnClose(wxCloseEvent& event);
     void OnClearChat(wxCommandEvent& event);
     void OnClearLogs(wxCommandEvent& event);
     void OnClearTemplate(wxCommandEvent& event);
-    void OnLoadSummaryModel(wxCommandEvent& event);
-    void OnLoadEmoTagModel(wxCommandEvent& event);
     void OnLogLevelChanged(wxCommandEvent& event);
+
+    // Settings UI integration
+    void OnLoadModelFromSettingsUI();
 
     // Core system lifecycle
     void Start();
@@ -95,6 +143,19 @@ public:
     std::string GetIdentityDirectiveFromUI() const;
     std::string GetSystemPromptFromUI() const;
     void ApplyTemplateSettingsToContext(ContextInfo* context, const std::string& context_id);
+
+    // Message generation helper methods
+    void CaptureTemplateForInspection(ContextInfo* context);
+    GenerationCallbacks CreateGenerationCallbacks();
+    void ExecuteMessageGeneration(ContextInfo* context, const std::string& input, const GenerationCallbacks& callbacks);
+    void HandleMessageGenerationError(const std::string& error_message);
+
+    // Common UI helper methods
+    void ShowErrorMessage(const std::string& message, const std::string& context = "");
+    void ShowSuccessMessage(const std::string& message);
+    void ShowWarningMessage(const std::string& message);
+    void LogAndDisplayError(const std::string& log_msg, const std::string& user_msg = "");
+    void LogAndDisplaySuccess(const std::string& log_msg, const std::string& user_msg = "");
 
     // UI Settings persistence
     void LoadUISettings();
@@ -115,20 +176,6 @@ private:
     wxButton* stop_button;
     wxButton* clear_button;
     
-    // Settings Panel
-    wxPanel* settings_panel;
-    wxTextCtrl* model_path_text;
-    wxButton* browse_model_button;
-    wxSlider* context_size_slider;
-    wxStaticText* context_size_label;
-    wxSlider* gpu_layers_slider;
-    wxStaticText* gpu_layers_label;
-    wxButton* load_model_button;
-    wxGauge* model_progress;
-    wxTextCtrl* environment_description_text;
-    wxTextCtrl* identity_directive_text;
-    wxTextCtrl* system_prompt_text;
-    
     // Discord Panel
     wxPanel* discord_panel;
     wxTextCtrl* discord_token_text;
@@ -143,31 +190,18 @@ private:
     wxButton* clear_logs_button;
     wxChoice* log_level_choice;
     
-    // Summary Settings Panel
-    wxPanel* summary_panel;
-    wxTextCtrl* summary_model_path_text;
-    wxButton* browse_summary_model_button;
-    wxStaticText* summary_status_text;
-    wxTextCtrl* summary_log_output_text;
-    wxTextCtrl* summary_last_generation_text;
-    wxTextCtrl* summary_system_prompt_text;
-    
-    // EmoTag Settings Panel
-    wxPanel* emotag_panel;
-    wxTextCtrl* emotag_model_path_text;
-    wxButton* browse_emotag_model_button;
-    wxStaticText* emotag_status_text;
-    wxTextCtrl* emotag_log_output_text;
-    wxTextCtrl* emotag_last_generation_text;
-    wxTextCtrl* emotag_system_prompt_text;
-    wxSlider* emotag_window_size_slider;
-    wxStaticText* emotag_window_size_text;
-    wxCheckBox* emotag_include_user_checkbox;
-    
     // Template Panel
     wxPanel* template_panel;
     wxTextCtrl* template_display;
     wxButton* clear_template_button;
+    
+    // Plugin UI Managers
+    std::unique_ptr<SummarizationPluginUI> summarization_ui;
+    std::unique_ptr<EmoTagPluginUI> emotag_ui;
+    std::unique_ptr<ContextPruningPluginUI> context_pruning_ui;
+    
+    // Settings UI Manager
+    std::unique_ptr<SettingsUI> settings_ui;
     
     // Core rework components (in dependency order)
     std::unique_ptr<SettingsManager> settings_manager;
@@ -200,11 +234,8 @@ private:
     
     // UI creation methods
     void CreateChatPanel();
-    void CreateSettingsPanel();
     void CreateDiscordPanel();
     void CreateLogsPanel();
-    void CreateSummaryPanel();
-    void CreateEmoTagPanel();
     void CreateTemplatePanel();
     
     // UI update methods
@@ -224,6 +255,11 @@ private:
     void UpdateSummaryPluginDebugInfo();  // Update summary plugin debug textboxes
     void UpdateEmoTagPluginDebugInfo();   // Update emotag plugin debug textboxes
     
+    // Individual plugin initialization methods
+    void InitializeSummarizationPlugin();
+    void InitializeEmoTagPlugin();
+    void InitializeContextPruningPlugin();
+    
     DECLARE_EVENT_TABLE()
 };
 
@@ -231,15 +267,11 @@ private:
 enum {
     ID_Send = 1000,
     ID_Stop,
-    ID_LoadModel,
     ID_ConnectDiscord,
     ID_Timer,
     ID_ClearChat,
     ID_ClearLogs,
-    ID_ClearTemplate,
-    ID_BrowseModel,
-    ID_BrowseSummaryModel,
-    ID_BrowseEmoTagModel
+    ID_ClearTemplate
 };
 
 // Event table mapping
@@ -248,14 +280,10 @@ wxBEGIN_EVENT_TABLE(LuminaChatFrame, wxFrame)
     EVT_MENU(wxID_ABOUT, LuminaChatFrame::OnAbout)
     EVT_BUTTON(ID_Send, LuminaChatFrame::OnSendMessage)
     EVT_BUTTON(ID_Stop, LuminaChatFrame::OnStopGeneration)
-    EVT_BUTTON(ID_LoadModel, LuminaChatFrame::OnLoadModel)
     EVT_BUTTON(ID_ConnectDiscord, LuminaChatFrame::OnConnectDiscord)
-    EVT_BUTTON(ID_BrowseModel, LuminaChatFrame::OnLoadModel)
     EVT_BUTTON(ID_ClearChat, LuminaChatFrame::OnClearChat)
     EVT_BUTTON(ID_ClearLogs, LuminaChatFrame::OnClearLogs)
     EVT_BUTTON(ID_ClearTemplate, LuminaChatFrame::OnClearTemplate)
-    EVT_BUTTON(ID_BrowseSummaryModel, LuminaChatFrame::OnLoadSummaryModel)
-    EVT_BUTTON(ID_BrowseEmoTagModel, LuminaChatFrame::OnLoadEmoTagModel)
     EVT_TIMER(ID_Timer, LuminaChatFrame::OnTimer)
     EVT_CLOSE(LuminaChatFrame::OnClose)
 wxEND_EVENT_TABLE()
@@ -298,16 +326,29 @@ LuminaChatFrame::LuminaChatFrame()
     
     // Create all UI panels
     CreateChatPanel();
-    CreateSettingsPanel();
     CreateDiscordPanel();
     CreateLogsPanel();
-    CreateSummaryPanel();
-    CreateEmoTagPanel();
     CreateTemplatePanel();
+    
+    // Create Settings UI manager
+    settings_ui = std::make_unique<SettingsUI>(this);
+    
+    // Create plugin UI managers
+    summarization_ui = std::make_unique<SummarizationPluginUI>(this);
+    emotag_ui = std::make_unique<EmoTagPluginUI>(this);
+    context_pruning_ui = std::make_unique<ContextPruningPluginUI>(this);
+    
+    // Add settings panel to notebook
+    notebook->AddPage(settings_ui->CreatePanel(), "Model Settings");
+    
+    // Add plugin panels to notebook
+    notebook->AddPage(summarization_ui->CreatePanel(), "Summary Settings");
+    notebook->AddPage(emotag_ui->CreatePanel(), "EmoTag Settings");
+    notebook->AddPage(context_pruning_ui->CreatePanel(), "Context Pruning");
     
     // Main layout
     wxBoxSizer* main_sizer = new wxBoxSizer(wxVERTICAL);
-    main_sizer->Add(notebook, 1, wxEXPAND | wxALL, 5);
+    main_sizer->Add(notebook, 1, wxEXPAND | wxALL, LuminaChatConstants::CONTROL_SPACING);
     SetSizer(main_sizer);
     
     // Create system timer
@@ -320,6 +361,8 @@ LuminaChatFrame::~LuminaChatFrame() {
     Stop();
 }
 
+// === UI Creation Methods ===
+
 void LuminaChatFrame::CreateChatPanel() {
     chat_panel = new wxPanel(notebook);
     notebook->AddPage(chat_panel, "Chat", true);
@@ -328,7 +371,7 @@ void LuminaChatFrame::CreateChatPanel() {
     chat_display = new wxRichTextCtrl(chat_panel, wxID_ANY, wxEmptyString,
                                       wxDefaultPosition, wxDefaultSize,
                                       wxRE_READONLY | wxRE_MULTILINE);
-    chat_display->SetBackgroundColour(wxColour(248, 249, 250));
+    chat_display->SetBackgroundColour(LuminaChatColors::BACKGROUND_LIGHT);
     
     // Input area
     chat_input = new wxTextCtrl(chat_panel, wxID_ANY, wxEmptyString,
@@ -344,9 +387,9 @@ void LuminaChatFrame::CreateChatPanel() {
     
     // Layout
     wxBoxSizer* button_sizer = new wxBoxSizer(wxHORIZONTAL);
-    button_sizer->Add(send_button, 0, wxALL, 5);
-    button_sizer->Add(stop_button, 0, wxALL, 5);
-    button_sizer->Add(clear_button, 0, wxALL, 5);
+    button_sizer->Add(send_button, 0, wxALL, LuminaChatConstants::CONTROL_SPACING);
+    button_sizer->Add(stop_button, 0, wxALL, LuminaChatConstants::CONTROL_SPACING);
+    button_sizer->Add(clear_button, 0, wxALL, LuminaChatConstants::CONTROL_SPACING);
     button_sizer->AddStretchSpacer();
     
     wxBoxSizer* chat_sizer = new wxBoxSizer(wxVERTICAL);
@@ -358,151 +401,6 @@ void LuminaChatFrame::CreateChatPanel() {
     
     // Bind enter key to send
     chat_input->Bind(wxEVT_TEXT_ENTER, &LuminaChatFrame::OnSendMessage, this);
-}
-
-void LuminaChatFrame::CreateSettingsPanel() {
-    settings_panel = new wxPanel(notebook);
-    notebook->AddPage(settings_panel, "Model Settings");
-    
-    // Create a scrolled window to contain all settings
-    wxScrolledWindow* scrolled_window = new wxScrolledWindow(settings_panel, wxID_ANY, 
-                                                            wxDefaultPosition, wxDefaultSize, 
-                                                            wxVSCROLL | wxHSCROLL);
-    scrolled_window->SetScrollRate(10, 10);
-    
-    // Model configuration group
-    wxStaticBoxSizer* model_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Model Configuration");
-    
-    // Model path selection
-    wxBoxSizer* path_sizer = new wxBoxSizer(wxHORIZONTAL);
-    path_sizer->Add(new wxStaticText(scrolled_window, wxID_ANY, "Model Path:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-    model_path_text = new wxTextCtrl(scrolled_window, wxID_ANY);
-    path_sizer->Add(model_path_text, 1, wxEXPAND | wxALL, 5);
-    browse_model_button = new wxButton(scrolled_window, ID_BrowseModel, "Browse...");
-    path_sizer->Add(browse_model_button, 0, wxALL, 5);
-    model_box->Add(path_sizer, 0, wxEXPAND);
-    
-    // Bind text change event to save model path
-    model_path_text->Bind(wxEVT_TEXT, [this](wxCommandEvent& event) {
-        if (settings_manager) {
-            settings_manager->SetString("Models", "main_model_path", model_path_text->GetValue().ToStdString());
-            // Don't auto-save on every keystroke for performance, just mark dirty
-        }
-    });
-    
-    // Context size control
-    wxBoxSizer* context_sizer = new wxBoxSizer(wxHORIZONTAL);
-    context_sizer->Add(new wxStaticText(scrolled_window, wxID_ANY, "Context Size:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-    context_size_slider = new wxSlider(scrolled_window, wxID_ANY, 4096, 512, 32768, 
-                                      wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL | wxSL_LABELS);
-    context_sizer->Add(context_size_slider, 1, wxEXPAND | wxALL, 5);
-    context_size_label = new wxStaticText(scrolled_window, wxID_ANY, "4096");
-    context_sizer->Add(context_size_label, 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-    model_box->Add(context_sizer, 0, wxEXPAND);
-    
-    // Bind slider change event to save settings
-    context_size_slider->Bind(wxEVT_SLIDER, [this](wxCommandEvent& event) {
-        UpdateUI();
-        if (settings_manager) {
-            settings_manager->SetInt("Models", "main_context_size", context_size_slider->GetValue());
-            settings_manager->SaveSettings();
-        }
-    });
-    
-    // GPU layers control
-    wxBoxSizer* gpu_sizer = new wxBoxSizer(wxHORIZONTAL);
-    gpu_sizer->Add(new wxStaticText(scrolled_window, wxID_ANY, "GPU Layers:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-    gpu_layers_slider = new wxSlider(scrolled_window, wxID_ANY, 999, 0, 999, 
-                                    wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL | wxSL_LABELS);
-    gpu_sizer->Add(gpu_layers_slider, 1, wxEXPAND | wxALL, 5);
-    gpu_layers_label = new wxStaticText(scrolled_window, wxID_ANY, "999");
-    gpu_sizer->Add(gpu_layers_label, 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-    model_box->Add(gpu_sizer, 0, wxEXPAND);
-    
-    // Bind slider change event to save settings
-    gpu_layers_slider->Bind(wxEVT_SLIDER, [this](wxCommandEvent& event) {
-        UpdateUI();
-        if (settings_manager) {
-            settings_manager->SetInt("Models", "main_gpu_layers", gpu_layers_slider->GetValue());
-            settings_manager->SaveSettings();
-        }
-    });
-    
-    // Load button and progress
-    wxBoxSizer* load_sizer = new wxBoxSizer(wxHORIZONTAL);
-    load_model_button = new wxButton(scrolled_window, ID_LoadModel, "Load Model");
-    load_sizer->Add(load_model_button, 0, wxALL, 5);
-    model_progress = new wxGauge(scrolled_window, wxID_ANY, 100);
-    load_sizer->Add(model_progress, 1, wxEXPAND | wxALL, 5);
-    model_box->Add(load_sizer, 0, wxEXPAND);
-    
-    // Template configuration group
-    wxStaticBoxSizer* template_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Template Configuration");
-    
-    // Environment Description textbox
-    template_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "Environment Description:"), 0, wxALL, 5);
-    environment_description_text = new wxTextCtrl(scrolled_window, wxID_ANY, wxEmptyString,
-                                                 wxDefaultPosition, wxSize(-1, 120),
-                                                 wxTE_MULTILINE | wxTE_WORDWRAP);
-    environment_description_text->SetToolTip("Define the environment and setting where the conversation takes place. This will be used in template variable replacement for environment-related sections.");
-    template_box->Add(environment_description_text, 0, wxEXPAND | wxALL, 5);
-    
-    // Auto-save on kill focus (when user moves away from field)
-    environment_description_text->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& event) {
-        if (settings_manager) {
-            settings_manager->SetString("Templates", "environment_description", environment_description_text->GetValue().ToStdString());
-            settings_manager->SaveSettings();
-        }
-        event.Skip();
-    });
-    
-    // Identity Directive textbox
-    template_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "Identity Directive:"), 0, wxALL, 5);
-    identity_directive_text = new wxTextCtrl(scrolled_window, wxID_ANY, wxEmptyString,
-                                           wxDefaultPosition, wxSize(-1, 120),
-                                           wxTE_MULTILINE | wxTE_WORDWRAP);
-    identity_directive_text->SetToolTip("Define the AI's core identity and behavioral guidelines. This will be used in template variable replacement for identity-related sections.");
-    template_box->Add(identity_directive_text, 0, wxEXPAND | wxALL, 5);
-    
-    // Auto-save on kill focus
-    identity_directive_text->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& event) {
-        if (settings_manager) {
-            settings_manager->SetString("Templates", "identity_directive", identity_directive_text->GetValue().ToStdString());
-            settings_manager->SaveSettings();
-        }
-        event.Skip();
-    });
-    
-    // System Prompt textbox
-    template_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "System Prompt:"), 0, wxALL, 5);
-    system_prompt_text = new wxTextCtrl(scrolled_window, wxID_ANY, wxEmptyString,
-                                       wxDefaultPosition, wxSize(-1, 120),
-                                       wxTE_MULTILINE | wxTE_WORDWRAP);
-    system_prompt_text->SetToolTip("Define the system-level instructions and context. This will be used in template variable replacement for system prompt sections.");
-    template_box->Add(system_prompt_text, 0, wxEXPAND | wxALL, 5);
-    
-    // Auto-save on kill focus
-    system_prompt_text->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& event) {
-        if (settings_manager) {
-            settings_manager->SetString("Templates", "system_prompt", system_prompt_text->GetValue().ToStdString());
-            settings_manager->SaveSettings();
-        }
-        event.Skip();
-    });
-    
-    // Main settings layout for scrolled content
-    wxBoxSizer* scrolled_sizer = new wxBoxSizer(wxVERTICAL);
-    scrolled_sizer->Add(model_box, 0, wxEXPAND | wxALL, 5);
-    scrolled_sizer->Add(template_box, 0, wxEXPAND | wxALL, 5);
-    scrolled_sizer->AddStretchSpacer();
-    
-    scrolled_window->SetSizer(scrolled_sizer);
-    
-    // Main panel layout with scrolled window
-    wxBoxSizer* settings_sizer = new wxBoxSizer(wxVERTICAL);
-    settings_sizer->Add(scrolled_window, 1, wxEXPAND | wxALL, 5);
-    
-    settings_panel->SetSizer(settings_sizer);
 }
 
 void LuminaChatFrame::CreateDiscordPanel() {
@@ -599,278 +497,6 @@ void LuminaChatFrame::CreateLogsPanel() {
     logs_panel->SetSizer(logs_sizer);
 }
 
-void LuminaChatFrame::CreateSummaryPanel() {
-    summary_panel = new wxPanel(notebook);
-    notebook->AddPage(summary_panel, "Summary Settings");
-    
-    // Create a scrolled window to contain all settings
-    wxScrolledWindow* scrolled_window = new wxScrolledWindow(summary_panel, wxID_ANY, 
-                                                            wxDefaultPosition, wxDefaultSize, 
-                                                            wxVSCROLL | wxHSCROLL);
-    scrolled_window->SetScrollRate(10, 10);
-    
-    // Summary model configuration group
-    wxStaticBoxSizer* model_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Summary Model Configuration");
-    
-    // Model path selection
-    wxBoxSizer* path_sizer = new wxBoxSizer(wxHORIZONTAL);
-    path_sizer->Add(new wxStaticText(scrolled_window, wxID_ANY, "Summary Model Path:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-    summary_model_path_text = new wxTextCtrl(scrolled_window, wxID_ANY);
-    path_sizer->Add(summary_model_path_text, 1, wxEXPAND | wxALL, 5);
-    browse_summary_model_button = new wxButton(scrolled_window, ID_BrowseSummaryModel, "Browse...");
-    path_sizer->Add(browse_summary_model_button, 0, wxALL, 5);
-    model_box->Add(path_sizer, 0, wxEXPAND);
-    
-    // Bind text change event to save model path
-    summary_model_path_text->Bind(wxEVT_TEXT, [this](wxCommandEvent& event) {
-        if (settings_manager) {
-            settings_manager->SetString("Models", "summary_model_path", summary_model_path_text->GetValue().ToStdString());
-            // Don't auto-save on every keystroke for performance, just mark dirty
-        }
-    });
-    
-    // Auto-configuration note
-    wxStaticText* auto_config_note = new wxStaticText(scrolled_window, wxID_ANY, 
-        "Note: Context size will be automatically set to 25% of main model context size.\n"
-        "GPU layers will match the main model setting.\n"
-        "Model loading is managed automatically by the SummarizationPlugin.");
-    auto_config_note->SetFont(auto_config_note->GetFont().Italic());
-    auto_config_note->SetForegroundColour(wxColour(100, 100, 100));
-    model_box->Add(auto_config_note, 0, wxALL, 5);
-    
-    // Status display
-    wxStaticBoxSizer* status_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Plugin Status");
-    summary_status_text = new wxStaticText(scrolled_window, wxID_ANY, "SummarizationPlugin: Not initialized");
-    summary_status_text->SetFont(summary_status_text->GetFont().Bold());
-    summary_status_text->SetForegroundColour(wxColour(150, 100, 50));
-    status_box->Add(summary_status_text, 0, wxALL, 5);
-    
-    // Log Output debug display
-    status_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "Log Output:"), 0, wxLEFT | wxRIGHT | wxTOP, 5);
-    summary_log_output_text = new wxTextCtrl(scrolled_window, wxID_ANY, "Plugin logs will appear here...",
-                                            wxDefaultPosition, wxSize(-1, 120),
-                                            wxTE_READONLY | wxTE_MULTILINE | wxTE_WORDWRAP);
-    summary_log_output_text->SetFont(wxFont(8, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
-    summary_log_output_text->SetBackgroundColour(wxColour(245, 245, 245));
-    status_box->Add(summary_log_output_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
-    
-    // Last Generation debug display
-    status_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "Last Generation:"), 0, wxLEFT | wxRIGHT | wxTOP, 5);
-    summary_last_generation_text = new wxTextCtrl(scrolled_window, wxID_ANY, "No generation data available yet...",
-                                                 wxDefaultPosition, wxSize(-1, 120),
-                                                 wxTE_READONLY | wxTE_MULTILINE | wxTE_WORDWRAP);
-    summary_last_generation_text->SetFont(wxFont(8, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
-    summary_last_generation_text->SetBackgroundColour(wxColour(245, 245, 245));
-    status_box->Add(summary_last_generation_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
-    
-    // Summary system prompt configuration group
-    wxStaticBoxSizer* prompt_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Summary System Prompt");
-    
-    // System Prompt textbox
-    prompt_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "System Prompt for Summarization:"), 0, wxALL, 5);
-    summary_system_prompt_text = new wxTextCtrl(scrolled_window, wxID_ANY, wxEmptyString,
-                                               wxDefaultPosition, wxSize(-1, 200),
-                                               wxTE_MULTILINE | wxTE_WORDWRAP);
-    summary_system_prompt_text->SetToolTip("Define the system prompt for the summarization model. This will instruct the AI on how to create summaries of conversation history.");
-    
-    // Set default summary prompt if empty
-    summary_system_prompt_text->SetValue(
-        "You are a helpful AI assistant that creates concise summaries of conversations. "
-        "When given a conversation history, provide a clear and informative summary that captures "
-        "the key points, decisions, and context. Focus on preserving important information while "
-        "being concise. Format your summary in a structured way with bullet points when appropriate."
-    );
-    
-    prompt_box->Add(summary_system_prompt_text, 1, wxEXPAND | wxALL, 5);
-    
-    // Auto-save on kill focus
-    summary_system_prompt_text->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& event) {
-        if (settings_manager) {
-            settings_manager->SetString("Summary", "system_prompt", summary_system_prompt_text->GetValue().ToStdString());
-            settings_manager->SaveSettings();
-        }
-        event.Skip();
-    });
-    
-    // Main settings layout for scrolled content
-    wxBoxSizer* scrolled_sizer = new wxBoxSizer(wxVERTICAL);
-    scrolled_sizer->Add(model_box, 0, wxEXPAND | wxALL, 5);
-    scrolled_sizer->Add(status_box, 0, wxEXPAND | wxALL, 5);
-    scrolled_sizer->Add(prompt_box, 1, wxEXPAND | wxALL, 5);
-    scrolled_sizer->AddStretchSpacer();
-    
-    scrolled_window->SetSizer(scrolled_sizer);
-    
-    // Main panel layout with scrolled window
-    wxBoxSizer* summary_sizer = new wxBoxSizer(wxVERTICAL);
-    summary_sizer->Add(scrolled_window, 1, wxEXPAND | wxALL, 5);
-    
-    summary_panel->SetSizer(summary_sizer);
-}
-
-void LuminaChatFrame::CreateEmoTagPanel() {
-    emotag_panel = new wxPanel(notebook);
-    notebook->AddPage(emotag_panel, "EmoTag Settings");
-    
-    // Create a scrolled window to contain all settings
-    wxScrolledWindow* scrolled_window = new wxScrolledWindow(emotag_panel, wxID_ANY, 
-                                                            wxDefaultPosition, wxDefaultSize, 
-                                                            wxVSCROLL | wxHSCROLL);
-    scrolled_window->SetScrollRate(10, 10);
-    
-    // EmoTag model configuration group
-    wxStaticBoxSizer* model_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Emotion Analysis Model Configuration");
-    
-    // Model path selection
-    wxBoxSizer* path_sizer = new wxBoxSizer(wxHORIZONTAL);
-    path_sizer->Add(new wxStaticText(scrolled_window, wxID_ANY, "Emotion Model Path:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-    emotag_model_path_text = new wxTextCtrl(scrolled_window, wxID_ANY);
-    path_sizer->Add(emotag_model_path_text, 1, wxEXPAND | wxALL, 5);
-    browse_emotag_model_button = new wxButton(scrolled_window, ID_BrowseEmoTagModel, "Browse...");
-    path_sizer->Add(browse_emotag_model_button, 0, wxALL, 5);
-    model_box->Add(path_sizer, 0, wxEXPAND);
-    
-    // Bind text change event to save model path
-    emotag_model_path_text->Bind(wxEVT_TEXT, [this](wxCommandEvent& event) {
-        if (settings_manager) {
-            settings_manager->SetString("Models", "emotion_model_path", emotag_model_path_text->GetValue().ToStdString());
-            // Don't auto-save on every keystroke for performance, just mark dirty
-        }
-    });
-    
-    // Auto-configuration note
-    wxStaticText* auto_config_note = new wxStaticText(scrolled_window, wxID_ANY, 
-        "Note: Context size will be automatically set to 30% of main model context size.\n"
-        "GPU layers will match the main model setting.\n"
-        "Model loading is managed automatically by the EmoTagPlugin.");
-    auto_config_note->SetFont(auto_config_note->GetFont().Italic());
-    auto_config_note->SetForegroundColour(wxColour(100, 100, 100));
-    model_box->Add(auto_config_note, 0, wxALL, 5);
-    
-    // Status display
-    wxStaticBoxSizer* status_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Plugin Status");
-    emotag_status_text = new wxStaticText(scrolled_window, wxID_ANY, "EmoTagPlugin: Not initialized");
-    emotag_status_text->SetFont(emotag_status_text->GetFont().Bold());
-    emotag_status_text->SetForegroundColour(wxColour(150, 100, 50));
-    status_box->Add(emotag_status_text, 0, wxALL, 5);
-    
-    // Log Output debug display
-    status_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "Log Output:"), 0, wxLEFT | wxRIGHT | wxTOP, 5);
-    emotag_log_output_text = new wxTextCtrl(scrolled_window, wxID_ANY, "Plugin logs will appear here...",
-                                           wxDefaultPosition, wxSize(-1, 120),
-                                           wxTE_READONLY | wxTE_MULTILINE | wxTE_WORDWRAP);
-    emotag_log_output_text->SetFont(wxFont(8, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
-    emotag_log_output_text->SetBackgroundColour(wxColour(245, 245, 245));
-    status_box->Add(emotag_log_output_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
-    
-    // Last Generation debug display
-    status_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "Last Generation:"), 0, wxLEFT | wxRIGHT | wxTOP, 5);
-    emotag_last_generation_text = new wxTextCtrl(scrolled_window, wxID_ANY, "No generation data available yet...",
-                                                wxDefaultPosition, wxSize(-1, 120),
-                                                wxTE_READONLY | wxTE_MULTILINE | wxTE_WORDWRAP);
-    emotag_last_generation_text->SetFont(wxFont(8, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
-    emotag_last_generation_text->SetBackgroundColour(wxColour(245, 245, 245));
-    status_box->Add(emotag_last_generation_text, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
-    
-    // Plugin configuration group
-    wxStaticBoxSizer* config_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Analysis Configuration");
-    
-    // Analysis Window Size
-    wxBoxSizer* window_size_sizer = new wxBoxSizer(wxHORIZONTAL);
-    window_size_sizer->Add(new wxStaticText(scrolled_window, wxID_ANY, "Analysis Window Size:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-    emotag_window_size_slider = new wxSlider(scrolled_window, wxID_ANY, 3, 1, 10, wxDefaultPosition, wxSize(200, -1));
-    emotag_window_size_slider->SetToolTip("Number of recent messages to keep and analyze (1-10)");
-    window_size_sizer->Add(emotag_window_size_slider, 1, wxEXPAND | wxALL, 5);
-    emotag_window_size_text = new wxStaticText(scrolled_window, wxID_ANY, "3");
-    emotag_window_size_text->SetFont(emotag_window_size_text->GetFont().Bold());
-    window_size_sizer->Add(emotag_window_size_text, 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-    config_box->Add(window_size_sizer, 0, wxEXPAND);
-    
-    // Bind slider change event
-    emotag_window_size_slider->Bind(wxEVT_SLIDER, [this](wxCommandEvent& event) {
-        int value = emotag_window_size_slider->GetValue();
-        emotag_window_size_text->SetLabel(wxString::Format("%d", value));
-        if (settings_manager) {
-            settings_manager->SetInt("Emotion", "analysis_window_size", value);
-            settings_manager->SaveSettings();
-        }
-        if (emotag_plugin) {
-            emotag_plugin->SetAnalysisWindow(static_cast<size_t>(value));
-        }
-    });
-    
-    // Include User Messages checkbox
-    emotag_include_user_checkbox = new wxCheckBox(scrolled_window, wxID_ANY, "Include User Messages in Analysis");
-    emotag_include_user_checkbox->SetToolTip("When enabled, user messages will be included in emotional analysis for richer context");
-    emotag_include_user_checkbox->SetValue(false); // Default to false
-    config_box->Add(emotag_include_user_checkbox, 0, wxALL, 5);
-    
-    // Bind checkbox change event
-    emotag_include_user_checkbox->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent& event) {
-        bool value = emotag_include_user_checkbox->GetValue();
-        if (settings_manager) {
-            settings_manager->SetBool("Emotion", "include_user_messages", value);
-            settings_manager->SaveSettings();
-        }
-        // Note: SetIncludeUserMessages removed in simplified EmoTagPlugin
-    });
-    
-    // Configuration note
-    wxStaticText* config_note = new wxStaticText(scrolled_window, wxID_ANY, 
-        "Analysis is triggered immediately after each AI response.\n"
-        "Window size determines how many recent messages are analyzed.\n"
-        "Including user messages provides fuller context but uses more tokens.");
-    config_note->SetFont(config_note->GetFont().Italic());
-    config_note->SetForegroundColour(wxColour(100, 100, 100));
-    config_box->Add(config_note, 0, wxALL, 5);
-    
-    // EmoTag system prompt configuration group
-    wxStaticBoxSizer* prompt_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Emotional Analysis System Prompt");
-    
-    // System Prompt textbox
-    prompt_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "System Prompt for Emotional Analysis:"), 0, wxALL, 5);
-    emotag_system_prompt_text = new wxTextCtrl(scrolled_window, wxID_ANY, wxEmptyString,
-                                               wxDefaultPosition, wxSize(-1, 200),
-                                               wxTE_MULTILINE | wxTE_WORDWRAP);
-    emotag_system_prompt_text->SetToolTip("Define the system prompt for the emotional analysis model. This will instruct the AI on how to analyze the emotional state of AI responses.");
-    
-    // Set default emotion prompt if empty
-    emotag_system_prompt_text->SetValue(
-        "You are an emotional state analyzer. When given AI assistant responses, analyze the emotional tone, "
-        "mood, and psychological state conveyed in the text. Provide a brief emotional overview that captures "
-        "the assistant's apparent emotional state, confidence level, and overall demeanor. "
-        "Focus on identifying patterns like: confident, uncertain, empathetic, analytical, cheerful, "
-        "cautious, enthusiastic, or reserved. Keep your analysis concise and actionable."
-    );
-    
-    prompt_box->Add(emotag_system_prompt_text, 1, wxEXPAND | wxALL, 5);
-    
-    // Auto-save on kill focus
-    emotag_system_prompt_text->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& event) {
-        if (settings_manager) {
-            settings_manager->SetString("Emotion", "system_prompt", emotag_system_prompt_text->GetValue().ToStdString());
-            settings_manager->SaveSettings();
-        }
-        event.Skip();
-    });
-    
-    // Main settings layout for scrolled content
-    wxBoxSizer* scrolled_sizer = new wxBoxSizer(wxVERTICAL);
-    scrolled_sizer->Add(model_box, 0, wxEXPAND | wxALL, 5);
-    scrolled_sizer->Add(status_box, 0, wxEXPAND | wxALL, 5);
-    scrolled_sizer->Add(config_box, 0, wxEXPAND | wxALL, 5);
-    scrolled_sizer->Add(prompt_box, 1, wxEXPAND | wxALL, 5);
-    scrolled_sizer->AddStretchSpacer();
-    
-    scrolled_window->SetSizer(scrolled_sizer);
-    
-    // Main panel layout with scrolled window
-    wxBoxSizer* emotag_sizer = new wxBoxSizer(wxVERTICAL);
-    emotag_sizer->Add(scrolled_window, 1, wxEXPAND | wxALL, 5);
-    
-    emotag_panel->SetSizer(emotag_sizer);
-}
-
 void LuminaChatFrame::CreateTemplatePanel() {
     template_panel = new wxPanel(notebook);
     notebook->AddPage(template_panel, "Template");
@@ -880,18 +506,12 @@ void LuminaChatFrame::CreateTemplatePanel() {
                                      wxDefaultPosition, wxDefaultSize,
                                      wxTE_READONLY | wxTE_MULTILINE | wxHSCROLL | wxVSCROLL);
     template_display->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
-    template_display->SetBackgroundColour(wxColour(250, 250, 250));
+    template_display->SetBackgroundColour(LuminaChatColors::TEMPLATE_BACKGROUND);
     
     // Initial text explaining the purpose
     template_display->SetValue(
-        "Template Inspection\n"
+        "Template Debugging Inspection\n"
         "===================\n\n"
-        "This tab shows the exact finalized chat template that was sent to the AI\n"
-        "after all variable substitutions and processing has occurred.\n\n"
-        "The template will be updated each time you send a message to the AI.\n"
-        "Use this to debug template processing and verify that variables are\n"
-        "being substituted correctly.\n\n"
-        "Template content will appear here after sending your first message..."
     );
     
     // Clear button
@@ -908,7 +528,20 @@ void LuminaChatFrame::CreateTemplatePanel() {
     template_panel->SetSizer(template_sizer);
 }
 
-// System lifecycle management
+// === System Lifecycle Management ===
+
+/**
+ * Initialize the LuminaChat system following the clean rework architecture.
+ * This method sets up all components in their strict dependency order:
+ * 1. Logger integration
+ * 2. Settings Manager
+ * 3. Sanitizer
+ * 4. Discord Manager
+ * 5. Llama Manager
+ * 6. Orchestrator
+ * 
+ * Plugins are initialized separately after model loading.
+ */
 void LuminaChatFrame::Start() {
     AddLogMessage("Initializing LuminaChat Rework Architecture with llama.cpp integration...");
     
@@ -955,6 +588,18 @@ void LuminaChatFrame::Start() {
         // Note: SummarizationPlugin initialization is now deferred until model loading
         AddLogMessage("Plugin initialization will be handled when user loads a model");
         
+        // Initialize Settings UI with dependencies
+        if (settings_ui) {
+            settings_ui->SetSettingsManager(settings_manager.get());
+            settings_ui->SetLlamaManager(llama_manager.get());
+            settings_ui->SetCallbacks(
+                [this](const std::string& msg) { AddLogMessage(msg); },
+                [this]() { OnLoadModelFromSettingsUI(); },
+                [this](ContextInfo* ctx, const std::string& id) { ApplyTemplateSettingsToContext(ctx, id); }
+            );
+            AddLogMessage("Settings UI dependencies configured");
+        }
+        
         // Register callbacks (higher components register with lower)
         RegisterCallbacks();
         AddLogMessage("Callback dependencies registered");
@@ -966,15 +611,15 @@ void LuminaChatFrame::Start() {
         AddLogMessage("Ready for manual model loading - click 'Load Model' button to proceed");
         
         running = true;
-        system_timer->Start(100);
+        system_timer->Start(LuminaChatConstants::TIMER_INTERVAL_MS);
         
         AddLogMessage("LuminaChat started successfully - ready for manual model loading");
         SetStatusText("System Ready - Click 'Load Model' to begin", 0);
         UpdateUI();
         
         // Set initial plugin status
-        UpdateSummaryPluginStatus("Waiting for model loading", wxColour(100, 100, 100));
-        UpdateEmoTagPluginStatus("Waiting for model loading", wxColour(100, 100, 100));
+        UpdateSummaryPluginStatus("Waiting for model loading", LuminaChatColors::NEUTRAL_GRAY);
+        UpdateEmoTagPluginStatus("Waiting for model loading", LuminaChatColors::NEUTRAL_GRAY);
         
     } catch (const std::exception& e) {
         wxString error_msg = wxString::Format("Failed to start LuminaChat: %s", e.what());
@@ -1009,6 +654,24 @@ void LuminaChatFrame::Stop() {
         summarization_plugin.reset();
         AddLogMessage("SummarizationPlugin stopped");
     }
+    
+    // Clear progress callback to avoid potential use-after-free
+    if (llama_manager) {
+        llama_manager->ClearProgressCallback();
+    }
+    
+    // Wait briefly for any ongoing model loading to complete
+    // Note: We use model_loading atomic flag to check if loading is in progress
+    int wait_count = 0;
+    while (model_loading.load() && wait_count < 50) { // Max 5 seconds wait
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        wait_count++;
+    }
+    
+    if (model_loading.load()) {
+        AddLogMessage("Warning: Model loading still in progress during shutdown");
+    }
+    
     orchestrator.reset();
     llama_manager.reset();
     discord_manager.reset();
@@ -1055,14 +718,15 @@ void LuminaChatFrame::OnLogLevelChanged(wxCommandEvent& event) {
     GetLogger().SetLogLevel(new_level);
 }
 
-// UI helper methods
+// === UI Helper Methods ===
+
 void LuminaChatFrame::AddChatMessage(const std::string& sender, const std::string& message, const wxColour& color) {
     wxDateTime now = wxDateTime::Now();
     
     chat_display->BeginSuppressUndo();
     chat_display->SetInsertionPointEnd();
     
-    chat_display->BeginTextColour(wxColour(128, 128, 128));
+    chat_display->BeginTextColour(LuminaChatColors::TIMESTAMP_GRAY);
     chat_display->WriteText(wxString::Format("[%s] ", now.Format("%H:%M:%S")));
     chat_display->EndTextColour();
     
@@ -1092,11 +756,12 @@ void LuminaChatFrame::AddLogMessage(const std::string& message) {
 }
 
 void LuminaChatFrame::UpdateUI() {
-    context_size_label->SetLabel(wxString::Format("%d", context_size_slider->GetValue()));
-    gpu_layers_label->SetLabel(wxString::Format("%d", gpu_layers_slider->GetValue()));
+    // Update Settings UI
+    if (settings_ui) {
+        settings_ui->UpdateUI();
+    }
     
     send_button->Enable(model_loaded && running);
-    load_model_button->Enable(running && !model_path_text->GetValue().IsEmpty() && !model_loading);
     connect_discord_button->Enable(running && !discord_token_text->GetValue().IsEmpty());
     
     if (model_loaded) {
@@ -1183,6 +848,41 @@ void LuminaChatFrame::RegisterCallbacks() {
         });
     }
     
+    // Register progress callback for model loading UI updates
+    if (llama_manager && settings_ui) {
+        llama_manager->RegisterProgressCallback([this](const std::string& model_id, float progress) {
+            // Convert progress to percentage and update UI progress bar
+            int percentage = static_cast<int>(progress * 100);
+            
+            // Use CallAfter to ensure UI updates happen on the main thread
+            CallAfter([this, percentage, model_id]() {
+                // Safety check: ensure UI components are still valid and app is running
+                if (!running.load() || !settings_ui) {
+                    return; // Application is shutting down or UI is destroyed
+                }
+                
+                try {
+                    settings_ui->UpdateModelProgress(percentage);
+                    
+                    // Update status bar with progress information
+                    if (percentage < 100) {
+                        SetStatusText(wxString::Format("Loading model: %d%%", percentage), 1);
+                    } else {
+                        SetStatusText("Model Loaded", 1);
+                    }
+                    
+                    // Add log message for progress tracking
+                    if (percentage % 10 == 0 || percentage >= 95) {
+                        AddLogMessage(wxString::Format("Model loading progress: %d%% (%s)", percentage, model_id).ToStdString());
+                    }
+                } catch (...) {
+                    // Ignore any UI update errors during shutdown
+                }
+            });
+        });
+        AddLogMessage("Progress callback registered with LlamaManager");
+    }
+    
     // Note: UI now uses direct async streaming instead of Orchestrator callbacks
     // This eliminates the synchronous callback tech debt
 }
@@ -1217,6 +917,15 @@ void LuminaChatFrame::LoadDefaultModels() {
     AddLogMessage("Summary model initialization will be handled by SummarizationPlugin");
 }
 
+/**
+ * Initialize all plugins after successful model loading.
+ * This method coordinates the initialization of:
+ * - SummarizationPlugin (for conversation summarization)
+ * - EmoTagPlugin (for emotional analysis)
+ * - ContextPruningPlugin (for context size management)
+ * 
+ * Each plugin is registered with the Orchestrator for coordination.
+ */
 void LuminaChatFrame::InitializePlugins() {
     if (!llama_manager || !orchestrator || !model_loaded) {
         AddLogMessage("ERROR: Cannot initialize plugins - prerequisites not met");
@@ -1226,96 +935,97 @@ void LuminaChatFrame::InitializePlugins() {
     AddLogMessage("Initializing plugins after successful model loading...");
     
     try {
-        // Initialize and start SummarizationPlugin
-        summarization_plugin = std::make_unique<LuminaChat::SummarizationPlugin>(orchestrator.get());
+        InitializeSummarizationPlugin();
+        InitializeEmoTagPlugin();
+        InitializeContextPruningPlugin();
         
-        // Register callback for plugin status updates
-        if (summarization_plugin) {
-            // TODO: When SummarizationPlugin supports status callbacks, register here
-            // summarization_plugin->RegisterStatusCallback([this](const std::string& status, bool is_error) {
-            //     CallAfter([this, status, is_error]() {
-            //         wxColour color = is_error ? wxColour(150, 50, 50) : wxColour(0, 150, 0);
-            //         UpdateSummaryPluginStatus(status, color);
-            //     });
-            // });
-        }
+        AddLogMessage("All plugins initialized successfully");
         
-        if (!summarization_plugin->Initialize()) {
-            AddLogMessage("Failed to initialize SummarizationPlugin");
-            UpdateSummaryPluginStatus("Initialization failed", wxColour(255, 0, 0));
-        } else {
-            AddLogMessage("SummarizationPlugin initialized successfully");
-            UpdateSummaryPluginStatus("Initialized and ready", wxColour(0, 150, 0));
-            
-            // Register the plugin with the Orchestrator for coordination
-            orchestrator->RegisterSummarizationPlugin(summarization_plugin.get());
-        }
-        
-        // Initialize and start EmoTagPlugin
-        emotag_plugin = std::make_unique<LuminaChat::EmoTagPlugin>(orchestrator.get());
-        
-        // Register callback for plugin status updates
-        if (emotag_plugin) {        emotag_plugin->SetStatusCallback([this](const std::string& status, bool is_error) {
+    } catch (const std::exception& e) {
+        AddLogMessage(wxString::Format("Error initializing plugins: %s", e.what()).ToStdString());
+        UpdateSummaryPluginStatus("Initialization failed", LuminaChatColors::ERROR_RED);
+    }
+}
+
+// === Individual Plugin Initialization Methods ===
+
+void LuminaChatFrame::InitializeSummarizationPlugin() {
+    summarization_plugin = std::make_unique<LuminaChat::SummarizationPlugin>(orchestrator.get());
+    
+    // Register callback for plugin status updates
+    if (summarization_plugin) {
+        summarization_plugin->SetStatusCallback([this](const std::string& status, bool is_error) {
             CallAfter([this, status, is_error]() {
-                wxColour color = is_error ? wxColour(150, 50, 50) : wxColour(0, 150, 0);
-                UpdateEmoTagPluginStatus(status, color);
+                wxColour color = is_error ? LuminaChatColors::ERROR_RED : LuminaChatColors::SUCCESS_GREEN;
+                UpdateSummaryPluginStatus(status, color);
             });
         });
     }
     
-    // Initialize the plugin (replaces Start() in the new architecture)
-    bool initialized = emotag_plugin->Initialize();
-    if (!initialized) {
+    if (!summarization_plugin->Initialize()) {
+        AddLogMessage("Failed to initialize SummarizationPlugin");
+        UpdateSummaryPluginStatus("Initialization failed", LuminaChatColors::ERROR_RED);
+    } else {
+        AddLogMessage("SummarizationPlugin initialized successfully");
+        UpdateSummaryPluginStatus("Initialized and ready", LuminaChatColors::SUCCESS_GREEN);
+        
+        // Register the plugin with the Orchestrator for coordination
+        orchestrator->RegisterSummarizationPlugin(summarization_plugin.get());
+    }
+}
+
+void LuminaChatFrame::InitializeEmoTagPlugin() {
+    emotag_plugin = std::make_unique<LuminaChat::EmoTagPlugin>(orchestrator.get());
+    
+    // Register callback for plugin status updates
+    if (emotag_plugin) {
+        emotag_plugin->SetStatusCallback([this](const std::string& status, bool is_error) {
+            CallAfter([this, status, is_error]() {
+                wxColour color = is_error ? LuminaChatColors::ERROR_RED : LuminaChatColors::SUCCESS_GREEN;
+                UpdateEmoTagPluginStatus(status, color);
+            });
+        });
+    }
+
+    // Initialize the plugin
+    if (!emotag_plugin->Initialize()) {
         AddLogMessage("Failed to initialize EmoTagPlugin");
-        UpdateEmoTagPluginStatus("Initialization failed", wxColour(150, 50, 50));
+        UpdateEmoTagPluginStatus("Initialization failed", LuminaChatColors::ERROR_RED);
         return;
     }
     
     // Register the plugin with the Orchestrator for coordination
     orchestrator->RegisterEmoTagPlugin(emotag_plugin.get());
         
-        // Configure plugin with current UI settings
-        if (emotag_window_size_slider) {
-            int window_size = emotag_window_size_slider->GetValue();
-            emotag_plugin->SetAnalysisWindow(static_cast<size_t>(window_size));
-            AddLogMessage("Configured EmoTagPlugin analysis window size: " + std::to_string(window_size));
-        }
+    // Configure plugin with default settings (UI manager will load actual settings later)
+    emotag_plugin->SetAnalysisWindow(3); // Default window size
+    AddLogMessage("Configured EmoTagPlugin with default analysis window size: 3");
+    
+    AddLogMessage("EmoTagPlugin initialized successfully");
+    UpdateEmoTagPluginStatus("Initialized and ready", LuminaChatColors::SUCCESS_GREEN);
+}
+
+void LuminaChatFrame::InitializeContextPruningPlugin() {
+    context_pruning_plugin = std::make_unique<LuminaChat::ContextPruningPlugin>(orchestrator.get());
+    
+    if (!context_pruning_plugin->Initialize()) {
+        AddLogMessage("Failed to initialize ContextPruningPlugin");
+    } else {
+        AddLogMessage("ContextPruningPlugin initialized successfully");
         
-        // Note: SetIncludeUserMessages removed in simplified EmoTagPlugin
-        // Plugin now only analyzes AI responses for emotional state
+        // Configure more aggressive thresholds for better context management
+        context_pruning_plugin->SetPruningThreshold(0.65f);  // Trigger at 65% instead of 75%
+        context_pruning_plugin->SetTargetUsage(0.35f);       // Reduce to 35% instead of 40%
+        context_pruning_plugin->SetEmergencyThreshold(0.85f); // Emergency at 85% instead of 90%
         
-        AddLogMessage("EmoTagPlugin initialized and started");
-        
-        // Update plugin status
-        UpdateEmoTagPluginStatus("Initialized and ready", wxColour(0, 150, 0));
-        
-        // Initialize and start ContextPruningPlugin
-        context_pruning_plugin = std::make_unique<LuminaChat::ContextPruningPlugin>(orchestrator.get());
-        
-        if (!context_pruning_plugin->Initialize()) {
-            AddLogMessage("Failed to initialize ContextPruningPlugin");
-        } else {
-            AddLogMessage("ContextPruningPlugin initialized successfully");
-            
-            // Configure more aggressive thresholds for better context management
-            context_pruning_plugin->SetPruningThreshold(0.65f);  // Trigger at 65% instead of 75%
-            context_pruning_plugin->SetTargetUsage(0.35f);       // Reduce to 35% instead of 40%
-            context_pruning_plugin->SetEmergencyThreshold(0.85f); // Emergency at 85% instead of 90%
-            
-            // Register with Orchestrator for context monitoring
-            orchestrator->RegisterContextPruningPlugin(context_pruning_plugin.get());
-            AddLogMessage("ContextPruningPlugin registered with Orchestrator for monitoring");
-        }
-        
-        AddLogMessage("All plugins initialized successfully");
-        
-    } catch (const std::exception& e) {
-        AddLogMessage(wxString::Format("Error initializing plugins: %s", e.what()).ToStdString());
-        UpdateSummaryPluginStatus("Initialization failed", wxColour(150, 50, 50));
+        // Register with Orchestrator for context monitoring
+        orchestrator->RegisterContextPruningPlugin(context_pruning_plugin.get());
+        AddLogMessage("ContextPruningPlugin registered with Orchestrator for monitoring");
     }
 }
 
-// Event handlers
+// === Event Handlers ===
+
 void LuminaChatFrame::OnExit(wxCommandEvent& event) {
     Close(true);
 }
@@ -1335,169 +1045,66 @@ void LuminaChatFrame::OnAbout(wxCommandEvent& event) {
                  wxOK | wxICON_INFORMATION);
 }
 
+/**
+ * Handle user message sending and AI response generation.
+ * This method orchestrates the complete message flow:
+ * 1. Validates system state and user input
+ * 2. Prepares the generation context with template settings
+ * 3. Captures template for debugging inspection
+ * 4. Initiates streaming response generation
+ * 5. Handles completion and error scenarios
+ */
 void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
+    // Validate system state
     if (!running || !llama_manager || !llama_manager->IsReady()) {
-        AddLogMessage("Cannot send message: system not ready");
+        LogAndDisplayError("Cannot send message: system not ready", "System not ready for message processing");
         return;
     }
     
+    // Validate input
     wxString input = chat_input->GetValue().Trim();
     if (input.IsEmpty()) {
         return;
     }
     
     try {
+        // Clear input and display user message
         chat_input->Clear();
-        AddChatMessage("You", input.ToStdString(), wxColour(50, 150, 50));
+        AddChatMessage("You", input.ToStdString(), LuminaChatColors::SUCCESS_GREEN);
         
-        // Get context and use async streaming for all UI output
+        // Get and validate context
         auto* context = llama_manager->GetContextInfo(current_context_id);
         if (!context) {
-            AddLogMessage("Error: Context not found: " + current_context_id);
-            AddChatMessage("System", "Error: Context not available", wxColour(150, 50, 50));
+            LogAndDisplayError("Context not found: " + current_context_id, "Context not available");
             return;
         }
         
         // Apply current template settings from UI before processing message
         ApplyTemplateSettingsToContext(context, current_context_id);
-        
         AddLogMessage("Processing message with context: " + current_context_id);
         
-        // Get the finalized template for inspection BEFORE starting generation
-        std::string finalized_template;
-        try {
-            // Build the full prompt to capture the template after variable substitution
-            finalized_template = context->BuildFullPrompt();
-            
-            // Update the template inspection tab with the finalized template
-            UpdateTemplateDisplay(finalized_template);
-            AddLogMessage("Template inspection updated with finalized template");
-            
-        } catch (const std::exception& template_e) {
-            AddLogMessage("Warning: Could not capture template for inspection: " + std::string(template_e.what()));
-        }
+        // Capture template for inspection
+        CaptureTemplateForInspection(context);
         
-        // Create callbacks for streaming response
-        GenerationCallbacks callbacks(
-            // Token callback - called for each token as it's generated
-            [this](const std::string& complete_response) {
-                // Since we now receive the complete response each time, replace the content
-                this->CallAfter([this, complete_response]() {
-                    ReplaceStreamingMessage(complete_response);
-                });
-            },
-            
-            // Completion callback - called when generation is done
-            [this](const std::string& full_response, bool success) {
-                this->CallAfter([this, full_response, success]() {
-                    EndStreamingMessage();
-                    SetGenerationUIState(false);  // Re-enable UI after generation
-                    UpdateContextStatus();  // Update context usage in status bar
-                    
-                    // PERFORMANCE FIX: Delay context monitoring to avoid interference with generation cleanup
-                    if (orchestrator) {
-                        // Use a timer to delay monitoring by 1 second after generation completes
-                        auto timer = new wxTimer();
-                        timer->Bind(wxEVT_TIMER, [this, timer](wxTimerEvent&) {
-                            if (orchestrator) {
-                                orchestrator->MonitorAllContextSizes();
-                            }
-                            delete timer;
-                        });
-                        timer->StartOnce(1000); // 1 second delay
-                    }
-                    
-                    if (success) {
-                        AddLogMessage("Response generation completed successfully");
-                        
-                        // Request emotional analysis for the context after AI response
-                        if (orchestrator) {
-                            auto* context = orchestrator->GetLlamaManager()->GetContextInfo(current_context_id);
-                            auto* emotag_plugin = orchestrator->GetEmoTagPlugin();
-                            if (context && emotag_plugin) {
-                                emotag_plugin->RequestEmotionalAnalysis(current_context_id, context->GetMessageHistory());
-                                AddLogMessage("Requested emotional analysis for context: " + current_context_id);
-                                
-                                // Immediately trigger processing of emotion analysis buffer
-                                // instead of waiting for scheduled task
-                                std::thread([this]() {
-                                    if (orchestrator) {
-                                        orchestrator->ProcessEmotionAnalysisBuffer();
-                                    }
-                                }).detach();
-                            }
-                        }
-                    } else {
-                        AddLogMessage("Response generation was stopped or failed");
-                        if (full_response.empty()) {
-                            AddChatMessage("System", "Response generation was interrupted.", wxColour(150, 50, 50));
-                        }
-                    }
-                });
-            },
-            
-            // Error callback - called if there's an error
-            [this](const std::string& error_message) {
-                this->CallAfter([this, error_message]() {
-                    if (is_streaming) {
-                        EndStreamingMessage();
-                    }
-                    SetGenerationUIState(false);  // Re-enable UI on error
-                    UpdateContextStatus();  // Update context usage in status bar
-                    
-                    // Trigger context monitoring even on error to check size
-                    if (orchestrator) {
-                        orchestrator->MonitorAllContextSizes();
-                    }
-                    
-                    AddLogMessage("Error generating response: " + error_message);
-                    AddChatMessage("System", "Error: " + error_message, wxColour(150, 50, 50));
-                });
-            }
-        );
-        
-        // Start streaming message display
-        StartStreamingMessage("Assistant", wxColour(50, 50, 150));
-        SetGenerationUIState(true);  // Disable UI during generation
-        
-        // Start async generation
-        bool started = context->HandleInputAsync(input.ToStdString(), callbacks, "user");
-        if (!started) {
-            EndStreamingMessage();
-            SetGenerationUIState(false);  // Re-enable UI on failure
-            AddLogMessage("Failed to start async generation");
-            AddChatMessage("System", "Failed to start response generation", wxColour(150, 50, 50));
-        }
+        // Create and execute generation request
+        auto callbacks = CreateGenerationCallbacks();
+        ExecuteMessageGeneration(context, input.ToStdString(), callbacks);
         
     } catch (const std::exception& e) {
-        if (is_streaming) {
-            EndStreamingMessage();
-        }
-        SetGenerationUIState(false);  // Re-enable UI on exception
-        AddLogMessage(wxString::Format("Error sending message: %s", e.what()).ToStdString());
-        AddChatMessage("System", wxString::Format("Error: %s", e.what()).ToStdString(), wxColour(150, 50, 50));
+        HandleMessageGenerationError(e.what());
     }
 }
 
-void LuminaChatFrame::OnLoadModel(wxCommandEvent& event) {
-    // Handle browse button
-    if (event.GetId() == ID_BrowseModel) {
-        wxFileDialog openFileDialog(this, "Select GGUF Model File", "", "",
-                                   "GGUF Model files (*.gguf)|*.gguf|All files (*.*)|*.*",
-                                   wxFD_OPEN | wxFD_FILE_MUST_EXIST);
-        
-        if (openFileDialog.ShowModal() == wxID_OK) {
-            model_path_text->SetValue(openFileDialog.GetPath());
-        }
-        UpdateUI();
+void LuminaChatFrame::OnLoadModelFromSettingsUI() {
+    if (!settings_ui || !llama_manager || !settings_manager) {
+        AddLogMessage("ERROR: Settings UI or required components not initialized");
         return;
     }
-    
-    // Handle load model
-    wxString model_path = model_path_text->GetValue().Trim();
-    if (model_path.IsEmpty()) {
+
+    std::string model_path = settings_ui->GetModelPath();
+    if (model_path.empty()) {
         AddLogMessage("Please select a model file first");
-        AddChatMessage("System", "Please select a model file first", wxColour(150, 100, 50));
+        AddChatMessage("System", "Please select a model file first", LuminaChatColors::WARNING_ORANGE);
         return;
     }
     
@@ -1506,144 +1113,112 @@ void LuminaChatFrame::OnLoadModel(wxCommandEvent& event) {
         return;
     }
     
-    // Check if already loading
     if (model_loading) {
         AddLogMessage("Model loading already in progress");
         return;
     }
     
-    try {
-        LOG_DEBUG_LuminaChat("Starting model load process");
-        AddLogMessage(wxString::Format("Loading model: %s", model_path).ToStdString());
+    // Set loading state immediately
+    model_loading = true;
+    settings_ui->SetModelLoadingState(true);
+    settings_ui->UpdateModelProgress(0);
+    SetStatusText("Starting model load...", 1);
+    
+    AddLogMessage(wxString::Format("Starting background model loading: %s", model_path).ToStdString());
+    
+    // Capture all needed values for the background thread
+    int context_size = settings_ui->GetContextSize();
+    int gpu_layers = settings_ui->GetGPULayers();
+    
+    // Create model config
+    ModelConfig config;
+    config.model_path = model_path;
+    config.context_size = context_size;
+    config.gpu_layers = gpu_layers;
+    
+    // Start model loading in a detached background thread
+    std::thread([this, config]() {
+        bool success = false;
+        std::string error_message;
         
-        // Set loading state FIRST
-        model_loading = true;
-        UpdateUI(); // This will disable the button and update status
-        
-        LOG_DEBUG_LuminaChat("Set loading state, calling UpdateUI()");
-        
-        int context_size = context_size_slider->GetValue();
-        int gpu_layers = gpu_layers_slider->GetValue();
-        
-        LOG_DEBUG_LuminaChat(wxString::Format("Got slider values - context_size: %d, gpu_layers: %d", context_size, gpu_layers).ToStdString());
-        
-        model_progress->SetValue(0);
-        
-        LOG_DEBUG_LuminaChat("About to call LlamaManager::LoadModel");
-        
-        // Load model through LlamaManager
-        ModelConfig config;
-        config.model_path = model_path.ToStdString();
-        config.context_size = context_size;
-        config.gpu_layers = gpu_layers;
-        
-        if (llama_manager->LoadModel(current_model_id, config)) {
-            LOG_DEBUG_LuminaChat("LlamaManager::LoadModel returned true - success");
+        try {
+            // Double-check that we're still supposed to be loading
+            if (!model_loading.load()) {
+                return; // Loading was cancelled before we started
+            }
             
-            LOG_DEBUG_LuminaChat("Setting model_loaded = true");
-            model_loaded = true;
+            // Load model through LlamaManager (this is the blocking operation)
+            success = llama_manager->LoadModel(current_model_id, config);
             
-            LOG_DEBUG_LuminaChat("Setting progress bar to 100%");
-            model_progress->SetValue(100);  // Show completion
+            if (!success) {
+                error_message = "Failed to load model. Check the file path and try again.";
+            }
             
-            LOG_DEBUG_LuminaChat("Setting status text to Model Loaded");
-            SetStatusText("Model Loaded", 1);
-            
-            LOG_DEBUG_LuminaChat("About to call GetOrCreateContextInfo");
+        } catch (const std::exception& e) {
+            success = false;
+            error_message = "Error loading model: " + std::string(e.what());
+        } catch (...) {
+            success = false;
+            error_message = "Unknown error occurred during model loading";
+        }
+        
+        // Final check - only update UI if we're still supposed to be loading
+        if (!model_loading.load()) {
+            return; // Loading was cancelled, don't update UI
+        }
+        
+        // Update UI on the main thread using CallAfter
+        CallAfter([this, success, error_message, config]() {
             try {
-                // Get main model context size from settings (architectural fix)
-                int32_t main_context_size = settings_manager->GetInt("Models", "main_context_size", 4096);
-                
-                LOG_DEBUG_LuminaChat("Calling GetOrCreateContextInfo with context_id=" + current_context_id + 
-                                   ", model_id=" + current_model_id + 
-                                   ", context_size=" + std::to_string(main_context_size));
-                auto* context_info = llama_manager->GetOrCreateContextInfo(current_context_id, current_model_id, main_context_size);
-                LOG_DEBUG_LuminaChat("GetOrCreateContextInfo call completed");
-                
-                if (context_info) {
-                    LOG_DEBUG_LuminaChat("GetOrCreateContextInfo returned valid context");
-                    // Apply template settings from UI (identity directive and system prompt)
-                    ApplyTemplateSettingsToContext(context_info, current_context_id);
-                    AddLogMessage("Model loaded successfully");
+                if (success) {
+                    model_loaded = true;
+                    settings_ui->UpdateModelProgress(100);
+                    SetStatusText("Model Loaded", 1);
                     
-                    // Now initialize plugins after successful model loading
-                    InitializePlugins();
+                    // Get main model context size from settings
+                    int32_t main_context_size = settings_manager->GetInt("Models", "main_context_size", 4096);
                     
-                    AddChatMessage("System", "Model loaded and ready for conversation!", wxColour(0, 150, 0));
+                    auto* context_info = llama_manager->GetOrCreateContextInfo(current_context_id, current_model_id, main_context_size);
+                    
+                    if (context_info) {
+                        // Apply template settings from Settings UI
+                        ApplyTemplateSettingsToContext(context_info, current_context_id);
+                        AddLogMessage("Model loaded successfully");
+                        
+                        // Initialize plugins after successful model loading
+                        InitializePlugins();
+                        
+                        ShowSuccessMessage("Model loaded and ready for conversation!");
+                    } else {
+                        AddLogMessage("ERROR: Failed to create context after model loading");
+                        ShowErrorMessage("Failed to create context after model loading");
+                        model_loaded = false;
+                    }
                 } else {
-                    LOG_ERROR_LuminaChat("GetOrCreateContextInfo returned null");
-                    AddLogMessage("ERROR: Failed to create context after model loading");
+                    model_loaded = false;
+                    if (!error_message.empty()) {
+                        LogAndDisplayError("Model loading failed: " + error_message, error_message);
+                    } else {
+                        ShowErrorMessage("Failed to load model. Check the file path and try again.");
+                    }
                 }
-            } catch (const std::exception& inner_e) {
-                LOG_ERROR_LuminaChat(wxString::Format("Exception in GetOrCreateContextInfo: %s", inner_e.what()).ToStdString());
-                throw; // Re-throw to be caught by outer handler
+                
+            } catch (const std::exception& e) {
+                LogAndDisplayError("Error in model loading completion: " + std::string(e.what()),
+                                  "Failed to complete model loading: " + std::string(e.what()));
+                model_loaded = false;
             }
-        } else {
-            LOG_ERROR_LuminaChat("LlamaManager::LoadModel returned false - failure");
-            AddLogMessage("ERROR: Failed to load model");
-            AddChatMessage("System", "Failed to load model. Check the file path and try again.", wxColour(150, 50, 50));
-        }
-        
-    } catch (const std::exception& e) {
-        LOG_ERROR_LuminaChat(wxString::Format("Exception caught in OnLoadModel: %s", e.what()).ToStdString());
-        AddLogMessage(wxString::Format("Error loading model: %s", e.what()).ToStdString());
-        AddChatMessage("System", wxString::Format("Failed to load model: %s", e.what()).ToStdString(), wxColour(150, 50, 50));
-        model_loaded = false;
-    }
-    
-    // Always reset loading state and update UI
-    LOG_DEBUG_LuminaChat("Resetting loading state and updating UI");
-    model_loading = false;
-    model_progress->SetValue(0);
-    UpdateUI();
-}
-
-void LuminaChatFrame::OnLoadSummaryModel(wxCommandEvent& event) {
-    // Handle browse button for summary model
-    if (event.GetId() == ID_BrowseSummaryModel) {
-        wxFileDialog openFileDialog(this, "Select Summary GGUF Model File", "", "",
-                                   "GGUF Model files (*.gguf)|*.gguf|All files (*.*)|*.*",
-                                   wxFD_OPEN | wxFD_FILE_MUST_EXIST);
-        
-        if (openFileDialog.ShowModal() == wxID_OK) {
-            summary_model_path_text->SetValue(openFileDialog.GetPath());
             
-            // Save the path immediately when selected
-            if (settings_manager) {
-                settings_manager->SetString("Models", "summary_model_path", openFileDialog.GetPath().ToStdString());
-                settings_manager->SaveSettings();
-                AddLogMessage("Summary model path updated: " + openFileDialog.GetPath().ToStdString());
+            // Always reset loading state
+            model_loading = false;
+            if (settings_ui) {
+                settings_ui->UpdateModelProgress(0);
+                settings_ui->SetModelLoadingState(false);
             }
-        }
-        return;
-    }
-    
-    // Note: Direct model loading is now handled by SummarizationPlugin
-    AddLogMessage("Summary model loading is managed by SummarizationPlugin - use the configuration above and restart the plugin");
-}
-
-void LuminaChatFrame::OnLoadEmoTagModel(wxCommandEvent& event) {
-    // Handle browse button for emotion model
-    if (event.GetId() == ID_BrowseEmoTagModel) {
-        wxFileDialog openFileDialog(this, "Select Emotion Analysis GGUF Model File", "", "",
-                                   "GGUF Model files (*.gguf)|*.gguf|All files (*.*)|*.*",
-                                   wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+            UpdateUI();
+        });
         
-        if (openFileDialog.ShowModal() == wxID_OK) {
-            emotag_model_path_text->SetValue(openFileDialog.GetPath());
-            
-            // Save the path immediately when selected
-            if (settings_manager) {
-                settings_manager->SetString("Models", "emotion_model_path", openFileDialog.GetPath().ToStdString());
-                settings_manager->SaveSettings();
-                AddLogMessage("Emotion model path updated: " + openFileDialog.GetPath().ToStdString());
-            }
-        }
-        return;
-    }
-    
-    // Note: Direct model loading is now handled by EmoTagPlugin
-    AddLogMessage("Emotion model loading is managed by EmoTagPlugin - use the configuration above and restart the plugin");
+    }).detach(); // Detach the thread so it runs independently
 }
 
 void LuminaChatFrame::OnConnectDiscord(wxCommandEvent& event) {
@@ -1661,8 +1236,7 @@ void LuminaChatFrame::OnConnectDiscord(wxCommandEvent& event) {
     
     wxString token = discord_token_text->GetValue().Trim();
     if (token.IsEmpty()) {
-        AddLogMessage("Please enter a Discord bot token first");
-        AddChatMessage("System", "Please enter a Discord bot token first", wxColour(150, 100, 50));
+        ShowErrorMessage("Please enter a Discord bot token first");
         return;
     }
     
@@ -1678,7 +1252,7 @@ void LuminaChatFrame::OnConnectDiscord(wxCommandEvent& event) {
         if (discord_manager && discord_manager->Connect(token.ToStdString())) {
             discord_connected = true;
             AddLogMessage("Connected to Discord successfully");
-            AddChatMessage("System", "Discord bot connected and ready!", wxColour(114, 137, 218));
+            AddChatMessage("System", "Discord bot connected and ready!", LuminaChatColors::DISCORD_BLUE);
             
             auto channels = discord_manager->GetChannels();
             channels_list->Clear();
@@ -1701,8 +1275,8 @@ void LuminaChatFrame::OnConnectDiscord(wxCommandEvent& event) {
         }
         
     } catch (const std::exception& e) {
-        AddLogMessage(wxString::Format("Error connecting to Discord: %s", e.what()).ToStdString());
-        AddChatMessage("System", wxString::Format("Failed to connect to Discord: %s", e.what()).ToStdString(), wxColour(150, 50, 50));
+        LogAndDisplayError(wxString::Format("Error connecting to Discord: %s", e.what()).ToStdString(),
+                          wxString::Format("Failed to connect to Discord: %s", e.what()).ToStdString());
         discord_connected = false;
     }
     
@@ -1735,10 +1309,10 @@ void LuminaChatFrame::OnTimer(wxTimerEvent& event) {
         orchestrator->ProcessScheduledTasks();
         UpdateUI();
         
-        // Update plugin debug info every 10 timer ticks (about once per second if timer is 100ms)
+        // Update plugin debug info at regular intervals
         static int debug_update_counter = 0;
         debug_update_counter++;
-        if (debug_update_counter >= 10) {
+        if (debug_update_counter >= LuminaChatConstants::DEBUG_UPDATE_INTERVAL) {
             debug_update_counter = 0;
             UpdateSummaryPluginDebugInfo();
             UpdateEmoTagPluginDebugInfo();
@@ -1760,7 +1334,7 @@ void LuminaChatFrame::StartStreamingMessage(const std::string& sender, const wxC
     chat_display->BeginSuppressUndo();
     chat_display->SetInsertionPointEnd();
     
-    chat_display->BeginTextColour(wxColour(128, 128, 128));
+    chat_display->BeginTextColour(LuminaChatColors::TIMESTAMP_GRAY);
     chat_display->WriteText(wxString::Format("[%s] ", now.Format("%H:%M:%S")));
     chat_display->EndTextColour();
     
@@ -1871,18 +1445,10 @@ void LuminaChatFrame::UpdateTemplateDisplay(const std::string& template_content)
     display_stream << "Template Length: " << template_content.length() << " characters\n";
     display_stream << "===========================================\n\n";
     
-    // Show the actual template that will be processed by llama.cpp
-    display_stream << "TEMPLATE CONTENT (sent to llama.cpp Jinja2 interpreter):\n";
-    display_stream << "--------------------------------------------------------\n";
+    // Show the actual template that was dynamically generated by ChatTemplateManager
+    display_stream << "TEMPLATE CONTENT (dynamically generated by ChatTemplateManager):\n";
+    display_stream << "--------------------------------------------------------------\n";
     display_stream << template_content;
-    
-    // Add footer with analysis
-    display_stream << "\n\n=== TEMPLATE ANALYSIS ===\n";
-    display_stream << "Contains 'for msg in messages': " << (template_content.find("for msg in messages") != std::string::npos ? "YES" : "NO") << "\n";
-    display_stream << "Contains '{{': " << (template_content.find("{{") != std::string::npos ? "YES" : "NO") << "\n";
-    display_stream << "Contains 'bos_token': " << (template_content.find("bos_token") != std::string::npos ? "YES" : "NO") << "\n";
-    display_stream << "Contains 'assistant<|end_header_id': " << (template_content.find("assistant<|end_header_id") != std::string::npos ? "YES" : "NO") << "\n";
-    display_stream << "=========================\n";
     
     template_display->SetValue(display_stream.str());
     template_display->SetInsertionPoint(0);  // Scroll to top
@@ -1904,159 +1470,47 @@ void LuminaChatFrame::OnClearTemplate(wxCommandEvent& event) {
 }
 
 void LuminaChatFrame::UpdateSummaryPluginStatus(const std::string& status, const wxColour& color) {
-    if (summary_status_text) {
-        summary_status_text->SetLabel("SummarizationPlugin: " + status);
-        if (color.IsOk()) {
-            summary_status_text->SetForegroundColour(color);
-        }
-        summary_status_text->GetParent()->Layout();  // Refresh the layout
+    if (summarization_ui) {
+        summarization_ui->UpdateStatus(status, color);
     }
 }
 
 void LuminaChatFrame::UpdateEmoTagPluginStatus(const std::string& status, const wxColour& color) {
-    if (emotag_status_text) {
-        emotag_status_text->SetLabel("EmoTagPlugin: " + status);
-        if (color.IsOk()) {
-            emotag_status_text->SetForegroundColour(color);
-        }
-        emotag_status_text->GetParent()->Layout();  // Refresh the layout
+    if (emotag_ui) {
+        emotag_ui->UpdateStatus(status, color);
     }
 }
 
 void LuminaChatFrame::UpdateSummaryPluginDebugInfo() {
-    if (!summarization_plugin) return;
-    
-    // Update log output
-    if (summary_log_output_text) {
-        auto logs = summarization_plugin->GetLogHistory();
-        wxString log_content;
-        
-        // Show last 10 log entries (to fit in 5-line textbox)
-        size_t start_idx = logs.size() > 10 ? logs.size() - 10 : 0;
-        for (size_t i = start_idx; i < logs.size(); ++i) {
-            if (!log_content.IsEmpty()) log_content += "\n";
-            log_content += logs[i];
-        }
-        
-        if (log_content.IsEmpty()) {
-            log_content = "No log entries yet...";
-        }
-        
-        // Only update if content has changed
-        if (summary_log_output_text->GetValue() != log_content) {
-            summary_log_output_text->SetValue(log_content);
-        }
-    }
-    
-    // Update last generation
-    if (summary_last_generation_text) {
-        auto gen_info = summarization_plugin->GetLastGeneration();
-        wxString gen_content;
-        
-        if (gen_info.has_generation) {
-            gen_content = wxString::Format(
-                "Context: %s\nTime: %s\n\nINPUT:\n%s\n\nOUTPUT:\n%s",
-                gen_info.context_id,
-                gen_info.timestamp,
-                gen_info.input,
-                gen_info.output
-            );
-        } else {
-            gen_content = "No generation data available yet...";
-        }
-        
-        // Only update if content has changed to preserve scroll position
-        if (summary_last_generation_text->GetValue() != gen_content) {
-            // Store current scroll position
-            long insertion_point = summary_last_generation_text->GetInsertionPoint();
-            
-            summary_last_generation_text->SetValue(gen_content);
-            
-            // Restore scroll position if the content got longer (new generation)
-            // But if it's the same length or shorter, keep at top for readability
-            if (gen_content.length() > summary_last_generation_text->GetValue().length() && insertion_point > 0) {
-                summary_last_generation_text->SetInsertionPoint(insertion_point);
-            }
-        }
+    if (summarization_ui && summarization_plugin) {
+        summarization_ui->UpdateDebugInfo(summarization_plugin.get());
     }
 }
 
 void LuminaChatFrame::UpdateEmoTagPluginDebugInfo() {
-    if (!emotag_plugin) return;
-    
-    // Update log output
-    if (emotag_log_output_text) {
-        auto logs = emotag_plugin->GetLogHistory();
-        wxString log_content;
-        
-        // Show last 10 log entries (to fit in 5-line textbox)
-        size_t start_idx = logs.size() > 10 ? logs.size() - 10 : 0;
-        for (size_t i = start_idx; i < logs.size(); ++i) {
-            if (!log_content.IsEmpty()) log_content += "\n";
-            log_content += logs[i];
-        }
-        
-        if (log_content.IsEmpty()) {
-            log_content = "No log entries yet...";
-        }
-        
-        // Only update if content has changed
-        if (emotag_log_output_text->GetValue() != log_content) {
-            emotag_log_output_text->SetValue(log_content);
-        }
-    }
-    
-    // Update last generation
-    if (emotag_last_generation_text) {
-        auto gen_info = emotag_plugin->GetLastGeneration();
-        wxString gen_content;
-        
-        if (gen_info.has_generation) {
-            gen_content = wxString::Format(
-                "Context: %s\nTime: %s\n\nINPUT:\n%s\n\nOUTPUT:\n%s",
-                gen_info.context_id,
-                gen_info.timestamp,
-                gen_info.input,
-                gen_info.output
-            );
-        } else {
-            gen_content = "No generation data available yet...";
-        }
-        
-        // Only update if content has changed to preserve scroll position
-        if (emotag_last_generation_text->GetValue() != gen_content) {
-            // Store current scroll position
-            long insertion_point = emotag_last_generation_text->GetInsertionPoint();
-            
-            emotag_last_generation_text->SetValue(gen_content);
-            
-            // Restore scroll position if the content got longer (new generation)
-            // But if it's the same length or shorter, keep at top for readability
-            if (gen_content.length() > emotag_last_generation_text->GetValue().length() && insertion_point > 0) {
-                emotag_last_generation_text->SetInsertionPoint(insertion_point);
-            }
-        }
+    if (emotag_ui && emotag_plugin) {
+        emotag_ui->UpdateDebugInfo(emotag_plugin.get());
     }
 }
 
 // Helper methods for initialization
 std::string LuminaChatFrame::GetEnvironmentDescriptionFromUI() const {
-    if (environment_description_text) {
-        return environment_description_text->GetValue().ToStdString();
+    if (settings_ui) {
+        return settings_ui->GetEnvironmentDescription();
     }
     return "";
 }
 
 std::string LuminaChatFrame::GetIdentityDirectiveFromUI() const {
-    if (identity_directive_text) {
-        return identity_directive_text->GetValue().ToStdString();
+    if (settings_ui) {
+        return settings_ui->GetIdentityDirective();
     }
     return "";
 }
 
 std::string LuminaChatFrame::GetSystemPromptFromUI() const {
-    if (system_prompt_text) {
-        return system_prompt_text->GetValue().ToStdString();
+    if (settings_ui) {
+        return settings_ui->GetSystemPrompt();
     }
     return "";
 }
@@ -2102,106 +1556,20 @@ void LuminaChatFrame::LoadUISettings() {
     AddLogMessage("Loading UI settings from configuration...");
     
     try {
-        // Load model settings
-        std::string model_path = settings_manager->GetString("Models", "main_model_path", "");
-        if (!model_path.empty() && model_path_text) {
-            model_path_text->SetValue(model_path);
-            AddLogMessage("Loaded model path: " + model_path);
+        // Load settings UI configuration
+        if (settings_ui) {
+            settings_ui->LoadSettings();
         }
         
-        // Load model configuration sliders
-        if (context_size_slider) {
-            int context_size = settings_manager->GetInt("Models", "main_context_size", 4096);
-            context_size_slider->SetValue(context_size);
-            AddLogMessage("Loaded context size: " + std::to_string(context_size));
+        // Load plugin settings through UI managers
+        if (summarization_ui) {
+            summarization_ui->LoadSettings(settings_manager.get());
         }
-        
-        if (gpu_layers_slider) {
-            int gpu_layers = settings_manager->GetInt("Models", "main_gpu_layers", 999);
-            gpu_layers_slider->SetValue(gpu_layers);
-            AddLogMessage("Loaded GPU layers: " + std::to_string(gpu_layers));
+        if (emotag_ui) {
+            emotag_ui->LoadSettings(settings_manager.get());
         }
-        
-        // Load template configuration
-        if (environment_description_text) {
-            std::string env_desc = settings_manager->GetString("Templates", "environment_description", "");
-            environment_description_text->SetValue(env_desc);
-            if (!env_desc.empty()) {
-                AddLogMessage("Loaded environment description from settings");
-            }
-        }
-        
-        if (identity_directive_text) {
-            std::string identity = settings_manager->GetString("Templates", "identity_directive", "");
-            identity_directive_text->SetValue(identity);
-            if (!identity.empty()) {
-                AddLogMessage("Loaded identity directive from settings");
-            }
-        }
-        
-        if (system_prompt_text) {
-            std::string system_prompt = settings_manager->GetString("Templates", "system_prompt", "");
-            system_prompt_text->SetValue(system_prompt);
-            if (!system_prompt.empty()) {
-                AddLogMessage("Loaded system prompt from settings");
-            }
-        }
-        
-        // Load summary model settings
-        if (summary_model_path_text) {
-            std::string summary_model_path = settings_manager->GetString("Models", "summary_model_path", "");
-            summary_model_path_text->SetValue(summary_model_path);
-            if (!summary_model_path.empty()) {
-                AddLogMessage("Loaded summary model path: " + summary_model_path);
-            }
-        }
-        
-        if (summary_system_prompt_text) {
-            std::string default_summary_prompt = 
-                "You are a helpful AI assistant that creates concise summaries of conversations. "
-                "When given a conversation history, provide a clear and informative summary that captures "
-                "the key points, decisions, and context. Focus on preserving important information while "
-                "being concise. Format your summary in a structured way with bullet points when appropriate.";
-                
-            std::string summary_prompt = settings_manager->GetString("Summary", "system_prompt", default_summary_prompt);
-            summary_system_prompt_text->SetValue(summary_prompt);
-            AddLogMessage("Loaded summary system prompt from settings");
-        }
-        
-        // Load emotion model settings
-        if (emotag_model_path_text) {
-            std::string emotag_model_path = settings_manager->GetString("Models", "emotion_model_path", "");
-            emotag_model_path_text->SetValue(emotag_model_path);
-            if (!emotag_model_path.empty()) {
-                AddLogMessage("Loaded emotion model path: " + emotag_model_path);
-            }
-        }
-        
-        if (emotag_system_prompt_text) {
-            std::string default_emotion_prompt = 
-                "You are an emotional state analyzer. When given AI assistant responses, analyze the emotional tone, "
-                "mood, and psychological state conveyed in the text. Provide a brief emotional overview that captures "
-                "the assistant's apparent emotional state, confidence level, and overall demeanor. "
-                "Focus on identifying patterns like: confident, uncertain, empathetic, analytical, cheerful, "
-                "cautious, enthusiastic, or reserved. Keep your analysis concise and actionable.";
-                
-            std::string emotion_prompt = settings_manager->GetString("Emotion", "system_prompt", default_emotion_prompt);
-            emotag_system_prompt_text->SetValue(emotion_prompt);
-            AddLogMessage("Loaded emotion system prompt from settings");
-        }
-        
-        // Load EmoTag configuration parameters
-        if (emotag_window_size_slider && emotag_window_size_text) {
-            int window_size = settings_manager->GetInt("Emotion", "analysis_window_size", 3);
-            emotag_window_size_slider->SetValue(window_size);
-            emotag_window_size_text->SetLabel(wxString::Format("%d", window_size));
-            AddLogMessage("Loaded emotion analysis window size: " + std::to_string(window_size));
-        }
-        
-        if (emotag_include_user_checkbox) {
-            bool include_user = settings_manager->GetBool("Emotion", "include_user_messages", false);
-            emotag_include_user_checkbox->SetValue(include_user);
-            AddLogMessage("Loaded emotion include user messages setting: " + std::string(include_user ? "enabled" : "disabled"));
+        if (context_pruning_ui) {
+            context_pruning_ui->LoadSettings(settings_manager.get());
         }
         
         // Load Discord settings
@@ -2251,47 +1619,20 @@ void LuminaChatFrame::SaveUISettings() {
     AddLogMessage("Saving UI settings to configuration...");
     
     try {
-        // Save model settings
-        if (model_path_text) {
-            std::string model_path = model_path_text->GetValue().ToStdString();
-            settings_manager->SetString("Models", "main_model_path", model_path);
+        // Save settings UI configuration
+        if (settings_ui) {
+            settings_ui->SaveSettings();
         }
         
-        if (context_size_slider) {
-            int context_size = context_size_slider->GetValue();
-            settings_manager->SetInt("Models", "main_context_size", context_size);
+        // Save plugin settings through UI managers
+        if (summarization_ui) {
+            summarization_ui->SaveSettings(settings_manager.get());
         }
-        
-        if (gpu_layers_slider) {
-            int gpu_layers = gpu_layers_slider->GetValue();
-            settings_manager->SetInt("Models", "main_gpu_layers", gpu_layers);
+        if (emotag_ui) {
+            emotag_ui->SaveSettings(settings_manager.get());
         }
-        
-        // Save template configuration
-        if (environment_description_text) {
-            std::string env_desc = environment_description_text->GetValue().ToStdString();
-            settings_manager->SetString("Templates", "environment_description", env_desc);
-        }
-        
-        if (identity_directive_text) {
-            std::string identity = identity_directive_text->GetValue().ToStdString();
-            settings_manager->SetString("Templates", "identity_directive", identity);
-        }
-        
-        if (system_prompt_text) {
-            std::string system_prompt = system_prompt_text->GetValue().ToStdString();
-            settings_manager->SetString("Templates", "system_prompt", system_prompt);
-        }
-        
-        // Save summary model settings
-        if (summary_model_path_text) {
-            std::string summary_model_path = summary_model_path_text->GetValue().ToStdString();
-            settings_manager->SetString("Models", "summary_model_path", summary_model_path);
-        }
-        
-        if (summary_system_prompt_text) {
-            std::string summary_prompt = summary_system_prompt_text->GetValue().ToStdString();
-            settings_manager->SetString("Summary", "system_prompt", summary_prompt);
+        if (context_pruning_ui) {
+            context_pruning_ui->SaveSettings(settings_manager.get());
         }
         
         // Save Discord settings
@@ -2330,4 +1671,152 @@ void LuminaChatFrame::SaveUISettings() {
     }
 }
 
+// === Message Generation Helper Methods ===
 
+void LuminaChatFrame::CaptureTemplateForInspection(ContextInfo* context) {
+    try {
+        // Build the full prompt to capture the template after variable substitution
+        std::string finalized_template = context->BuildFullPrompt();
+        
+        // Update the template inspection tab with the finalized template
+        UpdateTemplateDisplay(finalized_template);
+        AddLogMessage("Template inspection updated with finalized template");
+        
+    } catch (const std::exception& template_e) {
+        AddLogMessage("Warning: Could not capture template for inspection: " + std::string(template_e.what()));
+    }
+}
+
+GenerationCallbacks LuminaChatFrame::CreateGenerationCallbacks() {
+    return GenerationCallbacks(
+        // Token callback - called for each token as it's generated
+        [this](const std::string& complete_response) {
+            // Since we now receive the complete response each time, replace the content
+            this->CallAfter([this, complete_response]() {
+                ReplaceStreamingMessage(complete_response);
+            });
+        },
+        
+        // Completion callback - called when generation is done
+        [this](const std::string& full_response, bool success) {
+            this->CallAfter([this, full_response, success]() {
+                EndStreamingMessage();
+                SetGenerationUIState(false);  // Re-enable UI after generation
+                UpdateContextStatus();  // Update context usage in status bar
+                
+                // PERFORMANCE FIX: Delay context monitoring to avoid interference with generation cleanup
+                if (orchestrator) {
+                    // Use a timer to delay monitoring by the configured delay after generation completes
+                    auto timer = new wxTimer();
+                    timer->Bind(wxEVT_TIMER, [this, timer](wxTimerEvent&) {
+                        if (orchestrator) {
+                            orchestrator->MonitorAllContextSizes();
+                        }
+                        delete timer;
+                    });
+                    timer->StartOnce(LuminaChatConstants::CONTEXT_MONITORING_DELAY_MS);
+                }
+                
+                if (success) {
+                    AddLogMessage("Response generation completed successfully");
+                    
+                    // Request emotional analysis for the context after AI response
+                    if (orchestrator) {
+                        auto* context = orchestrator->GetLlamaManager()->GetContextInfo(current_context_id);
+                        auto* emotag_plugin = orchestrator->GetEmoTagPlugin();
+                        if (context && emotag_plugin) {
+                            emotag_plugin->RequestEmotionalAnalysis(current_context_id, context->GetMessageHistory());
+                            AddLogMessage("Requested emotional analysis for context: " + current_context_id);
+                            
+                            // Immediately trigger processing of emotion analysis buffer
+                            // instead of waiting for scheduled task
+                            std::thread([this]() {
+                                if (orchestrator) {
+                                    orchestrator->ProcessEmotionAnalysisBuffer();
+                                }
+                            }).detach();
+                        }
+                    }
+                } else {
+                    AddLogMessage("Response generation was stopped or failed");
+                    if (full_response.empty()) {
+                        AddChatMessage("System", "Response generation was interrupted.", LuminaChatColors::ERROR_RED);
+                    }
+                }
+            });
+        },
+        
+        // Error callback - called if there's an error
+        [this](const std::string& error_message) {
+            this->CallAfter([this, error_message]() {
+                if (is_streaming) {
+                    EndStreamingMessage();
+                }
+                SetGenerationUIState(false);  // Re-enable UI on error
+                UpdateContextStatus();  // Update context usage in status bar
+                
+                // Trigger context monitoring even on error to check size
+                if (orchestrator) {
+                    orchestrator->MonitorAllContextSizes();
+                }
+                
+                AddLogMessage("Error generating response: " + error_message);
+                AddChatMessage("System", "Error: " + error_message, LuminaChatColors::ERROR_RED);
+            });
+        }
+    );
+}
+
+void LuminaChatFrame::ExecuteMessageGeneration(ContextInfo* context, const std::string& input, const GenerationCallbacks& callbacks) {
+    // Start streaming message display
+    StartStreamingMessage("Assistant", LuminaChatColors::INFO_BLUE);
+    SetGenerationUIState(true);  // Disable UI during generation
+    
+    // Start async generation
+    bool started = context->HandleInputAsync(input, callbacks, "user");
+    if (!started) {
+        EndStreamingMessage();
+        SetGenerationUIState(false);  // Re-enable UI on failure
+        LogAndDisplayError("Failed to start async generation", "Failed to start response generation");
+    }
+}
+
+void LuminaChatFrame::HandleMessageGenerationError(const std::string& error_message) {
+    if (is_streaming) {
+        EndStreamingMessage();
+    }
+    SetGenerationUIState(false);  // Re-enable UI on exception
+    LogAndDisplayError("Error sending message: " + error_message, "Error: " + error_message);
+}
+
+// === Common UI Helper Methods ===
+
+void LuminaChatFrame::ShowErrorMessage(const std::string& message, const std::string& context) {
+    std::string full_message = context.empty() ? message : context + ": " + message;
+    AddLogMessage("ERROR: " + full_message);
+    AddChatMessage("System", message, LuminaChatColors::ERROR_RED);
+}
+
+void LuminaChatFrame::ShowSuccessMessage(const std::string& message) {
+    AddLogMessage(message);
+    AddChatMessage("System", message, LuminaChatColors::SUCCESS_GREEN);
+}
+
+void LuminaChatFrame::ShowWarningMessage(const std::string& message) {
+    AddLogMessage("WARNING: " + message);
+    AddChatMessage("System", message, LuminaChatColors::WARNING_ORANGE);
+}
+
+void LuminaChatFrame::LogAndDisplayError(const std::string& log_msg, const std::string& user_msg) {
+    AddLogMessage("ERROR: " + log_msg);
+    if (!user_msg.empty()) {
+        AddChatMessage("System", user_msg, LuminaChatColors::ERROR_RED);
+    }
+}
+
+void LuminaChatFrame::LogAndDisplaySuccess(const std::string& log_msg, const std::string& user_msg) {
+    AddLogMessage(log_msg);
+    if (!user_msg.empty()) {
+        AddChatMessage("System", user_msg, LuminaChatColors::SUCCESS_GREEN);
+    }
+}

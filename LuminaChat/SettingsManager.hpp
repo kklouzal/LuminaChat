@@ -345,16 +345,8 @@ public:
         LOG_SettingsManager("SetFloat [" + section + "]." + key + " = " + std::to_string(value));
     }
     
-    // Template management
-    // Note: Main chat templates are managed by ChatTemplateManager with hardcoded defaults.
-    // SettingsManager only stores user customizations and specialized templates (e.g. summary).
-    std::string GetChatTemplate(const std::string& template_name) {
-        return GetString("Templates", template_name);
-    }
-
-    void SetChatTemplate(const std::string& template_name, const std::string& template_content) {
-        SetString("Templates", template_name, template_content);
-    }
+    // Template management removed - ChatTemplateManager now handles all template functionality dynamically
+    // SettingsManager only stores user customizations for template variables (environment, identity, system prompt)
 
     // Check if settings need saving
     bool IsDirty() const {
@@ -403,8 +395,8 @@ public:
         SetFloat_Unlocked("Context", "prune_target", 0.4f);
         SetBool_Unlocked("Context", "auto_summarize", true);
 
-        // Default summary template (main chat template is now handled by ChatTemplateManager)
-        SetChatTemplate_Unlocked("summary", GetDefaultSummaryTemplate());
+        // Note: All templates are now handled dynamically by ChatTemplateManager
+        // No more hardcoded template storage needed
 
         settings_dirty = true;
         LOG_SettingsManager("Initialized default settings");
@@ -430,29 +422,6 @@ private:
     void SetFloat_Unlocked(const std::string& section, const std::string& key, float value) {
         sections[section].keys[key] = std::to_string(value);
         settings_dirty = true;
-    }
-    
-    void SetChatTemplate_Unlocked(const std::string& template_name, const std::string& template_content) {
-        sections["Templates"].keys[template_name] = template_content;
-        settings_dirty = true;
-    }
-
-    // Note: Default chat template is now handled directly by ChatTemplateManager
-    // This method is kept only for the summary template
-    std::string GetDefaultSummaryTemplate() {
-        return R"({{- bos_token }}
-
-<|start_header_id|>system_message<|end_header_id|>
-You are a helpful summarization assistant. Create a concise but comprehensive summary of the provided conversation, preserving key context, topics discussed, and important details.
-<|eot_id|>
-
-<|start_header_id|>user<|end_header_id|>
-Please summarize the following conversation:
-
-{{ content_to_summarize }}
-<|eot_id|>
-
-<|start_header_id|>assistant<|end_header_id|>)";
     }
 
     // Auto-save if settings are dirty

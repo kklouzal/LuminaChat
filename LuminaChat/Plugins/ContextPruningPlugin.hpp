@@ -736,7 +736,7 @@ inline void Orchestrator::MonitorAllContextSizes() {
         return; // No contexts to monitor
     }
     
-    LOG_Orchestrator("Monitoring " + std::to_string(contexts.size()) + " contexts for size management");
+    LOG_DEBUG_Orchestrator("Monitoring " + std::to_string(contexts.size()) + " contexts for size management");
     
     // Monitor each context through the plugin
     for (auto* context : contexts) [[likely]] {

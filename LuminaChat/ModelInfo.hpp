@@ -35,12 +35,16 @@ enum class ModelState {
 
 enum class ResourceEvent {
     MODEL_LOADING_STARTED,
+    MODEL_LOADING_PROGRESS,  // New event for progress updates
     MODEL_LOADED,
     MODEL_UNLOADED,
     MEMORY_USAGE_HIGH,
     TOKENIZATION_ERROR,
     CLEANUP_COMPLETED
 };
+
+// Callback type definitions for llama.cpp integration
+using ModelLoadingProgressCallback = std::function<bool(float progress, void* user_data)>;
 
 struct ModelConfig {
     std::string model_path;
@@ -100,6 +104,10 @@ private:
     // Orchestrator (higher) can register with ModelInfo (lower) for resource events
     std::function<void(const std::string&, ResourceEvent, const std::string&)> resource_callback;
     
+    // llama.cpp callback support
+    ModelLoadingProgressCallback progress_callback;
+    void* progress_callback_user_data = nullptr;
+    
     // Memory tracking
     std::atomic<size_t> estimated_memory_usage{0};
     
@@ -107,6 +115,9 @@ private:
     static std::unordered_map<std::string, ModelInfo*> loaded_model_files;
     static std::mutex loaded_files_mutex;
     
+    // Static callback wrappers for llama.cpp C API
+    static bool ModelLoadingProgressCallbackWrapper(float progress, void* user_data);
+
     // Helper methods
     void NotifyResourceEvent(ResourceEvent event, const std::string& message = "") const {
         if (resource_callback) {
@@ -257,6 +268,12 @@ public:
             model_params.n_gpu_layers = model_config.gpu_layers;
             model_params.use_mmap = model_config.use_mmap;
             model_params.use_mlock = model_config.use_mlock;
+            
+            // Set up progress callback if available
+            if (progress_callback) {
+                model_params.progress_callback = ModelLoadingProgressCallbackWrapper;
+                model_params.progress_callback_user_data = this;
+            }
             
             // Load the model
             temp_model = llama_model_load_from_file(model_config.model_path.c_str(), model_params);
@@ -430,6 +447,31 @@ public:
         resource_callback = std::move(callback);
     }
     
+    // llama.cpp callback registration
+    void RegisterProgressCallback(ModelLoadingProgressCallback callback, void* user_data = nullptr) {
+        progress_callback = std::move(callback);
+        progress_callback_user_data = user_data;
+    }
+    
+    void ClearProgressCallback() {
+        progress_callback = nullptr;
+        progress_callback_user_data = nullptr;
+    }
+    
+    // Internal method called by static callback wrapper
+    bool InternalProgressCallback(float progress) {
+        // Notify resource callback about progress if available
+        NotifyResourceEvent(ResourceEvent::MODEL_LOADING_PROGRESS, 
+                          "Loading progress: " + std::to_string(static_cast<int>(progress * 100)) + "%");
+        
+        // Call user's progress callback if available
+        if (progress_callback) {
+            return progress_callback(progress, progress_callback_user_data);
+        }
+        
+        return true; // Continue loading
+    }
+    
     // Model path registration for duplicate prevention
     static void RegisterModelInstance(const std::string& model_path, ModelInfo* model_info) {
         RegisterModelForPath(model_path, model_info);
@@ -463,3 +505,16 @@ public:
 // Static member definitions
 inline std::unordered_map<std::string, ModelInfo*> ModelInfo::loaded_model_files;
 inline std::mutex ModelInfo::loaded_files_mutex;
+
+// Static callback wrapper for llama.cpp C API
+inline bool ModelInfo::ModelLoadingProgressCallbackWrapper(float progress, void* user_data) {
+    if (!user_data) return true;
+    
+    ModelInfo* model_info = static_cast<ModelInfo*>(user_data);
+    
+    try {
+        return model_info->InternalProgressCallback(progress);
+    } catch (...) {
+        return false; // Cancel loading on exception
+    }
+}
