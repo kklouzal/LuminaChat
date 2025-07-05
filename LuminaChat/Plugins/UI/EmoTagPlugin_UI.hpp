@@ -10,9 +10,8 @@
 #include <wx/sizer.h>
 #include <wx/scrolwin.h>
 #include <wx/filedlg.h>
-#include "EmoTagPlugin.hpp"
-
-class SettingsManager; // Forward declaration
+#include "../EmoTagPlugin.hpp"
+#include "../../SettingsManager.hpp"
 
 class EmoTagPluginUI : public wxEvtHandler {
 public:

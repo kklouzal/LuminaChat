@@ -410,11 +410,11 @@ public:
         // Calculate new context size (needed tokens + 5% buffer)
         size_t new_context_size = static_cast<size_t>(needed_tokens * 1.05f);
         
-        // Get main model context size as hard limit
-        int main_context_size = settings_manager->GetInt("Models", "main_context_size", 4096);
-        if (new_context_size > static_cast<size_t>(main_context_size)) {
+        // Get outer model context size as hard limit
+        int outer_context_size = settings_manager->GetInt("Models", "outer_context_size", 4096);
+        if (new_context_size > static_cast<size_t>(outer_context_size)) {
             LOG_WARNING_SummarizationPlugin("Cannot resize summary context to " + std::to_string(new_context_size) + 
-                " tokens - would exceed main context limit of " + std::to_string(main_context_size));
+                " tokens - would exceed outer context limit of " + std::to_string(outer_context_size));
             return false;
         }
         
@@ -472,20 +472,20 @@ private:
             return false;
         }
         
-        // Get main model settings to derive summary model config
-        int main_context_size = settings_manager->GetInt("Models", "main_context_size", 4096);
-        int main_gpu_layers = settings_manager->GetInt("Models", "main_gpu_layers", 999);
+        // Get outer model settings to derive summary model config
+        int outer_context_size = settings_manager->GetInt("Models", "outer_context_size", 4096);
+        int outer_gpu_layers = settings_manager->GetInt("Models", "outer_gpu_layers", 999);
         
         // Context size calculation for pairwise summarization
         // Need enough space for: system prompt (~200 tokens) + 2 messages (up to 2000 tokens each) 
         // + formatting overhead (~100 tokens) + response generation (~200 tokens)
         // Total: ~4500 tokens minimum for large message pairs
-        // Use 50% of main context size with minimum 4500 tokens to handle large conversations
-        int summary_context_size = std::max(4500, (main_context_size * 50) / 100);
+        // Use 50% of outer context size with minimum 4500 tokens to handle large conversations
+        int summary_context_size = std::max(4500, (outer_context_size * 50) / 100);
         
         LOG_SummarizationPlugin("Loading summary model: " + summary_model_path + 
                                " (context: " + std::to_string(summary_context_size) + 
-                               " [50% of main, optimized for large message pairs], gpu_layers: " + std::to_string(main_gpu_layers) + ")");
+                               " [50% of outer, optimized for large message pairs], gpu_layers: " + std::to_string(outer_gpu_layers) + ")");
         
         if (status_callback) status_callback("Loading summary model: " + summary_model_path, false);
         
@@ -494,7 +494,7 @@ private:
             ModelConfig config;
             config.model_path = summary_model_path;
             config.context_size = summary_context_size;
-            config.gpu_layers = main_gpu_layers;
+            config.gpu_layers = outer_gpu_layers;
             
             if (!llama_manager->LoadModel(summary_model_id, config)) {
                 LOG_ERROR_SummarizationPlugin("Failed to load summary model: " + summary_model_path);
@@ -801,15 +801,15 @@ inline void Orchestrator::OnSummarizationComplete(const std::string& context_id,
         }
         
         // No fallback values - settings must be properly configured
-        int32_t context_size = settings->GetInt("Models", "main_context_size", 0);
+        int32_t context_size = settings->GetInt("Models", "outer_context_size", 0);
         if (context_size <= 0) {
-            LOG_ERROR_Orchestrator("Invalid main_context_size configuration for summarization: " + context_id);
+            LOG_ERROR_Orchestrator("Invalid outer_context_size configuration for summarization: " + context_id);
             SetContextState(context_id, ProcessingState::ERROR_STATE);
             return;
         }
         
         // Apply summary to original context
-        auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", context_size);
+        auto* context = llama_manager->GetOrCreateContextInfo(context_id, "outer_model", context_size);
         if (context) {
             context->ApplyCompletedSummary(response.summary);
             LOG_Orchestrator("Summary applied to context: " + context_id);

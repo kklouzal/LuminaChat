@@ -8,9 +8,8 @@
 #include <wx/sizer.h>
 #include <wx/scrolwin.h>
 #include <wx/filedlg.h>
-#include "SummarizationPlugin.hpp"
-
-class SettingsManager; // Forward declaration
+#include "../SummarizationPlugin.hpp"
+#include "../../SettingsManager.hpp"
 
 class SummarizationPluginUI : public wxEvtHandler {
 public:

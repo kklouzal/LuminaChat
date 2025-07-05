@@ -48,10 +48,12 @@
 #include "Orchestrator.hpp"
 #include "Plugins/SummarizationPlugin.hpp"
 #include "Plugins/EmoTagPlugin.hpp"
-#include "Plugins/SummarizationPlugin_UI.hpp"
-#include "Plugins/EmoTagPlugin_UI.hpp"
-#include "Plugins/ContextPruningPlugin_UI.hpp"
-#include "Settings_UI.hpp"
+#include "Plugins/UI/SummarizationPlugin_UI.hpp"
+#include "Plugins/UI/EmoTagPlugin_UI.hpp"
+#include "Plugins/UI/ContextPruningPlugin_UI.hpp"
+#include "UI/Settings_UI.hpp"
+#include "UI/OuterVoice_UI.hpp"
+#include "UI/InnerVoice_UI.hpp"
 
 #include <memory>
 #include <thread>
@@ -127,7 +129,7 @@ public:
     void OnLogLevelChanged(wxCommandEvent& event);
 
     // Settings UI integration
-    void OnLoadModelFromSettingsUI();
+    void OnLoadModelFromSettingsUI(const std::string& model_path, int context_size, int gpu_layers);
 
     // Core system lifecycle
     void Start();
@@ -200,7 +202,11 @@ private:
     std::unique_ptr<EmoTagPluginUI> emotag_ui;
     std::unique_ptr<ContextPruningPluginUI> context_pruning_ui;
     
-    // Settings UI Manager
+    // Voice Settings UI Managers
+    std::unique_ptr<OuterVoiceUI> outer_voice_ui;
+    std::unique_ptr<InnerVoiceUI> inner_voice_ui;
+    
+    // General Settings UI Manager
     std::unique_ptr<SettingsUI> settings_ui;
     
     // Core rework components (in dependency order)
@@ -223,8 +229,8 @@ private:
     wxTimer* system_timer;
     
     // Current active context and model IDs
-    std::string current_context_id{"main_chat"};
-    std::string current_model_id{"main_model"};
+    std::string current_context_id{"outer_chat"};
+    std::string current_model_id{"outer_model"};
     
     // Streaming state management
     std::atomic<bool> is_streaming{false};
@@ -330,7 +336,11 @@ LuminaChatFrame::LuminaChatFrame()
     CreateLogsPanel();
     CreateTemplatePanel();
     
-    // Create Settings UI manager
+    // Create Voice Settings UI managers
+    outer_voice_ui = std::make_unique<OuterVoiceUI>(this);
+    inner_voice_ui = std::make_unique<InnerVoiceUI>(this);
+    
+    // Create General Settings UI manager
     settings_ui = std::make_unique<SettingsUI>(this);
     
     // Create plugin UI managers
@@ -338,8 +348,12 @@ LuminaChatFrame::LuminaChatFrame()
     emotag_ui = std::make_unique<EmoTagPluginUI>(this);
     context_pruning_ui = std::make_unique<ContextPruningPluginUI>(this);
     
-    // Add settings panel to notebook
-    notebook->AddPage(settings_ui->CreatePanel(), "Model Settings");
+    // Add voice settings panels to notebook
+    notebook->AddPage(outer_voice_ui->CreatePanel(), "Outer Voice Settings");
+    notebook->AddPage(inner_voice_ui->CreatePanel(), "Inner Voice Settings");
+    
+    // Add general settings panel to notebook
+    notebook->AddPage(settings_ui->CreatePanel(), "General Settings");
     
     // Add plugin panels to notebook
     notebook->AddPage(summarization_ui->CreatePanel(), "Summary Settings");
@@ -588,16 +602,39 @@ void LuminaChatFrame::Start() {
         // Note: SummarizationPlugin initialization is now deferred until model loading
         AddLogMessage("Plugin initialization will be handled when user loads a model");
         
-        // Initialize Settings UI with dependencies
-        if (settings_ui) {
-            settings_ui->SetSettingsManager(settings_manager.get());
-            settings_ui->SetLlamaManager(llama_manager.get());
-            settings_ui->SetCallbacks(
+        // Initialize Outer Voice UI with dependencies
+        if (outer_voice_ui) {
+            outer_voice_ui->SetSettingsManager(settings_manager.get());
+            outer_voice_ui->SetLlamaManager(llama_manager.get());
+            outer_voice_ui->SetCallbacks(
                 [this](const std::string& msg) { AddLogMessage(msg); },
-                [this]() { OnLoadModelFromSettingsUI(); },
                 [this](ContextInfo* ctx, const std::string& id) { ApplyTemplateSettingsToContext(ctx, id); }
             );
-            AddLogMessage("Settings UI dependencies configured");
+            AddLogMessage("Outer Voice UI dependencies configured");
+        }
+        
+        // Initialize General Settings UI with dependencies
+        if (settings_ui) {
+            settings_ui->SetSettingsManager(settings_manager.get());
+            settings_ui->SetCallbacks(
+                [this](const std::string& msg) { AddLogMessage(msg); },
+                [this](const std::string& path, int ctx_size, int gpu_layers) { 
+                    OnLoadModelFromSettingsUI(path, ctx_size, gpu_layers); 
+                },
+                [this](ContextInfo* ctx, const std::string& id) { ApplyTemplateSettingsToContext(ctx, id); }
+            );
+            AddLogMessage("General Settings UI dependencies configured");
+        }
+        
+        // Initialize Inner Voice UI with dependencies
+        if (inner_voice_ui) {
+            inner_voice_ui->SetSettingsManager(settings_manager.get());
+            inner_voice_ui->SetLlamaManager(llama_manager.get());
+            inner_voice_ui->SetCallbacks(
+                [this](const std::string& msg) { AddLogMessage(msg); },
+                [this](ContextInfo* ctx, const std::string& id) { ApplyTemplateSettingsToContext(ctx, id); }
+            );
+            AddLogMessage("Inner Voice UI dependencies configured");
         }
         
         // Register callbacks (higher components register with lower)
@@ -607,14 +644,14 @@ void LuminaChatFrame::Start() {
         // Load UI settings from configuration
         LoadUISettings();
         
-        // Note: Model loading is now manual - user must click "Load Model" button
-        AddLogMessage("Ready for manual model loading - click 'Load Model' button to proceed");
+        // Note: Model loading is now unified in the General Settings tab
+        AddLogMessage("Ready for model loading - use General Settings tab to load model");
         
         running = true;
         system_timer->Start(LuminaChatConstants::TIMER_INTERVAL_MS);
         
-        AddLogMessage("LuminaChat started successfully - ready for manual model loading");
-        SetStatusText("System Ready - Click 'Load Model' to begin", 0);
+        AddLogMessage("LuminaChat started successfully - model loading available in General Settings tab");
+        SetStatusText("System Ready - Use General Settings tab to load model", 0);
         UpdateUI();
         
         // Set initial plugin status
@@ -756,7 +793,15 @@ void LuminaChatFrame::AddLogMessage(const std::string& message) {
 }
 
 void LuminaChatFrame::UpdateUI() {
-    // Update Settings UI
+    // Update Voice Settings UIs
+    if (outer_voice_ui) {
+        outer_voice_ui->UpdateUI();
+    }
+    if (inner_voice_ui) {
+        inner_voice_ui->UpdateUI();
+    }
+    
+    // Update General Settings UI
     if (settings_ui) {
         settings_ui->UpdateUI();
     }
@@ -895,21 +940,21 @@ void LuminaChatFrame::LoadDefaultModels() {
     
     AddLogMessage("Loading default models from settings...");
     
-    // Load main model
-    if (!llama_manager->LoadModelFromSettings("main_model", "main")) {
-        AddLogMessage("WARNING: Failed to load main model from settings");
+    // Load outer model
+    if (!llama_manager->LoadModelFromSettings("outer_model", "outer")) {
+        AddLogMessage("WARNING: Failed to load outer model from settings");
     } else {
-        AddLogMessage("Main model loaded successfully");
+        AddLogMessage("Outer model loaded successfully");
         
-        // Get main model context size from settings
-        int32_t main_context_size = settings_manager->GetInt("Models", "main_context_size", 4096);
+        // Get outer model context size from settings
+        int32_t outer_context_size = settings_manager->GetInt("Models", "outer_context_size", 4096);
         
-        // Create default context with main model
-        auto* context = llama_manager->GetOrCreateContextInfo("main_context", "main_model", main_context_size);
+        // Create default context with outer model
+        auto* context = llama_manager->GetOrCreateContextInfo("outer_context", "outer_model", outer_context_size);
         if (context) {
-            AddLogMessage("Main context created successfully with context size: " + std::to_string(main_context_size));
+            AddLogMessage("Outer context created successfully with context size: " + std::to_string(outer_context_size));
             // Apply template settings from UI (identity directive and system prompt)
-            ApplyTemplateSettingsToContext(context, "main_context");
+            ApplyTemplateSettingsToContext(context, "outer_context");
         }
     }
     
@@ -1095,13 +1140,12 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
     }
 }
 
-void LuminaChatFrame::OnLoadModelFromSettingsUI() {
+void LuminaChatFrame::OnLoadModelFromSettingsUI(const std::string& model_path, int context_size, int gpu_layers) {
     if (!settings_ui || !llama_manager || !settings_manager) {
         AddLogMessage("ERROR: Settings UI or required components not initialized");
         return;
     }
 
-    std::string model_path = settings_ui->GetModelPath();
     if (model_path.empty()) {
         AddLogMessage("Please select a model file first");
         AddChatMessage("System", "Please select a model file first", LuminaChatColors::WARNING_ORANGE);
@@ -1124,11 +1168,7 @@ void LuminaChatFrame::OnLoadModelFromSettingsUI() {
     settings_ui->UpdateModelProgress(0);
     SetStatusText("Starting model load...", 1);
     
-    AddLogMessage(wxString::Format("Starting background model loading: %s", model_path).ToStdString());
-    
-    // Capture all needed values for the background thread
-    int context_size = settings_ui->GetContextSize();
-    int gpu_layers = settings_ui->GetGPULayers();
+    AddLogMessage(wxString::Format("Starting unified model loading: %s", model_path).ToStdString());
     
     // Create model config
     ModelConfig config;
@@ -1175,15 +1215,13 @@ void LuminaChatFrame::OnLoadModelFromSettingsUI() {
                     settings_ui->UpdateModelProgress(100);
                     SetStatusText("Model Loaded", 1);
                     
-                    // Get main model context size from settings
-                    int32_t main_context_size = settings_manager->GetInt("Models", "main_context_size", 4096);
-                    
-                    auto* context_info = llama_manager->GetOrCreateContextInfo(current_context_id, current_model_id, main_context_size);
+                    // Create context with the configured size
+                    auto* context_info = llama_manager->GetOrCreateContextInfo(current_context_id, current_model_id, config.context_size);
                     
                     if (context_info) {
                         // Apply template settings from Settings UI
                         ApplyTemplateSettingsToContext(context_info, current_context_id);
-                        AddLogMessage("Model loaded successfully");
+                        AddLogMessage("Model loaded successfully from unified interface");
                         
                         // Initialize plugins after successful model loading
                         InitializePlugins();
@@ -1556,7 +1594,17 @@ void LuminaChatFrame::LoadUISettings() {
     AddLogMessage("Loading UI settings from configuration...");
     
     try {
-        // Load settings UI configuration
+        // Load outer voice UI configuration
+        if (outer_voice_ui) {
+            outer_voice_ui->LoadSettings();
+        }
+        
+        // Load inner voice UI configuration
+        if (inner_voice_ui) {
+            inner_voice_ui->LoadSettings();
+        }
+        
+        // Load general settings UI configuration
         if (settings_ui) {
             settings_ui->LoadSettings();
         }
@@ -1619,7 +1667,17 @@ void LuminaChatFrame::SaveUISettings() {
     AddLogMessage("Saving UI settings to configuration...");
     
     try {
-        // Save settings UI configuration
+        // Save outer voice UI configuration
+        if (outer_voice_ui) {
+            outer_voice_ui->SaveSettings();
+        }
+        
+        // Save inner voice UI configuration
+        if (inner_voice_ui) {
+            inner_voice_ui->SaveSettings();
+        }
+        
+        // Save general settings UI configuration
         if (settings_ui) {
             settings_ui->SaveSettings();
         }

@@ -359,11 +359,14 @@ public:
         std::lock_guard<std::mutex> lock(settings_mutex);
         
         // Model configuration
-        SetString_Unlocked("Models", "main_model_path", "");
+        SetString_Unlocked("Models", "outer_model_path", "");
+        SetString_Unlocked("Models", "inner_model_path", "");
         SetString_Unlocked("Models", "summary_model_path", "");
-        SetInt_Unlocked("Models", "main_context_size", 8192);
+        SetInt_Unlocked("Models", "outer_context_size", 8192);
+        SetInt_Unlocked("Models", "inner_context_size", 8192);
         SetInt_Unlocked("Models", "summary_context_size", 4096);
-        SetInt_Unlocked("Models", "main_gpu_layers", 999);
+        SetInt_Unlocked("Models", "outer_gpu_layers", 999);
+        SetInt_Unlocked("Models", "inner_gpu_layers", 999);
         SetInt_Unlocked("Models", "summary_gpu_layers", 999);
 
         // Discord configuration

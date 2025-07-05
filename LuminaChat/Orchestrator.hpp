@@ -628,15 +628,15 @@ inline void Orchestrator::InputReceived(std::string_view input, std::string_view
 #endif
         
         // No fallback values - settings must be properly configured
-        int32_t context_size = settings->GetInt("Models", "main_context_size", 0);
+        int32_t context_size = settings->GetInt("Models", "outer_context_size", 0);
         if (context_size <= 0) [[unlikely]] {
-            LOG_ERROR_Orchestrator("Invalid main_context_size configuration for context: " + std::string(context_id));
+            LOG_ERROR_Orchestrator("Invalid outer_context_size configuration for context: " + std::string(context_id));
             SetContextState(context_id, ProcessingState::ERROR_STATE);
             return;
         }
         
         // Route to appropriate context
-        auto* context = llama_manager->GetOrCreateContextInfo(std::string(context_id), "main_model", context_size);
+        auto* context = llama_manager->GetOrCreateContextInfo(std::string(context_id), "outer_model", context_size);
         if (!context) [[unlikely]] {
             LOG_ERROR_Orchestrator("Failed to get/create context: " + std::string(context_id));
             SetContextState(context_id, ProcessingState::ERROR_STATE);
@@ -862,21 +862,21 @@ inline void Orchestrator::ProcessDiscordChannelRequest(const DiscordChannelReque
                 }
                 
                 // No fallback values - settings must be properly configured
-                int32_t context_size = settings->GetInt("Models", "main_context_size", 0);
+                int32_t context_size = settings->GetInt("Models", "outer_context_size", 0);
                 if (context_size <= 0) [[unlikely]] {
-                    LOG_ERROR_Orchestrator("Invalid main_context_size configuration for Discord channel: " + request.channel_id);
+                    LOG_ERROR_Orchestrator("Invalid outer_context_size configuration for Discord channel: " + request.channel_id);
                     DiscordChannelResponse response;
                     response.should_respond = false;
                     response.response_content = "";
                     response.target_channel = request.channel_id;
-                    response.error_message = "Invalid main_context_size configuration";
+                    response.error_message = "Invalid outer_context_size configuration";
                     callback(response);
                     break;
                 }
                 
                 // Setup new channel context
                 std::string context_id = "discord_" + request.channel_id;
-                auto* context = llama_manager->GetOrCreateContextInfo(context_id, "main_model", context_size);
+                auto* context = llama_manager->GetOrCreateContextInfo(context_id, "outer_model", context_size);
                 
                 if (context) [[likely]] {
                     context->UpdateEnvironment("Discord channel: " + request.channel_id);

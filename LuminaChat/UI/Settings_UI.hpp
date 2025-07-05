@@ -12,19 +12,19 @@
 #include <wx/filedlg.h>
 #include <memory>
 #include <functional>
+#include "../SettingsManager.hpp"
 
 // Forward declarations
-class SettingsManager;
 class LlamaManager;
 class ContextInfo;
 
 /**
- * Settings UI Manager - Handles all general application settings UI
+ * Settings UI Manager - Handles general application settings UI
  * 
  * Responsibilities:
  * - Model configuration UI (path, context size, GPU layers)
  * - Template configuration UI (environment, identity, system prompt)
- * - Settings loading/saving to SettingsManager
+ * - Settings loading/saving to SettingsManager for general settings
  * - Model loading coordination
  * - UI state management and validation
  */
@@ -32,7 +32,7 @@ class SettingsUI {
 public:
     // Callback types for communication with main frame
     using LogCallback = std::function<void(const std::string&)>;
-    using ModelLoadCallback = std::function<void()>;
+    using ModelLoadCallback = std::function<void(const std::string&, int, int)>;
     using ContextApplyCallback = std::function<void(ContextInfo*, const std::string&)>;
 
     explicit SettingsUI(wxWindow* parent);
@@ -67,21 +67,17 @@ public:
     int GetGPULayers() const;
 
 private:
-    // UI Components - Model Configuration
+    // UI Components - General Settings
     wxPanel* settings_panel{nullptr};
     wxScrolledWindow* scrolled_window{nullptr};
-    
-    // Model path selection
+
+    // Model Configuration
     wxTextCtrl* model_path_text{nullptr};
     wxButton* browse_model_button{nullptr};
-    
-    // Model configuration sliders
     wxSlider* context_size_slider{nullptr};
     wxStaticText* context_size_label{nullptr};
     wxSlider* gpu_layers_slider{nullptr};
     wxStaticText* gpu_layers_label{nullptr};
-    
-    // Model loading
     wxButton* load_model_button{nullptr};
     wxGauge* model_progress{nullptr};
 
@@ -186,7 +182,7 @@ inline wxPanel* SettingsUI::CreatePanel() {
 
 inline void SettingsUI::CreateModelConfigurationSection(wxBoxSizer* main_sizer) {
     // Model configuration group
-    wxStaticBoxSizer* model_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Model Configuration");
+    wxStaticBoxSizer* model_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Unified Model Configuration");
     
     // Model path selection
     wxBoxSizer* path_sizer = new wxBoxSizer(wxHORIZONTAL);
@@ -272,12 +268,12 @@ inline void SettingsUI::SetupSliderEvents() {
     if (load_model_button) {
         load_model_button->Bind(wxEVT_COMMAND_BUTTON_CLICKED, &SettingsUI::OnLoadModel, this);
     }
-}
-
-inline void SettingsUI::SetupTextEvents() {
     if (model_path_text) {
         model_path_text->Bind(wxEVT_TEXT, &SettingsUI::OnModelPathChange, this);
     }
+}
+
+inline void SettingsUI::SetupTextEvents() {
     if (environment_description_text) {
         environment_description_text->Bind(wxEVT_KILL_FOCUS, &SettingsUI::OnEnvironmentDescriptionFocusLost, this);
     }
@@ -545,7 +541,10 @@ inline void SettingsUI::OnBrowseModel(wxCommandEvent& event) {
 
 inline void SettingsUI::OnLoadModel(wxCommandEvent& event) {
     if (model_load_callback) {
-        model_load_callback();
+        std::string model_path = model_path_text ? model_path_text->GetValue().ToStdString() : "";
+        int context_size = context_size_slider ? context_size_slider->GetValue() : 4096;
+        int gpu_layers = gpu_layers_slider ? gpu_layers_slider->GetValue() : 999;
+        model_load_callback(model_path, context_size, gpu_layers);
     }
 }
 
@@ -573,6 +572,7 @@ inline void SettingsUI::OnModelPathChange(wxCommandEvent& event) {
     UpdateUI();
 }
 
+// Event handlers
 inline void SettingsUI::OnEnvironmentDescriptionFocusLost(wxFocusEvent& event) {
     if (settings_manager && environment_description_text) {
         settings_manager->SetString("Templates", "environment_description", environment_description_text->GetValue().ToStdString());

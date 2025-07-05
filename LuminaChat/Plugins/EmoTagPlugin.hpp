@@ -441,11 +441,11 @@ public:
         // Calculate new context size (needed tokens + 25% buffer for system prompt and generation overhead)
         size_t new_context_size = static_cast<size_t>(needed_tokens * 1.25f) + 500;
         
-        // Get main model context size as hard limit
-        int main_context_size = settings_manager->GetInt("Models", "main_context_size", 4096);
-        if (new_context_size > static_cast<size_t>(main_context_size)) {
+        // Get outer model context size as hard limit
+        int outer_context_size = settings_manager->GetInt("Models", "outer_context_size", 4096);
+        if (new_context_size > static_cast<size_t>(outer_context_size)) {
             LogWarning("Cannot resize emotion context to " + std::to_string(new_context_size) + 
-                " tokens - would exceed main context limit of " + std::to_string(main_context_size));
+                " tokens - would exceed outer context limit of " + std::to_string(outer_context_size));
             return false;
         }
         
@@ -503,20 +503,20 @@ private:
             return false;
         }
         
-        // Get main model settings to derive emotion model config
-        int main_context_size = settings_manager->GetInt("Models", "main_context_size", 4096);
-        int main_gpu_layers = settings_manager->GetInt("Models", "main_gpu_layers", 999);
+        // Get outer model settings to derive emotion model config
+        int outer_context_size = settings_manager->GetInt("Models", "outer_context_size", 4096);
+        int outer_gpu_layers = settings_manager->GetInt("Models", "outer_gpu_layers", 999);
         
         // Context size calculation for emotional analysis
         // Need enough space for: system prompt (~300 tokens) + AI responses (up to 1000 tokens each for 3 responses)
         // + formatting overhead (~100 tokens) + response generation (~200 tokens)
         // Total: ~3600 tokens minimum for typical analysis
-        // Use 50% of main context size with minimum 4500 tokens (matching SummarizationPlugin for reliability)
-        int emotion_context_size = std::max(4500, (main_context_size * 50) / 100);
+        // Use 50% of outer context size with minimum 4500 tokens (matching SummarizationPlugin for reliability)
+        int emotion_context_size = std::max(4500, (outer_context_size * 50) / 100);
         
         LogInfo("Loading emotion model: " + emotion_model_path + 
                         " (context: " + std::to_string(emotion_context_size) + 
-                        " [30% of main, optimized for response analysis], gpu_layers: " + std::to_string(main_gpu_layers) + ")");
+                        " [30% of outer, optimized for response analysis], gpu_layers: " + std::to_string(outer_gpu_layers) + ")");
         
         if (status_callback) status_callback("Loading emotion model: " + emotion_model_path, false);
         
@@ -525,7 +525,7 @@ private:
             ModelConfig config;
             config.model_path = emotion_model_path;
             config.context_size = emotion_context_size;
-            config.gpu_layers = main_gpu_layers;
+            config.gpu_layers = outer_gpu_layers;
             
             if (!llama_manager->LoadModel(emotion_model_id, config)) {
                 LogError("Failed to load emotion model: " + emotion_model_path);

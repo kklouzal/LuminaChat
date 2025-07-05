@@ -8,9 +8,8 @@
 #include <wx/checkbox.h>
 #include <wx/sizer.h>
 #include <wx/scrolwin.h>
-#include "ContextPruningPlugin.hpp"
-
-class SettingsManager; // Forward declaration
+#include "../ContextPruningPlugin.hpp"
+#include "../../SettingsManager.hpp"
 
 class ContextPruningPluginUI : public wxEvtHandler {
 public:
