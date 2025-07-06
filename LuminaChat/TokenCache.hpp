@@ -564,7 +564,7 @@ public:
     void ResizeCache(size_t new_max_size) {
         std::unique_lock<std::shared_mutex> lock(cache_mutex);
         LOG_TokenCache("Resizing high-performance cache: " + std::to_string(max_cache_size.load()) + 
-                      " → " + std::to_string(new_max_size) + " entries");
+                      " -> " + std::to_string(new_max_size) + " entries");
         
         max_cache_size.store(new_max_size, std::memory_order_relaxed);
         cleanup_threshold.store(static_cast<size_t>(new_max_size * 0.8), std::memory_order_relaxed);
@@ -657,7 +657,7 @@ public:
     // ULTRA-HIGH-PERFORMANCE CACHE OPERATIONS
     // ================================================================
     
-    // Primary text→tokens lookup with zero-allocation hash key and early atomic checks
+    // Primary text->tokens lookup with zero-allocation hash key and early atomic checks
     [[nodiscard]] std::optional<std::vector<int32_t>> GetTokensFromText(std::string_view text, bool add_special = true) const noexcept {
         // Quick atomic check - if cache is empty, no need to lock
         if (current_cache_size.load(std::memory_order_acquire) == 0) [[unlikely]] {
@@ -685,7 +685,7 @@ public:
         return std::nullopt;
     }
     
-    // Reverse tokens→text lookup using cached hash with early atomic checks
+    // Reverse tokens->text lookup using cached hash with early atomic checks
     [[nodiscard]] std::optional<std::string> GetTextFromTokens(const std::vector<int32_t>& tokens) const noexcept {
         if (tokens.empty()) [[unlikely]] {
             return std::nullopt;

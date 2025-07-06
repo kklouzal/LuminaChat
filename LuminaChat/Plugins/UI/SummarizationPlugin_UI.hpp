@@ -158,7 +158,7 @@ inline void SummarizationPluginUI::UpdateDebugInfo(LuminaChat::SummarizationPlug
         for (const auto& entry : log_history) {
             log_text += entry + "\n";
         }
-        summary_log_output_text->SetValue(log_text);
+        summary_log_output_text->SetValue(wxString::FromUTF8(log_text));
         
         // Scroll to bottom
         summary_log_output_text->SetInsertionPointEnd();
@@ -171,9 +171,9 @@ inline void SummarizationPluginUI::UpdateDebugInfo(LuminaChat::SummarizationPlug
             std::string gen_text = "Timestamp: " + last_gen.timestamp + "\n\n";
             gen_text += "Input:\n" + last_gen.input + "\n\n";
             gen_text += "Output:\n" + last_gen.output;
-            summary_last_generation_text->SetValue(gen_text);
+            summary_last_generation_text->SetValue(wxString::FromUTF8(gen_text));
         } else {
-            summary_last_generation_text->SetValue("No generation recorded yet.");
+            summary_last_generation_text->SetValue(wxString::FromUTF8("No generation recorded yet."));
         }
     }
 }

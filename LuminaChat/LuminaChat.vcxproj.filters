@@ -13,47 +13,98 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <Filter Include="Header Files\Context">
+      <UniqueIdentifier>{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\Plugins">
+      <UniqueIdentifier>{83C3F6C1-8B4A-11D0-8D11-00A0C91BC942}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\Plugins\UI">
+      <UniqueIdentifier>{84C3F6C1-8B4A-11D0-8D11-00A0C91BC942}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\UI">
+      <UniqueIdentifier>{85C3F6C1-8B4A-11D0-8D11-00A0C91BC942}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="rework\LuminaChat.cpp">
+    <ClCompile Include="LuminaChat.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="rework\ChatTemplateManager.hpp">
+    <ClInclude Include="ChatTemplateManager.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="rework\ContextInfo.hpp">
+    <ClInclude Include="Context\BatchManager.hpp">
+      <Filter>Header Files\Context</Filter>
+    </ClInclude>
+    <ClInclude Include="Context\ContextInfo.hpp">
+      <Filter>Header Files\Context</Filter>
+    </ClInclude>
+    <ClInclude Include="Context\ContextIO.hpp">
+      <Filter>Header Files\Context</Filter>
+    </ClInclude>
+    <ClInclude Include="Context\ContextState.hpp">
+      <Filter>Header Files\Context</Filter>
+    </ClInclude>
+    <ClInclude Include="ContextStats.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="rework\ContextPruningPlugin.hpp">
+    <ClInclude Include="DiscordManager.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="rework\DiscordManager.hpp">
+    <ClInclude Include="LlamaManager.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="rework\LlamaManager.hpp">
+    <ClInclude Include="Logger.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="rework\Logger.hpp">
+    <ClInclude Include="ModelInfo.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="rework\ModelInfo.hpp">
+    <ClInclude Include="Orchestrator.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="rework\Orchestrator.hpp">
+    <ClInclude Include="Plugins\ContextPruningPlugin.hpp">
+      <Filter>Header Files\Plugins</Filter>
+    </ClInclude>
+    <ClInclude Include="Plugins\EmoTagPlugin.hpp">
+      <Filter>Header Files\Plugins</Filter>
+    </ClInclude>
+    <ClInclude Include="Plugins\SummarizationPlugin.hpp">
+      <Filter>Header Files\Plugins</Filter>
+    </ClInclude>
+    <ClInclude Include="Plugins\UI\ContextPruningPlugin_UI.hpp">
+      <Filter>Header Files\Plugins\UI</Filter>
+    </ClInclude>
+    <ClInclude Include="Plugins\UI\EmoTagPlugin_UI.hpp">
+      <Filter>Header Files\Plugins\UI</Filter>
+    </ClInclude>
+    <ClInclude Include="Plugins\UI\SummarizationPlugin_UI.hpp">
+      <Filter>Header Files\Plugins\UI</Filter>
+    </ClInclude>
+    <ClInclude Include="ProcessingPipeline.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="rework\ProcessingPipeline.hpp">
+    <ClInclude Include="Sanitizer.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="rework\Sanitizer.hpp">
+    <ClInclude Include="SettingsManager.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="rework\SettingsManager.hpp">
+    <ClInclude Include="TokenCache.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="rework\TokenCache.hpp">
+    <ClInclude Include="UI\InnerVoice_UI.hpp">
+      <Filter>Header Files\UI</Filter>
+    </ClInclude>
+    <ClInclude Include="UI\OuterVoice_UI.hpp">
+      <Filter>Header Files\UI</Filter>
+    </ClInclude>
+    <ClInclude Include="UI\Settings_UI.hpp">
+      <Filter>Header Files\UI</Filter>
+    </ClInclude>
+    <ClInclude Include="Utilities.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

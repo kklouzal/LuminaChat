@@ -22,17 +22,17 @@ class ContextInfo;
  * Settings UI Manager - Handles general application settings UI
  * 
  * Responsibilities:
- * - Model configuration UI (path, context size, GPU layers)
+ * - Central model loading coordination (reads from individual voice tabs)
  * - Template configuration UI (environment, identity, system prompt)
  * - Settings loading/saving to SettingsManager for general settings
- * - Model loading coordination
+ * - Application startup and model loading orchestration
  * - UI state management and validation
  */
 class SettingsUI {
 public:
     // Callback types for communication with main frame
     using LogCallback = std::function<void(const std::string&)>;
-    using ModelLoadCallback = std::function<void(const std::string&, int, int)>;
+    using LoadModelsCallback = std::function<void()>;
     using ContextApplyCallback = std::function<void(ContextInfo*, const std::string&)>;
 
     explicit SettingsUI(wxWindow* parent);
@@ -44,7 +44,7 @@ public:
     // External dependencies injection
     void SetSettingsManager(SettingsManager* settings_manager);
     void SetLlamaManager(LlamaManager* llama_manager);
-    void SetCallbacks(LogCallback log_cb, ModelLoadCallback model_load_cb, ContextApplyCallback context_apply_cb);
+    void SetCallbacks(LogCallback log_cb, LoadModelsCallback load_models_cb, ContextApplyCallback context_apply_cb);
 
     // Settings persistence
     void LoadSettings();
@@ -59,32 +59,20 @@ public:
     // Template settings access for context application
     std::string GetEnvironmentDescription() const;
     std::string GetIdentityDirective() const;
-    std::string GetSystemPrompt() const;
-
-    // Model configuration access
-    std::string GetModelPath() const;
-    int GetContextSize() const;
-    int GetGPULayers() const;
 
 private:
     // UI Components - General Settings
     wxPanel* settings_panel{nullptr};
     wxScrolledWindow* scrolled_window{nullptr};
 
-    // Model Configuration
-    wxTextCtrl* model_path_text{nullptr};
-    wxButton* browse_model_button{nullptr};
-    wxSlider* context_size_slider{nullptr};
-    wxStaticText* context_size_label{nullptr};
-    wxSlider* gpu_layers_slider{nullptr};
-    wxStaticText* gpu_layers_label{nullptr};
-    wxButton* load_model_button{nullptr};
+    // Central Model Loading
+    wxButton* load_models_button{nullptr};
     wxGauge* model_progress{nullptr};
+    wxStaticText* status_text{nullptr};
 
     // Template Configuration
     wxTextCtrl* environment_description_text{nullptr};
     wxTextCtrl* identity_directive_text{nullptr};
-    wxTextCtrl* system_prompt_text{nullptr};
 
     // External dependencies
     wxWindow* parent_window{nullptr};
@@ -93,45 +81,33 @@ private:
 
     // Callbacks
     LogCallback log_callback;
-    ModelLoadCallback model_load_callback;
+    LoadModelsCallback load_models_callback;
     ContextApplyCallback context_apply_callback;
 
     // State tracking
-    bool model_loaded{false};
-    bool model_loading{false};
-    std::string current_model_id{"main_model"};
+    bool models_loaded{false};
+    bool models_loading{false};
 
     // UI Creation methods
-    void CreateModelConfigurationSection(wxBoxSizer* main_sizer);
+    void CreateModelLoadingSection(wxBoxSizer* main_sizer);
     void CreateTemplateConfigurationSection(wxBoxSizer* main_sizer);
     
     // Event handlers
-    void OnBrowseModel(wxCommandEvent& event);
-    void OnLoadModel(wxCommandEvent& event);
-    void OnContextSizeChange(wxCommandEvent& event);
-    void OnGPULayersChange(wxCommandEvent& event);
-    void OnModelPathChange(wxCommandEvent& event);
+    void OnLoadModels(wxCommandEvent& event);
     void OnEnvironmentDescriptionFocusLost(wxFocusEvent& event);
     void OnIdentityDirectiveFocusLost(wxFocusEvent& event);
-    void OnSystemPromptFocusLost(wxFocusEvent& event);
 
     // Helper methods
     void LogMessage(const std::string& message);
-    void SetupSliderEvents();
-    void SetupTextEvents();
-    void ValidateModelConfiguration();
-    void UpdateSliderLabels();
+    void SetupEvents();
     
     // Settings helpers
-    void LoadModelSettings();
     void LoadTemplateSettings();
-    void SaveModelSettings();
     void SaveTemplateSettings();
 
     // Constants for IDs
     enum {
-        ID_BrowseModel = 20001,
-        ID_LoadModel = 20002
+        ID_LoadModels = 20001
     };
 };
 
@@ -160,7 +136,7 @@ inline wxPanel* SettingsUI::CreatePanel() {
     wxBoxSizer* main_sizer = new wxBoxSizer(wxVERTICAL);
 
     // Create configuration sections
-    CreateModelConfigurationSection(main_sizer);
+    CreateModelLoadingSection(main_sizer);
     CreateTemplateConfigurationSection(main_sizer);
     
     // Add stretch spacer
@@ -174,54 +150,29 @@ inline wxPanel* SettingsUI::CreatePanel() {
     settings_panel->SetSizer(panel_sizer);
 
     // Setup event handlers
-    SetupSliderEvents();
-    SetupTextEvents();
+    SetupEvents();
 
     return settings_panel;
 }
 
-inline void SettingsUI::CreateModelConfigurationSection(wxBoxSizer* main_sizer) {
-    // Model configuration group
-    wxStaticBoxSizer* model_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Unified Model Configuration");
+inline void SettingsUI::CreateModelLoadingSection(wxBoxSizer* main_sizer) {
+    // Central model loading group
+    wxStaticBoxSizer* loading_box = new wxStaticBoxSizer(wxVERTICAL, scrolled_window, "Model Loading");
     
-    // Model path selection
-    wxBoxSizer* path_sizer = new wxBoxSizer(wxHORIZONTAL);
-    path_sizer->Add(new wxStaticText(scrolled_window, wxID_ANY, "Model Path:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-    model_path_text = new wxTextCtrl(scrolled_window, wxID_ANY);
-    path_sizer->Add(model_path_text, 1, wxEXPAND | wxALL, 5);
-    browse_model_button = new wxButton(scrolled_window, ID_BrowseModel, "Browse...");
-    path_sizer->Add(browse_model_button, 0, wxALL, 5);
-    model_box->Add(path_sizer, 0, wxEXPAND);
-
-    // Context size control
-    wxBoxSizer* context_sizer = new wxBoxSizer(wxHORIZONTAL);
-    context_sizer->Add(new wxStaticText(scrolled_window, wxID_ANY, "Context Size:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-    context_size_slider = new wxSlider(scrolled_window, wxID_ANY, 4096, 512, 32768, 
-                                      wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL | wxSL_LABELS);
-    context_sizer->Add(context_size_slider, 1, wxEXPAND | wxALL, 5);
-    context_size_label = new wxStaticText(scrolled_window, wxID_ANY, "4096");
-    context_sizer->Add(context_size_label, 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-    model_box->Add(context_sizer, 0, wxEXPAND);
-
-    // GPU layers control
-    wxBoxSizer* gpu_sizer = new wxBoxSizer(wxHORIZONTAL);
-    gpu_sizer->Add(new wxStaticText(scrolled_window, wxID_ANY, "GPU Layers:"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-    gpu_layers_slider = new wxSlider(scrolled_window, wxID_ANY, 999, 0, 999, 
-                                    wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL | wxSL_LABELS);
-    gpu_sizer->Add(gpu_layers_slider, 1, wxEXPAND | wxALL, 5);
-    gpu_layers_label = new wxStaticText(scrolled_window, wxID_ANY, "999");
-    gpu_sizer->Add(gpu_layers_label, 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
-    model_box->Add(gpu_sizer, 0, wxEXPAND);
-
+    // Status text
+    status_text = new wxStaticText(scrolled_window, wxID_ANY, "Ready to load models from individual voice configurations");
+    loading_box->Add(status_text, 0, wxEXPAND | wxALL, 5);
+    
     // Load button and progress
     wxBoxSizer* load_sizer = new wxBoxSizer(wxHORIZONTAL);
-    load_model_button = new wxButton(scrolled_window, ID_LoadModel, "Load Model");
-    load_sizer->Add(load_model_button, 0, wxALL, 5);
+    load_models_button = new wxButton(scrolled_window, ID_LoadModels, "Load All Models");
+    load_models_button->SetToolTip("Load all models based on configurations from Outer Voice and Inner Voice tabs");
+    load_sizer->Add(load_models_button, 0, wxALL, 5);
     model_progress = new wxGauge(scrolled_window, wxID_ANY, 100);
     load_sizer->Add(model_progress, 1, wxEXPAND | wxALL, 5);
-    model_box->Add(load_sizer, 0, wxEXPAND);
+    loading_box->Add(load_sizer, 0, wxEXPAND);
 
-    main_sizer->Add(model_box, 0, wxEXPAND | wxALL, 5);
+    main_sizer->Add(loading_box, 0, wxEXPAND | wxALL, 5);
 }
 
 inline void SettingsUI::CreateTemplateConfigurationSection(wxBoxSizer* main_sizer) {
@@ -244,44 +195,18 @@ inline void SettingsUI::CreateTemplateConfigurationSection(wxBoxSizer* main_size
     identity_directive_text->SetToolTip("Define the AI's core identity and behavioral guidelines. This will be used in template variable replacement for identity-related sections.");
     template_box->Add(identity_directive_text, 0, wxEXPAND | wxALL, 5);
 
-    // System Prompt
-    template_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "System Prompt:"), 0, wxALL, 5);
-    system_prompt_text = new wxTextCtrl(scrolled_window, wxID_ANY, wxEmptyString,
-                                       wxDefaultPosition, wxSize(-1, 120),
-                                       wxTE_MULTILINE | wxTE_WORDWRAP);
-    system_prompt_text->SetToolTip("Define the system-level instructions and context. This will be used in template variable replacement for system prompt sections.");
-    template_box->Add(system_prompt_text, 0, wxEXPAND | wxALL, 5);
-
     main_sizer->Add(template_box, 0, wxEXPAND | wxALL, 5);
 }
 
-inline void SettingsUI::SetupSliderEvents() {
-    if (context_size_slider) {
-        context_size_slider->Bind(wxEVT_SLIDER, &SettingsUI::OnContextSizeChange, this);
+inline void SettingsUI::SetupEvents() {
+    if (load_models_button) {
+        load_models_button->Bind(wxEVT_COMMAND_BUTTON_CLICKED, &SettingsUI::OnLoadModels, this);
     }
-    if (gpu_layers_slider) {
-        gpu_layers_slider->Bind(wxEVT_SLIDER, &SettingsUI::OnGPULayersChange, this);
-    }
-    if (browse_model_button) {
-        browse_model_button->Bind(wxEVT_COMMAND_BUTTON_CLICKED, &SettingsUI::OnBrowseModel, this);
-    }
-    if (load_model_button) {
-        load_model_button->Bind(wxEVT_COMMAND_BUTTON_CLICKED, &SettingsUI::OnLoadModel, this);
-    }
-    if (model_path_text) {
-        model_path_text->Bind(wxEVT_TEXT, &SettingsUI::OnModelPathChange, this);
-    }
-}
-
-inline void SettingsUI::SetupTextEvents() {
     if (environment_description_text) {
         environment_description_text->Bind(wxEVT_KILL_FOCUS, &SettingsUI::OnEnvironmentDescriptionFocusLost, this);
     }
     if (identity_directive_text) {
         identity_directive_text->Bind(wxEVT_KILL_FOCUS, &SettingsUI::OnIdentityDirectiveFocusLost, this);
-    }
-    if (system_prompt_text) {
-        system_prompt_text->Bind(wxEVT_KILL_FOCUS, &SettingsUI::OnSystemPromptFocusLost, this);
     }
 }
 
@@ -294,9 +219,9 @@ inline void SettingsUI::SetLlamaManager(LlamaManager* llama_manager) {
     this->llama_manager = llama_manager;
 }
 
-inline void SettingsUI::SetCallbacks(LogCallback log_cb, ModelLoadCallback model_load_cb, ContextApplyCallback context_apply_cb) {
+inline void SettingsUI::SetCallbacks(LogCallback log_cb, LoadModelsCallback load_models_cb, ContextApplyCallback context_apply_cb) {
     log_callback = log_cb;
-    model_load_callback = model_load_cb;
+    load_models_callback = load_models_cb;
     context_apply_callback = context_apply_cb;
 }
 
@@ -308,37 +233,9 @@ inline void SettingsUI::LoadSettings() {
     }
 
     LogMessage("Loading settings UI configuration...");
-    LoadModelSettings();
     LoadTemplateSettings();
     UpdateUI();
     LogMessage("Settings UI loaded successfully");
-}
-
-inline void SettingsUI::LoadModelSettings() {
-    if (!settings_manager) return;
-
-    // Load model path
-    if (model_path_text) {
-        std::string model_path = settings_manager->GetString("Models", "main_model_path", "");
-        model_path_text->SetValue(model_path);
-        if (!model_path.empty()) {
-            LogMessage("Loaded model path: " + model_path);
-        }
-    }
-
-    // Load context size
-    if (context_size_slider) {
-        int context_size = settings_manager->GetInt("Models", "main_context_size", 4096);
-        context_size_slider->SetValue(context_size);
-        LogMessage("Loaded context size: " + std::to_string(context_size));
-    }
-
-    // Load GPU layers
-    if (gpu_layers_slider) {
-        int gpu_layers = settings_manager->GetInt("Models", "main_gpu_layers", 999);
-        gpu_layers_slider->SetValue(gpu_layers);
-        LogMessage("Loaded GPU layers: " + std::to_string(gpu_layers));
-    }
 }
 
 inline void SettingsUI::LoadTemplateSettings() {
@@ -361,15 +258,6 @@ inline void SettingsUI::LoadTemplateSettings() {
             LogMessage("Loaded identity directive from settings");
         }
     }
-
-    // Load system prompt
-    if (system_prompt_text) {
-        std::string system_prompt = settings_manager->GetString("Templates", "system_prompt", "");
-        system_prompt_text->SetValue(system_prompt);
-        if (!system_prompt.empty()) {
-            LogMessage("Loaded system prompt from settings");
-        }
-    }
 }
 
 inline void SettingsUI::SaveSettings() {
@@ -379,32 +267,9 @@ inline void SettingsUI::SaveSettings() {
     }
 
     LogMessage("Saving settings UI configuration...");
-    SaveModelSettings();
     SaveTemplateSettings();
     settings_manager->SaveSettings();
     LogMessage("Settings UI saved successfully");
-}
-
-inline void SettingsUI::SaveModelSettings() {
-    if (!settings_manager) return;
-
-    // Save model path
-    if (model_path_text) {
-        std::string model_path = model_path_text->GetValue().ToStdString();
-        settings_manager->SetString("Models", "main_model_path", model_path);
-    }
-
-    // Save context size
-    if (context_size_slider) {
-        int context_size = context_size_slider->GetValue();
-        settings_manager->SetInt("Models", "main_context_size", context_size);
-    }
-
-    // Save GPU layers
-    if (gpu_layers_slider) {
-        int gpu_layers = gpu_layers_slider->GetValue();
-        settings_manager->SetInt("Models", "main_gpu_layers", gpu_layers);
-    }
 }
 
 inline void SettingsUI::SaveTemplateSettings() {
@@ -421,41 +286,32 @@ inline void SettingsUI::SaveTemplateSettings() {
         std::string identity = identity_directive_text->GetValue().ToStdString();
         settings_manager->SetString("Templates", "identity_directive", identity);
     }
-
-    // Save system prompt
-    if (system_prompt_text) {
-        std::string system_prompt = system_prompt_text->GetValue().ToStdString();
-        settings_manager->SetString("Templates", "system_prompt", system_prompt);
-    }
 }
 
 // UI state management
 inline void SettingsUI::UpdateUI() {
-    UpdateSliderLabels();
-    ValidateModelConfiguration();
-}
-
-inline void SettingsUI::UpdateSliderLabels() {
-    if (context_size_label && context_size_slider) {
-        context_size_label->SetLabel(wxString::Format("%d", context_size_slider->GetValue()));
-    }
-    if (gpu_layers_label && gpu_layers_slider) {
-        gpu_layers_label->SetLabel(wxString::Format("%d", gpu_layers_slider->GetValue()));
-    }
-}
-
-inline void SettingsUI::ValidateModelConfiguration() {
-    if (load_model_button && model_path_text) {
-        bool has_model_path = !model_path_text->GetValue().IsEmpty();
-        
-        if (model_loading) {
-            // During loading, show as "Loading..." and keep enabled for potential cancellation
-            load_model_button->SetLabel("Loading Model...");
-            load_model_button->Enable(false); // Disable for now, could add cancellation later
+    // Update button state based on loading status
+    if (load_models_button) {
+        if (models_loading) {
+            load_models_button->SetLabel("Loading Models...");
+            load_models_button->Enable(false);
+        } else if (models_loaded) {
+            load_models_button->SetLabel("Models Loaded");
+            load_models_button->Enable(false);
         } else {
-            // Normal state - show "Load Model" and enable based on path availability
-            load_model_button->SetLabel("Load Model");
-            load_model_button->Enable(has_model_path);
+            load_models_button->SetLabel("Load All Models");
+            load_models_button->Enable(true);
+        }
+    }
+    
+    // Update status text
+    if (status_text) {
+        if (models_loading) {
+            status_text->SetLabel("Loading models from voice configurations...");
+        } else if (models_loaded) {
+            status_text->SetLabel("All models loaded successfully");
+        } else {
+            status_text->SetLabel("Ready to load models from individual voice configurations");
         }
     }
 }
@@ -467,12 +323,12 @@ inline void SettingsUI::UpdateModelProgress(int progress) {
 }
 
 inline void SettingsUI::SetModelLoadingState(bool loading) {
-    model_loading = loading;
+    models_loading = loading;
     UpdateUI();
 }
 
 inline void SettingsUI::SetModelLoadedState(bool loaded) {
-    model_loaded = loaded;
+    models_loaded = loaded;
     UpdateUI();
 }
 
@@ -491,85 +347,12 @@ inline std::string SettingsUI::GetIdentityDirective() const {
     return "";
 }
 
-inline std::string SettingsUI::GetSystemPrompt() const {
-    if (system_prompt_text) {
-        return system_prompt_text->GetValue().ToStdString();
-    }
-    return "";
-}
-
-// Model configuration access
-inline std::string SettingsUI::GetModelPath() const {
-    if (model_path_text) {
-        return model_path_text->GetValue().ToStdString();
-    }
-    return "";
-}
-
-inline int SettingsUI::GetContextSize() const {
-    if (context_size_slider) {
-        return context_size_slider->GetValue();
-    }
-    return 4096; // Default fallback
-}
-
-inline int SettingsUI::GetGPULayers() const {
-    if (gpu_layers_slider) {
-        return gpu_layers_slider->GetValue();
-    }
-    return 999; // Default fallback
-}
-
 // Event handlers
-inline void SettingsUI::OnBrowseModel(wxCommandEvent& event) {
-    wxFileDialog openFileDialog(parent_window, "Choose Model File", "", "",
-                               "GGUF files (*.gguf)|*.gguf|All files (*.*)|*.*",
-                               wxFD_OPEN | wxFD_FILE_MUST_EXIST);
-
-    if (openFileDialog.ShowModal() == wxID_CANCEL) {
-        return;
+inline void SettingsUI::OnLoadModels(wxCommandEvent& event) {
+    if (load_models_callback) {
+        LogMessage("Initiating load of all models from voice configurations...");
+        load_models_callback();
     }
-
-    wxString path = openFileDialog.GetPath();
-    if (model_path_text) {
-        model_path_text->SetValue(path);
-        OnModelPathChange(event); // Trigger save
-    }
-    
-    LogMessage("Selected model file: " + path.ToStdString());
-}
-
-inline void SettingsUI::OnLoadModel(wxCommandEvent& event) {
-    if (model_load_callback) {
-        std::string model_path = model_path_text ? model_path_text->GetValue().ToStdString() : "";
-        int context_size = context_size_slider ? context_size_slider->GetValue() : 4096;
-        int gpu_layers = gpu_layers_slider ? gpu_layers_slider->GetValue() : 999;
-        model_load_callback(model_path, context_size, gpu_layers);
-    }
-}
-
-inline void SettingsUI::OnContextSizeChange(wxCommandEvent& event) {
-    UpdateUI();
-    if (settings_manager && context_size_slider) {
-        settings_manager->SetInt("Models", "main_context_size", context_size_slider->GetValue());
-        settings_manager->SaveSettings();
-    }
-}
-
-inline void SettingsUI::OnGPULayersChange(wxCommandEvent& event) {
-    UpdateUI();
-    if (settings_manager && gpu_layers_slider) {
-        settings_manager->SetInt("Models", "main_gpu_layers", gpu_layers_slider->GetValue());
-        settings_manager->SaveSettings();
-    }
-}
-
-inline void SettingsUI::OnModelPathChange(wxCommandEvent& event) {
-    if (settings_manager && model_path_text) {
-        settings_manager->SetString("Models", "main_model_path", model_path_text->GetValue().ToStdString());
-        // Note: Don't auto-save on every keystroke for performance
-    }
-    UpdateUI();
 }
 
 // Event handlers
@@ -584,14 +367,6 @@ inline void SettingsUI::OnEnvironmentDescriptionFocusLost(wxFocusEvent& event) {
 inline void SettingsUI::OnIdentityDirectiveFocusLost(wxFocusEvent& event) {
     if (settings_manager && identity_directive_text) {
         settings_manager->SetString("Templates", "identity_directive", identity_directive_text->GetValue().ToStdString());
-        settings_manager->SaveSettings();
-    }
-    event.Skip();
-}
-
-inline void SettingsUI::OnSystemPromptFocusLost(wxFocusEvent& event) {
-    if (settings_manager && system_prompt_text) {
-        settings_manager->SetString("Templates", "system_prompt", system_prompt_text->GetValue().ToStdString());
         settings_manager->SaveSettings();
     }
     event.Skip();

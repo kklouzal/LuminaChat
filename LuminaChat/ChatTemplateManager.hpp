@@ -15,9 +15,7 @@ enum class TemplateSection {
     IDENTITY_DIRECTIVE,
     SYSTEM_PROMPT,
     OLD_CHAT_SUMMARY,
-    PAST_SESSIONS,
     SUMMARY,
-    MOTIF_CONTEXT,
     INTERNAL_REFLECTION,
     EMOTIONAL_STATE
 };
@@ -57,7 +55,7 @@ struct TemplateVariable {
  * Chat Template Manager - Direct template building without legacy Jinja2 processing
  * 
  * This implementation uses direct string building for template rendering:
- * - Direct variable substitution for the 9 key variables only
+ * - Direct variable substitution for the 7 key variables only
  * - Proper conversation history formatting with exact role handling
  * - Conditional section rendering for optional content
  * - No artificial processing or message echoing
@@ -65,8 +63,7 @@ struct TemplateVariable {
 class ChatTemplateManager {
 private:
     // Use array for better cache locality and faster access
-    std::array<TemplateVariable, 9> sections;
-    std::vector<std::string> past_sessions;
+    std::array<TemplateVariable, 7> sections;
     std::vector<std::string> summaries;
     
     // Enhanced caching system
@@ -79,11 +76,11 @@ private:
         "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"
     };
     
-    // Template section names for replacement - ONLY these 9 variables
-    static constexpr std::array<std::string_view, 9> section_names = {
+    // Template section names for replacement - ONLY these 7 variables
+    static constexpr std::array<std::string_view, 7> section_names = {
         "overarching_environment", "identity_directive", "system_prompt",
-        "old_chat_summary", "past_sessions", "summary", 
-        "motif_context", "internal_reflection", "emotional_state"
+        "old_chat_summary", "summary", 
+        "internal_reflection", "emotional_state"
     };
     
     // Compile-time constants for memory estimation
@@ -126,11 +123,6 @@ public:
     [[nodiscard]] std::string_view GetSection(TemplateSection section) const noexcept;
     [[nodiscard]] bool IsSectionActive(TemplateSection section) const noexcept;
     
-    // Special array section handling with move semantics
-    void AddPastSession(std::string memory);
-    void ClearPastSessions() noexcept;
-    [[nodiscard]] const std::vector<std::string>& GetPastSessions() const noexcept { return past_sessions; }
-    
     // Template rendering with message history - optimized version
     [[nodiscard]] const std::string& RenderTemplate(const std::vector<std::pair<std::string, std::string>>& messages);
     
@@ -148,8 +140,6 @@ public:
     void UpdateSummary(std::string_view summary);
     void UpdateOldChatSummary(std::string old_summary);
     void UpdateOldChatSummary(std::string_view old_summary);
-    void UpdateMotifContext(std::string motif);
-    void UpdateMotifContext(std::string_view motif);
     void UpdateInternalReflection(std::string reflection);
     void UpdateInternalReflection(std::string_view reflection);
     void UpdateEmotionalState(std::string emotional_state);
@@ -178,13 +168,6 @@ public:
             if (!content.empty()) [[likely]] {  // Active sections usually have content
                 hash ^= std::hash<std::string>{}(content) + hash_multiplier + (hash << 6) + (hash >> 2);
             }
-        }
-    }
-    
-    // Hash past sessions with branch prediction
-    if (!past_sessions.empty()) [[unlikely]] {  // Past sessions less common
-        for (const auto& session : past_sessions) {
-            hash ^= std::hash<std::string>{}(session) + hash_multiplier + (hash << 6) + (hash >> 2);
         }
     }
     
@@ -224,11 +207,6 @@ public:
         }
     }
     
-    // Calculate past sessions size
-    for (const auto& session : past_sessions) {
-        total_size += session.size() + HEADER_OVERHEAD_PER_SECTION;
-    }
-    
     // Calculate summaries size
     size_t summaries_size = 0;
     for (const auto& summary : summaries) {
@@ -249,90 +227,92 @@ public:
     std::string result;
     result.reserve(total_size);
     
-    // Helper lambda for consistent section rendering - optimized with string_view
-    auto render_section = [&result](std::string_view header, std::string_view content) {
-        if (!content.empty()) [[likely]] {
-            result += "<|start_header_id|>";
-            result += header;
-            result += "<|end_header_id|>\n";
-            result += content;
-            result += "\n<|eot_id|>\n\n";
-        }
-    };
+    // Build single system message containing all sections
+    std::string system_content;
+    size_t system_size = 0;
     
-    // Render sections in order using array indexing for better performance
-    if (sections[0].active) [[unlikely]] { // OVERARCHING_ENVIRONMENT
-        render_section("environment", sections[0].content);
-    }
-    
-    if (sections[1].active) [[unlikely]] { // IDENTITY_DIRECTIVE
-        render_section("persona", sections[1].content);
-    }
-    
-    // Always add system message section
-    result += "<|start_header_id|>system<|end_header_id|>\n";
-    if (sections[2].active) [[likely]] { // SYSTEM_PROMPT - most common active section
-        result += sections[2].content;
-    }
-    result += "\n<|eot_id|>\n\n";
-    
-    // Past sessions
-    if (!past_sessions.empty()) [[unlikely]] {
-        for (size_t i = 0; i < past_sessions.size(); ++i) {
-            render_section("memory_" + std::to_string(i + 1), past_sessions[i]);
+    // Pre-calculate system content size
+    for (size_t i = 0; i < sections.size(); ++i) {
+        if (sections[i].active && !sections[i].content.empty()) {
+            system_size += sections[i].content.size() + 20; // padding for section labels
         }
     }
+    for (const auto& summary : summaries) {
+        system_size += summary.size() + 10; // padding for separators
+    }
     
-    // Combined summaries optimization
-    if (sections[3].active || sections[5].active || !summaries.empty()) [[unlikely]] { // OLD_CHAT_SUMMARY, SUMMARY, or summaries vector
+    system_content.reserve(system_size);
+    
+    // Add sections to system content in logical order
+    if (sections[0].active && !sections[0].content.empty()) { // OVERARCHING_ENVIRONMENT
+        if (!system_content.empty()) system_content += "\n\n";
+        system_content += "###THE ENVIRONMENT###\n";
+        system_content += sections[0].content;
+    }
+    
+    if (sections[1].active && !sections[1].content.empty()) { // IDENTITY_DIRECTIVE
+        if (!system_content.empty()) system_content += "\n\n";
+        system_content += "###YOUR PERSONA/IDENTITY###\n";
+        system_content += sections[1].content;
+    }
+    
+    if (sections[5].active && !sections[5].content.empty()) { // INTERNAL_REFLECTION
+        if (!system_content.empty()) system_content += "\n\n";
+        system_content += "###YOUR INTERNAL THOUGHTS AND REASONING###\n";
+        system_content += sections[5].content;
+    }
+    
+    if (sections[2].active && !sections[2].content.empty()) { // SYSTEM_PROMPT
+        if (!system_content.empty()) system_content += "\n\n";
+        system_content += "###CORE DIRECTIVES###\n";
+        system_content += sections[2].content;
+    }
+    
+    // Combined summaries
+    if (sections[3].active || sections[4].active || !summaries.empty()) { // OLD_CHAT_SUMMARY, SUMMARY, or summaries vector
         std::string combined_summaries;
-        size_t combined_size = 0;
         
-        // Pre-calculate combined size
-        if (sections[3].active) [[unlikely]] combined_size += sections[3].content.size();
-        if (sections[5].active) [[unlikely]] combined_size += sections[5].content.size();
-        for (const auto& summary : summaries) {
-            combined_size += summary.size() + 2; // + separator
-        }
-        
-        combined_summaries.reserve(combined_size);
-        
-        // Build combined summaries
-        if (sections[3].active && !sections[3].content.empty()) [[unlikely]] {
+        if (sections[3].active && !sections[3].content.empty()) {
             combined_summaries += sections[3].content;
         }
         
         for (const auto& summary : summaries) {
-            if (!summary.empty()) [[likely]] {
-                if (!combined_summaries.empty()) [[likely]] {
+            if (!summary.empty()) {
+                if (!combined_summaries.empty()) {
                     combined_summaries += "\n\n";
                 }
                 combined_summaries += summary;
             }
         }
         
-        if (sections[5].active && !sections[5].content.empty()) [[unlikely]] {
-            if (!combined_summaries.empty()) [[likely]] {
+        if (sections[4].active && !sections[4].content.empty()) {
+            if (!combined_summaries.empty()) {
                 combined_summaries += "\n\n";
             }
-            combined_summaries += sections[5].content;
+            combined_summaries += sections[4].content;
         }
         
-        if (!combined_summaries.empty()) [[likely]] {
-            render_section("old_chat_summary", combined_summaries);
+        if (!combined_summaries.empty()) {
+            if (!system_content.empty()) system_content += "\n\n";
+            system_content += "###OLD CHAT HISTORY###\n";
+            system_content += combined_summaries;
         }
     }
     
-    // Other sections
-    if (sections[6].active) [[unlikely]] { // MOTIF_CONTEXT
-        render_section("motif", sections[6].content);
+    if (sections[6].active && !sections[6].content.empty()) { // EMOTIONAL_STATE
+        if (!system_content.empty()) system_content += "\n\n";
+        system_content += "###YOUR CURRENT EMOTIONAL STATE###\n";
+        system_content += sections[6].content;
     }
     
-    if (sections[7].active) [[unlikely]] { // INTERNAL_REFLECTION
-        render_section("internal", sections[7].content);
+    // Add the complete system message FIRST
+    if (!system_content.empty()) {
+        result += "<|start_header_id|>system<|end_header_id|>\n";
+        result += system_content;
+        result += "\n<|eot_id|>\n\n";
     }
     
-    // Add conversation history
+    // Add conversation history AFTER system message
     for (const auto& [role, content] : messages) {
         if (role == "assistant") [[likely]] { // Assistant messages more common in history
             result += "<|start_header_id|>assistant<|end_header_id|>\n";
@@ -348,10 +328,6 @@ public:
         }
     }
     
-    if (sections[8].active) [[unlikely]] { // EMOTIONAL_STATE
-        render_section("emotion", sections[8].content);
-    }
-    
     // Add final assistant turn marker
     result += "<|start_header_id|>assistant<|end_header_id|>\n";
     
@@ -365,7 +341,6 @@ inline ChatTemplateManager::ChatTemplateManager() {
     }
     
     // Reserve space for common use cases
-    past_sessions.reserve(8);
     summaries.reserve(8);
 }
 
@@ -440,21 +415,6 @@ inline bool ChatTemplateManager::IsSectionActive(TemplateSection section) const 
     return false;
 }
 
-inline void ChatTemplateManager::AddPastSession(std::string memory) {
-    // Fast validation check
-    if (!memory.empty() && HasReservedTokens(memory)) [[unlikely]] {
-        throw std::invalid_argument("AddPastSession: Memory content contains reserved template tokens");
-    }
-    
-    past_sessions.emplace_back(std::move(memory));
-    template_dirty = true;
-}
-
-inline void ChatTemplateManager::ClearPastSessions() noexcept {
-    past_sessions.clear();
-    template_dirty = true;
-}
-
 // Optimized template rendering with intelligent caching
 [[nodiscard]] inline const std::string& ChatTemplateManager::RenderTemplate(const std::vector<std::pair<std::string, std::string>>& messages) {
     // Fast input validation for messages
@@ -524,14 +484,6 @@ inline void ChatTemplateManager::UpdateOldChatSummary(std::string old_summary) {
 
 inline void ChatTemplateManager::UpdateOldChatSummary(std::string_view old_summary) {
     SetSection(TemplateSection::OLD_CHAT_SUMMARY, old_summary, !old_summary.empty());
-}
-
-inline void ChatTemplateManager::UpdateMotifContext(std::string motif) {
-    SetSection(TemplateSection::MOTIF_CONTEXT, std::move(motif), !motif.empty());
-}
-
-inline void ChatTemplateManager::UpdateMotifContext(std::string_view motif) {
-    SetSection(TemplateSection::MOTIF_CONTEXT, motif, !motif.empty());
 }
 
 inline void ChatTemplateManager::UpdateInternalReflection(std::string reflection) {

@@ -699,7 +699,7 @@ private:
                 // Multiple pairs - combine them
                 std::ostringstream final_stream;
                 for (size_t i = 0; i < pair_summaries.size(); ++i) {
-                    final_stream << "• " << pair_summaries[i] << "\n";
+                    final_stream << "* " << pair_summaries[i] << "\n";
                 }
                 final_summary = final_stream.str();
             }

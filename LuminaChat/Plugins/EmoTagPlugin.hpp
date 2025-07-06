@@ -262,7 +262,7 @@ public:
     PluginStats GetStats() const {
         std::string model_path = "";
         if (settings_manager) {
-            model_path = settings_manager->GetString("Models", "emotion_model_path", "");
+            model_path = settings_manager->GetString("Models", "emotag_model_path", "");
         }
         
         return {
@@ -496,7 +496,7 @@ private:
         if (status_callback) status_callback("Initializing emotion model...", false);
         
         // Get emotion model configuration from settings
-        std::string emotion_model_path = settings_manager->GetString("Models", "emotion_model_path", "");
+        std::string emotion_model_path = settings_manager->GetString("Models", "emotag_model_path", "");
         if (emotion_model_path.empty()) {
             LogWarning("No emotion model path configured - plugin will be disabled");
             if (status_callback) status_callback("No emotion model configured", true);

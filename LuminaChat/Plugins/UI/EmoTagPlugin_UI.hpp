@@ -200,12 +200,13 @@ inline void EmoTagPluginUI::UpdateDebugInfo(LuminaChat::EmoTagPlugin* plugin) {
         
         // Only update if content has actually changed
         wxString current_content = emotag_log_output_text->GetValue();
-        if (current_content != log_text) {
+        wxString new_log_text = wxString::FromUTF8(log_text);
+        if (current_content != new_log_text) {
             // Preserve scroll position
             long insertion_point = emotag_log_output_text->GetInsertionPoint();
             long scroll_pos = emotag_log_output_text->GetScrollPos(wxVERTICAL);
             
-            emotag_log_output_text->SetValue(log_text);
+            emotag_log_output_text->SetValue(new_log_text);
             
             // Restore scroll position if we weren't at the end
             if (insertion_point != current_content.length()) {
@@ -232,12 +233,13 @@ inline void EmoTagPluginUI::UpdateDebugInfo(LuminaChat::EmoTagPlugin* plugin) {
         
         // Only update if content has actually changed
         wxString current_content = emotag_last_generation_text->GetValue();
-        if (current_content != gen_text) {
+        wxString new_gen_text = wxString::FromUTF8(gen_text);
+        if (current_content != new_gen_text) {
             // Preserve scroll position
             long insertion_point = emotag_last_generation_text->GetInsertionPoint();
             long scroll_pos = emotag_last_generation_text->GetScrollPos(wxVERTICAL);
             
-            emotag_last_generation_text->SetValue(gen_text);
+            emotag_last_generation_text->SetValue(new_gen_text);
             
             // Restore scroll position if we weren't at the end
             if (insertion_point != current_content.length()) {

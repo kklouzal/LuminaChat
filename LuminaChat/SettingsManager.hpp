@@ -90,12 +90,26 @@ public:
     // Initialize the settings manager
     bool Initialize() {
         std::string default_path = GetSettingsFilePath();
-        if (!LoadSettings(default_path)) {
+        bool loaded_successfully = LoadSettings(default_path);
+        
+        if (!loaded_successfully) {
             // If loading failed, create with defaults and save
             LOG_SettingsManager("Creating new settings file with defaults");
             SetDefaults();
             return SaveSettings();
         }
+        
+        // Settings loaded successfully, now sanitize and validate
+        LOG_SettingsManager("Settings loaded, performing sanitization and validation...");
+        SanitizeSettings();      // Remove deprecated/unused settings
+        ValidateAndFixSettings(); // Fix invalid values
+        
+        // Save if sanitization/validation made changes
+        if (settings_dirty) {
+            LOG_SettingsManager("Saving sanitized settings...");
+            SaveSettings();
+        }
+        
         return true;
     }
 
@@ -455,5 +469,211 @@ private:
         }
         
         return result;
+    }
+
+    // Settings sanitization - remove deprecated/unused settings
+    void SanitizeSettings() {
+        std::lock_guard<std::mutex> lock(settings_mutex);
+        
+        LOG_SettingsManager("Starting settings sanitization...");
+        
+        // Define the current valid settings structure
+        static const std::unordered_map<std::string, std::vector<std::string>> VALID_SETTINGS = {
+            {"Models", {
+                // Current voice model settings
+                "outer_model_path", "inner_model_path", "summary_model_path",
+                "outer_context_size", "inner_context_size", "summary_context_size", 
+                "outer_gpu_layers", "inner_gpu_layers", "summary_gpu_layers",
+                "outer_system_prompt", "inner_system_prompt",
+                
+                // Legacy template configuration (kept for backwards compatibility)
+                "environment_description", "identity_directive", "system_prompt",
+                
+                // Plugin model paths
+                "emotag_model_path", "emotag_system_prompt", "emotag_analysis_window", "emotag_include_user"
+            }},
+            {"Templates", {
+                // Template configuration (new dedicated section)
+                "environment_description", "identity_directive", "system_prompt"
+            }},
+            {"Discord", {
+                "bot_token", "default_channel", "auto_respond", "history_backfill", "backfill_limit"
+            }},
+            {"UI", {
+                "theme", "window_width", "window_height", "auto_scroll"
+            }},
+            {"Logging", {
+                "level", "file_output", "file_path"
+            }},
+            {"Plugins", {
+                "sanitization", "summarization", "discord_channel_management", "history_backfill"
+            }},
+            {"Context", {
+                "prune_threshold", "prune_target", "auto_summarize"
+            }}
+        };
+        
+        bool settings_changed = false;
+        std::vector<std::string> removed_sections;
+        std::vector<std::pair<std::string, std::string>> removed_keys;
+        
+        // Check each section in the loaded settings
+        auto section_it = sections.begin();
+        while (section_it != sections.end()) {
+            const std::string& section_name = section_it->first;
+            auto& section = section_it->second;
+            
+            // Check if this section is valid
+            auto valid_section_it = VALID_SETTINGS.find(section_name);
+            if (valid_section_it == VALID_SETTINGS.end()) {
+                // This entire section is deprecated
+                LOG_SettingsManager("Removing deprecated section: [" + section_name + "]");
+                removed_sections.push_back(section_name);
+                section_it = sections.erase(section_it);
+                settings_changed = true;
+                continue;
+            }
+            
+            // Section is valid, check individual keys
+            const auto& valid_keys = valid_section_it->second;
+            auto key_it = section.keys.begin();
+            while (key_it != section.keys.end()) {
+                const std::string& key_name = key_it->first;
+                
+                // Check if this key is valid for this section
+                if (std::find(valid_keys.begin(), valid_keys.end(), key_name) == valid_keys.end()) {
+                    // This key is deprecated
+                    LOG_SettingsManager("Removing deprecated key: [" + section_name + "]." + key_name + " = '" + key_it->second + "'");
+                    removed_keys.emplace_back(section_name, key_name);
+                    key_it = section.keys.erase(key_it);
+                    settings_changed = true;
+                } else {
+                    ++key_it;
+                }
+            }
+            
+            ++section_it;
+        }
+        
+        // Log summary of sanitization
+        if (settings_changed) {
+            settings_dirty = true;
+            LOG_SettingsManager("Settings sanitization complete:");
+            LOG_SettingsManager("- Removed " + std::to_string(removed_sections.size()) + " deprecated sections");
+            LOG_SettingsManager("- Removed " + std::to_string(removed_keys.size()) + " deprecated keys");
+            
+            // Detailed logging of what was removed
+            for (const auto& section : removed_sections) {
+                LOG_SettingsManager("  Removed section: [" + section + "]");
+            }
+            for (const auto& key_pair : removed_keys) {
+                LOG_SettingsManager("  Removed key: [" + key_pair.first + "]." + key_pair.second);
+            }
+        } else {
+            LOG_SettingsManager("Settings sanitization complete - no deprecated settings found");
+        }
+    }
+    
+    // Validate setting values and fix any that are invalid
+    void ValidateAndFixSettings() {
+        std::lock_guard<std::mutex> lock(settings_mutex);
+        
+        LOG_SettingsManager("Starting settings validation...");
+        bool settings_changed = false;
+        
+        // Validate Models section
+        if (sections.find("Models") != sections.end()) {
+            auto& models_section = sections["Models"];
+            
+            // Validate context sizes
+            for (const std::string& context_key : {"outer_context_size", "inner_context_size", "summary_context_size"}) {
+                if (models_section.keys.find(context_key) != models_section.keys.end()) {
+                    try {
+                        int value = std::stoi(models_section.keys[context_key]);
+                        int clamped_value = std::clamp(value, MIN_CONTEXT_SIZE, MAX_CONTEXT_SIZE);
+                        if (value != clamped_value) {
+                            LOG_SettingsManager("Fixed invalid " + context_key + ": " + std::to_string(value) + " -> " + std::to_string(clamped_value));
+                            models_section.keys[context_key] = std::to_string(clamped_value);
+                            settings_changed = true;
+                        }
+                    } catch (...) {
+                        // Invalid value, set to default
+                        int default_value = (context_key == "summary_context_size") ? 4096 : 8192;
+                        LOG_SettingsManager("Fixed invalid " + context_key + ": non-numeric -> " + std::to_string(default_value));
+                        models_section.keys[context_key] = std::to_string(default_value);
+                        settings_changed = true;
+                    }
+                }
+            }
+            
+            // Validate GPU layers
+            for (const std::string& gpu_key : {"outer_gpu_layers", "inner_gpu_layers", "summary_gpu_layers"}) {
+                if (models_section.keys.find(gpu_key) != models_section.keys.end()) {
+                    try {
+                        int value = std::stoi(models_section.keys[gpu_key]);
+                        int clamped_value = std::clamp(value, MIN_GPU_LAYERS, MAX_GPU_LAYERS);
+                        if (value != clamped_value) {
+                            LOG_SettingsManager("Fixed invalid " + gpu_key + ": " + std::to_string(value) + " -> " + std::to_string(clamped_value));
+                            models_section.keys[gpu_key] = std::to_string(clamped_value);
+                            settings_changed = true;
+                        }
+                    } catch (...) {
+                        // Invalid value, set to default
+                        LOG_SettingsManager("Fixed invalid " + gpu_key + ": non-numeric -> 999");
+                        models_section.keys[gpu_key] = "999";
+                        settings_changed = true;
+                    }
+                }
+            }
+            
+            // Validate emotag analysis window (should be 1-10)
+            if (models_section.keys.find("emotag_analysis_window") != models_section.keys.end()) {
+                try {
+                    int value = std::stoi(models_section.keys["emotag_analysis_window"]);
+                    int clamped_value = std::clamp(value, 1, 10);
+                    if (value != clamped_value) {
+                        LOG_SettingsManager("Fixed invalid emotag_analysis_window: " + std::to_string(value) + " -> " + std::to_string(clamped_value));
+                        models_section.keys["emotag_analysis_window"] = std::to_string(clamped_value);
+                        settings_changed = true;
+                    }
+                } catch (...) {
+                    LOG_SettingsManager("Fixed invalid emotag_analysis_window: non-numeric -> 3");
+                    models_section.keys["emotag_analysis_window"] = "3";
+                    settings_changed = true;
+                }
+            }
+        }
+        
+        // Validate Context section
+        if (sections.find("Context") != sections.end()) {
+            auto& context_section = sections["Context"];
+            
+            // Validate threshold values (should be 0.0 to 1.0)
+            for (const std::string& threshold_key : {"prune_threshold", "prune_target"}) {
+                if (context_section.keys.find(threshold_key) != context_section.keys.end()) {
+                    try {
+                        float value = std::stof(context_section.keys[threshold_key]);
+                        float clamped_value = std::clamp(value, 0.0f, 1.0f);
+                        if (std::abs(value - clamped_value) > 0.001f) {
+                            LOG_SettingsManager("Fixed invalid " + threshold_key + ": " + std::to_string(value) + " -> " + std::to_string(clamped_value));
+                            context_section.keys[threshold_key] = std::to_string(clamped_value);
+                            settings_changed = true;
+                        }
+                    } catch (...) {
+                        float default_value = (threshold_key == "prune_threshold") ? 0.8f : 0.4f;
+                        LOG_SettingsManager("Fixed invalid " + threshold_key + ": non-numeric -> " + std::to_string(default_value));
+                        context_section.keys[threshold_key] = std::to_string(default_value);
+                        settings_changed = true;
+                    }
+                }
+            }
+        }
+        
+        if (settings_changed) {
+            settings_dirty = true;
+            LOG_SettingsManager("Settings validation complete - some values were corrected");
+        } else {
+            LOG_SettingsManager("Settings validation complete - all values are valid");
+        }
     }
 };

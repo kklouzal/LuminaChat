@@ -52,10 +52,14 @@ public:
     // UI state management
     void UpdateUI();
 
+    // Template display functionality for debugging
+    void UpdateTemplateDisplay(const std::string& template_content);
+
     // Inner Voice configuration access
     std::string GetModelPath() const;
     int GetContextSize() const;
     int GetGPULayers() const;
+    std::string GetSystemPrompt() const;
 
 private:
     // UI Components - Inner Voice Configuration
@@ -71,6 +75,16 @@ private:
     wxStaticText* context_size_label{nullptr};
     wxSlider* gpu_layers_slider{nullptr};
     wxStaticText* gpu_layers_label{nullptr};
+    
+    // System prompt configuration
+    wxTextCtrl* system_prompt_text{nullptr};
+
+    // Template display components for debugging
+    wxNotebook* inner_notebook{nullptr};
+    wxPanel* config_panel{nullptr};
+    wxPanel* template_panel{nullptr};
+    wxTextCtrl* template_display{nullptr};
+    std::string last_finalized_template;
 
     // External dependencies
     wxWindow* parent_window{nullptr};
@@ -86,12 +100,14 @@ private:
 
     // UI Creation methods
     void CreateInnerVoiceConfigurationSection(wxBoxSizer* main_sizer);
+    void CreateTemplateSection(wxPanel* parent, wxBoxSizer* main_sizer);
     
     // Event handlers
     void OnBrowseModel(wxCommandEvent& event);
     void OnContextSizeChange(wxCommandEvent& event);
     void OnGPULayersChange(wxCommandEvent& event);
     void OnModelPathChange(wxCommandEvent& event);
+    void OnSystemPromptFocusLost(wxFocusEvent& event);
 
     // Helper methods
     void LogMessage(const std::string& message);
@@ -120,23 +136,46 @@ inline InnerVoiceUI::InnerVoiceUI(wxWindow* parent)
 inline wxPanel* InnerVoiceUI::CreatePanel() {
     settings_panel = new wxPanel(parent_window);
     
-    // Create scrolled window for the settings
-    scrolled_window = new wxScrolledWindow(settings_panel, wxID_ANY);
+    // Create notebook for organizing content into tabs
+    inner_notebook = new wxNotebook(settings_panel, wxID_ANY);
+    
+    // Configuration tab
+    config_panel = new wxPanel(inner_notebook);
+    inner_notebook->AddPage(config_panel, "Configuration");
+    
+    // Create scrolled window for the configuration
+    scrolled_window = new wxScrolledWindow(config_panel, wxID_ANY);
     scrolled_window->SetScrollRate(5, 5);
+    scrolled_window->EnableScrolling(true, true);
+    scrolled_window->SetCanFocus(false); // Prevent scrolled window from stealing focus
     
     // Main vertical sizer for the scrolled content
-    wxBoxSizer* main_sizer = new wxBoxSizer(wxVERTICAL);
+    wxBoxSizer* config_sizer = new wxBoxSizer(wxVERTICAL);
     
-    // Create sections
-    CreateInnerVoiceConfigurationSection(main_sizer);
+    // Create configuration section
+    CreateInnerVoiceConfigurationSection(config_sizer);
     
     // Set up scrolled window
-    scrolled_window->SetSizer(main_sizer);
+    scrolled_window->SetSizer(config_sizer);
     scrolled_window->FitInside();
     
-    // Panel layout
+    // Config panel layout
+    wxBoxSizer* config_panel_sizer = new wxBoxSizer(wxVERTICAL);
+    config_panel_sizer->Add(scrolled_window, 1, wxEXPAND | wxALL, 5);
+    config_panel->SetSizer(config_panel_sizer);
+    
+    // Template Display tab
+    template_panel = new wxPanel(inner_notebook);
+    inner_notebook->AddPage(template_panel, "Template Display");
+    
+    // Template section sizer
+    wxBoxSizer* template_sizer = new wxBoxSizer(wxVERTICAL);
+    CreateTemplateSection(template_panel, template_sizer);
+    template_panel->SetSizer(template_sizer);
+    
+    // Main panel layout with notebook
     wxBoxSizer* panel_sizer = new wxBoxSizer(wxVERTICAL);
-    panel_sizer->Add(scrolled_window, 1, wxEXPAND | wxALL, 5);
+    panel_sizer->Add(inner_notebook, 1, wxEXPAND | wxALL, 5);
     settings_panel->SetSizer(panel_sizer);
     
     // Set up events
@@ -178,12 +217,57 @@ inline void InnerVoiceUI::CreateInnerVoiceConfigurationSection(wxBoxSizer* main_
     gpu_sizer->Add(gpu_layers_label, 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
     model_box->Add(gpu_sizer, 0, wxEXPAND);
 
+    // System prompt control
+    model_box->Add(new wxStaticText(scrolled_window, wxID_ANY, "Inner Voice System Prompt:"), 0, wxALL, 5);
+    system_prompt_text = new wxTextCtrl(scrolled_window, wxID_ANY, wxEmptyString,
+                                       wxDefaultPosition, wxSize(-1, 120),
+                                       wxTE_MULTILINE | wxTE_WORDWRAP | wxWANTS_CHARS);
+    system_prompt_text->SetToolTip("Define the system-level instructions and context specific to the Inner Voice. This will be used in template variable replacement for the inner voice system prompt sections.");
+    
+    // Ensure the text control can receive focus properly by binding mouse events
+    system_prompt_text->Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& event) {
+        if (system_prompt_text && !system_prompt_text->HasFocus()) {
+            system_prompt_text->SetFocus();
+        }
+        event.Skip(); // Allow normal processing
+    });
+    
+    model_box->Add(system_prompt_text, 0, wxEXPAND | wxALL, 5);
+
     // Add info text about unified model loading
     wxStaticText* info_text = new wxStaticText(scrolled_window, wxID_ANY, "Note: Use the \"Load Model\" button in the General Settings tab to load models.");
     info_text->SetForegroundColour(wxColour(100, 100, 100)); // Gray text
     model_box->Add(info_text, 0, wxEXPAND | wxALL, 5);
 
     main_sizer->Add(model_box, 0, wxEXPAND | wxALL, 5);
+}
+
+inline void InnerVoiceUI::CreateTemplateSection(wxPanel* parent, wxBoxSizer* main_sizer) {
+    // Template display (read-only monospace text control)
+    template_display = new wxTextCtrl(parent, wxID_ANY, wxEmptyString,
+                                     wxDefaultPosition, wxDefaultSize,
+                                     wxTE_READONLY | wxTE_MULTILINE | wxHSCROLL | wxVSCROLL);
+    template_display->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+    
+    // Initial explanatory text
+    template_display->SetValue(
+        "Inner Voice Template Display\n"
+        "============================\n\n"
+        "This displays the exact template sent to the Inner Voice AI model\n"
+        "during the two-stage reasoning process. The template includes:\n\n"
+        "* Environment description\n"
+        "* Identity directive\n"
+        "* System prompt\n"
+        "* Conversation history\n"
+        "* Template variables\n\n"
+        "The template will be updated automatically when you send a message\n"
+        "and the inner voice reasoning begins.\n\n"
+        "Use this to debug template processing and verify that variables\n"
+        "are being substituted correctly for the inner voice context."
+    );
+    
+    // Add to sizer - template display takes all available space
+    main_sizer->Add(template_display, 1, wxEXPAND | wxALL, 5);
 }
 
 inline void InnerVoiceUI::SetupSliderEvents() {
@@ -198,6 +282,9 @@ inline void InnerVoiceUI::SetupSliderEvents() {
     }
     if (model_path_text) {
         model_path_text->Bind(wxEVT_TEXT, &InnerVoiceUI::OnModelPathChange, this);
+    }
+    if (system_prompt_text) {
+        system_prompt_text->Bind(wxEVT_KILL_FOCUS, &InnerVoiceUI::OnSystemPromptFocusLost, this);
     }
 }
 
@@ -253,6 +340,15 @@ inline void InnerVoiceUI::LoadInnerVoiceSettings() {
         gpu_layers_slider->SetValue(gpu_layers);
         LogMessage("Loaded inner voice GPU layers: " + std::to_string(gpu_layers));
     }
+
+    // Load system prompt
+    if (system_prompt_text) {
+        std::string system_prompt = settings_manager->GetString("Models", "inner_system_prompt", "");
+        system_prompt_text->SetValue(system_prompt);
+        if (!system_prompt.empty()) {
+            LogMessage("Loaded inner voice system prompt");
+        }
+    }
 }
 
 inline void InnerVoiceUI::SaveSettings() {
@@ -287,6 +383,12 @@ inline void InnerVoiceUI::SaveInnerVoiceSettings() {
         int gpu_layers = gpu_layers_slider->GetValue();
         settings_manager->SetInt("Models", "inner_gpu_layers", gpu_layers);
     }
+
+    // Save system prompt
+    if (system_prompt_text) {
+        std::string system_prompt = system_prompt_text->GetValue().ToStdString();
+        settings_manager->SetString("Models", "inner_system_prompt", system_prompt);
+    }
 }
 
 // UI state management
@@ -309,6 +411,23 @@ inline void InnerVoiceUI::ValidateModelConfiguration() {
     // This method is kept for consistency and potential future use
 }
 
+// Template display functionality for debugging
+inline void InnerVoiceUI::UpdateTemplateDisplay(const std::string& template_content) {
+    if (template_display) {
+        // Try UTF-8 conversion first, fallback to default if it fails
+        wxString wx_content = wxString::FromUTF8(template_content);
+        if (wx_content.IsEmpty() && !template_content.empty()) {
+            // UTF-8 conversion failed, try default conversion
+            wx_content = wxString(template_content);
+            LogMessage("UTF-8 conversion failed for inner voice template, using default conversion");
+        }
+        template_display->SetValue(wx_content);
+        last_finalized_template = template_content; // Keep track of the last finalized template
+        LogMessage("Updated inner voice template display with " + std::to_string(template_content.length()) + " characters");
+    }
+    LogMessage("Template Content: " + template_content);
+}
+
 // Inner Voice configuration access
 inline std::string InnerVoiceUI::GetModelPath() const {
     if (model_path_text) {
@@ -329,6 +448,13 @@ inline int InnerVoiceUI::GetGPULayers() const {
         return gpu_layers_slider->GetValue();
     }
     return 999; // Default fallback
+}
+
+inline std::string InnerVoiceUI::GetSystemPrompt() const {
+    if (system_prompt_text) {
+        return system_prompt_text->GetValue().ToStdString();
+    }
+    return ""; // Default fallback
 }
 
 // Event handlers
@@ -372,6 +498,13 @@ inline void InnerVoiceUI::OnModelPathChange(wxCommandEvent& event) {
         // Note: Don't auto-save on every keystroke for performance
     }
     UpdateUI();
+}
+
+inline void InnerVoiceUI::OnSystemPromptFocusLost(wxFocusEvent& event) {
+    if (settings_manager && system_prompt_text) {
+        settings_manager->SetString("Models", "inner_system_prompt", system_prompt_text->GetValue().ToStdString());
+        settings_manager->SaveSettings();
+    }
 }
 
 // Helper methods

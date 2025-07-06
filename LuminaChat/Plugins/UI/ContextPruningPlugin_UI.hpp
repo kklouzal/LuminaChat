@@ -207,7 +207,7 @@ inline void ContextPruningPluginUI::UpdateDebugInfo(LuminaChat::ContextPruningPl
             stats.emergency_prunings_triggered,
             stats.plugin_ready ? "Yes" : "No"
         ).ToStdString();
-        statistics_text->SetValue(stats_text);
+        statistics_text->SetValue(wxString::FromUTF8(stats_text));
     }
     
     // Note: The plugin doesn't have a GetLogHistory method like the other plugins,

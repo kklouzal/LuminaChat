@@ -150,7 +150,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ChatTemplateManager.hpp" />
+    <ClInclude Include="Context\BatchManager.hpp" />
     <ClInclude Include="Context\ContextInfo.hpp" />
+    <ClInclude Include="Context\ContextIO.hpp" />
     <ClInclude Include="Context\ContextState.hpp" />
     <ClInclude Include="ContextStats.hpp" />
     <ClInclude Include="DiscordManager.hpp" />
@@ -161,10 +163,16 @@
     <ClInclude Include="Plugins\ContextPruningPlugin.hpp" />
     <ClInclude Include="Plugins\EmoTagPlugin.hpp" />
     <ClInclude Include="Plugins\SummarizationPlugin.hpp" />
+    <ClInclude Include="Plugins\UI\ContextPruningPlugin_UI.hpp" />
+    <ClInclude Include="Plugins\UI\EmoTagPlugin_UI.hpp" />
+    <ClInclude Include="Plugins\UI\SummarizationPlugin_UI.hpp" />
     <ClInclude Include="ProcessingPipeline.hpp" />
     <ClInclude Include="Sanitizer.hpp" />
     <ClInclude Include="SettingsManager.hpp" />
     <ClInclude Include="TokenCache.hpp" />
+    <ClInclude Include="UI\InnerVoice_UI.hpp" />
+    <ClInclude Include="UI\OuterVoice_UI.hpp" />
+    <ClInclude Include="UI\Settings_UI.hpp" />
     <ClInclude Include="Utilities.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

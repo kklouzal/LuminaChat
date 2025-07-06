@@ -228,7 +228,7 @@ struct ScheduledTask {
  * 
  * The Orchestrator serves as the central coordinator for all AI processing workflows,
  * implementing a plugin architecture that handles complex multi-step operations
- * through a consistent Request → Process → Callback pattern.
+ * through a consistent Request -> Process -> Callback pattern.
  * 
  * Key responsibilities:
  * - Message routing between UI/Discord and ContextInfo

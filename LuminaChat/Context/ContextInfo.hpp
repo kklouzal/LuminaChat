@@ -188,10 +188,8 @@ public:    // Constructor overloads
     template<typename String> void UpdateSystemPrompt(String&& system_msg) noexcept;
     template<typename String> void ApplySummary(String&& summary) noexcept;  // Updates template's summary section
     template<typename String> void UpdateOldChatSummary(String&& old_summary) noexcept; // For context pruning
-    template<typename String> void UpdateMotifContext(String&& motif) noexcept;
     template<typename String> void UpdateInternalReflection(String&& reflection) noexcept;
     template<typename String> void UpdateEmotionalState(String&& emotional_state) noexcept;
-    template<typename String> void AddPastSessionMemory(String&& memory) noexcept;
     
     // Context management
     bool RebuildContext();
@@ -546,16 +544,6 @@ template<typename String>
 }
 
 template<typename String>
-[[msvc::forceinline]] inline void ContextInfo::UpdateMotifContext(String&& motif) noexcept {
-    static_assert(std::is_convertible_v<std::decay_t<String>, std::string>, 
-                  "String parameter must be convertible to std::string");
-    template_manager->UpdateMotifContext(std::forward<String>(motif));
-    context_needs_rebuild.store(true, std::memory_order_relaxed);
-    template_dirty.store(true, std::memory_order_relaxed);
-    LOG_DEBUG_ContextInfo("Updated motif context");
-}
-
-template<typename String>
 [[msvc::forceinline]] inline void ContextInfo::UpdateInternalReflection(String&& reflection) noexcept {
     static_assert(std::is_convertible_v<std::decay_t<String>, std::string>, 
                   "String parameter must be convertible to std::string");
@@ -575,26 +563,59 @@ template<typename String>
     LOG_DEBUG_ContextInfo("Updated emotional state");
 }
 
-template<typename String>
-[[msvc::forceinline]] inline void ContextInfo::AddPastSessionMemory(String&& memory) noexcept {
-    static_assert(std::is_convertible_v<std::decay_t<String>, std::string>, 
-                  "String parameter must be convertible to std::string");
-    template_manager->AddPastSession(std::forward<String>(memory));
-    context_needs_rebuild.store(true, std::memory_order_relaxed);
-    template_dirty.store(true, std::memory_order_relaxed);
-    LOG_DEBUG_ContextInfo("Added past session memory");
-}
-
 [[msvc::forceinline]] inline std::string ContextInfo::BuildFullPrompt() noexcept {
     if (!template_manager) [[unlikely]] {
         LOG_ERROR_ContextInfo("Template manager not available");
         return "";
     }
     
-    // Render template with current message history
-    std::string rendered_prompt = template_manager->RenderTemplate(message_history);
+    // Check if this is the inner voice context - use special rendering for inner voice
+    std::string rendered_prompt;
+    if (context_id == "inner_context") {
+        // For inner voice: include the last 3 assistant responses and the most recent non-assistant message
+        std::vector<std::pair<std::string, std::string>> inner_voice_history;
+        if (!message_history.empty()) {
+            // First, find the most recent non-assistant message
+            std::pair<std::string, std::string> recent_non_assistant;
+            bool found_non_assistant = false;
+            for (auto it = message_history.rbegin(); it != message_history.rend(); ++it) {
+                if (it->first != "assistant") {
+                    recent_non_assistant = *it;
+                    found_non_assistant = true;
+                    break;
+                }
+            }
+            
+            // Then, collect the last 5 assistant responses (in reverse chronological order)
+            std::vector<std::pair<std::string, std::string>> assistant_responses;
+            for (auto it = message_history.rbegin(); it != message_history.rend() && assistant_responses.size() < 5; ++it) {
+                if (it->first == "assistant") {
+                    assistant_responses.push_back(*it);
+                }
+            }
+            
+            // Build the history in chronological order: [assistant 3, assistant 2, assistant 1, user 1]
+            // Reverse the assistant responses to get chronological order (oldest first)
+            std::reverse(assistant_responses.begin(), assistant_responses.end());
+            
+            // Add assistant responses first
+            for (const auto& response : assistant_responses) {
+                inner_voice_history.push_back(response);
+            }
+            
+            // Add the most recent non-assistant message last
+            if (found_non_assistant) {
+                inner_voice_history.push_back(recent_non_assistant);
+            }
+        }
+        rendered_prompt = template_manager->RenderTemplate(inner_voice_history);
+        LOG_DEBUG_ContextInfo("Built inner voice prompt with " + std::to_string(inner_voice_history.size()) + " messages (last 3 assistant + most recent non-assistant): " + std::to_string(rendered_prompt.length()) + " characters");
+    } else {
+        // For outer voice and other contexts: include full chat history
+        rendered_prompt = template_manager->RenderTemplate(message_history);
+        LOG_DEBUG_ContextInfo("Built full prompt: " + std::to_string(rendered_prompt.length()) + " characters");
+    }
     
-    LOG_DEBUG_ContextInfo("Built full prompt: " + std::to_string(rendered_prompt.length()) + " characters");
     return rendered_prompt;
 }
 

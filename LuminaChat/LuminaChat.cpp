@@ -33,6 +33,7 @@
 #include <wx/filedlg.h>
 #include <wx/event.h>
 #include <wx/scrolwin.h>
+#include <wx/splitter.h>
 
 // Include rework components in strict dependency order
 #include "Logger.hpp"
@@ -125,11 +126,10 @@ public:
     void OnClose(wxCloseEvent& event);
     void OnClearChat(wxCommandEvent& event);
     void OnClearLogs(wxCommandEvent& event);
-    void OnClearTemplate(wxCommandEvent& event);
     void OnLogLevelChanged(wxCommandEvent& event);
 
     // Settings UI integration
-    void OnLoadModelFromSettingsUI(const std::string& model_path, int context_size, int gpu_layers);
+    void OnLoadAllModelsFromVoiceSettings();
 
     // Core system lifecycle
     void Start();
@@ -143,13 +143,15 @@ public:
     // Template configuration helpers
     std::string GetEnvironmentDescriptionFromUI() const;
     std::string GetIdentityDirectiveFromUI() const;
-    std::string GetSystemPromptFromUI() const;
+    std::string GetOuterVoiceSystemPromptFromUI() const;
+    std::string GetInnerVoiceSystemPromptFromUI() const;
     void ApplyTemplateSettingsToContext(ContextInfo* context, const std::string& context_id);
 
     // Message generation helper methods
-    void CaptureTemplateForInspection(ContextInfo* context);
+    void CaptureTemplateForInspection(ContextInfo* context, const std::string& context_id = "");
     GenerationCallbacks CreateGenerationCallbacks();
     void ExecuteMessageGeneration(ContextInfo* context, const std::string& input, const GenerationCallbacks& callbacks);
+    void ExecuteTwoStageReasoning(ContextInfo* inner_context, ContextInfo* outer_context, const std::string& input);
     void HandleMessageGenerationError(const std::string& error_message);
 
     // Common UI helper methods
@@ -172,6 +174,10 @@ private:
     
     // Chat Panel
     wxPanel* chat_panel;
+    wxSplitterWindow* chat_splitter;  // Splitter for resizable layout
+    wxPanel* inner_voice_panel;       // Panel for inner voice section
+    wxPanel* main_chat_panel;         // Panel for main chat section
+    wxTextCtrl* inner_voice_display;  // New textbox for inner voice output
     wxRichTextCtrl* chat_display;
     wxTextCtrl* chat_input;
     wxButton* send_button;
@@ -191,11 +197,6 @@ private:
     wxTextCtrl* logs_display;
     wxButton* clear_logs_button;
     wxChoice* log_level_choice;
-    
-    // Template Panel
-    wxPanel* template_panel;
-    wxTextCtrl* template_display;
-    wxButton* clear_template_button;
     
     // Plugin UI Managers
     std::unique_ptr<SummarizationPluginUI> summarization_ui;
@@ -229,20 +230,22 @@ private:
     wxTimer* system_timer;
     
     // Current active context and model IDs
-    std::string current_context_id{"outer_chat"};
+    std::string current_context_id{"outer_context"};
     std::string current_model_id{"outer_model"};
     
     // Streaming state management
     std::atomic<bool> is_streaming{false};
     std::string current_assistant_message;
     long assistant_message_start_pos = -1;
-    std::string last_finalized_template;  // Store the last template for inspection
+    
+    // Inner voice streaming state management
+    std::atomic<bool> is_inner_voice_streaming{false};
+    std::string current_inner_voice_message;
     
     // UI creation methods
     void CreateChatPanel();
     void CreateDiscordPanel();
     void CreateLogsPanel();
-    void CreateTemplatePanel();
     
     // UI update methods
     void UpdateUI();
@@ -253,9 +256,15 @@ private:
     void AppendToStreamingMessage(const std::string& text);
     void ReplaceStreamingMessage(const std::string& text);  // Replace entire streaming content
     void EndStreamingMessage();
+    
+    // Inner voice streaming methods
+    void StartInnerVoiceStreaming();
+    void AppendToInnerVoiceStreaming(const std::string& text);
+    void ReplaceInnerVoiceStreaming(const std::string& text);
+    void EndInnerVoiceStreaming();
+    
     void SetGenerationUIState(bool generating);  // Enable/disable UI during generation
     void AddLogMessage(const std::string& message);
-    void UpdateTemplateDisplay(const std::string& template_content);  // Update template inspection tab
     void UpdateSummaryPluginStatus(const std::string& status, const wxColour& color = wxNullColour);  // Update summary plugin status
     void UpdateEmoTagPluginStatus(const std::string& status, const wxColour& color = wxNullColour);  // Update emotag plugin status
     void UpdateSummaryPluginDebugInfo();  // Update summary plugin debug textboxes
@@ -276,8 +285,7 @@ enum {
     ID_ConnectDiscord,
     ID_Timer,
     ID_ClearChat,
-    ID_ClearLogs,
-    ID_ClearTemplate
+    ID_ClearLogs
 };
 
 // Event table mapping
@@ -289,7 +297,6 @@ wxBEGIN_EVENT_TABLE(LuminaChatFrame, wxFrame)
     EVT_BUTTON(ID_ConnectDiscord, LuminaChatFrame::OnConnectDiscord)
     EVT_BUTTON(ID_ClearChat, LuminaChatFrame::OnClearChat)
     EVT_BUTTON(ID_ClearLogs, LuminaChatFrame::OnClearLogs)
-    EVT_BUTTON(ID_ClearTemplate, LuminaChatFrame::OnClearTemplate)
     EVT_TIMER(ID_Timer, LuminaChatFrame::OnTimer)
     EVT_CLOSE(LuminaChatFrame::OnClose)
 wxEND_EVENT_TABLE()
@@ -334,7 +341,6 @@ LuminaChatFrame::LuminaChatFrame()
     CreateChatPanel();
     CreateDiscordPanel();
     CreateLogsPanel();
-    CreateTemplatePanel();
     
     // Create Voice Settings UI managers
     outer_voice_ui = std::make_unique<OuterVoiceUI>(this);
@@ -381,37 +387,76 @@ void LuminaChatFrame::CreateChatPanel() {
     chat_panel = new wxPanel(notebook);
     notebook->AddPage(chat_panel, "Chat", true);
     
+    // Create splitter window for resizable layout
+    chat_splitter = new wxSplitterWindow(chat_panel, wxID_ANY, 
+                                        wxDefaultPosition, wxDefaultSize,
+                                        wxSP_3D | wxSP_LIVE_UPDATE);
+    chat_splitter->SetMinimumPaneSize(80);  // Minimum size for each pane
+    
+    // Create top panel for inner voice display
+    inner_voice_panel = new wxPanel(chat_splitter);
+    wxStaticText* inner_voice_label = new wxStaticText(inner_voice_panel, wxID_ANY, "Inner Voice Context (Real-time):");
+    inner_voice_label->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_BOLD));
+    
+    inner_voice_display = new wxTextCtrl(inner_voice_panel, wxID_ANY, wxEmptyString,
+                                        wxDefaultPosition, wxDefaultSize,
+                                        wxTE_READONLY | wxTE_MULTILINE | wxHSCROLL | wxVSCROLL);
+    inner_voice_display->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
+    inner_voice_display->SetBackgroundColour(wxColour(248, 248, 255)); // Light blue tint
+    inner_voice_display->SetValue("Inner voice output will appear here during generation...");
+    
+    // Layout for inner voice panel
+    wxBoxSizer* inner_voice_sizer = new wxBoxSizer(wxVERTICAL);
+    inner_voice_sizer->Add(inner_voice_label, 0, wxALL, 2);
+    inner_voice_sizer->Add(inner_voice_display, 1, wxEXPAND | wxALL, 5);
+    inner_voice_panel->SetSizer(inner_voice_sizer);
+    
+    // Create bottom panel for main chat and input
+    main_chat_panel = new wxPanel(chat_splitter);
+    
     // Chat display area
-    chat_display = new wxRichTextCtrl(chat_panel, wxID_ANY, wxEmptyString,
+    wxStaticText* chat_label = new wxStaticText(main_chat_panel, wxID_ANY, "Main Chat:");
+    chat_label->SetFont(wxFont(9, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_BOLD));
+    
+    chat_display = new wxRichTextCtrl(main_chat_panel, wxID_ANY, wxEmptyString,
                                       wxDefaultPosition, wxDefaultSize,
                                       wxRE_READONLY | wxRE_MULTILINE);
     chat_display->SetBackgroundColour(LuminaChatColors::BACKGROUND_LIGHT);
     
     // Input area
-    chat_input = new wxTextCtrl(chat_panel, wxID_ANY, wxEmptyString,
+    chat_input = new wxTextCtrl(main_chat_panel, wxID_ANY, wxEmptyString,
                                wxDefaultPosition, wxDefaultSize,
                                wxTE_PROCESS_ENTER | wxTE_MULTILINE);
     chat_input->SetMinSize(wxSize(-1, 80));
     
     // Control buttons
-    send_button = new wxButton(chat_panel, ID_Send, "Send");
-    stop_button = new wxButton(chat_panel, ID_Stop, "Stop");
+    send_button = new wxButton(main_chat_panel, ID_Send, "Send");
+    stop_button = new wxButton(main_chat_panel, ID_Stop, "Stop");
     stop_button->Enable(false);  // Initially disabled
-    clear_button = new wxButton(chat_panel, ID_ClearChat, "Clear");
+    clear_button = new wxButton(main_chat_panel, ID_ClearChat, "Clear");
     
-    // Layout
+    // Layout for control buttons
     wxBoxSizer* button_sizer = new wxBoxSizer(wxHORIZONTAL);
     button_sizer->Add(send_button, 0, wxALL, LuminaChatConstants::CONTROL_SPACING);
     button_sizer->Add(stop_button, 0, wxALL, LuminaChatConstants::CONTROL_SPACING);
     button_sizer->Add(clear_button, 0, wxALL, LuminaChatConstants::CONTROL_SPACING);
     button_sizer->AddStretchSpacer();
     
-    wxBoxSizer* chat_sizer = new wxBoxSizer(wxVERTICAL);
-    chat_sizer->Add(chat_display, 1, wxEXPAND | wxALL, 5);
-    chat_sizer->Add(chat_input, 0, wxEXPAND | wxALL, 5);
-    chat_sizer->Add(button_sizer, 0, wxEXPAND);
+    // Layout for main chat panel
+    wxBoxSizer* main_chat_sizer = new wxBoxSizer(wxVERTICAL);
+    main_chat_sizer->Add(chat_label, 0, wxALL, 2);
+    main_chat_sizer->Add(chat_display, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 5);
+    main_chat_sizer->Add(chat_input, 0, wxEXPAND | wxALL, 5);
+    main_chat_sizer->Add(button_sizer, 0, wxEXPAND);
+    main_chat_panel->SetSizer(main_chat_sizer);
     
-    chat_panel->SetSizer(chat_sizer);
+    // Set up the splitter window
+    chat_splitter->SplitHorizontally(inner_voice_panel, main_chat_panel, 150); // Initial split at 150 pixels for inner voice
+    
+    // Layout for the main chat panel
+    wxBoxSizer* chat_panel_sizer = new wxBoxSizer(wxVERTICAL);
+    chat_panel_sizer->Add(chat_splitter, 1, wxEXPAND);
+    chat_panel->SetSizer(chat_panel_sizer);
     
     // Bind enter key to send
     chat_input->Bind(wxEVT_TEXT_ENTER, &LuminaChatFrame::OnSendMessage, this);
@@ -511,37 +556,6 @@ void LuminaChatFrame::CreateLogsPanel() {
     logs_panel->SetSizer(logs_sizer);
 }
 
-void LuminaChatFrame::CreateTemplatePanel() {
-    template_panel = new wxPanel(notebook);
-    notebook->AddPage(template_panel, "Template");
-    
-    // Template display (read-only monospace text control)
-    template_display = new wxTextCtrl(template_panel, wxID_ANY, wxEmptyString,
-                                     wxDefaultPosition, wxDefaultSize,
-                                     wxTE_READONLY | wxTE_MULTILINE | wxHSCROLL | wxVSCROLL);
-    template_display->SetFont(wxFont(9, wxFONTFAMILY_TELETYPE, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL));
-    template_display->SetBackgroundColour(LuminaChatColors::TEMPLATE_BACKGROUND);
-    
-    // Initial text explaining the purpose
-    template_display->SetValue(
-        "Template Debugging Inspection\n"
-        "===================\n\n"
-    );
-    
-    // Clear button
-    wxBoxSizer* template_controls_sizer = new wxBoxSizer(wxHORIZONTAL);
-    template_controls_sizer->AddStretchSpacer();
-    clear_template_button = new wxButton(template_panel, ID_ClearTemplate, "Clear Template");
-    template_controls_sizer->Add(clear_template_button, 0, wxALL, 5);
-    
-    // Layout
-    wxBoxSizer* template_sizer = new wxBoxSizer(wxVERTICAL);
-    template_sizer->Add(template_display, 1, wxEXPAND | wxALL, 5);
-    template_sizer->Add(template_controls_sizer, 0, wxEXPAND);
-    
-    template_panel->SetSizer(template_sizer);
-}
-
 // === System Lifecycle Management ===
 
 /**
@@ -618,9 +632,7 @@ void LuminaChatFrame::Start() {
             settings_ui->SetSettingsManager(settings_manager.get());
             settings_ui->SetCallbacks(
                 [this](const std::string& msg) { AddLogMessage(msg); },
-                [this](const std::string& path, int ctx_size, int gpu_layers) { 
-                    OnLoadModelFromSettingsUI(path, ctx_size, gpu_layers); 
-                },
+                [this]() { OnLoadAllModelsFromVoiceSettings(); },
                 [this](ContextInfo* ctx, const std::string& id) { ApplyTemplateSettingsToContext(ctx, id); }
             );
             AddLogMessage("General Settings UI dependencies configured");
@@ -645,13 +657,13 @@ void LuminaChatFrame::Start() {
         LoadUISettings();
         
         // Note: Model loading is now unified in the General Settings tab
-        AddLogMessage("Ready for model loading - use General Settings tab to load model");
+        AddLogMessage("Ready for model loading - configure individual voice models in their respective tabs, then use General Settings to load all models");
         
         running = true;
         system_timer->Start(LuminaChatConstants::TIMER_INTERVAL_MS);
         
-        AddLogMessage("LuminaChat started successfully - model loading available in General Settings tab");
-        SetStatusText("System Ready - Use General Settings tab to load model", 0);
+        AddLogMessage("LuminaChat started successfully - configure voice models in individual tabs, then load via General Settings");
+        SetStatusText("System Ready - Configure voice models in individual tabs", 0);
         UpdateUI();
         
         // Set initial plugin status
@@ -771,13 +783,13 @@ void LuminaChatFrame::AddChatMessage(const std::string& sender, const std::strin
         chat_display->BeginTextColour(color);
     }
     chat_display->BeginBold();
-    chat_display->WriteText(sender + ": ");
+    chat_display->WriteText(wxString::FromUTF8(sender) + ": ");
     chat_display->EndBold();
     if (color.IsOk()) {
         chat_display->EndTextColour();
     }
     
-    chat_display->WriteText(message + "\n");
+    chat_display->WriteText(wxString::FromUTF8(message) + "\n");
     
     chat_display->EndSuppressUndo();
     chat_display->ScrollIntoView(chat_display->GetLastPosition(), WXK_DOWN);
@@ -785,7 +797,7 @@ void LuminaChatFrame::AddChatMessage(const std::string& sender, const std::strin
 
 void LuminaChatFrame::AddLogMessage(const std::string& message) {
     wxDateTime now = wxDateTime::Now();
-    wxString log_entry = wxString::Format("[%s] %s\n", now.Format("%Y-%m-%d %H:%M:%S"), message);
+    wxString log_entry = wxString::Format("[%s] %s\n", now.Format("%Y-%m-%d %H:%M:%S"), wxString::FromUTF8(message));
     
     logs_display->SetInsertionPointEnd();
     logs_display->WriteText(log_entry);
@@ -1078,25 +1090,25 @@ void LuminaChatFrame::OnExit(wxCommandEvent& event) {
 void LuminaChatFrame::OnAbout(wxCommandEvent& event) {
     wxMessageBox("LuminaChat - Clean Rework Architecture\n\n"
                  "Features:\n"
-                 "• Clean component hierarchy with no circular dependencies\n"
-                 "• Plugin architecture foundation for AI workflows\n"
-                 "• Dynamic chat template management\n"
-                 "• Discord bot integration with auto-response\n"
-                 "• Advanced context size management\n"
-                 "• Content sanitization and filtering\n"
-                 "• Performance-optimized token caching\n\n"
+                 "* Clean component hierarchy with no circular dependencies\n"
+                 "* Plugin architecture foundation for AI workflows\n"
+                 "* Dynamic chat template management\n"
+                 "* Discord bot integration with auto-response\n"
+                 "* Advanced context size management\n"
+                 "* Content sanitization and filtering\n"
+                 "* Performance-optimized token caching\n\n"
                  "Built with wxWidgets following the rework architecture principles.",
                  "About LuminaChat",
                  wxOK | wxICON_INFORMATION);
 }
 
 /**
- * Handle user message sending and AI response generation.
+ * Handle user message sending with two-stage reasoning process.
  * This method orchestrates the complete message flow:
  * 1. Validates system state and user input
- * 2. Prepares the generation context with template settings
- * 3. Captures template for debugging inspection
- * 4. Initiates streaming response generation
+ * 2. Stage 1: Inner voice generates reasoning/thoughts
+ * 3. Stage 2: Outer voice receives reasoning via UpdateReasoningThoughts
+ * 4. Stage 3: Outer voice generates final response with reasoning context
  * 5. Handles completion and error scenarios
  */
 void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
@@ -1117,43 +1129,80 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
         chat_input->Clear();
         AddChatMessage("You", input.ToStdString(), LuminaChatColors::SUCCESS_GREEN);
         
-        // Get and validate context
-        auto* context = llama_manager->GetContextInfo(current_context_id);
-        if (!context) {
-            LogAndDisplayError("Context not found: " + current_context_id, "Context not available");
+        // Get and validate both contexts
+        auto* inner_context = llama_manager->GetContextInfo("inner_context");
+        auto* outer_context = llama_manager->GetContextInfo("outer_context");
+        
+        // Detailed diagnostics for missing contexts
+        if (!inner_context || !outer_context) {
+            std::string missing = "";
+            std::string diagnostics = "Context availability check:\n";
+            
+            if (!inner_context) {
+                missing += "inner_context ";
+                diagnostics += "- Inner context: NOT FOUND\n";
+            } else {
+                diagnostics += "- Inner context: OK\n";
+            }
+            
+            if (!outer_context) {
+                missing += "outer_context ";
+                diagnostics += "- Outer context: NOT FOUND\n";
+            } else {
+                diagnostics += "- Outer context: OK\n";
+            }
+            
+            // Add model loading status
+            diagnostics += "Model loading status:\n";
+            diagnostics += "- model_loaded flag: " + std::string(model_loaded ? "true" : "false") + "\n";
+            diagnostics += "- model_loading flag: " + std::string(model_loading ? "true" : "false") + "\n";
+            
+            // Check if models are actually loaded
+            if (llama_manager) {
+                diagnostics += "- LlamaManager ready: " + std::string(llama_manager->IsReady() ? "true" : "false") + "\n";
+                
+                // Check if models exist
+                try {
+                    auto* outer_model = llama_manager->GetModelInfo("outer_model");
+                    auto* inner_model = llama_manager->GetModelInfo("inner_model");
+                    diagnostics += "- Outer model exists: " + std::string(outer_model ? "true" : "false") + "\n";
+                    diagnostics += "- Inner model exists: " + std::string(inner_model ? "true" : "false") + "\n";
+                } catch (...) {
+                    diagnostics += "- Unable to check model status\n";
+                }
+            }
+            
+            AddLogMessage(diagnostics);
+            LogAndDisplayError("Required contexts not found: " + missing, 
+                             "Required AI contexts not available. Please ensure you have:\n"
+                             "1. Configured model paths in Outer Voice and Inner Voice tabs\n"
+                             "2. Clicked 'Load All Models' in General Settings tab\n"
+                             "3. Waited for models to finish loading\n\n"
+                             "Check the System Logs tab for detailed diagnostics.");
             return;
         }
         
-        // Apply current template settings from UI before processing message
-        ApplyTemplateSettingsToContext(context, current_context_id);
-        AddLogMessage("Processing message with context: " + current_context_id);
+        // Apply template settings to both contexts
+        ApplyTemplateSettingsToContext(inner_context, "inner_context");
+        ApplyTemplateSettingsToContext(outer_context, "outer_context");
+        AddLogMessage("Processing message with two-stage reasoning: inner -> outer");
         
-        // Capture template for inspection
-        CaptureTemplateForInspection(context);
-        
-        // Create and execute generation request
-        auto callbacks = CreateGenerationCallbacks();
-        ExecuteMessageGeneration(context, input.ToStdString(), callbacks);
+        // Start the two-stage reasoning process
+        ExecuteTwoStageReasoning(inner_context, outer_context, input.ToStdString());
         
     } catch (const std::exception& e) {
         HandleMessageGenerationError(e.what());
     }
 }
 
-void LuminaChatFrame::OnLoadModelFromSettingsUI(const std::string& model_path, int context_size, int gpu_layers) {
-    if (!settings_ui || !llama_manager || !settings_manager) {
-        AddLogMessage("ERROR: Settings UI or required components not initialized");
-        return;
-    }
-
-    if (model_path.empty()) {
-        AddLogMessage("Please select a model file first");
-        AddChatMessage("System", "Please select a model file first", LuminaChatColors::WARNING_ORANGE);
+void LuminaChatFrame::OnLoadAllModelsFromVoiceSettings() {
+    if (!settings_ui || !llama_manager || !settings_manager || !outer_voice_ui || !inner_voice_ui) {
+        AddLogMessage("ERROR: Required UI components not initialized");
         return;
     }
     
     if (!running) {
-        AddLogMessage("Cannot load model: system not running");
+        AddLogMessage("Cannot load models: system not running");
         return;
     }
     
@@ -1166,39 +1215,102 @@ void LuminaChatFrame::OnLoadModelFromSettingsUI(const std::string& model_path, i
     model_loading = true;
     settings_ui->SetModelLoadingState(true);
     settings_ui->UpdateModelProgress(0);
-    SetStatusText("Starting model load...", 1);
+    SetStatusText("Starting model loading from voice configurations...", 1);
     
-    AddLogMessage(wxString::Format("Starting unified model loading: %s", model_path).ToStdString());
+    AddLogMessage("Starting model loading from individual voice configurations...");
     
-    // Create model config
-    ModelConfig config;
-    config.model_path = model_path;
-    config.context_size = context_size;
-    config.gpu_layers = gpu_layers;
+    // Get model configurations from individual voice tabs
+    std::string outer_model_path = outer_voice_ui->GetModelPath();
+    int outer_context_size = outer_voice_ui->GetContextSize();
+    int outer_gpu_layers = outer_voice_ui->GetGPULayers();
+    
+    std::string inner_model_path = inner_voice_ui->GetModelPath();
+    int inner_context_size = inner_voice_ui->GetContextSize();
+    int inner_gpu_layers = inner_voice_ui->GetGPULayers();
+    
+    // Validate that at least one model is configured
+    if (outer_model_path.empty() && inner_model_path.empty()) {
+        AddLogMessage("No models configured in voice settings");
+        AddChatMessage("System", "Please configure models in the Outer Voice or Inner Voice tabs first", LuminaChatColors::WARNING_ORANGE);
+        model_loading = false;
+        settings_ui->SetModelLoadingState(false);
+        return;
+    }
     
     // Start model loading in a detached background thread
-    std::thread([this, config]() {
-        bool success = false;
+    std::thread([this, outer_model_path, outer_context_size, outer_gpu_layers, 
+                inner_model_path, inner_context_size, inner_gpu_layers]() {
+        bool outer_success = false;
+        bool inner_success = false;
         std::string error_message;
+        int total_progress = 0;
         
         try {
-            // Double-check that we're still supposed to be loading
-            if (!model_loading.load()) {
-                return; // Loading was cancelled before we started
+            // Load outer voice model if configured
+            if (!outer_model_path.empty()) {
+                if (!model_loading.load()) return; // Check for cancellation
+                
+                AddLogMessage("Loading outer voice model: " + outer_model_path);
+                ModelConfig outer_config;
+                outer_config.model_path = outer_model_path;
+                outer_config.context_size = outer_context_size;
+                outer_config.gpu_layers = outer_gpu_layers;
+                
+                outer_success = llama_manager->LoadModel("outer_model", outer_config);
+                total_progress += 50; // 50% progress for first model
+                
+                CallAfter([this, total_progress]() {
+                    if (settings_ui) settings_ui->UpdateModelProgress(total_progress);
+                });
+                
+                if (outer_success) {
+                    AddLogMessage("Outer voice model loaded successfully");
+                    
+                    // Create outer context
+                    auto* outer_context = llama_manager->GetOrCreateContextInfo("outer_context", "outer_model", outer_context_size);
+                    if (outer_context) {
+                        ApplyTemplateSettingsToContext(outer_context, "outer_context");
+                        AddLogMessage("Outer voice context created and configured");
+                    }
+                } else {
+                    error_message += "Failed to load outer voice model. ";
+                }
             }
             
-            // Load model through LlamaManager (this is the blocking operation)
-            success = llama_manager->LoadModel(current_model_id, config);
-            
-            if (!success) {
-                error_message = "Failed to load model. Check the file path and try again.";
+            // Load inner voice model if configured
+            if (!inner_model_path.empty()) {
+                if (!model_loading.load()) return; // Check for cancellation
+                
+                AddLogMessage("Loading inner voice model: " + inner_model_path);
+                ModelConfig inner_config;
+                inner_config.model_path = inner_model_path;
+                inner_config.context_size = inner_context_size;
+                inner_config.gpu_layers = inner_gpu_layers;
+                
+                inner_success = llama_manager->LoadModel("inner_model", inner_config);
+                total_progress = 100; // Complete progress
+                
+                CallAfter([this, total_progress]() {
+                    if (settings_ui) settings_ui->UpdateModelProgress(total_progress);
+                });
+                
+                if (inner_success) {
+                    AddLogMessage("Inner voice model loaded successfully");
+                    
+                    // Create inner context
+                    auto* inner_context = llama_manager->GetOrCreateContextInfo("inner_context", "inner_model", inner_context_size);
+                    if (inner_context) {
+                        ApplyTemplateSettingsToContext(inner_context, "inner_context");
+                        AddLogMessage("Inner voice context created and configured");
+                    }
+                } else {
+                    error_message += "Failed to load inner voice model. ";
+                }
             }
             
         } catch (const std::exception& e) {
-            success = false;
-            error_message = "Error loading model: " + std::string(e.what());
+            error_message = "Error loading models: " + std::string(e.what());
         } catch (...) {
-            success = false;
             error_message = "Unknown error occurred during model loading";
         }
         
@@ -1208,36 +1320,35 @@ void LuminaChatFrame::OnLoadModelFromSettingsUI(const std::string& model_path, i
         }
         
         // Update UI on the main thread using CallAfter
-        CallAfter([this, success, error_message, config]() {
+        CallAfter([this, outer_success, inner_success, error_message]() {
             try {
-                if (success) {
+                bool any_success = outer_success || inner_success;
+                
+                if (any_success) {
                     model_loaded = true;
                     settings_ui->UpdateModelProgress(100);
-                    SetStatusText("Model Loaded", 1);
+                    settings_ui->SetModelLoadedState(true);
+                    SetStatusText("Models Loaded", 1);
                     
-                    // Create context with the configured size
-                    auto* context_info = llama_manager->GetOrCreateContextInfo(current_context_id, current_model_id, config.context_size);
+                    // Initialize plugins after successful model loading
+                    InitializePlugins();
                     
-                    if (context_info) {
-                        // Apply template settings from Settings UI
-                        ApplyTemplateSettingsToContext(context_info, current_context_id);
-                        AddLogMessage("Model loaded successfully from unified interface");
-                        
-                        // Initialize plugins after successful model loading
-                        InitializePlugins();
-                        
-                        ShowSuccessMessage("Model loaded and ready for conversation!");
-                    } else {
-                        AddLogMessage("ERROR: Failed to create context after model loading");
-                        ShowErrorMessage("Failed to create context after model loading");
-                        model_loaded = false;
+                    if (outer_success && inner_success) {
+                        ShowSuccessMessage("Both voice models loaded and ready!");
+                        AddLogMessage("All voice models loaded successfully");
+                    } else if (outer_success) {
+                        ShowSuccessMessage("Outer voice model loaded and ready!");
+                        AddLogMessage("Outer voice model loaded successfully");
+                    } else if (inner_success) {
+                        ShowSuccessMessage("Inner voice model loaded and ready!");
+                        AddLogMessage("Inner voice model loaded successfully");
                     }
                 } else {
                     model_loaded = false;
                     if (!error_message.empty()) {
                         LogAndDisplayError("Model loading failed: " + error_message, error_message);
                     } else {
-                        ShowErrorMessage("Failed to load model. Check the file path and try again.");
+                        ShowErrorMessage("Failed to load models. Check the file paths in voice settings.");
                     }
                 }
                 
@@ -1325,6 +1436,11 @@ void LuminaChatFrame::OnConnectDiscord(wxCommandEvent& event) {
 void LuminaChatFrame::OnClearChat(wxCommandEvent& event) {
     chat_display->Clear();
     
+    // Clear inner voice display as well
+    if (inner_voice_display) {
+        inner_voice_display->SetValue("Inner voice output will appear here during generation...");
+    }
+    
     // Also clear the context history to reset token count
     if (llama_manager && model_loaded) {
         auto* context = llama_manager->GetContextInfo(current_context_id);
@@ -1335,7 +1451,7 @@ void LuminaChatFrame::OnClearChat(wxCommandEvent& event) {
         }
     }
     
-    AddLogMessage("Chat display cleared");
+    AddLogMessage("Chat display and inner voice display cleared");
 }
 
 void LuminaChatFrame::OnClearLogs(wxCommandEvent& event) {
@@ -1380,7 +1496,7 @@ void LuminaChatFrame::StartStreamingMessage(const std::string& sender, const wxC
         chat_display->BeginTextColour(color);
     }
     chat_display->BeginBold();
-    chat_display->WriteText(sender + ": ");
+    chat_display->WriteText(wxString::FromUTF8(sender) + ": ");
     chat_display->EndBold();
     if (color.IsOk()) {
         chat_display->EndTextColour();
@@ -1401,7 +1517,7 @@ void LuminaChatFrame::AppendToStreamingMessage(const std::string& text) {
     
     chat_display->BeginSuppressUndo();
     chat_display->SetInsertionPointEnd();
-    chat_display->WriteText(text);
+    chat_display->WriteText(wxString::FromUTF8(text));
     chat_display->EndSuppressUndo();
     chat_display->ScrollIntoView(chat_display->GetLastPosition(), WXK_DOWN);
 }
@@ -1423,7 +1539,7 @@ void LuminaChatFrame::ReplaceStreamingMessage(const std::string& text) {
     // Select and replace the current streaming message content
     long current_end = chat_display->GetLastPosition();
     chat_display->SetSelection(assistant_message_start_pos, current_end);
-    chat_display->WriteText(text);
+    chat_display->WriteText(wxString::FromUTF8(text));
     
     chat_display->EndSuppressUndo();
     chat_display->ScrollIntoView(chat_display->GetLastPosition(), WXK_DOWN);
@@ -1452,6 +1568,63 @@ void LuminaChatFrame::EndStreamingMessage() {
     chat_input->SetFocus();
 }
 
+void LuminaChatFrame::StartInnerVoiceStreaming() {
+    is_inner_voice_streaming = true;
+    current_inner_voice_message.clear();
+    
+    if (inner_voice_display) {
+        inner_voice_display->SetValue("");
+    }
+}
+
+void LuminaChatFrame::AppendToInnerVoiceStreaming(const std::string& text) {
+    if (!is_inner_voice_streaming || !inner_voice_display) {
+        return;
+    }
+    
+    current_inner_voice_message += text;
+    
+    // Update the display by appending to the current content
+    wxString current_content = inner_voice_display->GetValue();
+    inner_voice_display->SetValue(current_content + wxString::FromUTF8(text));
+    
+    // Auto-scroll to the end to show the latest content
+    inner_voice_display->SetInsertionPointEnd();
+    inner_voice_display->ShowPosition(inner_voice_display->GetLastPosition());
+}
+
+void LuminaChatFrame::ReplaceInnerVoiceStreaming(const std::string& text) {
+    if (!is_inner_voice_streaming || !inner_voice_display) {
+        return;
+    }
+    
+    current_inner_voice_message = text;
+    
+    // Replace the entire content with the new text
+    inner_voice_display->SetValue(wxString::FromUTF8(text));
+    
+    // Auto-scroll to the end
+    inner_voice_display->SetInsertionPointEnd();
+    inner_voice_display->ShowPosition(inner_voice_display->GetLastPosition());
+}
+
+void LuminaChatFrame::EndInnerVoiceStreaming() {
+    if (!is_inner_voice_streaming) {
+        return;
+    }
+    
+    is_inner_voice_streaming = false;
+    
+    if (inner_voice_display) {
+        // Add a final newline and completion message
+        wxString final_content = inner_voice_display->GetValue() + "\n";
+        inner_voice_display->SetValue(final_content);
+        inner_voice_display->SetInsertionPointEnd();
+    }
+    
+    current_inner_voice_message.clear();
+}
+
 void LuminaChatFrame::OnStopGeneration(wxCommandEvent& event) {
     if (!running || !llama_manager) {
         return;
@@ -1467,44 +1640,6 @@ void LuminaChatFrame::OnStopGeneration(wxCommandEvent& event) {
     } else {
         AddLogMessage("No active generation to stop");
     }
-}
-
-void LuminaChatFrame::UpdateTemplateDisplay(const std::string& template_content) {
-    last_finalized_template = template_content;
-    
-    // Create a comprehensive header for the template with debugging info
-    wxDateTime now = wxDateTime::Now();
-    
-    std::ostringstream display_stream;
-    display_stream << "=== FINALIZED CHAT TEMPLATE INSPECTION ===\n";
-    display_stream << "Generated: " << now.Format("%Y-%m-%d %H:%M:%S").ToStdString() << "\n";
-    display_stream << "Context ID: " << current_context_id << "\n";
-    display_stream << "Model ID: " << current_model_id << "\n";
-    display_stream << "Template Length: " << template_content.length() << " characters\n";
-    display_stream << "===========================================\n\n";
-    
-    // Show the actual template that was dynamically generated by ChatTemplateManager
-    display_stream << "TEMPLATE CONTENT (dynamically generated by ChatTemplateManager):\n";
-    display_stream << "--------------------------------------------------------------\n";
-    display_stream << template_content;
-    
-    template_display->SetValue(display_stream.str());
-    template_display->SetInsertionPoint(0);  // Scroll to top
-}
-
-void LuminaChatFrame::OnClearTemplate(wxCommandEvent& event) {
-    template_display->SetValue(
-        "Template Inspection\n"
-        "===================\n\n"
-        "This tab shows the exact finalized chat template that was sent to the AI\n"
-        "after all variable substitutions and processing has occurred.\n\n"
-        "The template will be updated each time you send a message to the AI.\n"
-        "Use this to debug template processing and verify that variables are\n"
-        "being substituted correctly.\n\n"
-        "Template content will appear here after sending your first message..."
-    );
-    last_finalized_template.clear();
-    AddLogMessage("Template display cleared");
 }
 
 void LuminaChatFrame::UpdateSummaryPluginStatus(const std::string& status, const wxColour& color) {
@@ -1546,9 +1681,16 @@ std::string LuminaChatFrame::GetIdentityDirectiveFromUI() const {
     return "";
 }
 
-std::string LuminaChatFrame::GetSystemPromptFromUI() const {
-    if (settings_ui) {
-        return settings_ui->GetSystemPrompt();
+std::string LuminaChatFrame::GetOuterVoiceSystemPromptFromUI() const {
+    if (outer_voice_ui) {
+        return outer_voice_ui->GetSystemPrompt();
+    }
+    return "";
+}
+
+std::string LuminaChatFrame::GetInnerVoiceSystemPromptFromUI() const {
+    if (inner_voice_ui) {
+        return inner_voice_ui->GetSystemPrompt();
     }
     return "";
 }
@@ -1567,7 +1709,20 @@ void LuminaChatFrame::ApplyTemplateSettingsToContext(ContextInfo* context, const
     
     std::string environment_description = GetEnvironmentDescriptionFromUI();
     std::string identity_directive = GetIdentityDirectiveFromUI();
-    std::string system_prompt = GetSystemPromptFromUI();
+    
+    // Get the appropriate system prompt based on context ID
+    std::string system_prompt;
+    if (context_id.find("outer") != std::string::npos) {
+        system_prompt = GetOuterVoiceSystemPromptFromUI();
+        AddLogMessage("Using Outer Voice system prompt for context: " + context_id);
+    } else if (context_id.find("inner") != std::string::npos) {
+        system_prompt = GetInnerVoiceSystemPromptFromUI();
+        AddLogMessage("Using Inner Voice system prompt for context: " + context_id);
+    } else {
+        // Default to outer voice for unspecified contexts
+        system_prompt = GetOuterVoiceSystemPromptFromUI();
+        AddLogMessage("Using default (Outer Voice) system prompt for context: " + context_id);
+    }
     
     if (!environment_description.empty()) {
         context->UpdateEnvironment(environment_description);
@@ -1731,14 +1886,25 @@ void LuminaChatFrame::SaveUISettings() {
 
 // === Message Generation Helper Methods ===
 
-void LuminaChatFrame::CaptureTemplateForInspection(ContextInfo* context) {
+void LuminaChatFrame::CaptureTemplateForInspection(ContextInfo* context, const std::string& context_id) {
     try {
         // Build the full prompt to capture the template after variable substitution
         std::string finalized_template = context->BuildFullPrompt();
         
-        // Update the template inspection tab with the finalized template
-        UpdateTemplateDisplay(finalized_template);
-        AddLogMessage("Template inspection updated with finalized template");
+        // Determine which voice UI should display the template
+        std::string actual_context_id = context_id.empty() ? current_context_id : context_id;
+        
+        if (actual_context_id == "inner_context" && inner_voice_ui) {
+            inner_voice_ui->UpdateTemplateDisplay(finalized_template);
+            AddLogMessage("Inner voice template inspection updated with finalized template");
+        } else if (actual_context_id == "outer_context" && outer_voice_ui) {
+            outer_voice_ui->UpdateTemplateDisplay(finalized_template);
+            AddLogMessage("Outer voice template inspection updated with finalized template");
+        } else {
+            // Fallback: try to determine from current state or log warning
+            std::string context_debug_info = "Cannot determine voice UI - actual_context_id: " + actual_context_id + ", current_context_id: " + current_context_id;
+            AddLogMessage("Warning: " + context_debug_info);
+        }
         
     } catch (const std::exception& template_e) {
         AddLogMessage("Warning: Could not capture template for inspection: " + std::string(template_e.what()));
@@ -1784,6 +1950,7 @@ GenerationCallbacks LuminaChatFrame::CreateGenerationCallbacks() {
                         auto* emotag_plugin = orchestrator->GetEmoTagPlugin();
                         if (context && emotag_plugin) {
                             emotag_plugin->RequestEmotionalAnalysis(current_context_id, context->GetMessageHistory());
+
                             AddLogMessage("Requested emotional analysis for context: " + current_context_id);
                             
                             // Immediately trigger processing of emotion analysis buffer
@@ -1836,6 +2003,113 @@ void LuminaChatFrame::ExecuteMessageGeneration(ContextInfo* context, const std::
         EndStreamingMessage();
         SetGenerationUIState(false);  // Re-enable UI on failure
         LogAndDisplayError("Failed to start async generation", "Failed to start response generation");
+    }
+}
+
+void LuminaChatFrame::ExecuteTwoStageReasoning(ContextInfo* inner_context, ContextInfo* outer_context, const std::string& input) {
+    // Set UI state for processing
+    SetGenerationUIState(true);
+    AddLogMessage("Starting two-stage reasoning process...");
+    
+    // CRITICAL: Share chat history between contexts so inner voice has the same context as outer voice
+    AddLogMessage("Synchronizing chat history between inner and outer voice contexts...");
+    const auto& outer_history = outer_context->GetMessageHistory();
+    
+    // Clear inner context history first to ensure clean state
+    inner_context->ClearMessageHistory();
+    
+    // Copy all historical messages from outer context to inner context
+    for (const auto& [role, content] : outer_history) {
+        inner_context->AddHistoricalMessage(role, content);
+    }
+    
+    AddLogMessage("Chat history synchronized: " + std::to_string(outer_history.size()) + " messages copied to inner voice context");
+    
+    // Start inner voice streaming display
+    StartInnerVoiceStreaming();
+    
+    // Stage 1: Generate inner voice reasoning (stream to inner voice display)
+    AddLogMessage("Stage 1: Inner voice reasoning...");
+    
+    // Create callbacks for inner voice (Stage 1) - stream to inner voice display
+    auto inner_callbacks = GenerationCallbacks(
+        // Token callback - stream to inner voice display
+        [this](const std::string& token) {
+            this->CallAfter([this, token]() {
+                AppendToInnerVoiceStreaming(token);
+            });
+        },
+        
+        // Completion callback for inner voice
+        [this, outer_context, input](const std::string& inner_response, bool success) {
+            this->CallAfter([this, outer_context, input, inner_response, success]() {
+                // End inner voice streaming
+                EndInnerVoiceStreaming();
+                
+                if (success && !inner_response.empty()) {
+                    AddLogMessage("Stage 1 Complete: Inner voice generated reasoning");
+                    AddLogMessage("Inner reasoning length: " + std::to_string(inner_response.length()) + " characters");
+                    
+                    // Stage 2: Update outer voice with reasoning thoughts
+                    AddLogMessage("Stage 2: Updating outer voice with internal reflection...");
+                    try {
+                        outer_context->UpdateInternalReflection(inner_response);
+                        AddLogMessage("Stage 2 Complete: Internal reflection updated in outer voice");
+                        
+                        // Stage 3: Generate final response with outer voice
+                        AddLogMessage("Stage 3: Generating final response with outer voice...");
+                        
+                        // Capture template for inspection (outer voice with reasoning)
+                        CaptureTemplateForInspection(outer_context, "outer_context");
+                        
+                        // Create callbacks for outer voice final response (with streaming)
+                        auto outer_callbacks = CreateGenerationCallbacks();
+                        
+                        // Start streaming message display for final response
+                        StartStreamingMessage("Assistant", LuminaChatColors::INFO_BLUE);
+                        
+                        // Generate final response with outer voice
+                        bool started = outer_context->HandleInputAsync(input, outer_callbacks, "user");
+                        if (!started) {
+                            EndStreamingMessage();
+                            SetGenerationUIState(false);
+                            LogAndDisplayError("Failed to start outer voice generation", "Failed to generate final response");
+                        }
+                        
+                    } catch (const std::exception& e) {
+                        SetGenerationUIState(false);
+                        LogAndDisplayError("Error in Stage 2: " + std::string(e.what()), "Error updating reasoning thoughts");
+                    }
+                    
+                } else {
+                    // Inner voice failed
+                    SetGenerationUIState(false);
+                    std::string error_msg = success ? "Inner voice generated empty response" : "Inner voice generation failed";
+                    LogAndDisplayError("Stage 1 Failed: " + error_msg, "Inner voice reasoning failed");
+                }
+            });
+        },
+        
+        // Error callback for inner voice
+        [this](const std::string& error_message) {
+            this->CallAfter([this, error_message]() {
+                // End inner voice streaming on error
+                EndInnerVoiceStreaming();
+                SetGenerationUIState(false);
+                LogAndDisplayError("Stage 1 Error: " + error_message, "Inner voice reasoning error: " + error_message);
+            });
+        }
+    );
+    
+    // Capture inner voice template for inspection before starting reasoning
+    CaptureTemplateForInspection(inner_context, "inner_context");
+    
+    // Start inner voice reasoning (Stage 1)
+    bool started = inner_context->HandleInputAsync(input, inner_callbacks, "user");
+    if (!started) {
+        EndInnerVoiceStreaming();  // End streaming if generation fails to start
+        SetGenerationUIState(false);
+        LogAndDisplayError("Failed to start inner voice reasoning", "Failed to start reasoning process");
     }
 }
 
