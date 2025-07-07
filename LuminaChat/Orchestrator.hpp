@@ -129,8 +129,13 @@ struct alignas(OrchestratorConstants::CACHE_LINE_SIZE) DiscordChannelRequest {
 struct alignas(OrchestratorConstants::CACHE_LINE_SIZE) DiscordChannelResponse {
     bool should_respond = true;
     std::string response_content;
+    std::string internal_reasoning = "";  // Inner voice reasoning/thoughts
     std::string target_channel;
     std::string error_message;
+    size_t context_current = 0;  // Current context usage
+    size_t context_maximum = 0;  // Maximum context size
+    std::string model_name = "";  // Which model was used
+    std::string processing_time = "";  // How long processing took
     
     // Move constructor for performance
     DiscordChannelResponse(DiscordChannelResponse&& other) noexcept = default;
@@ -268,6 +273,7 @@ private:
     
     // Callback registrations
     std::function<void(std::string_view, InputSource)> output_callback;
+    std::function<void(const DiscordChannelResponse&)> discord_response_callback;  // Enhanced Discord response
     std::atomic<bool> output_callback_registered{false};  // Lock-free callback availability check
     
     // Plugin processing functions
@@ -280,6 +286,11 @@ private:
                                      std::function<void(LuminaChat::EmotionAnalysisResponse)> callback);
     void ProcessDiscordChannelRequest(const DiscordChannelRequest& request,
                                     std::function<void(DiscordChannelResponse)> callback);
+    
+    // Discord two-stage reasoning implementation
+    void ExecuteDiscordTwoStageReasoning(ContextInfo* inner_context, ContextInfo* outer_context,
+                                       const std::string& input, const DiscordChannelRequest& request,
+                                       std::function<void(DiscordChannelResponse)> callback);
     
     // Internal helpers - optimized with string_view for hot paths
     [[nodiscard]] std::string GetSanitizedInput(std::string_view input, InputSource source);
@@ -305,6 +316,7 @@ public:
     
     // Callback registration (called by higher-level components)
     void RegisterOutputCallback(std::function<void(std::string_view, InputSource)>&& callback);
+    void RegisterDiscordResponseCallback(std::function<void(const DiscordChannelResponse&)>&& callback);
     
     // Core message routing - optimized with string_view for reduced copying
     void InputReceived(std::string_view input, std::string_view context_id, 
@@ -581,6 +593,11 @@ inline void Orchestrator::RegisterOutputCallback(std::function<void(std::string_
     LOG_Orchestrator("Output callback registered");
 }
 
+inline void Orchestrator::RegisterDiscordResponseCallback(std::function<void(const DiscordChannelResponse&)>&& callback) {
+    discord_response_callback = std::move(callback);
+    LOG_Orchestrator("Discord response callback registered");
+}
+
 inline void Orchestrator::InputReceived(std::string_view input, std::string_view context_id, 
                                        InputSource source, std::string_view username) {
     
@@ -696,8 +713,26 @@ inline void Orchestrator::OnRawDiscordMessage(std::string_view content,
     request.timestamp = std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
     
-    // Queue for processing through Discord channel pipeline
-    [[maybe_unused]] auto queue_result = discord_channel_pipeline.QueueRequest(std::move(request)); // Use move for efficiency
+    // Process request with response callback
+    ProcessDiscordChannelRequest(request, [this](const DiscordChannelResponse& response) {
+        // Send response back to Discord if we should respond and have a callback
+        if (response.should_respond && !response.response_content.empty() && discord_response_callback) {
+            LOG_Orchestrator("Sending Discord response to channel " + response.target_channel + ": " + 
+                           response.response_content.substr(0, 50) + "...");
+            discord_response_callback(response);
+        } else if (!response.should_respond) {
+            LOG_Orchestrator("Discord response suppressed for channel " + response.target_channel);
+        } else if (response.response_content.empty()) {
+            LOG_Orchestrator("Discord response empty for channel " + response.target_channel);
+        } else if (!discord_response_callback) {
+            LOG_ERROR_Orchestrator("Discord response callback not registered - cannot send response to channel " + response.target_channel);
+        }
+        
+        // Log any errors
+        if (!response.error_message.empty()) {
+            LOG_ERROR_Orchestrator("Discord processing error for channel " + response.target_channel + ": " + response.error_message);
+        }
+    });
     
     // Update statistics - lock-free atomic increment
     stats.discord_messages_handled.fetch_add(1, std::memory_order_relaxed);
@@ -831,19 +866,102 @@ inline void Orchestrator::ProcessDiscordChannelRequest(const DiscordChannelReque
     try {
     switch (request.request_type) {
         case DiscordChannelRequest::Type::INCOMING_MESSAGE: [[likely]] {
-                // Map channel to context (simple 1:1 mapping for now)
-                std::string context_id = "discord_" + request.channel_id;
+                // Create inner and outer context pairs for this channel
+                std::string inner_context_id = "inner_context_" + request.channel_id;
+                std::string outer_context_id = "outer_context_" + request.channel_id;
                 
-                // Process message through main workflow
-                InputReceived(request.content, context_id, InputSource::DISCORD, request.username);
+                // Get settings for context sizes
+                auto* settings = GetSettingsManager();
+                if (!settings) [[unlikely]] {
+                    LOG_ERROR_Orchestrator("SettingsManager not available for Discord message processing: " + request.channel_id);
+                    DiscordChannelResponse response;
+                    response.should_respond = false;
+                    response.response_content = "";
+                    response.target_channel = request.channel_id;
+                    response.error_message = "SettingsManager not available";
+                    callback(response);
+                    break;
+                }
                 
-                // For now, assume response should be sent
-                DiscordChannelResponse response;
-                response.should_respond = true;
-                response.response_content = ""; // Response handled by output callback
-                response.target_channel = request.channel_id;
-                response.error_message = "";
-                callback(response);
+                // Get context sizes for inner and outer voices
+                int32_t inner_context_size = settings->GetInt("Models", "inner_context_size", 4096);
+                int32_t outer_context_size = settings->GetInt("Models", "outer_context_size", 8192);
+                
+                // Create or get the context pairs
+                auto* inner_context = llama_manager->GetOrCreateContextInfo(inner_context_id, "inner_model", inner_context_size);
+                auto* outer_context = llama_manager->GetOrCreateContextInfo(outer_context_id, "outer_model", outer_context_size);
+                
+                if (!inner_context || !outer_context) [[unlikely]] {
+                    LOG_ERROR_Orchestrator("Failed to create context pairs for Discord channel: " + request.channel_id);
+                    DiscordChannelResponse response;
+                    response.should_respond = false;
+                    response.response_content = "";
+                    response.target_channel = request.channel_id;
+                    response.error_message = "Failed to create context pairs";
+                    callback(response);
+                    break;
+                }
+                
+                // Load and apply all template settings for Discord contexts (same as UI contexts)
+                
+                // 1. Environment Description - use the same rich environment as UI contexts
+                std::string environment_description = settings->GetString("Templates", "environment_description", "");
+                if (!environment_description.empty()) {
+                    inner_context->UpdateEnvironment(environment_description);
+                    outer_context->UpdateEnvironment(environment_description);
+                    LOG_DEBUG_Orchestrator("Applied environment description to Discord contexts for channel: " + request.channel_id);
+                } else {
+                    // Fallback to basic Discord channel info if no environment description set
+                    std::string fallback_environment = "Discord channel: " + request.channel_id;
+                    inner_context->UpdateEnvironment(fallback_environment);
+                    outer_context->UpdateEnvironment(fallback_environment);
+                    LOG_WARNING_Orchestrator("No environment description configured, using fallback for Discord channel: " + request.channel_id);
+                }
+                
+                // 2. Identity Directive - load from settings
+                std::string identity = settings->GetString("Templates", "identity_directive", "");
+                if (!identity.empty()) {
+                    inner_context->UpdateIdentity(identity);
+                    outer_context->UpdateIdentity(identity);
+                    LOG_DEBUG_Orchestrator("Applied identity directive to Discord contexts for channel: " + request.channel_id);
+                } else {
+                    LOG_WARNING_Orchestrator("No identity directive configured for Discord channel: " + request.channel_id);
+                }
+                
+                // 3. System Prompts - load context-specific prompts
+                std::string inner_system_prompt = settings->GetString("Models", "inner_system_prompt", "");
+                std::string outer_system_prompt = settings->GetString("Models", "outer_system_prompt", "");
+                
+                if (!inner_system_prompt.empty()) {
+                    inner_context->UpdateSystemPrompt(inner_system_prompt);
+                    LOG_DEBUG_Orchestrator("Applied inner system prompt to Discord context for channel: " + request.channel_id);
+                } else {
+                    LOG_WARNING_Orchestrator("No inner system prompt configured for Discord channel: " + request.channel_id);
+                }
+                
+                if (!outer_system_prompt.empty()) {
+                    outer_context->UpdateSystemPrompt(outer_system_prompt);
+                    LOG_DEBUG_Orchestrator("Applied outer system prompt to Discord context for channel: " + request.channel_id);
+                } else {
+                    LOG_WARNING_Orchestrator("No outer system prompt configured for Discord channel: " + request.channel_id);
+                }
+                
+                // Process message through two-stage reasoning
+                std::string sanitized_input = GetSanitizedInput(request.content, InputSource::DISCORD);
+                if (sanitized_input.empty()) [[unlikely]] {
+                    LOG_Orchestrator("Discord message blocked by sanitization for channel: " + request.channel_id);
+                    DiscordChannelResponse response;
+                    response.should_respond = false;
+                    response.response_content = "";
+                    response.target_channel = request.channel_id;
+                    response.error_message = "";
+                    callback(response);
+                    break;
+                }
+                
+                // Execute two-stage reasoning for Discord messages
+                ExecuteDiscordTwoStageReasoning(inner_context, outer_context, sanitized_input, request, callback);
+                
                 break;
             }
             
@@ -1092,3 +1210,157 @@ inline void Orchestrator::UpdateDiscordPresence() {
 }
 
 // CRITICAL: Some method definitions are located at the BOTTOM of individual plugin files to combat circular dependencies.
+
+inline void Orchestrator::ExecuteDiscordTwoStageReasoning(ContextInfo* inner_context, ContextInfo* outer_context,
+                                                         const std::string& input, const DiscordChannelRequest& request,
+                                                         std::function<void(DiscordChannelResponse)> callback) {
+    LOG_Orchestrator("Starting two-stage reasoning for Discord channel: " + request.channel_id);
+    
+    // Start timing for performance tracking
+    auto start_time = std::chrono::steady_clock::now();
+    
+    try {
+        // CRITICAL: Share chat history between contexts so inner voice has the same context as outer voice
+        LOG_Orchestrator("Synchronizing chat history between inner and outer voice contexts for channel: " + request.channel_id);
+        const auto& outer_history = outer_context->GetMessageHistory();
+        
+        // Clear inner context history first to ensure clean state
+        inner_context->ClearMessageHistory();
+        
+        // Copy all historical messages from outer context to inner context
+        for (const auto& [role, content] : outer_history) {
+            inner_context->AddHistoricalMessage(role, content);
+        }
+        
+        LOG_Orchestrator("Chat history synchronized for channel " + request.channel_id + ": " + 
+                        std::to_string(outer_history.size()) + " messages copied to inner voice context");
+        
+        // Stage 1: Generate inner voice reasoning
+        LOG_Orchestrator("Stage 1: Inner voice reasoning for Discord channel: " + request.channel_id);
+        
+        // Create callbacks for inner voice (Stage 1)
+        GenerationCallbacks inner_callbacks;
+        
+        // Completion callback for inner voice
+        inner_callbacks.on_complete = [this, outer_context, input, request, callback, start_time](const std::string& inner_response, bool success) {
+            if (success && !inner_response.empty()) {
+                LOG_Orchestrator("Stage 1 Complete: Inner voice generated reasoning for channel " + request.channel_id +
+                               " (length: " + std::to_string(inner_response.length()) + " characters)");
+                
+                // Stage 2: Update outer voice with reasoning thoughts
+                LOG_Orchestrator("Stage 2: Updating outer voice with internal reflection for channel: " + request.channel_id);
+                try {
+                    outer_context->UpdateInternalReflection(inner_response);
+                    LOG_Orchestrator("Stage 2 Complete: Internal reflection updated in outer voice for channel: " + request.channel_id);
+                    
+                    // Stage 3: Generate final response with outer voice
+                    LOG_Orchestrator("Stage 3: Generating final response with outer voice for channel: " + request.channel_id);
+                    
+                    // Create callbacks for outer voice final response
+                    GenerationCallbacks outer_callbacks;
+                    outer_callbacks.on_complete = [this, request, callback, inner_response, outer_context, start_time](const std::string& response, bool success) {
+                        // Calculate processing time
+                        auto end_time = std::chrono::steady_clock::now();
+                        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+                        std::string processing_time = std::to_string(duration.count()) + "ms";
+                        
+                        DiscordChannelResponse discord_response;
+                        discord_response.should_respond = success;
+                        discord_response.response_content = response;
+                        discord_response.internal_reasoning = inner_response;  // Capture inner voice reasoning
+                        discord_response.target_channel = request.channel_id;
+                        discord_response.error_message = success ? "" : "Generation failed";
+                        
+                        // Add context usage information
+                        if (outer_context) {
+                            discord_response.context_current = outer_context->GetActualContextTokens();
+                            discord_response.context_maximum = outer_context->GetMaxContextTokens();
+                        }
+                        
+                        // Add model and timing information
+                        discord_response.model_name = "LuminaChat AI";  // Could be enhanced to show actual model names
+                        discord_response.processing_time = processing_time;
+                        
+                        LOG_Orchestrator("Two-stage reasoning complete for Discord channel " + request.channel_id + 
+                                       " (success: " + (success ? "true" : "false") + ", time: " + processing_time + ")");
+                        callback(discord_response);
+                    };
+                    
+                    outer_callbacks.on_error = [this, request, callback](const std::string& error) {
+                        LOG_ERROR_Orchestrator("Stage 3 Error for Discord channel " + request.channel_id + ": " + error);
+                        DiscordChannelResponse discord_response;
+                        discord_response.should_respond = false;
+                        discord_response.response_content = "";
+                        discord_response.target_channel = request.channel_id;
+                        discord_response.error_message = "Stage 3 error: " + error;
+                        callback(discord_response);
+                    };
+                    
+                    // Generate final response with outer voice
+                    bool started = outer_context->HandleInputAsync(input, outer_callbacks, request.username);
+                    if (!started) [[unlikely]] {
+                        LOG_ERROR_Orchestrator("Failed to start outer voice generation for Discord channel: " + request.channel_id);
+                        DiscordChannelResponse response;
+                        response.should_respond = false;
+                        response.response_content = "";
+                        response.target_channel = request.channel_id;
+                        response.error_message = "Failed to start Stage 3 processing";
+                        callback(response);
+                    }
+                    
+                } catch (const std::exception& e) {
+                    LOG_ERROR_Orchestrator("Stage 2 Error for Discord channel " + request.channel_id + ": " + e.what());
+                    DiscordChannelResponse response;
+                    response.should_respond = false;
+                    response.response_content = "";
+                    response.target_channel = request.channel_id;
+                    response.error_message = "Stage 2 error: " + std::string(e.what());
+                    callback(response);
+                }
+                
+            } else {
+                // Inner voice failed
+                std::string error_msg = success ? "Inner voice generated empty response" : "Inner voice generation failed";
+                LOG_ERROR_Orchestrator("Stage 1 Failed for Discord channel " + request.channel_id + ": " + error_msg);
+                DiscordChannelResponse response;
+                response.should_respond = false;
+                response.response_content = "";
+                response.target_channel = request.channel_id;
+                response.error_message = "Stage 1 failed: " + error_msg;
+                callback(response);
+            }
+        };
+        
+        // Error callback for inner voice
+        inner_callbacks.on_error = [this, request, callback](const std::string& error_message) {
+            LOG_ERROR_Orchestrator("Stage 1 Error for Discord channel " + request.channel_id + ": " + error_message);
+            DiscordChannelResponse response;
+            response.should_respond = false;
+            response.response_content = "";
+            response.target_channel = request.channel_id;
+            response.error_message = "Stage 1 error: " + error_message;
+            callback(response);
+        };
+        
+        // Start inner voice reasoning (Stage 1)
+        bool started = inner_context->HandleInputAsync(input, inner_callbacks, request.username);
+        if (!started) [[unlikely]] {
+            LOG_ERROR_Orchestrator("Failed to start inner voice reasoning for Discord channel: " + request.channel_id);
+            DiscordChannelResponse response;
+            response.should_respond = false;
+            response.response_content = "";
+            response.target_channel = request.channel_id;
+            response.error_message = "Failed to start two-stage reasoning";
+            callback(response);
+        }
+        
+    } catch (const std::exception& e) {
+        LOG_ERROR_Orchestrator("Exception in two-stage reasoning for Discord channel " + request.channel_id + ": " + e.what());
+        DiscordChannelResponse response;
+        response.should_respond = false;
+        response.response_content = "";
+        response.target_channel = request.channel_id;
+        response.error_message = "Two-stage reasoning error: " + std::string(e.what());
+        callback(response);
+    }
+}

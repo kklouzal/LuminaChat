@@ -571,7 +571,7 @@ template<typename String>
     
     // Check if this is the inner voice context - use special rendering for inner voice
     std::string rendered_prompt;
-    if (context_id == "inner_context") {
+    if (context_id.starts_with("inner_context_")) {
         // For inner voice: include the last 3 assistant responses and the most recent non-assistant message
         std::vector<std::pair<std::string, std::string>> inner_voice_history;
         if (!message_history.empty()) {
@@ -610,10 +610,12 @@ template<typename String>
         }
         rendered_prompt = template_manager->RenderTemplate(inner_voice_history);
         LOG_DEBUG_ContextInfo("Built inner voice prompt with " + std::to_string(inner_voice_history.size()) + " messages (last 3 assistant + most recent non-assistant): " + std::to_string(rendered_prompt.length()) + " characters");
+        LOG_DEBUG_ContextInfo("Inner voice prompt content (first 200 chars): " + rendered_prompt.substr(0, 200) + "...");
     } else {
         // For outer voice and other contexts: include full chat history
         rendered_prompt = template_manager->RenderTemplate(message_history);
         LOG_DEBUG_ContextInfo("Built full prompt: " + std::to_string(rendered_prompt.length()) + " characters");
+        LOG_DEBUG_ContextInfo("Full prompt content (first 200 chars): " + rendered_prompt.substr(0, 200) + "...");
     }
     
     return rendered_prompt;

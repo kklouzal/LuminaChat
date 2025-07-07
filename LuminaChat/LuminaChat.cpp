@@ -59,6 +59,7 @@
 #include <memory>
 #include <thread>
 #include <atomic>
+#include <sstream>
 
 // Configuration constants
 namespace LuminaChatConstants {
@@ -188,6 +189,7 @@ private:
     wxPanel* discord_panel;
     wxTextCtrl* discord_token_text;
     wxButton* connect_discord_button;
+    wxTextCtrl* allowed_channels_text;
     wxListBox* channels_list;
     wxChoice* active_channel_choice;
     wxCheckBox* auto_respond_checkbox;
@@ -251,6 +253,8 @@ private:
     void UpdateUI();
     void UpdateModelProgress(int progress);
     void UpdateContextStatus();  // Track and display context usage
+    void UpdateDiscordAllowedChannels();  // Update Discord manager with allowed channels
+    void RefreshDiscordChannelList();  // Refresh the Discord channel list from the manager
     void AddChatMessage(const std::string& sender, const std::string& message, const wxColour& color = wxNullColour);
     void StartStreamingMessage(const std::string& sender, const wxColour& color = wxNullColour);
     void AppendToStreamingMessage(const std::string& text);
@@ -475,9 +479,17 @@ void LuminaChatFrame::CreateDiscordPanel() {
     discord_token_text = new wxTextCtrl(discord_panel, wxID_ANY, wxEmptyString, 
                                        wxDefaultPosition, wxDefaultSize, wxTE_PASSWORD);
     token_sizer->Add(discord_token_text, 1, wxEXPAND | wxALL, 5);
-    connect_discord_button = new wxButton(discord_panel, ID_ConnectDiscord, "Connect");
+    connect_discord_button = new wxButton(discord_panel, ID_ConnectDiscord, "Connect Discord");
     token_sizer->Add(connect_discord_button, 0, wxALL, 5);
     discord_box->Add(token_sizer, 0, wxEXPAND);
+    
+    // Allowed channels input
+    wxBoxSizer* allowed_channels_sizer = new wxBoxSizer(wxHORIZONTAL);
+    allowed_channels_sizer->Add(new wxStaticText(discord_panel, wxID_ANY, "Allowed Channels (comma-separated IDs):"), 0, wxALIGN_CENTER_VERTICAL | wxALL, 5);
+    allowed_channels_text = new wxTextCtrl(discord_panel, wxID_ANY, wxEmptyString);
+    allowed_channels_text->SetToolTip("Enter Discord channel IDs separated by commas (e.g., 123456789,987654321)");
+    allowed_channels_sizer->Add(allowed_channels_text, 1, wxEXPAND | wxALL, 5);
+    discord_box->Add(allowed_channels_sizer, 0, wxEXPAND);
     
     // Auto-save Discord token on kill focus
     discord_token_text->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& event) {
@@ -485,6 +497,19 @@ void LuminaChatFrame::CreateDiscordPanel() {
             settings_manager->SetString("Discord", "bot_token", discord_token_text->GetValue().ToStdString());
             settings_manager->SaveSettings();
         }
+        event.Skip();
+    });
+    
+    // Auto-save allowed channels on kill focus
+    allowed_channels_text->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& event) {
+        if (settings_manager) {
+            std::string channels_value = allowed_channels_text->GetValue().ToStdString();
+            AddLogMessage("Saving allowed channels: '" + channels_value + "'");
+            settings_manager->SetString("Discord", "allowed_channels", channels_value);
+            settings_manager->SaveSettings();
+        }
+        // Update the Discord manager with new allowed channels
+        UpdateDiscordAllowedChannels();
         event.Skip();
     });
     
@@ -612,6 +637,37 @@ void LuminaChatFrame::Start() {
             throw std::runtime_error("Orchestrator initialization failed");
         }
         AddLogMessage("Orchestrator initialized");
+        
+        // Register Discord response callback to send responses back through DiscordManager
+        orchestrator->RegisterDiscordResponseCallback([this](const DiscordChannelResponse& response) {
+            if (discord_manager && discord_connected) {
+                bool sent = discord_manager->SendAIResponseAdvanced(
+                    response.target_channel,
+                    response.response_content,
+                    response.internal_reasoning,
+                    response.context_current,
+                    response.context_maximum,
+                    response.model_name,
+                    response.processing_time
+                );
+                
+                if (sent) {
+                    AddLogMessage("Discord embed response sent to channel " + response.target_channel + 
+                                 " (context: " + std::to_string(response.context_current) + "/" + 
+                                 std::to_string(response.context_maximum) + ")");
+                } else {
+                    AddLogMessage("ERROR: Failed to send Discord embed response to channel " + response.target_channel);
+                }
+            } else {
+                AddLogMessage("ERROR: Cannot send Discord response - manager not available or not connected");
+            }
+        });
+        AddLogMessage("Discord response callback registered");
+        
+        // Set up Discord manager dependencies
+        discord_manager->SetLlamaManager(llama_manager.get());
+        discord_manager->SetOrchestrator(orchestrator.get());
+        AddLogMessage("Discord Manager dependencies configured");
         
         // Note: SummarizationPlugin initialization is now deferred until model loading
         AddLogMessage("Plugin initialization will be handled when user loads a model");
@@ -1374,7 +1430,7 @@ void LuminaChatFrame::OnConnectDiscord(wxCommandEvent& event) {
     if (discord_connected) {
         discord_manager->Disconnect();
         discord_connected = false;
-        connect_discord_button->SetLabel("Connect");
+        connect_discord_button->SetLabel("Connect Discord");
         channels_list->Clear();
         active_channel_choice->Clear();
         AddLogMessage("Disconnected from Discord");
@@ -1397,40 +1453,81 @@ void LuminaChatFrame::OnConnectDiscord(wxCommandEvent& event) {
     try {
         AddLogMessage("Connecting to Discord...");
         connect_discord_button->Enable(false);
+        connect_discord_button->SetLabel("Connecting...");
         
-        if (discord_manager && discord_manager->Connect(token.ToStdString())) {
-            discord_connected = true;
-            AddLogMessage("Connected to Discord successfully");
-            AddChatMessage("System", "Discord bot connected and ready!", LuminaChatColors::DISCORD_BLUE);
+        // Update allowed channels before connecting
+        UpdateDiscordAllowedChannels();
+        
+        // Set up message callback for Discord manager
+        discord_manager->RegisterMessageCallback([this](const std::string& content, const std::string& channel_id, const std::string& username) {
+            // Log the message
+            AddLogMessage(wxString::Format("Discord message from %s in channel %s: %s", 
+                         username, channel_id, content.substr(0, 50)).ToStdString());
             
-            auto channels = discord_manager->GetChannels();
-            channels_list->Clear();
-            active_channel_choice->Clear();
-            
-            for (const auto& channel : channels) {
-                wxString channel_display = wxString::Format("%s (%s)", channel.name, channel.id);
-                channels_list->Append(channel_display);
-                active_channel_choice->Append(channel.name);
+            // Route to orchestrator for processing
+            if (orchestrator) {
+                orchestrator->OnRawDiscordMessage(content, channel_id, username);
+            } else {
+                AddLogMessage("ERROR: Orchestrator not available for Discord message processing");
             }
-            
-            if (!channels.empty()) {
-                active_channel_choice->SetSelection(0);
+        });
+        
+        // Start connection in a separate thread since D++ is async
+        std::thread([this, token]() {
+            try {
+                if (discord_manager->Connect(token.ToStdString())) {
+                    // Connection successful - update UI on main thread
+                    CallAfter([this]() {
+                        discord_connected = true;
+                        AddLogMessage("Connected to Discord successfully");
+                        AddChatMessage("System", "Discord bot connected and ready!", LuminaChatColors::DISCORD_BLUE);
+                        
+                        // Wait a moment for guilds to load, then update channel list
+                        wxTimer* timer = new wxTimer();
+                        timer->Bind(wxEVT_TIMER, [this, timer](wxTimerEvent&) {
+                            RefreshDiscordChannelList();
+                            delete timer;
+                        });
+                        timer->StartOnce(2000);
+                        
+                        connect_discord_button->SetLabel("Disconnect");
+                        connect_discord_button->Enable(true);
+                        UpdateUI();
+                    });
+                } else {
+                    // Connection failed
+                    CallAfter([this]() {
+                        std::string error_details = discord_manager->GetLastError();
+                        std::string error_msg = error_details.empty() ? "Failed to connect to Discord" : error_details;
+                        
+                        AddLogMessage("ERROR: " + error_msg);
+                        AddChatMessage("System", "Discord connection failed: " + error_msg, wxColour(255, 0, 0));
+                        connect_discord_button->SetLabel("Connect Discord");
+                        connect_discord_button->Enable(true);
+                        discord_connected = false;
+                        UpdateUI();
+                    });
+                }
+            } catch (const std::exception& e) {
+                CallAfter([this, e]() {
+                    LogAndDisplayError(wxString::Format("Error connecting to Discord: %s", e.what()).ToStdString(),
+                                      wxString::Format("Failed to connect to Discord: %s", e.what()).ToStdString());
+                    connect_discord_button->SetLabel("Connect Discord");
+                    connect_discord_button->Enable(true);
+                    discord_connected = false;
+                    UpdateUI();
+                });
             }
-            
-            connect_discord_button->SetLabel("Disconnect");
-            
-        } else {
-            throw std::runtime_error("Discord API connection failed");
-        }
+        }).detach();
         
     } catch (const std::exception& e) {
-        LogAndDisplayError(wxString::Format("Error connecting to Discord: %s", e.what()).ToStdString(),
-                          wxString::Format("Failed to connect to Discord: %s", e.what()).ToStdString());
+        LogAndDisplayError(wxString::Format("Error starting Discord connection: %s", e.what()).ToStdString(),
+                          wxString::Format("Failed to start Discord connection: %s", e.what()).ToStdString());
+        connect_discord_button->SetLabel("Connect Discord");
+        connect_discord_button->Enable(true);
         discord_connected = false;
+        UpdateUI();
     }
-    
-    connect_discord_button->Enable(true);
-    UpdateUI();
 }
 
 void LuminaChatFrame::OnClearChat(wxCommandEvent& event) {
@@ -1784,6 +1881,18 @@ void LuminaChatFrame::LoadUISettings() {
             }
         }
         
+        if (allowed_channels_text) {
+            std::string allowed_channels = settings_manager->GetString("Discord", "allowed_channels", "");
+            AddLogMessage("Loading allowed channels from settings: '" + allowed_channels + "'");
+            allowed_channels_text->SetValue(allowed_channels);
+            if (!allowed_channels.empty()) {
+                AddLogMessage("Loaded Discord allowed channels from settings");
+                UpdateDiscordAllowedChannels();
+            } else {
+                AddLogMessage("No allowed channels found in settings");
+            }
+        }
+        
         if (auto_respond_checkbox) {
             bool auto_respond = settings_manager->GetBool("Discord", "auto_respond", true);
             auto_respond_checkbox->SetValue(auto_respond);
@@ -1852,6 +1961,12 @@ void LuminaChatFrame::SaveUISettings() {
         if (discord_token_text) {
             std::string discord_token = discord_token_text->GetValue().ToStdString();
             settings_manager->SetString("Discord", "bot_token", discord_token);
+        }
+        
+        if (allowed_channels_text) {
+            std::string allowed_channels = allowed_channels_text->GetValue().ToStdString();
+            AddLogMessage("Saving allowed channels to settings: '" + allowed_channels + "'");
+            settings_manager->SetString("Discord", "allowed_channels", allowed_channels);
         }
         
         if (auto_respond_checkbox) {
@@ -2150,5 +2265,86 @@ void LuminaChatFrame::LogAndDisplaySuccess(const std::string& log_msg, const std
     AddLogMessage(log_msg);
     if (!user_msg.empty()) {
         AddChatMessage("System", user_msg, LuminaChatColors::SUCCESS_GREEN);
+    }
+}
+
+void LuminaChatFrame::UpdateDiscordAllowedChannels() {
+    if (!discord_manager || !allowed_channels_text) {
+        return;
+    }
+    
+    try {
+        // Parse the comma-separated channel IDs
+        std::string channels_str = allowed_channels_text->GetValue().ToStdString();
+        std::vector<std::string> channel_ids;
+        
+        if (!channels_str.empty()) {
+            // Split by comma and trim whitespace
+            std::stringstream ss(channels_str);
+            std::string channel_id;
+            
+            while (std::getline(ss, channel_id, ',')) {
+                // Trim whitespace
+                channel_id.erase(0, channel_id.find_first_not_of(" \t\n\r"));
+                channel_id.erase(channel_id.find_last_not_of(" \t\n\r") + 1);
+                
+                // Validate that it's a valid Discord channel ID (numeric)
+                if (!channel_id.empty() && std::all_of(channel_id.begin(), channel_id.end(), ::isdigit)) {
+                    channel_ids.push_back(channel_id);
+                }
+            }
+        }
+        
+        // Update the Discord manager with the new allowed channels
+        discord_manager->SetAllowedChannels(channel_ids);
+        
+        AddLogMessage(wxString::Format("Updated allowed Discord channels: %d channels configured", 
+                     static_cast<int>(channel_ids.size())).ToStdString());
+        
+    } catch (const std::exception& e) {
+        AddLogMessage(wxString::Format("Error updating Discord allowed channels: %s", e.what()).ToStdString());
+    }
+}
+
+void LuminaChatFrame::RefreshDiscordChannelList() {
+    if (!discord_manager || !discord_connected) {
+        return;
+    }
+    
+    try {
+        auto channels = discord_manager->GetChannels();
+        channels_list->Clear();
+        active_channel_choice->Clear();
+        
+        AddLogMessage(wxString::Format("Loaded %d Discord channels", static_cast<int>(channels.size())).ToStdString());
+        
+        for (const auto& channel : channels) {
+            wxString channel_display = wxString::Format("%s [%s] (%s)%s", 
+                                                       channel.name, 
+                                                       channel.guild_name,
+                                                       channel.id,
+                                                       channel.is_allowed ? " *ALLOWED*" : "");
+            channels_list->Append(channel_display);
+            active_channel_choice->Append(channel.name);
+        }
+        
+        if (!channels.empty()) {
+            active_channel_choice->SetSelection(0);
+        }
+        
+        // Update status
+        size_t guild_count = discord_manager->GetGuildCount();
+        size_t allowed_count = 0;
+        for (const auto& channel : channels) {
+            if (channel.is_allowed) allowed_count++;
+        }
+        
+        AddLogMessage(wxString::Format("Discord status: %d guilds, %d channels (%d allowed)", 
+                     static_cast<int>(guild_count), 
+                     static_cast<int>(channels.size()),
+                     static_cast<int>(allowed_count)).ToStdString());
+        
+    } catch (const std::exception& e) {
+        AddLogMessage(wxString::Format("Error refreshing Discord channel list: %s", e.what()).ToStdString());
     }
 }

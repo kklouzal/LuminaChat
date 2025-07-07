@@ -386,6 +386,7 @@ public:
         // Discord configuration
         SetString_Unlocked("Discord", "bot_token", "");
         SetString_Unlocked("Discord", "default_channel", "");
+        SetString_Unlocked("Discord", "allowed_channels", "");
         SetBool_Unlocked("Discord", "auto_respond", true);
         SetBool_Unlocked("Discord", "history_backfill", true);
         SetInt_Unlocked("Discord", "backfill_limit", 100);
@@ -497,7 +498,7 @@ private:
                 "environment_description", "identity_directive", "system_prompt"
             }},
             {"Discord", {
-                "bot_token", "default_channel", "auto_respond", "history_backfill", "backfill_limit"
+                "bot_token", "default_channel", "allowed_channels", "auto_respond", "history_backfill", "backfill_limit"
             }},
             {"UI", {
                 "theme", "window_width", "window_height", "auto_scroll"

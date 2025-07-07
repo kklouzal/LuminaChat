@@ -465,6 +465,8 @@ inline bool ContextInputOutput::ProcessPromptTokens(const std::vector<int32_t>& 
         if constexpr (ContextIOConstants::ENABLE_DEBUG_LOGGING) {
             LOG_DEBUG("ContextInputOutput", "Generated " + std::to_string(response_tokens.size()) + 
                      " tokens, final response length: " + std::to_string(clean_response.length()));
+            LOG_DEBUG("ContextInputOutput", "Raw response (first 200 chars): " + full_response.substr(0, 200) + "...");
+            LOG_DEBUG("ContextInputOutput", "Clean response (first 200 chars): " + clean_response.substr(0, 200) + "...");
         }
         
         return clean_response;
