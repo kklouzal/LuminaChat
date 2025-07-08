@@ -262,6 +262,12 @@ public:
         system_content += sections[5].content;
     }
     
+    if (sections[6].active && !sections[6].content.empty()) { // EMOTIONAL_STATE
+        if (!system_content.empty()) system_content += "\n\n";
+        system_content += "###YOUR CURRENT EMOTIONAL STATE###\n";
+        system_content += sections[6].content;
+    }
+    
     if (sections[2].active && !sections[2].content.empty()) { // SYSTEM_PROMPT
         if (!system_content.empty()) system_content += "\n\n";
         system_content += "###CORE DIRECTIVES###\n";
@@ -297,12 +303,6 @@ public:
             system_content += "###OLD CHAT HISTORY###\n";
             system_content += combined_summaries;
         }
-    }
-    
-    if (sections[6].active && !sections[6].content.empty()) { // EMOTIONAL_STATE
-        if (!system_content.empty()) system_content += "\n\n";
-        system_content += "###YOUR CURRENT EMOTIONAL STATE###\n";
-        system_content += sections[6].content;
     }
     
     // Add the complete system message FIRST

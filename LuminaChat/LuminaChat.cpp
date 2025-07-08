@@ -336,7 +336,7 @@ LuminaChatFrame::LuminaChatFrame()
     CreateStatusBar(3);
     SetStatusText("Welcome to LuminaChat!", 0);
     SetStatusText("No Model", 1);
-    SetStatusText("Context: --/--", 2);
+    SetStatusText("Inner: --/-- | Outer: --/--", 2);
     
     // Create main notebook for tabbed interface
     notebook = new wxNotebook(this, wxID_ANY);
@@ -891,42 +891,42 @@ void LuminaChatFrame::UpdateUI() {
 
 void LuminaChatFrame::UpdateContextStatus() {
     if (!llama_manager || !model_loaded || !running) {
-        SetStatusText("Context: --/--", 2);
+        SetStatusText("Inner: --/-- | Outer: --/--", 2);
         return;
     }
     
     try {
-        // Get the current context info
-        auto* context = llama_manager->GetContextInfo(current_context_id);
-        if (!context) {
-            SetStatusText("Context: No Context", 2);
-            return;
+        // Get both context infos
+        auto* inner_context = llama_manager->GetContextInfo("inner_context");
+        auto* outer_context = llama_manager->GetContextInfo("outer_context");
+        
+        wxString status_text;
+        
+        // Format inner context info
+        if (inner_context) {
+            int inner_used = static_cast<int>(inner_context->GetActualContextTokens());
+            int inner_max = static_cast<int>(inner_context->GetMaxContextTokens());
+            status_text += wxString::Format("Inner: %d/%d", inner_used, inner_max);
+        } else {
+            status_text += "Inner: --/--";
         }
         
-        // Get context usage information directly
-        int used_tokens = static_cast<int>(context->GetActualContextTokens());
-        int max_tokens = static_cast<int>(context->GetMaxContextTokens());
+        status_text += " | ";
         
-        // Format the status text
-        wxString context_status = wxString::Format("Context: %d/%d", used_tokens, max_tokens);
-        
-        // Add visual indicators based on usage percentage
-        if (max_tokens > 0) {
-            double usage_percent = (double)used_tokens / max_tokens * 100.0;
-            if (usage_percent >= 90.0) {
-                context_status += " (FULL)";
-            } else if (usage_percent >= 75.0) {
-                context_status += " (HIGH)";
-            } else if (usage_percent >= 50.0) {
-                context_status += " (MED)";
-            }
+        // Format outer context info
+        if (outer_context) {
+            int outer_used = static_cast<int>(outer_context->GetActualContextTokens());
+            int outer_max = static_cast<int>(outer_context->GetMaxContextTokens());
+            status_text += wxString::Format("Outer: %d/%d", outer_used, outer_max);
+        } else {
+            status_text += "Outer: --/--";
         }
         
-        SetStatusText(context_status, 2);
+        SetStatusText(status_text, 2);
         
     } catch (const std::exception& e) {
         AddLogMessage(wxString::Format("Error updating context status: %s", e.what()).ToStdString());
-        SetStatusText("Context: Error", 2);
+        SetStatusText("Inner: Error | Outer: Error", 2);
     }
 }
 
@@ -1811,14 +1811,23 @@ void LuminaChatFrame::ApplyTemplateSettingsToContext(ContextInfo* context, const
     std::string system_prompt;
     if (context_id.find("outer") != std::string::npos) {
         system_prompt = GetOuterVoiceSystemPromptFromUI();
-        AddLogMessage("Using Outer Voice system prompt for context: " + context_id);
+        AddLogMessage("Using Outer Voice system prompt for context: " + context_id + " (length: " + std::to_string(system_prompt.length()) + ")");
+        if (!system_prompt.empty()) {
+            AddLogMessage("Outer Voice system prompt content (first 50 chars): '" + system_prompt.substr(0, 50) + (system_prompt.length() > 50 ? "..." : "") + "'");
+        }
     } else if (context_id.find("inner") != std::string::npos) {
         system_prompt = GetInnerVoiceSystemPromptFromUI();
-        AddLogMessage("Using Inner Voice system prompt for context: " + context_id);
+        AddLogMessage("Using Inner Voice system prompt for context: " + context_id + " (length: " + std::to_string(system_prompt.length()) + ")");
+        if (!system_prompt.empty()) {
+            AddLogMessage("Inner Voice system prompt content (first 50 chars): '" + system_prompt.substr(0, 50) + (system_prompt.length() > 50 ? "..." : "") + "'");
+        }
     } else {
         // Default to outer voice for unspecified contexts
         system_prompt = GetOuterVoiceSystemPromptFromUI();
-        AddLogMessage("Using default (Outer Voice) system prompt for context: " + context_id);
+        AddLogMessage("Using default (Outer Voice) system prompt for context: " + context_id + " (length: " + std::to_string(system_prompt.length()) + ")");
+        if (!system_prompt.empty()) {
+            AddLogMessage("Default system prompt content (first 50 chars): '" + system_prompt.substr(0, 50) + (system_prompt.length() > 50 ? "..." : "") + "'");
+        }
     }
     
     if (!environment_description.empty()) {
@@ -1831,9 +1840,12 @@ void LuminaChatFrame::ApplyTemplateSettingsToContext(ContextInfo* context, const
         AddLogMessage("Applied identity directive to context: " + context_id);
     }
     
+    // Always update system prompt to ensure proper clearing when empty
+    context->UpdateSystemPrompt(system_prompt);
     if (!system_prompt.empty()) {
-        context->UpdateSystemPrompt(system_prompt);
-        AddLogMessage("Applied system prompt to context: " + context_id);
+        AddLogMessage("Applied system prompt to context: " + context_id + " (first 50 chars: '" + system_prompt.substr(0, 50) + (system_prompt.length() > 50 ? "..." : "") + "')");
+    } else {
+        AddLogMessage("Cleared system prompt for context: " + context_id);
     }
 }
 

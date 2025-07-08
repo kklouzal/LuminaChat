@@ -230,6 +230,47 @@ public:
                 
                 LogInfo("Applied emotional state to context: " + context_id);
                 
+                // If this is an outer_voice context, also apply to the corresponding inner_voice context
+                std::string inner_context_id;
+                bool has_inner_context = false;
+                
+                if (context_id.starts_with("outer_context_")) {
+                    // Discord context pattern: "outer_context_" + channel_id -> "inner_context_" + channel_id
+                    std::string channel_id = context_id.substr(14); // Remove "outer_context_" prefix
+                    inner_context_id = "inner_context_" + channel_id;
+                    has_inner_context = true;
+                } else if (context_id == "outer_context") {
+                    // UI context pattern: "outer_context" -> "inner_context"
+                    inner_context_id = "inner_context";
+                    has_inner_context = true;
+                }
+                
+                if (has_inner_context) {
+                    auto* inner_context = llama_manager->GetContextInfo(inner_context_id);
+                    if (inner_context) {
+                        // Try to acquire plugin processing lock for the inner context
+                        if (inner_context->TryAcquirePluginProcessing("EmoTagPlugin")) {
+                            try {
+                                inner_context->UpdateEmotionalState(emotional_state);
+                                contexts_updated++;
+                                LogInfo("Applied emotional state to inner_voice context: " + inner_context_id);
+                                
+                                // Release plugin processing lock for inner context
+                                [[maybe_unused]] bool released = inner_context->ReleasePluginProcessing("EmoTagPlugin");
+                            } catch (const std::exception& inner_ex) {
+                                // Release plugin processing lock on exception
+                                [[maybe_unused]] bool released = inner_context->ReleasePluginProcessing("EmoTagPlugin");
+                                LogWarning("Failed to apply emotional state to inner_voice context " + inner_context_id + ": " + std::string(inner_ex.what()));
+                                // Don't fail the whole operation if inner context update fails
+                            }
+                        } else {
+                            LogWarning("Could not acquire plugin processing lock for inner_voice context: " + inner_context_id + " - context may be busy");
+                        }
+                    } else {
+                        LogDebug("No corresponding inner_voice context found for: " + inner_context_id);
+                    }
+                }
+                
                 // Release plugin processing lock
                 [[maybe_unused]] bool released = original_context->ReleasePluginProcessing("EmoTagPlugin");
                 return true;

@@ -495,7 +495,11 @@ private:
             }},
             {"Templates", {
                 // Template configuration (new dedicated section)
-                "environment_description", "identity_directive", "system_prompt"
+                "environment_description", "identity_directive", "system_prompt", "last_selected_persona"
+            }},
+            {"Personas", {
+                // Persona management - dynamic keys are handled separately
+                // Note: Persona keys follow pattern "persona_N_name" and "persona_N_directive" where N is 0-99
             }},
             {"Discord", {
                 "bot_token", "default_channel", "allowed_channels", "auto_respond", "history_backfill", "backfill_limit"
@@ -540,9 +544,31 @@ private:
             auto key_it = section.keys.begin();
             while (key_it != section.keys.end()) {
                 const std::string& key_name = key_it->first;
+                bool key_is_valid = false;
                 
-                // Check if this key is valid for this section
-                if (std::find(valid_keys.begin(), valid_keys.end(), key_name) == valid_keys.end()) {
+                // Special handling for Personas section - allow dynamic persona keys
+                if (section_name == "Personas") {
+                    // Check if key matches persona pattern: persona_N_name or persona_N_directive
+                    if (key_name.substr(0, 8) == "persona_") {
+                        size_t underscore_pos = key_name.find('_', 8);
+                        if (underscore_pos != std::string::npos) {
+                            std::string suffix = key_name.substr(underscore_pos + 1);
+                            std::string number_part = key_name.substr(8, underscore_pos - 8);
+                            
+                            // Check if number part is valid (0-99) and suffix is valid
+                            if ((suffix == "name" || suffix == "directive") && 
+                                std::all_of(number_part.begin(), number_part.end(), ::isdigit) &&
+                                !number_part.empty() && std::stoi(number_part) >= 0 && std::stoi(number_part) <= 99) {
+                                key_is_valid = true;
+                            }
+                        }
+                    }
+                } else {
+                    // Standard validation for other sections
+                    key_is_valid = (std::find(valid_keys.begin(), valid_keys.end(), key_name) != valid_keys.end());
+                }
+                
+                if (!key_is_valid) {
                     // This key is deprecated
                     LOG_SettingsManager("Removing deprecated key: [" + section_name + "]." + key_name + " = '" + key_it->second + "'");
                     removed_keys.emplace_back(section_name, key_name);
