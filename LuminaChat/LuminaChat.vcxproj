@@ -146,7 +146,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="LuminaChat.cpp" />
+    <ClCompile Include="Core\LuminaChat.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ChatTemplateManager.hpp" />

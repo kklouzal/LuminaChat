@@ -15,6 +15,7 @@
 #include <functional>
 #include <vector>
 #include "../SettingsManager.hpp"
+#include "../Logger.hpp"
 
 // Forward declarations
 class LlamaManager;
@@ -33,7 +34,6 @@ class ContextInfo;
 class SettingsUI {
 public:
     // Callback types for communication with main frame
-    using LogCallback = std::function<void(const std::string&)>;
     using LoadModelsCallback = std::function<void()>;
     using ContextApplyCallback = std::function<void(ContextInfo*, const std::string&)>;
 
@@ -46,7 +46,7 @@ public:
     // External dependencies injection
     void SetSettingsManager(SettingsManager* settings_manager);
     void SetLlamaManager(LlamaManager* llama_manager);
-    void SetCallbacks(LogCallback log_cb, LoadModelsCallback load_models_cb, ContextApplyCallback context_apply_cb);
+    void SetCallbacks(LoadModelsCallback load_models_cb, ContextApplyCallback context_apply_cb);
 
     // Settings persistence
     void LoadSettings();
@@ -89,7 +89,6 @@ private:
     LlamaManager* llama_manager{nullptr};
 
     // Callbacks
-    LogCallback log_callback;
     LoadModelsCallback load_models_callback;
     ContextApplyCallback context_apply_callback;
 
@@ -112,7 +111,6 @@ private:
     void OnDeletePersona(wxCommandEvent& event);
 
     // Helper methods
-    void LogMessage(const std::string& message);
     void SetupEvents();
     
     // Settings helpers
@@ -301,8 +299,7 @@ inline void SettingsUI::SetLlamaManager(LlamaManager* llama_manager) {
     this->llama_manager = llama_manager;
 }
 
-inline void SettingsUI::SetCallbacks(LogCallback log_cb, LoadModelsCallback load_models_cb, ContextApplyCallback context_apply_cb) {
-    log_callback = log_cb;
+inline void SettingsUI::SetCallbacks(LoadModelsCallback load_models_cb, ContextApplyCallback context_apply_cb) {
     load_models_callback = load_models_cb;
     context_apply_callback = context_apply_cb;
 }
@@ -310,16 +307,16 @@ inline void SettingsUI::SetCallbacks(LogCallback log_cb, LoadModelsCallback load
 // Settings persistence
 inline void SettingsUI::LoadSettings() {
     if (!settings_manager) {
-        LogMessage("WARNING: Cannot load settings - SettingsManager not initialized");
+        LOG_WARNING("Settings", "Cannot load settings - SettingsManager not initialized");
         return;
     }
 
-    LogMessage("Loading settings UI configuration...");
+    LOG_INFO("Settings", "Loading settings UI configuration...");
     
     // CRITICAL FIX: Validate current identity directive and clean up if needed
     std::string current_directive = settings_manager->GetString("Templates", "identity_directive", "");
     if (!current_directive.empty() && !ValidateDirectiveContent(current_directive)) {
-        LogMessage("CRITICAL: Detected corrupted identity directive - clearing it to fix Discord output loop");
+        LOG_ERROR("Settings", "CRITICAL: Detected corrupted identity directive - clearing it to fix Discord output loop");
         ClearCurrentIdentityDirective();
     }
     
@@ -329,7 +326,7 @@ inline void SettingsUI::LoadSettings() {
     LoadTemplateSettings();
     LoadPersonaList();
     UpdateUI();
-    LogMessage("Settings UI loaded successfully");
+    LOG_INFO("Settings", "Settings UI loaded successfully");
 }
 
 inline void SettingsUI::LoadTemplateSettings() {
@@ -340,7 +337,7 @@ inline void SettingsUI::LoadTemplateSettings() {
         std::string env_desc = settings_manager->GetString("Templates", "environment_description", "");
         environment_description_text->SetValue(env_desc);
         if (!env_desc.empty()) {
-            LogMessage("Loaded environment description from settings");
+            LOG_INFO("Settings", "Loaded environment description from settings");
         }
     }
 
@@ -349,21 +346,21 @@ inline void SettingsUI::LoadTemplateSettings() {
         std::string identity = settings_manager->GetString("Templates", "identity_directive", "");
         identity_directive_text->SetValue(identity);
         if (!identity.empty()) {
-            LogMessage("Loaded identity directive from settings");
+            LOG_INFO("Settings", "Loaded identity directive from settings");
         }
     }
 }
 
 inline void SettingsUI::SaveSettings() {
     if (!settings_manager) {
-        LogMessage("WARNING: Cannot save settings - SettingsManager not initialized");
+        LOG_WARNING("Settings", "Cannot save settings - SettingsManager not initialized");
         return;
     }
 
-    LogMessage("Saving settings UI configuration...");
+    LOG_INFO("Settings", "Saving settings UI configuration...");
     SaveTemplateSettings();
     settings_manager->SaveSettings();
-    LogMessage("Settings UI saved successfully");
+    LOG_INFO("Settings", "Settings UI saved successfully");
 }
 
 inline void SettingsUI::SaveTemplateSettings() {
@@ -447,7 +444,7 @@ inline std::string SettingsUI::GetIdentityDirective() const {
 // Event handlers
 inline void SettingsUI::OnLoadModels(wxCommandEvent& event) {
     if (load_models_callback) {
-        LogMessage("Initiating load of all models from voice configurations...");
+        LOG_INFO("Settings", "Initiating load of all models from voice configurations...");
         load_models_callback();
     }
 }
@@ -470,20 +467,13 @@ inline void SettingsUI::OnIdentityDirectiveFocusLost(wxFocusEvent& event) {
             settings_manager->SetString("Templates", "identity_directive", directive);
             settings_manager->SaveSettings();
         } else {
-            LogMessage("ERROR: Identity directive contains problematic content - not saved");
+            LOG_ERROR("Settings", "Identity directive contains problematic content - not saved");
             // Optionally reload the last good value
             std::string last_good = settings_manager->GetString("Templates", "identity_directive", "");
             identity_directive_text->SetValue(last_good);
         }
     }
     event.Skip();
-}
-
-// Helper methods
-inline void SettingsUI::LogMessage(const std::string& message) {
-    if (log_callback) {
-        log_callback(message);
-    }
 }
 
 // Persona Management Methods
@@ -498,7 +488,7 @@ inline void SettingsUI::LoadPersonaList() {
         int index = persona_list->FindString(last_persona);
         if (index != wxNOT_FOUND) {
             persona_list->SetSelection(index);
-            LogMessage("Auto-selected last used persona: " + last_persona);
+            LOG_INFO("Settings", "Auto-selected last used persona: " + last_persona);
         }
     }
     
@@ -525,7 +515,7 @@ inline void SettingsUI::RefreshPersonaList() {
         persona_list->Append(name);
     }
     
-    LogMessage("Loaded " + std::to_string(persona_names.size()) + " saved personas");
+    LOG_INFO("Settings", "Loaded " + std::to_string(persona_names.size()) + " saved personas");
 }
 
 inline void SettingsUI::SavePersona(const std::string& name, const std::string& directive) {
@@ -533,7 +523,7 @@ inline void SettingsUI::SavePersona(const std::string& name, const std::string& 
     
     // CRITICAL FIX: Validate directive content before saving
     if (!ValidateDirectiveContent(directive)) {
-        LogMessage("ERROR: Cannot save persona '" + name + "' - content validation failed");
+        LOG_ERROR("Settings", "Cannot save persona '" + name + "' - content validation failed");
         return;
     }
     
@@ -549,7 +539,7 @@ inline void SettingsUI::SavePersona(const std::string& name, const std::string& 
     }
     
     if (slot == -1) {
-        LogMessage("ERROR: Cannot save persona - no available slots");
+        LOG_ERROR("Settings", "Cannot save persona - no available slots");
         return;
     }
     
@@ -561,7 +551,7 @@ inline void SettingsUI::SavePersona(const std::string& name, const std::string& 
     settings_manager->SetString("Personas", directive_key, directive);
     settings_manager->SaveSettings();
     
-    LogMessage("Saved persona: " + name + " (slot " + std::to_string(slot) + ")");
+    LOG_INFO("Settings", "Saved persona: " + name + " (slot " + std::to_string(slot) + ")");
     
     // Refresh the list and select the saved persona
     RefreshPersonaList();
@@ -592,15 +582,15 @@ inline void SettingsUI::LoadPersona(const std::string& name) {
                 settings_manager->SetString("Templates", "last_selected_persona", name);
                 settings_manager->SaveSettings();
                 
-                LogMessage("Loaded persona: " + name);
+                LOG_INFO("Settings", "Loaded persona: " + name);
             } else {
-                LogMessage("ERROR: Persona '" + name + "' contains invalid or potentially problematic content");
+                LOG_ERROR("Settings", "Persona '" + name + "' contains invalid or potentially problematic content");
             }
             return;
         }
     }
     
-    LogMessage("ERROR: Persona not found: " + name);
+    LOG_ERROR("Settings", "Persona not found: " + name);
 }
 
 inline void SettingsUI::DeletePersona(const std::string& name) {
@@ -617,7 +607,7 @@ inline void SettingsUI::DeletePersona(const std::string& name) {
             settings_manager->SetString("Personas", directive_key, "");
             settings_manager->SaveSettings();
             
-            LogMessage("Deleted persona: " + name);
+            LOG_INFO("Settings", "Deleted persona: " + name);
             
             // Clear the persona name field if it matches
             if (persona_name_text && persona_name_text->GetValue().ToStdString() == name) {
@@ -631,7 +621,7 @@ inline void SettingsUI::DeletePersona(const std::string& name) {
         }
     }
     
-    LogMessage("ERROR: Persona not found for deletion: " + name);
+    LOG_ERROR("Settings", "Persona not found for deletion: " + name);
 }
 
 inline std::string SettingsUI::GetSelectedPersonaName() const {
@@ -675,12 +665,12 @@ inline void SettingsUI::OnSavePersona(wxCommandEvent& event) {
     std::string directive = identity_directive_text->GetValue().ToStdString();
     
     if (name.empty()) {
-        LogMessage("ERROR: Cannot save persona - name is empty");
+        LOG_ERROR("Settings", "Cannot save persona - name is empty");
         return;
     }
     
     if (directive.empty()) {
-        LogMessage("ERROR: Cannot save persona - identity directive is empty");
+        LOG_ERROR("Settings", "Cannot save persona - identity directive is empty");
         return;
     }
     
@@ -700,7 +690,7 @@ inline void SettingsUI::OnSavePersona(wxCommandEvent& event) {
 inline void SettingsUI::OnLoadPersona(wxCommandEvent& event) {
     std::string selected_name = GetSelectedPersonaName();
     if (selected_name.empty()) {
-        LogMessage("ERROR: No persona selected to load");
+        LOG_ERROR("Settings", "No persona selected to load");
         return;
     }
     
@@ -710,7 +700,7 @@ inline void SettingsUI::OnLoadPersona(wxCommandEvent& event) {
 inline void SettingsUI::OnDeletePersona(wxCommandEvent& event) {
     std::string selected_name = GetSelectedPersonaName();
     if (selected_name.empty()) {
-        LogMessage("ERROR: No persona selected to delete");
+        LOG_ERROR("Settings", "No persona selected to delete");
         return;
     }
     
@@ -745,7 +735,7 @@ inline bool SettingsUI::ValidateDirectiveContent(const std::string& content) {
             
             // If we find more than 3 occurrences of any pattern, it's likely problematic
             if (count > 3) {
-                LogMessage("WARNING: Identity directive contains repetitive pattern: " + pattern + " (found " + std::to_string(count) + " times)");
+                LOG_WARNING("Settings", "Identity directive contains repetitive pattern: " + pattern + " (found " + std::to_string(count) + " times)");
                 return false;
             }
         }
@@ -753,14 +743,14 @@ inline bool SettingsUI::ValidateDirectiveContent(const std::string& content) {
     
     // Check for excessive length (over 5000 characters might be problematic)
     if (content.length() > 5000) {
-        LogMessage("WARNING: Identity directive is very long (" + std::to_string(content.length()) + " characters) - this might cause issues");
+        LOG_WARNING("Settings", "Identity directive is very long (" + std::to_string(content.length()) + " characters) - this might cause issues");
         return false;
     }
     
     // Check for common template injection patterns
     if (content.find("{{") != std::string::npos || content.find("}}") != std::string::npos ||
         content.find("{%") != std::string::npos || content.find("%}") != std::string::npos) {
-        LogMessage("WARNING: Identity directive contains template syntax that could cause processing issues");
+        LOG_WARNING("Settings", "Identity directive contains template syntax that could cause processing issues");
         return false;
     }
     
@@ -771,7 +761,7 @@ inline bool SettingsUI::ValidateDirectiveContent(const std::string& content) {
 inline void SettingsUI::ClearCurrentIdentityDirective() {
     if (!settings_manager) return;
     
-    LogMessage("EMERGENCY FIX: Clearing potentially corrupted identity directive");
+    LOG_ERROR("Settings", "EMERGENCY FIX: Clearing potentially corrupted identity directive");
     
     // Clear the current identity directive
     settings_manager->SetString("Templates", "identity_directive", "");
@@ -783,13 +773,13 @@ inline void SettingsUI::ClearCurrentIdentityDirective() {
         identity_directive_text->SetValue("");
     }
     
-    LogMessage("Identity directive cleared - Discord output should return to normal");
+    LOG_INFO("Settings", "Identity directive cleared - Discord output should return to normal");
 }
 
 inline void SettingsUI::ValidateAndCleanAllPersonas() {
     if (!settings_manager) return;
     
-    LogMessage("Validating and cleaning all saved personas...");
+    LOG_INFO("Settings", "Validating and cleaning all saved personas...");
     
     int cleaned_count = 0;
     
@@ -803,7 +793,7 @@ inline void SettingsUI::ValidateAndCleanAllPersonas() {
         
         if (!name.empty() && !directive.empty()) {
             if (!ValidateDirectiveContent(directive)) {
-                LogMessage("CLEANING: Removing corrupted persona '" + name + "'");
+                LOG_WARNING("Settings", "CLEANING: Removing corrupted persona '" + name + "'");
                 settings_manager->SetString("Personas", name_key, "");
                 settings_manager->SetString("Personas", directive_key, "");
                 cleaned_count++;
@@ -814,8 +804,8 @@ inline void SettingsUI::ValidateAndCleanAllPersonas() {
     if (cleaned_count > 0) {
         settings_manager->SaveSettings();
         RefreshPersonaList();
-        LogMessage("Cleaned " + std::to_string(cleaned_count) + " corrupted personas");
+        LOG_INFO("Settings", "Cleaned " + std::to_string(cleaned_count) + " corrupted personas");
     } else {
-        LogMessage("All personas are valid - no cleanup needed");
+        LOG_INFO("Settings", "All personas are valid - no cleanup needed");
     }
 }

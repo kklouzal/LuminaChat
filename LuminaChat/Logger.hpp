@@ -43,7 +43,7 @@ private:
     struct alignas(64) LogEntry {
         LogLevel level;
         std::chrono::system_clock::time_point timestamp;
-        std::string_view component;
+        std::string component;  // Changed from string_view to string to avoid lifetime issues
         std::string message;
         
         LogEntry() = default;
@@ -79,8 +79,8 @@ private:
         std::mutex update_mutex;  // Only for timestamp formatting, not reads
     } ts_cache;
 
-    // Pre-allocated formatting buffer (thread_local for thread safety)
-    static thread_local std::array<char, 1024> format_buffer;
+    // Pre-allocated formatting buffer (thread_local for thread safety) - increased size
+    static thread_local std::array<char, 4096> format_buffer;
     
     void WorkerThreadFunc() {
         while (!should_stop.load(std::memory_order_acquire)) [[likely]] {
@@ -107,11 +107,25 @@ private:
     }
     
     void ProcessLogEntry(const LogEntry& entry) {
+        // Validate entry data before processing
+        if (entry.component.empty() || entry.message.empty()) {
+            // Log a debug message about empty entries but don't spam the UI
+            static std::atomic<int> empty_entry_count{0};
+            if (empty_entry_count.fetch_add(1) < 5) {  // Only log first 5 occurrences
+                std::lock_guard<std::mutex> lock(callback_mutex);
+                if (output_callback) {
+                    const char* debug_msg = "[LOGGER_WARNING] Empty log entry detected - check component/message validity";
+                    output_callback(std::string_view(debug_msg, std::strlen(debug_msg)));
+                }
+            }
+            return;  // Skip processing empty entries
+        }
+        
         const char* level_str = GetLevelString(entry.level);
         const char* timestamp_str = GetFastTimestamp(entry.timestamp);
         
-        // Use std::to_chars for faster integer conversion and avoid snprintf overhead
-        std::array<char, 1024> local_buffer;
+        // Use larger buffer to handle longer messages (increased from 1024 to 4096)
+        std::array<char, 4096> local_buffer;
         char* ptr = local_buffer.data();
         char* end = local_buffer.data() + local_buffer.size();
         
@@ -144,15 +158,24 @@ private:
                 output_callback(std::string_view(local_buffer.data(), ptr - local_buffer.data()));
             }
         } else [[unlikely]] {
-            // Buffer overflow protection - truncate message
-            const size_t available = end - ptr - 1; // Leave space for null terminator
+            // Buffer overflow protection - truncate message with indicator
+            const size_t available = end - ptr - 4; // Leave space for "..." and null terminator
             if (available > 0) [[likely]] {
                 std::memcpy(ptr, entry.message.data(), available);
                 ptr += available;
+                // Add truncation indicator
+                *ptr++ = '.'; *ptr++ = '.'; *ptr++ = '.';
                 
                 std::lock_guard<std::mutex> lock(callback_mutex);
                 if (output_callback) [[likely]] {
                     output_callback(std::string_view(local_buffer.data(), ptr - local_buffer.data()));
+                }
+            } else [[unlikely]] {
+                // Extremely rare case where even the header doesn't fit
+                const char* truncated_msg = "[LOG_BUFFER_OVERFLOW]";
+                std::lock_guard<std::mutex> lock(callback_mutex);
+                if (output_callback) [[likely]] {
+                    output_callback(std::string_view(truncated_msg, std::strlen(truncated_msg)));
                 }
             }
         }
@@ -308,8 +331,8 @@ public:
     }
 };
 
-// Thread-local buffer definition
-thread_local std::array<char, 1024> Logger::format_buffer{};
+// Thread-local buffer definition - increased size to match ProcessLogEntry buffer
+thread_local std::array<char, 4096> Logger::format_buffer{};
 
 // Global logger instance
 [[nodiscard]] inline Logger& GetLogger() {
@@ -317,18 +340,38 @@ thread_local std::array<char, 1024> Logger::format_buffer{};
     return logger;
 }
 
-// High-performance logging macros with compile-time optimization
+// High-performance logging macros with compile-time optimization and validation
 #define LOG_DEBUG(component, message) \
-    GetLogger().LogMessage<Logger::LogLevel::DBG>(component, message)
+    do { \
+        const auto& msg_ref = (message); \
+        if (!std::string_view(msg_ref).empty()) { \
+            GetLogger().LogMessage<Logger::LogLevel::DBG>(component, msg_ref); \
+        } \
+    } while(0)
 
 #define LOG_INFO(component, message) \
-    GetLogger().LogMessage<Logger::LogLevel::INF>(component, message)
+    do { \
+        const auto& msg_ref = (message); \
+        if (!std::string_view(msg_ref).empty()) { \
+            GetLogger().LogMessage<Logger::LogLevel::INF>(component, msg_ref); \
+        } \
+    } while(0)
 
 #define LOG_WARNING(component, message) \
-    GetLogger().LogMessage<Logger::LogLevel::WRN>(component, message)
+    do { \
+        const auto& msg_ref = (message); \
+        if (!std::string_view(msg_ref).empty()) { \
+            GetLogger().LogMessage<Logger::LogLevel::WRN>(component, msg_ref); \
+        } \
+    } while(0)
 
 #define LOG_ERROR(component, message) \
-    GetLogger().LogMessage<Logger::LogLevel::ERR>(component, message)
+    do { \
+        const auto& msg_ref = (message); \
+        if (!std::string_view(msg_ref).empty()) { \
+            GetLogger().LogMessage<Logger::LogLevel::ERR>(component, msg_ref); \
+        } \
+    } while(0)
 
 // Component-specific convenience macros using string literals for zero-cost abstraction
 #define LOG_Logger(message) LOG_INFO("Logger", message)
@@ -346,6 +389,9 @@ thread_local std::array<char, 1024> Logger::format_buffer{};
 #define LOG_EmoTagPlugin(message) LOG_INFO("EmoTagPlugin", message)
 #define LOG_LuminaChat(message) LOG_INFO("LuminaChat", message)
 #define LOG_ContextState(message) LOG_INFO("ContextState", message)
+#define LOG_UI(message) LOG_INFO("UI", message)
+#define LOG_Settings(message) LOG_INFO("Settings", message)
+#define LOG_MessageGeneration(message) LOG_INFO("MessageGeneration", message)
 
 #define LOG_DEBUG_Logger(message) LOG_DEBUG("Logger", message)
 #define LOG_DEBUG_SettingsManager(message) LOG_DEBUG("SettingsManager", message)
@@ -378,6 +424,7 @@ thread_local std::array<char, 1024> Logger::format_buffer{};
 #define LOG_ERROR_EmoTagPlugin(message) LOG_ERROR("EmoTagPlugin", message)
 #define LOG_ERROR_LuminaChat(message) LOG_ERROR("LuminaChat", message)
 #define LOG_ERROR_ContextState(message) LOG_ERROR("ContextState", message)
+#define LOG_ERROR_MessageGeneration(message) LOG_ERROR("MessageGeneration", message)
 
 #define LOG_WARNING_Logger(message) LOG_WARNING("Logger", message)
 #define LOG_WARNING_SettingsManager(message) LOG_WARNING("SettingsManager", message)
@@ -394,6 +441,7 @@ thread_local std::array<char, 1024> Logger::format_buffer{};
 #define LOG_WARNING_EmoTagPlugin(message) LOG_WARNING("EmoTagPlugin", message)
 #define LOG_WARNING_LuminaChat(message) LOG_WARNING("LuminaChat", message)
 #define LOG_WARNING_ContextState(message) LOG_WARNING("ContextState", message)
+#define LOG_WARNING_MessageGeneration(message) LOG_WARNING("MessageGeneration", message)
 
 // Legacy LogHandler compatibility macros (will be updated to use new Logger)
 #define LLAMA_LOG(message) LOG_INFO("LlamaManager", message)

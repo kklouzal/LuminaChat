@@ -13,6 +13,7 @@
 #include <memory>
 #include <functional>
 #include "../SettingsManager.hpp"
+#include "../Logger.hpp"
 
 // Forward declarations
 class LlamaManager;
@@ -31,7 +32,6 @@ class ContextInfo;
 class OuterVoiceUI {
 public:
     // Callback types for communication with main frame
-    using LogCallback = std::function<void(const std::string&)>;
     using ContextApplyCallback = std::function<void(ContextInfo*, const std::string&)>;
 
     explicit OuterVoiceUI(wxWindow* parent);
@@ -43,7 +43,7 @@ public:
     // External dependencies injection
     void SetSettingsManager(SettingsManager* settings_manager);
     void SetLlamaManager(LlamaManager* llama_manager);
-    void SetCallbacks(LogCallback log_cb, ContextApplyCallback context_apply_cb);
+    void SetCallbacks(ContextApplyCallback context_apply_cb);
 
     // Settings persistence
     void LoadSettings();
@@ -92,7 +92,6 @@ private:
     LlamaManager* llama_manager{nullptr};
 
     // Callbacks
-    LogCallback log_callback;
     ContextApplyCallback context_apply_callback;
 
     // State tracking
@@ -110,7 +109,6 @@ private:
     void OnSystemPromptFocusLost(wxFocusEvent& event);
 
     // Helper methods
-    void LogMessage(const std::string& message);
     void SetupSliderEvents();
     void ValidateModelConfiguration();
     void UpdateSliderLabels();
@@ -298,22 +296,21 @@ inline void OuterVoiceUI::SetLlamaManager(LlamaManager* llama_manager) {
     this->llama_manager = llama_manager;
 }
 
-inline void OuterVoiceUI::SetCallbacks(LogCallback log_cb, ContextApplyCallback context_apply_cb) {
-    log_callback = log_cb;
+inline void OuterVoiceUI::SetCallbacks(ContextApplyCallback context_apply_cb) {
     context_apply_callback = context_apply_cb;
 }
 
 // Settings persistence
 inline void OuterVoiceUI::LoadSettings() {
     if (!settings_manager) {
-        LogMessage("WARNING: Cannot load settings - SettingsManager not initialized");
+        LOG_WARNING("UI", "Cannot load settings - SettingsManager not initialized");
         return;
     }
 
-    LogMessage("Loading outer voice settings UI configuration...");
+    LOG_INFO("UI", "Loading outer voice settings UI configuration...");
     LoadOuterVoiceSettings();
     UpdateUI();
-    LogMessage("Outer voice settings UI loaded successfully");
+    LOG_INFO("UI", "Outer voice settings UI loaded successfully");
 }
 
 inline void OuterVoiceUI::LoadOuterVoiceSettings() {
@@ -324,7 +321,7 @@ inline void OuterVoiceUI::LoadOuterVoiceSettings() {
         std::string model_path = settings_manager->GetString("Models", "outer_model_path", "");
         model_path_text->SetValue(model_path);
         if (!model_path.empty()) {
-            LogMessage("Loaded outer voice model path: " + model_path);
+            LOG_INFO("UI", "Loaded outer voice model path: " + model_path);
         }
     }
 
@@ -332,34 +329,34 @@ inline void OuterVoiceUI::LoadOuterVoiceSettings() {
     if (context_size_slider) {
         int context_size = settings_manager->GetInt("Models", "outer_context_size", 4096);
         context_size_slider->SetValue(context_size);
-        LogMessage("Loaded outer voice context size: " + std::to_string(context_size));
+        LOG_INFO("UI", "Loaded outer voice context size: " + std::to_string(context_size));
     }
 
     // Load GPU layers
     if (gpu_layers_slider) {
         int gpu_layers = settings_manager->GetInt("Models", "outer_gpu_layers", 999);
         gpu_layers_slider->SetValue(gpu_layers);
-        LogMessage("Loaded outer voice GPU layers: " + std::to_string(gpu_layers));
+        LOG_INFO("UI", "Loaded outer voice GPU layers: " + std::to_string(gpu_layers));
     }
 
     // Load system prompt
     if (system_prompt_text) {
         std::string system_prompt = settings_manager->GetString("Models", "outer_system_prompt", "");
         system_prompt_text->SetValue(system_prompt);
-        LogMessage("Loaded outer voice system prompt: " + system_prompt);
+        LOG_INFO("UI", "Loaded outer voice system prompt: " + system_prompt);
     }
 }
 
 inline void OuterVoiceUI::SaveSettings() {
     if (!settings_manager) {
-        LogMessage("WARNING: Cannot save settings - SettingsManager not initialized");
+        LOG_WARNING("UI", "Cannot save settings - SettingsManager not initialized");
         return;
     }
 
-    LogMessage("Saving outer voice settings UI configuration...");
+    LOG_INFO("UI", "Saving outer voice settings UI configuration...");
     SaveOuterVoiceSettings();
     settings_manager->SaveSettings();
-    LogMessage("Outer voice settings UI saved successfully");
+    LOG_INFO("UI", "Outer voice settings UI saved successfully");
 }
 
 inline void OuterVoiceUI::SaveOuterVoiceSettings() {
@@ -413,11 +410,11 @@ inline void OuterVoiceUI::UpdateTemplateDisplay(const std::string& template_cont
         if (wx_content.IsEmpty() && !template_content.empty()) {
             // UTF-8 conversion failed, try default conversion
             wx_content = wxString(template_content);
-            LogMessage("UTF-8 conversion failed for outer voice template, using default conversion");
+            LOG_WARNING("UI", "UTF-8 conversion failed for outer voice template, using default conversion");
         }
         template_display->SetValue(wx_content);
         last_finalized_template = template_content; // Keep track of the last finalized template
-        LogMessage("Updated outer voice template display with " + std::to_string(template_content.length()) + " characters");
+        LOG_DEBUG("UI", "Updated outer voice template display with " + std::to_string(template_content.length()) + " characters");
     }
 }
 
@@ -466,7 +463,7 @@ inline void OuterVoiceUI::OnBrowseModel(wxCommandEvent& event) {
         OnModelPathChange(event); // Trigger save
     }
     
-    LogMessage("Selected outer voice model file: " + path.ToStdString());
+    LOG_INFO("UI", "Selected outer voice model file: " + path.ToStdString());
 }
 
 inline void OuterVoiceUI::OnContextSizeChange(wxCommandEvent& event) {
@@ -497,13 +494,6 @@ inline void OuterVoiceUI::OnSystemPromptFocusLost(wxFocusEvent& event) {
     if (settings_manager && system_prompt_text) {
         settings_manager->SetString("Models", "outer_system_prompt", system_prompt_text->GetValue().ToStdString());
         settings_manager->SaveSettings();
-    }
-}
-
-// Helper methods
-inline void OuterVoiceUI::LogMessage(const std::string& message) {
-    if (log_callback) {
-        log_callback(message);
     }
 }
 

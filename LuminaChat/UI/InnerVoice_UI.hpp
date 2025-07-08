@@ -13,6 +13,7 @@
 #include <memory>
 #include <functional>
 #include "../SettingsManager.hpp"
+#include "../Logger.hpp"
 
 // Forward declarations
 class LlamaManager;
@@ -31,7 +32,6 @@ class ContextInfo;
 class InnerVoiceUI {
 public:
     // Callback types for communication with main frame
-    using LogCallback = std::function<void(const std::string&)>;
     using ContextApplyCallback = std::function<void(ContextInfo*, const std::string&)>;
 
     explicit InnerVoiceUI(wxWindow* parent);
@@ -43,7 +43,7 @@ public:
     // External dependencies injection
     void SetSettingsManager(SettingsManager* settings_manager);
     void SetLlamaManager(LlamaManager* llama_manager);
-    void SetCallbacks(LogCallback log_cb, ContextApplyCallback context_apply_cb);
+    void SetCallbacks(ContextApplyCallback context_apply_cb);
 
     // Settings persistence
     void LoadSettings();
@@ -92,7 +92,6 @@ private:
     LlamaManager* llama_manager{nullptr};
 
     // Callbacks
-    LogCallback log_callback;
     ContextApplyCallback context_apply_callback;
 
     // State tracking
@@ -110,7 +109,6 @@ private:
     void OnSystemPromptFocusLost(wxFocusEvent& event);
 
     // Helper methods
-    void LogMessage(const std::string& message);
     void SetupSliderEvents();
     void ValidateModelConfiguration();
     void UpdateSliderLabels();
@@ -297,22 +295,21 @@ inline void InnerVoiceUI::SetLlamaManager(LlamaManager* llama_manager) {
     this->llama_manager = llama_manager;
 }
 
-inline void InnerVoiceUI::SetCallbacks(LogCallback log_cb, ContextApplyCallback context_apply_cb) {
-    log_callback = log_cb;
+inline void InnerVoiceUI::SetCallbacks(ContextApplyCallback context_apply_cb) {
     context_apply_callback = context_apply_cb;
 }
 
 // Settings persistence
 inline void InnerVoiceUI::LoadSettings() {
     if (!settings_manager) {
-        LogMessage("WARNING: Cannot load settings - SettingsManager not initialized");
+        LOG_WARNING("InnerVoice", "Cannot load settings - SettingsManager not initialized");
         return;
     }
 
-    LogMessage("Loading inner voice settings UI configuration...");
+    LOG_INFO("InnerVoice", "Loading inner voice settings UI configuration...");
     LoadInnerVoiceSettings();
     UpdateUI();
-    LogMessage("Inner voice settings UI loaded successfully");
+    LOG_INFO("InnerVoice", "Inner voice settings UI loaded successfully");
 }
 
 inline void InnerVoiceUI::LoadInnerVoiceSettings() {
@@ -323,7 +320,7 @@ inline void InnerVoiceUI::LoadInnerVoiceSettings() {
         std::string model_path = settings_manager->GetString("Models", "inner_model_path", "");
         model_path_text->SetValue(model_path);
         if (!model_path.empty()) {
-            LogMessage("Loaded inner voice model path: " + model_path);
+            LOG_INFO("InnerVoice", "Loaded inner voice model path: " + model_path);
         }
     }
 
@@ -331,14 +328,14 @@ inline void InnerVoiceUI::LoadInnerVoiceSettings() {
     if (context_size_slider) {
         int context_size = settings_manager->GetInt("Models", "inner_context_size", 4096);
         context_size_slider->SetValue(context_size);
-        LogMessage("Loaded inner voice context size: " + std::to_string(context_size));
+        LOG_INFO("InnerVoice", "Loaded inner voice context size: " + std::to_string(context_size));
     }
 
     // Load GPU layers
     if (gpu_layers_slider) {
         int gpu_layers = settings_manager->GetInt("Models", "inner_gpu_layers", 999);
         gpu_layers_slider->SetValue(gpu_layers);
-        LogMessage("Loaded inner voice GPU layers: " + std::to_string(gpu_layers));
+        LOG_INFO("InnerVoice", "Loaded inner voice GPU layers: " + std::to_string(gpu_layers));
     }
 
     // Load system prompt
@@ -346,21 +343,21 @@ inline void InnerVoiceUI::LoadInnerVoiceSettings() {
         std::string system_prompt = settings_manager->GetString("Models", "inner_system_prompt", "");
         system_prompt_text->SetValue(system_prompt);
         if (!system_prompt.empty()) {
-            LogMessage("Loaded inner voice system prompt");
+            LOG_INFO("InnerVoice", "Loaded inner voice system prompt");
         }
     }
 }
 
 inline void InnerVoiceUI::SaveSettings() {
     if (!settings_manager) {
-        LogMessage("WARNING: Cannot save settings - SettingsManager not initialized");
+        LOG_WARNING("UI", "Cannot save settings - SettingsManager not initialized");
         return;
     }
 
-    LogMessage("Saving inner voice settings UI configuration...");
+    LOG_INFO("UI", "Saving inner voice settings UI configuration...");
     SaveInnerVoiceSettings();
     settings_manager->SaveSettings();
-    LogMessage("Inner voice settings UI saved successfully");
+    LOG_INFO("UI", "Inner voice settings UI saved successfully");
 }
 
 inline void InnerVoiceUI::SaveInnerVoiceSettings() {
@@ -419,13 +416,13 @@ inline void InnerVoiceUI::UpdateTemplateDisplay(const std::string& template_cont
         if (wx_content.IsEmpty() && !template_content.empty()) {
             // UTF-8 conversion failed, try default conversion
             wx_content = wxString(template_content);
-            LogMessage("UTF-8 conversion failed for inner voice template, using default conversion");
+            LOG_WARNING("UI", "UTF-8 conversion failed for inner voice template, using default conversion");
         }
         template_display->SetValue(wx_content);
         last_finalized_template = template_content; // Keep track of the last finalized template
-        LogMessage("Updated inner voice template display with " + std::to_string(template_content.length()) + " characters");
+        LOG_DEBUG("UI", "Updated inner voice template display with " + std::to_string(template_content.length()) + " characters");
     }
-    LogMessage("Template Content: " + template_content);
+    LOG_DEBUG("UI", "Template Content: " + template_content);
 }
 
 // Inner Voice configuration access
@@ -473,7 +470,7 @@ inline void InnerVoiceUI::OnBrowseModel(wxCommandEvent& event) {
         OnModelPathChange(event); // Trigger save
     }
     
-    LogMessage("Selected inner voice model file: " + path.ToStdString());
+    LOG_INFO("UI", "Selected inner voice model file: " + path.ToStdString());
 }
 
 inline void InnerVoiceUI::OnContextSizeChange(wxCommandEvent& event) {
@@ -504,12 +501,5 @@ inline void InnerVoiceUI::OnSystemPromptFocusLost(wxFocusEvent& event) {
     if (settings_manager && system_prompt_text) {
         settings_manager->SetString("Models", "inner_system_prompt", system_prompt_text->GetValue().ToStdString());
         settings_manager->SaveSettings();
-    }
-}
-
-// Helper methods
-inline void InnerVoiceUI::LogMessage(const std::string& message) {
-    if (log_callback) {
-        log_callback(message);
     }
 }

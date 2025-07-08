@@ -1,12 +1,12 @@
 #pragma once
 
-#include "Context/ContextInfo.hpp"
-#include "ContextStats.hpp"
-#include "ProcessingPipeline.hpp"
-#include "Orchestrator.hpp"
-#include "LlamaManager.hpp"
-#include "SettingsManager.hpp"
-#include "Logger.hpp"
+#include "../Context/ContextInfo.hpp"
+#include "../ContextStats.hpp"
+#include "../ProcessingPipeline.hpp"
+#include "../Orchestrator.hpp"
+#include "../LlamaManager.hpp"
+#include "../SettingsManager.hpp"
+#include "../Logger.hpp"
 #include <functional>
 #include <cstdint>
 #include <atomic>

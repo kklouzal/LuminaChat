@@ -1,12 +1,12 @@
 #pragma once
 
-#include "Context/ContextInfo.hpp"
-#include "ProcessingPipeline.hpp"
-#include "Orchestrator.hpp"
-#include "LlamaManager.hpp"
-#include "SettingsManager.hpp"
-#include "Logger.hpp"
-#include "Utilities.hpp"
+#include "../Context/ContextInfo.hpp"
+#include "../ProcessingPipeline.hpp"
+#include "../Orchestrator.hpp"
+#include "../LlamaManager.hpp"
+#include "../SettingsManager.hpp"
+#include "../Logger.hpp"
+#include "../Utilities.hpp"
 #include <chrono>
 #include <thread>
 #include <memory>
