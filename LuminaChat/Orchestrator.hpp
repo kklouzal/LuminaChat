@@ -16,6 +16,7 @@
 #include "LlamaManager.hpp"
 #include "Context/ContextInfo.hpp"
 #include "Logger.hpp"
+#include "ErrorHandling.hpp"
 
 // Pruning buffer for plugin consumption
 struct PrunedMessageBatch {
@@ -630,7 +631,7 @@ inline void Orchestrator::InputReceived(std::string_view input, std::string_view
     // Set context to processing state
     SetContextState(context_id, ProcessingState::NORMAL_PROCESSING);
     
-    try {
+    SafeExecute([this, context_id, sanitized_input, source, username]() {
         // Get context size for main model - settings manager is required
         auto* settings = GetSettingsManager();
         if (!settings) [[unlikely]] {
@@ -691,11 +692,7 @@ inline void Orchestrator::InputReceived(std::string_view input, std::string_view
         // Update statistics - lock-free atomic increment
         stats.messages_processed.fetch_add(1, std::memory_order_relaxed);
         
-    } catch (const std::exception& e) {
-        // Exception handling is unlikely in normal operation
-        LOG_ERROR_Orchestrator("Error processing input: " + std::string(e.what()));
-        SetContextState(context_id, ProcessingState::ERROR_STATE);
-    }
+    }, "input processing", "Orchestrator");
 }
 
 inline void Orchestrator::OnRawDiscordMessage(std::string_view content, 

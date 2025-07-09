@@ -4,6 +4,7 @@
 #include "Context/ContextInfo.hpp"
 #include "SettingsManager.hpp"
 #include "Logger.hpp"
+#include "ErrorHandling.hpp"
 // llama.cpp includes
 #include "llama.h"
 #include <memory>

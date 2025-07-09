@@ -7,6 +7,7 @@
 #include "../LlamaManager.hpp"
 #include "../SettingsManager.hpp"
 #include "../Logger.hpp"
+#include "../ErrorHandling.hpp"
 #include <functional>
 #include <cstdint>
 #include <atomic>

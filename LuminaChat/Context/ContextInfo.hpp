@@ -6,6 +6,7 @@
 #include "../ModelInfo.hpp"
 #include "../TokenCache.hpp"
 #include "../Logger.hpp"
+#include "../ErrorHandling.hpp"
 #include "../Utilities.hpp"
 // llama.cpp includes
 #include "llama-cpp.h"

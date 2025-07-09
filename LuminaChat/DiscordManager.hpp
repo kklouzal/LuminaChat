@@ -23,6 +23,8 @@
 #include <map>
 #include <dpp/dpp.h>
 #include <dpp/nlohmann/json.hpp>
+#include "Logger.hpp"
+#include "ErrorHandling.hpp"
 
 // Forward declaration - InputSource is defined in Orchestrator.hpp
 enum class InputSource;

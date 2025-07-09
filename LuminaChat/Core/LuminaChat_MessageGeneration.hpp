@@ -9,6 +9,7 @@
 #include <string>
 #include "../Logger.hpp"
 #include "../ErrorHandling.hpp"
+#include "../ErrorHandling.hpp"
 
 // === Message Generation and Processing Methods ===
 
@@ -97,7 +98,7 @@ inline GenerationCallbacks LuminaChatFrame::CreateGenerationCallbacks() {
                 } else {
                     LOG_MessageGeneration("Response generation was stopped or failed");
                     if (full_response.empty()) {
-                        AddChatMessage("System", "Response generation was interrupted.", LuminaChatColors::ERROR_RED);
+                        HandleWarning("Response generation was interrupted", "Message Generation", true);
                     }
                 }
             });
@@ -123,7 +124,7 @@ inline GenerationCallbacks LuminaChatFrame::CreateGenerationCallbacks() {
                 }
                 
                 LOG_ERROR_MessageGeneration("Error generating response: " + error_message);
-                AddChatMessage("System", "Error: " + error_message, LuminaChatColors::ERROR_RED);
+                HandleError("Error generating response: " + error_message, "Message Generation", true);
             });
         }
     );

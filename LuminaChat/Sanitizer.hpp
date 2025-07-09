@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Logger.hpp"
+#include "ErrorHandling.hpp"
 #include "SettingsManager.hpp"
 #include <string>
 #include <vector>
@@ -107,11 +108,9 @@ public:
         
         // Step 3: Optional filter callback notification
         if (filter_callback) {
-            try {
+            SafeExecute([&]() {
                 filter_callback(original_input, allowed);
-            } catch (const std::exception& e) {
-                LOG_WARNING_Sanitizer("Filter callback error: " + std::string(e.what()));
-            }
+            }, "execute filter callback for input", "Sanitizer");
         }
         
         if (!allowed) {
@@ -132,11 +131,9 @@ public:
         bool allowed = IsContentAllowed(response);
         
         if (filter_callback) {
-            try {
+            SafeExecute([&]() {
                 filter_callback(response, allowed);
-            } catch (const std::exception& e) {
-                LOG_WARNING_Sanitizer("Filter callback error for assistant response: " + std::string(e.what()));
-            }
+            }, "execute filter callback for assistant response", "Sanitizer");
         }
         
         if (!allowed) {
@@ -225,11 +222,9 @@ public:
         // Perform retroactive cleanup if callback is available
         if (pattern_was_added && callback_to_call) {
             LOG_Sanitizer("Performing retroactive cleanup for newly blacklisted pattern");
-            try {
+            SafeExecute([&]() {
                 callback_to_call(pattern);
-            } catch (const std::exception& e) {
-                LOG_ERROR_Sanitizer("Error during retroactive cleanup: " + std::string(e.what()));
-            }
+            }, "perform retroactive cleanup", "Sanitizer");
         }
         
         return pattern_was_added;
@@ -323,7 +318,7 @@ private:
             
             return cleaned;
         } catch (const std::exception& e) {
-            LOG_WARNING_Sanitizer("Discord formatting cleanup failed: " + std::string(e.what()));
+            HandleError("Discord formatting cleanup failed: " + std::string(e.what()), "Sanitizer");
             return text;
         }
     }
@@ -420,7 +415,7 @@ private:
             
             return normalized;
         } catch (const std::exception& e) {
-            LOG_WARNING_Sanitizer("Whitespace normalization failed: " + std::string(e.what()));
+            HandleError("Whitespace normalization failed: " + std::string(e.what()), "Sanitizer");
             // Fallback to basic trim
             const size_t start = text.find_first_not_of(" \t\n\r");
             if (start == std::string::npos) return "";

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Logger.hpp"
+#include "ErrorHandling.hpp"
 #include <string>
 #include <unordered_map>
 #include <fstream>

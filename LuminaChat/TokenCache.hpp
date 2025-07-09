@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Logger.hpp"
+#include "ErrorHandling.hpp"
 // llama.cpp includes
 #include "llama-cpp.h"
 #include <unordered_map>

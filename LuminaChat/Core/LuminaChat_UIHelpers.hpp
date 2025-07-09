@@ -68,7 +68,7 @@ inline void LuminaChatFrame::UpdateContextStatus() {
         SetStatusText(inner_status + " | " + outer_status, 2);
         
     } catch (const std::exception& e) {
-        LOG_ERROR_LuminaChat("Error updating context status: " + std::string(e.what()));
+        HandleError("Error updating context status: " + std::string(e.what()), "Context Status");
         SetStatusText("Context Error", 2);
     }
 }
@@ -120,7 +120,7 @@ inline void LuminaChatFrame::UpdateDiscordAllowedChannels() {
         return;
     }
     
-    try {
+    SafeExecute([&]() {
         // Parse the comma-separated channel IDs using utility function
         std::string channels_str = allowed_channels_text->GetValue().ToStdString();
         auto channel_ids = LuminaChatValidationUtilities::ParseDiscordChannelIDs(channels_str);
@@ -130,10 +130,7 @@ inline void LuminaChatFrame::UpdateDiscordAllowedChannels() {
         
         LOG_LuminaChat(wxString::Format("Updated allowed Discord channels: %d channels configured", 
                      static_cast<int>(channel_ids.size())).ToStdString());
-        
-    } catch (const std::exception& e) {
-        HandleError("Error updating Discord allowed channels: " + std::string(e.what()), "Discord Integration");
-    }
+    }, "update Discord allowed channels", "Discord Integration");
 }
 
 inline void LuminaChatFrame::RefreshDiscordChannelList() {
@@ -175,6 +172,6 @@ inline void LuminaChatFrame::RefreshDiscordChannelList() {
                      static_cast<int>(allowed_count)).ToStdString());
         
     } catch (const std::exception& e) {
-        LOG_ERROR_LuminaChat(wxString::Format("Error refreshing Discord channel list: %s", e.what()).ToStdString());
+        HandleError("Error refreshing Discord channel list: " + std::string(e.what()), "Discord Integration");
     }
 }

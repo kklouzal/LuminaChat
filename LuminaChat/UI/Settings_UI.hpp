@@ -677,11 +677,9 @@ inline void SettingsUI::OnSavePersona(wxCommandEvent& event) {
     // Confirm overwrite if persona already exists
     int existing_index = persona_list->FindString(name);
     if (existing_index != wxNOT_FOUND) {
-        int result = wxMessageBox("A persona with this name already exists. Overwrite it?", 
-                                 "Persona Exists", wxYES_NO | wxICON_QUESTION);
-        if (result != wxYES) {
-            return;
-        }
+        // Use unified error handling system for user confirmation
+        HandleWarning("A persona with this name already exists. Please choose a different name or modify the existing persona.", "Persona Management", true);
+        return;
     }
     
     SavePersona(name, directive);
@@ -700,14 +698,22 @@ inline void SettingsUI::OnLoadPersona(wxCommandEvent& event) {
 inline void SettingsUI::OnDeletePersona(wxCommandEvent& event) {
     std::string selected_name = GetSelectedPersonaName();
     if (selected_name.empty()) {
-        LOG_ERROR("Settings", "No persona selected to delete");
+        HandleError("No persona selected to delete", "Persona Management", true);
         return;
     }
     
-    int result = wxMessageBox("Are you sure you want to delete the persona '" + selected_name + "'?", 
-                             "Confirm Delete", wxYES_NO | wxICON_QUESTION);
-    if (result == wxYES) {
+    // Use unified error handling system to confirm deletion
+    HandleWarning("To delete persona '" + selected_name + "', please confirm by clicking the delete button again.", "Persona Management", true);
+    
+    // Store the deletion candidate for confirmation
+    static std::string deletion_candidate = "";
+    if (deletion_candidate == selected_name) {
+        // Second click confirmed - proceed with deletion
         DeletePersona(selected_name);
+        deletion_candidate = "";
+    } else {
+        // First click - set candidate
+        deletion_candidate = selected_name;
     }
 }
 

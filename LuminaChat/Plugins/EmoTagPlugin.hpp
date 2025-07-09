@@ -6,6 +6,7 @@
 #include "../LlamaManager.hpp"
 #include "../SettingsManager.hpp"
 #include "../Logger.hpp"
+#include "../ErrorHandling.hpp"
 #include "../Utilities.hpp"
 #include <chrono>
 #include <memory>
@@ -150,14 +151,17 @@ public:
      * This is the main processing method used by the Orchestrator's pipeline
      */
     EmotionAnalysisResponse ProcessEmotionAnalysisRequest(const EmotionAnalysisRequest& request) {
-        try {
+        EmotionAnalysisResponse result("", request.context_id, false, 0, "Unknown error occurred");
+        
+        bool success = TryExecute([&]() {
             LogInfo("Processing emotion analysis for context: " + request.context_id + 
                    " (" + std::to_string(request.batch.ai_responses.size()) + " responses)");
             
             if (!emotion_model_ready.load() || !llama_manager) {
                 std::string error_msg = "Emotion model not ready for processing batch";
                 LogError(error_msg);
-                return EmotionAnalysisResponse("", request.context_id, false, 0, error_msg);
+                result = EmotionAnalysisResponse("", request.context_id, false, 0, error_msg);
+                return;
             }
             
             // Process the batch to generate emotional state (existing logic)
@@ -166,11 +170,12 @@ public:
             if (emotional_state.empty()) {
                 std::string error_msg = "Failed to generate emotional state for context: " + request.context_id;
                 LogError(error_msg);
-                return EmotionAnalysisResponse("", request.context_id, false, 0, error_msg);
+                result = EmotionAnalysisResponse("", request.context_id, false, 0, error_msg);
+                return;
             }
             
             // Create success response with the generated emotional state
-            EmotionAnalysisResponse response{
+            result = EmotionAnalysisResponse{
                 emotional_state,
                 request.context_id,
                 true,
@@ -184,50 +189,55 @@ public:
             emotional_states_generated++;
             batches_processed++;
             
-            return response;
-            
-        } catch (const std::exception& e) {
-            std::string error_msg = "Exception processing emotion analysis: " + std::string(e.what());
-            LogError(error_msg);
-            return EmotionAnalysisResponse("", request.context_id, false, 0, error_msg);
+        }, "emotion analysis processing", "EmoTagPlugin");
+        
+        if (!success) {
+            std::string error_msg = "Failed to process emotion analysis for context: " + request.context_id;
+            result = EmotionAnalysisResponse("", request.context_id, false, 0, error_msg);
         }
+        
+        return result;
     }
     
     /**
      * Apply an emotional state to a context (called by Orchestrator after successful processing)
      */
     bool ApplyEmotionalStateToContext(const std::string& context_id, const std::string& emotional_state) {
-        try {
+        bool overall_result = false;
+        
+        bool success = TryExecute([&]() {
             if (!llama_manager) {
                 LogError("LlamaManager not available for applying emotional state");
-                return false;
+                overall_result = false;
+                return;
             }
             
             // Get the original context
             auto* original_context = llama_manager->GetContextInfo(context_id);
             if (!original_context) {
                 LogWarning("Original context not found for emotional state application: " + context_id);
-                return false;
+                overall_result = false;
+                return;
             }
             
             // Apply the emotional state to the context
             if (emotional_state.empty()) {
                 LogWarning("Emotional state is empty - skipping update for context: " + context_id);
-                return false;
+                overall_result = false;
+                return;
             }
             
             // Try to acquire plugin processing lock for safe emotional state application
             if (!original_context->TryAcquirePluginProcessing("EmoTagPlugin")) {
                 LogWarning("Could not acquire plugin processing lock for context: " + context_id + " - context may be busy");
-                return false;
+                overall_result = false;
+                return;
             }
             
-            try {
-                // Apply the clean emotional state to the context
+            // Apply the clean emotional state to the context with automatic lock release
+            bool apply_success = TryExecute([&]() {
                 original_context->UpdateEmotionalState(emotional_state);
-                
                 contexts_updated++;
-                
                 LogInfo("Applied emotional state to context: " + context_id);
                 
                 // If this is an outer_voice context, also apply to the corresponding inner_voice context
@@ -250,17 +260,17 @@ public:
                     if (inner_context) {
                         // Try to acquire plugin processing lock for the inner context
                         if (inner_context->TryAcquirePluginProcessing("EmoTagPlugin")) {
-                            try {
+                            bool inner_success = TryExecute([&]() {
                                 inner_context->UpdateEmotionalState(emotional_state);
                                 contexts_updated++;
                                 LogInfo("Applied emotional state to inner_voice context: " + inner_context_id);
-                                
-                                // Release plugin processing lock for inner context
-                                [[maybe_unused]] bool released = inner_context->ReleasePluginProcessing("EmoTagPlugin");
-                            } catch (const std::exception& inner_ex) {
-                                // Release plugin processing lock on exception
-                                [[maybe_unused]] bool released = inner_context->ReleasePluginProcessing("EmoTagPlugin");
-                                LogWarning("Failed to apply emotional state to inner_voice context " + inner_context_id + ": " + std::string(inner_ex.what()));
+                            }, "inner context emotional state update", "EmoTagPlugin");
+                            
+                            // Always release the inner context lock
+                            [[maybe_unused]] bool released = inner_context->ReleasePluginProcessing("EmoTagPlugin");
+                            
+                            if (!inner_success) {
+                                LogWarning("Failed to apply emotional state to inner_voice context: " + inner_context_id);
                                 // Don't fail the whole operation if inner context update fails
                             }
                         } else {
@@ -270,21 +280,15 @@ public:
                         LogDebug("No corresponding inner_voice context found for: " + inner_context_id);
                     }
                 }
-                
-                // Release plugin processing lock
-                [[maybe_unused]] bool released = original_context->ReleasePluginProcessing("EmoTagPlugin");
-                return true;
-                
-            } catch (const std::exception&) {
-                // Release plugin processing lock on exception
-                [[maybe_unused]] bool released = original_context->ReleasePluginProcessing("EmoTagPlugin");
-                throw; // Re-throw the exception
-            }
+            }, "emotional state application", "EmoTagPlugin");
             
-        } catch (const std::exception& e) {
-            LogError("Exception applying emotional state to context: " + std::string(e.what()));
-            return false;
-        }
+            // Always release the main context lock
+            [[maybe_unused]] bool released = original_context->ReleasePluginProcessing("EmoTagPlugin");
+            overall_result = apply_success;
+            
+        }, "emotional state context application", "EmoTagPlugin");
+        
+        return success && overall_result;
     }
     
     /**
@@ -429,6 +433,7 @@ public:
     
     /**
      * Add a log entry to plugin-specific log history (for debugging)
+     * NOTE: This is only for UI debugging display - actual logging goes through unified Logger system
      */
     void AddLogEntry(const std::string& log_message) {
         std::lock_guard<std::mutex> lock(debug_mutex);
@@ -440,7 +445,7 @@ public:
         }
     }
     
-    // Helper methods for logging that also capture to debug history
+    // Helper methods that use the unified Logger and ErrorHandling systems
     void LogInfo(const std::string& message) {
         LOG_EmoTagPlugin(message);
         AddLogEntry("[INFO] " + message);
@@ -449,11 +454,15 @@ public:
     void LogWarning(const std::string& message) {
         LOG_WARNING_EmoTagPlugin(message);
         AddLogEntry("[WARN] " + message);
+        // Also use unified error handling for consistency
+        HandleWarning(message, "EmoTagPlugin", false);
     }
     
     void LogError(const std::string& message) {
         LOG_ERROR_EmoTagPlugin(message);
         AddLogEntry("[ERROR] " + message);
+        // Also use unified error handling for consistency and UI notification
+        HandleError(message, "EmoTagPlugin", false);
     }
     
     void LogDebug(const std::string& message) {

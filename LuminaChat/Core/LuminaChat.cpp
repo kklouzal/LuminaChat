@@ -37,6 +37,7 @@
 
 // Include rework components in strict dependency order
 #include "../Logger.hpp"
+#include "../ErrorHandling.hpp"
 #include "../SettingsManager.hpp"
 #include "../Sanitizer.hpp"
 #include "../DiscordManager.hpp"
@@ -354,92 +355,97 @@ LuminaChatFrame::~LuminaChatFrame() {
  * Plugins are initialized separately after model loading.
  */
 void LuminaChatFrame::Start() {
-    LOG_LuminaChat("Initializing LuminaChat Rework Architecture with llama.cpp integration...");
+    if (running) return;
     
     try {
-        // Initialize components in strict dependency order
-        // Register GLOBAL Logger output callback to display logs in UI
+        LOG_LuminaChat("Starting LuminaChat system...");
+        
+        // === STEP 1: Register ErrorHandler UI callbacks for unified error handling ===
+        // This connects the global ErrorHandler to our UI components
+        LuminaChat::ErrorHandler::GetInstance().RegisterErrorCallback([this](const std::string& message, const std::string& context) {
+            // Use CallAfter to ensure UI updates happen on the main thread
+            CallAfter([this, message, context]() {
+                std::string display_message = context.empty() ? message : context + ": " + message;
+                AddChatMessage("System", display_message, LuminaChatColors::ERROR_RED);
+            });
+        });
+        
+        LuminaChat::ErrorHandler::GetInstance().RegisterWarningCallback([this](const std::string& message, const std::string& context) {
+            CallAfter([this, message, context]() {
+                std::string display_message = context.empty() ? message : context + ": " + message;
+                AddChatMessage("System", display_message, LuminaChatColors::WARNING_ORANGE);
+            });
+        });
+        
+        LuminaChat::ErrorHandler::GetInstance().RegisterSuccessCallback([this](const std::string& message, const std::string& context) {
+            CallAfter([this, message, context]() {
+                std::string display_message = context.empty() ? message : context + ": " + message;
+                AddChatMessage("System", display_message, LuminaChatColors::SUCCESS_GREEN);
+            });
+        });
+        
+        LuminaChat::ErrorHandler::GetInstance().RegisterInfoCallback([this](const std::string& message, const std::string& context) {
+            CallAfter([this, message, context]() {
+                std::string display_message = context.empty() ? message : context + ": " + message;
+                AddChatMessage("System", display_message, LuminaChatColors::INFO_BLUE);
+            });
+        });
+        
+        LOG_LuminaChat("ErrorHandler UI callbacks registered for unified error handling");
+        
+        // === STEP 2: Initialize core components in dependency order ===
+        // Register Logger UI callback first to ensure logs are displayed
         GetLogger().RegisterOutputCallback([this](std::string_view log_message) {
-            CallAfter([this, log_str = std::string(log_message)]() {
-                OnLogMessage(log_str);
+            // Use CallAfter to ensure UI updates happen on the main thread
+            CallAfter([this, log_message]() {
+                OnLogMessage(log_message);
             });
         });
+        LOG_LuminaChat("Logger UI callback registered successfully");
         
-        LOG_LuminaChat("Global Logger connected to UI");
-        
-        // Register GLOBAL ErrorHandler callbacks for UI notifications
-        auto& error_handler = LuminaChat::ErrorHandler::GetInstance();
-        error_handler.RegisterErrorCallback([this](const std::string& message, const std::string& context) {
-            CallAfter([this, message, context]() {
-                AddChatMessage("System", message, LuminaChatColors::ERROR_RED);
-            });
-        });
-        error_handler.RegisterWarningCallback([this](const std::string& message, const std::string& context) {
-            CallAfter([this, message, context]() {
-                AddChatMessage("System", message, LuminaChatColors::WARNING_ORANGE);
-            });
-        });
-        error_handler.RegisterSuccessCallback([this](const std::string& message, const std::string& context) {
-            CallAfter([this, message, context]() {
-                AddChatMessage("System", message, LuminaChatColors::SUCCESS_GREEN);
-            });
-        });
-        error_handler.RegisterInfoCallback([this](const std::string& message, const std::string& context) {
-            CallAfter([this, message, context]() {
-                AddChatMessage("System", message, LuminaChatColors::INFO_BLUE);
-            });
-        });
-        
-        LOG_LuminaChat("Global ErrorHandler callbacks registered for UI notifications");
-        
+        // Initialize Settings Manager with proper settings file path
         settings_manager = std::make_unique<SettingsManager>();
-        if (!settings_manager->Initialize()) {
-            LOG_WARNING_LuminaChat("Failed to initialize settings manager, using defaults");
+        if (!settings_manager->LoadSettings("")) {  // Empty string uses default path (luminachat.ini)
+            HandleWarning("Failed to load luminachat.ini, using defaults", "Settings");
         } else {
-            LOG_LuminaChat("Settings Manager initialized successfully");
+            LOG_LuminaChat("Settings loaded successfully");
         }
         
+        // Initialize Sanitizer
         sanitizer = std::make_unique<Sanitizer>();
-        sanitizer->LoadBlacklist("blacklist.txt");
         LOG_LuminaChat("Sanitizer initialized");
         
+        // Initialize Discord Manager
         discord_manager = std::make_unique<DiscordManager>();
         LOG_LuminaChat("Discord Manager initialized");
         
-        // Initialize LlamaManager with settings integration
-        llama_manager = std::make_unique<LlamaManager>(settings_manager.get());
+        // Initialize Llama Manager
+        llama_manager = std::make_unique<LlamaManager>();
         if (!llama_manager->Initialize()) {
-            LOG_ERROR_LuminaChat("Failed to initialize LlamaManager");
-            throw std::runtime_error("LlamaManager initialization failed");
+            HandleError("Failed to initialize LlamaManager", "LlamaManager");
+            return;
         }
-        LOG_LuminaChat("Llama Manager initialized with llama.cpp backend");
-
+        LOG_LuminaChat("Llama Manager initialized successfully");
+        
+        // Initialize Orchestrator (depends on LlamaManager)
         orchestrator = std::make_unique<Orchestrator>(llama_manager.get());
-        if (!orchestrator->Initialize()) {
-            LOG_ERROR_LuminaChat("Failed to initialize Orchestrator");
-            throw std::runtime_error("Orchestrator initialization failed");
-        }
         LOG_LuminaChat("Orchestrator initialized");
         
-        // Register Discord response callback to send responses back through DiscordManager
+        // === STEP 3: Set up inter-component dependencies ===
+        // Register Discord response callback with orchestrator
         orchestrator->RegisterDiscordResponseCallback([this](const DiscordChannelResponse& response) {
-            if (discord_manager && discord_connected) {
-                bool sent = discord_manager->SendAIResponseAdvanced(
-                    response.target_channel,
-                    response.response_content,
-                    response.internal_reasoning,
-                    response.context_current,
-                    response.context_maximum,
-                    response.model_name,
-                    response.processing_time
-                );
-                
+            if (discord_manager && discord_manager->IsConnected()) {
+                bool sent = discord_manager->SendAIResponse(response.target_channel, 
+                                                          response.response_content,
+                                                          response.internal_reasoning,
+                                                          response.context_current,
+                                                          response.context_maximum);
                 if (sent) {
-                    LOG_LuminaChat("Discord embed response sent to channel " + response.target_channel + 
+                    LOG_LuminaChat("Discord response sent successfully to channel " + response.target_channel +
                                  " (context: " + std::to_string(response.context_current) + "/" + 
                                  std::to_string(response.context_maximum) + ")");
                 } else {
-                    LOG_ERROR_LuminaChat("Failed to send Discord embed response to channel " + response.target_channel);
+                    LOG_ERROR_LuminaChat("Failed to send Discord response to channel " + response.target_channel);
                 }
             } else {
                 LOG_ERROR_LuminaChat("Cannot send Discord response - manager not available or not connected");
@@ -649,7 +655,7 @@ void LuminaChatFrame::RegisterCallbacks() {
                     return; // Application is shutting down or UI is destroyed
                 }
                 
-                try {
+                SafeExecute([&]() {
                     settings_ui->UpdateModelProgress(percentage);
                     
                     // Update status bar with progress information
@@ -663,9 +669,7 @@ void LuminaChatFrame::RegisterCallbacks() {
                     if (percentage % 10 == 0 || percentage >= 95) {
                         LOG_LuminaChat(wxString::Format("Model loading progress: %d%% (%s)", percentage, model_id).ToStdString());
                     }
-                } catch (...) {
-                    // Ignore any UI update errors during shutdown
-                }
+                }, "update model loading progress", "UI");
             });
         });
         LOG_LuminaChat("Progress callback registered with LlamaManager");
@@ -722,17 +726,13 @@ void LuminaChatFrame::InitializePlugins() {
     
     LOG_LuminaChat("Initializing plugins after successful model loading...");
     
-    try {
+    SafeExecute([&]() {
         InitializeSummarizationPlugin();
         InitializeEmoTagPlugin();
         InitializeContextPruningPlugin();
         
         LOG_LuminaChat("All plugins initialized successfully");
-        
-    } catch (const std::exception& e) {
-        LOG_ERROR_LuminaChat(wxString::Format("Error initializing plugins: %s", e.what()).ToStdString());
-        UpdateSummaryPluginStatus("Initialization failed", LuminaChatColors::ERROR_RED);
-    }
+    }, "initialize plugins", "Plugin Initialization");
 }
 
 // === Individual Plugin Initialization Methods ===
@@ -855,7 +855,7 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
         return;
     }
     
-    try {
+    SafeExecute([this, input]() {
         // Clear input and display user message
         chat_input->Clear();
         AddChatMessage("You", input.ToStdString(), LuminaChatColors::SUCCESS_GREEN);
@@ -893,12 +893,19 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
                 diagnostics += "- LlamaManager ready: " + std::string(llama_manager->IsReady() ? "true" : "false") + "\n";
                 
                 // Check if models exist
-                try {
+                TryExecute([&]() {
                     auto* outer_model = llama_manager->GetModelInfo("outer_model");
                     auto* inner_model = llama_manager->GetModelInfo("inner_model");
                     diagnostics += "- Outer model exists: " + std::string(outer_model ? "true" : "false") + "\n";
                     diagnostics += "- Inner model exists: " + std::string(inner_model ? "true" : "false") + "\n";
-                } catch (...) {
+                }, "check model status", "Model Status");
+                
+                if (!TryExecute([&]() {
+                    auto* outer_model = llama_manager->GetModelInfo("outer_model");
+                    auto* inner_model = llama_manager->GetModelInfo("inner_model");
+                    diagnostics += "- Outer model exists: " + std::string(outer_model ? "true" : "false") + "\n";
+                    diagnostics += "- Inner model exists: " + std::string(inner_model ? "true" : "false") + "\n";
+                }, "check model status", "Model Status")) {
                     diagnostics += "- Unable to check model status\n";
                 }
             }
@@ -921,9 +928,7 @@ void LuminaChatFrame::OnSendMessage(wxCommandEvent& event) {
         // Start the two-stage reasoning process
         ExecuteTwoStageReasoning(inner_context, outer_context, input.ToStdString());
         
-    } catch (const std::exception& e) {
-        HandleMessageGenerationError(e.what());
-    }
+    }, "process message", "Message Processing");
 }
 
 void LuminaChatFrame::OnLoadAllModelsFromVoiceSettings() {
@@ -976,7 +981,7 @@ void LuminaChatFrame::OnLoadAllModelsFromVoiceSettings() {
         std::string error_message;
         int total_progress = 0;
         
-        try {
+        SafeExecute([&]() {
             // Load outer voice model if configured
             if (!outer_model_path.empty()) {
                 if (!model_loading.load()) return; // Check for cancellation
@@ -1038,12 +1043,7 @@ void LuminaChatFrame::OnLoadAllModelsFromVoiceSettings() {
                     error_message += "Failed to load inner voice model. ";
                 }
             }
-            
-        } catch (const std::exception& e) {
-            error_message = "Error loading models: " + std::string(e.what());
-        } catch (...) {
-            error_message = "Unknown error occurred during model loading";
-        }
+        }, "load voice models", "Model Loading");
         
         // Final check - only update UI if we're still supposed to be loading
         if (!model_loading.load()) {
@@ -1052,7 +1052,7 @@ void LuminaChatFrame::OnLoadAllModelsFromVoiceSettings() {
         
         // Update UI on the main thread using CallAfter
         CallAfter([this, outer_success, inner_success, error_message]() {
-            try {
+            SafeExecute([&]() {
                 bool any_success = outer_success || inner_success;
                 
                 if (any_success) {
@@ -1082,11 +1082,7 @@ void LuminaChatFrame::OnLoadAllModelsFromVoiceSettings() {
                         HandleError("Failed to load models. Check the file paths in voice settings.", "Model Loading", true);
                     }
                 }
-                
-            } catch (const std::exception& e) {
-                HandleError("Error in model loading completion: " + std::string(e.what()), "Model Loading", true);
-                model_loaded = false;
-            }
+            }, "handle model loading completion", "Model Loading");
             
             // Always reset loading state
             model_loading = false;
@@ -1124,7 +1120,7 @@ void LuminaChatFrame::OnConnectDiscord(wxCommandEvent& event) {
         return;
     }
     
-    try {
+    SafeExecute([this, token]() {
         LOG_LuminaChat("Connecting to Discord...");
         connect_discord_button->Enable(false);
         connect_discord_button->SetLabel("Connecting...");
@@ -1148,13 +1144,13 @@ void LuminaChatFrame::OnConnectDiscord(wxCommandEvent& event) {
         
         // Start connection in a separate thread since D++ is async
         std::thread([this, token]() {
-            try {
+            SafeExecute([this, token]() {
                 if (discord_manager->Connect(token.ToStdString())) {
                     // Connection successful - update UI on main thread
                     CallAfter([this]() {
                         discord_connected = true;
                         LOG_LuminaChat("Connected to Discord successfully");
-                        AddChatMessage("System", "Discord bot connected and ready!", LuminaChatColors::DISCORD_BLUE);
+                        HandleSuccess("Discord bot connected and ready!", "Discord Connection");
                         
                         // Wait a moment for guilds to load, then update channel list
                         wxTimer* timer = new wxTimer();
@@ -1174,32 +1170,17 @@ void LuminaChatFrame::OnConnectDiscord(wxCommandEvent& event) {
                         std::string error_details = discord_manager->GetLastError();
                         std::string error_msg = error_details.empty() ? "Failed to connect to Discord" : error_details;
                         
-                        LOG_ERROR_LuminaChat(error_msg);
-                        AddChatMessage("System", "Discord connection failed: " + error_msg, wxColour(255, 0, 0));
+                        HandleError("Discord connection failed: " + error_msg, "Discord Connection");
                         connect_discord_button->SetLabel("Connect Discord");
                         connect_discord_button->Enable(true);
                         discord_connected = false;
                         UpdateUI();
                     });
                 }
-            } catch (const std::exception& e) {
-                CallAfter([this, e]() {
-                    HandleError("Error connecting to Discord: " + std::string(e.what()), "Discord Connection", true);
-                    connect_discord_button->SetLabel("Connect Discord");
-                    connect_discord_button->Enable(true);
-                    discord_connected = false;
-                    UpdateUI();
-                });
-            }
+            }, "Discord connection", "Discord Connection");
         }).detach();
         
-    } catch (const std::exception& e) {
-        HandleError("Error starting Discord connection: " + std::string(e.what()), "Discord Connection", true);
-        connect_discord_button->SetLabel("Connect Discord");
-        connect_discord_button->Enable(true);
-        discord_connected = false;
-        UpdateUI();
-    }
+    }, "Discord connection setup", "Discord Connection");
 }
 
 void LuminaChatFrame::OnClearChat(wxCommandEvent& event) {
