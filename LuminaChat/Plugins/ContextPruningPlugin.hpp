@@ -186,6 +186,15 @@ private:
     void LogWarning(const std::string& message) {
         LOG_WARNING_ContextPruning(message);
         AddLogEntry("[WARN] " + message);
+        // Also use unified error handling for consistency
+        HandleWarning(message, "ContextPruning", false);
+    }
+    
+    void LogError(const std::string& message) {
+        LOG_ERROR_ContextPruning(message);
+        AddLogEntry("[ERROR] " + message);
+        // Also use unified error handling for consistency and UI notification
+        HandleError(message, "ContextPruning", false);
     }
     
     void AddLogEntry(const std::string& entry) {

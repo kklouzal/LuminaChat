@@ -122,7 +122,7 @@ public:
     void SaveUISettings();
 
     // Callback handlers (registered with lower-level components)
-    void OnLogMessage(std::string_view log_message);
+    void OnLogMessage(const std::string& log_message);
 
 private:
     // UI Components organized by panel
@@ -396,9 +396,11 @@ void LuminaChatFrame::Start() {
         // === STEP 2: Initialize core components in dependency order ===
         // Register Logger UI callback first to ensure logs are displayed
         GetLogger().RegisterOutputCallback([this](std::string_view log_message) {
+            // Convert string_view to string to ensure data lifetime across threads
+            std::string log_str(log_message);
             // Use CallAfter to ensure UI updates happen on the main thread
-            CallAfter([this, log_message]() {
-                OnLogMessage(log_message);
+            CallAfter([this, log_str]() {
+                OnLogMessage(log_str);
             });
         });
         LOG_LuminaChat("Logger UI callback registered successfully");
@@ -419,8 +421,8 @@ void LuminaChatFrame::Start() {
         discord_manager = std::make_unique<DiscordManager>();
         LOG_LuminaChat("Discord Manager initialized");
         
-        // Initialize Llama Manager
-        llama_manager = std::make_unique<LlamaManager>();
+        // Initialize Llama Manager with SettingsManager dependency
+        llama_manager = std::make_unique<LlamaManager>(settings_manager.get());
         if (!llama_manager->Initialize()) {
             HandleError("Failed to initialize LlamaManager", "LlamaManager");
             return;
@@ -429,6 +431,11 @@ void LuminaChatFrame::Start() {
         
         // Initialize Orchestrator (depends on LlamaManager)
         orchestrator = std::make_unique<Orchestrator>(llama_manager.get());
+        if (!orchestrator->Initialize()) {
+            LOG_ERROR_LuminaChat("Failed to initialize Orchestrator");
+            HandleError("Failed to initialize Orchestrator", "Initialization", true);
+            return;
+        }
         LOG_LuminaChat("Orchestrator initialized");
         
         // === STEP 3: Set up inter-component dependencies ===
@@ -574,7 +581,7 @@ void LuminaChatFrame::Stop() {
 }
 
 // Callback implementations
-void LuminaChatFrame::OnLogMessage(std::string_view log_message) {
+void LuminaChatFrame::OnLogMessage(const std::string& log_message) {
     // This method receives log messages from the global Logger and displays them in the UI
     // Logger already provides fully formatted log entries with timestamps, so we just display them directly
     
@@ -583,14 +590,13 @@ void LuminaChatFrame::OnLogMessage(std::string_view log_message) {
         return;
     }
     
-    // Convert string_view to wxString safely
-    std::string log_str(log_message);
-    wxString log_entry = wxString::FromUTF8(log_str) + "\n";
+    // Convert string to wxString safely
+    wxString log_entry = wxString::FromUTF8(log_message) + "\n";
     
     // Safety check for conversion failure
-    if (log_entry.IsEmpty() && !log_str.empty()) {
+    if (log_entry.IsEmpty() && !log_message.empty()) {
         // UTF-8 conversion failed, try default conversion
-        log_entry = wxString(log_str) + "\n";
+        log_entry = wxString(log_message) + "\n";
     }
     
     logs_display->SetInsertionPointEnd();

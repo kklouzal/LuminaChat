@@ -378,11 +378,15 @@ public:
     void LogWarning(const std::string& message) {
         LOG_WARNING_SummarizationPlugin(message);
         AddLogEntry("[WARN] " + message);
+        // Also use unified error handling for consistency
+        HandleWarning(message, "SummarizationPlugin", false);
     }
     
     void LogError(const std::string& message) {
         LOG_ERROR_SummarizationPlugin(message);
         AddLogEntry("[ERROR] " + message);
+        // Also use unified error handling for consistency and UI notification
+        HandleError(message, "SummarizationPlugin", false);
     }
     
     void LogDebug(const std::string& message) {

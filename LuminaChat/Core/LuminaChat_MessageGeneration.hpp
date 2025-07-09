@@ -90,7 +90,9 @@ inline GenerationCallbacks LuminaChatFrame::CreateGenerationCallbacks() {
                             std::thread([this]() {
                                 std::this_thread::sleep_for(std::chrono::milliseconds(LuminaChatConstants::EMOTION_ANALYSIS_DELAY_MS));
                                 if (orchestrator) {
-                                    orchestrator->ProcessScheduledTasks();
+                                    LOG_MessageGeneration("Manually triggering emotion analysis buffer processing...");
+                                    orchestrator->ProcessEmotionAnalysisBuffer();
+                                    LOG_MessageGeneration("Manual emotion analysis buffer processing completed");
                                 }
                             }).detach();
                         }
