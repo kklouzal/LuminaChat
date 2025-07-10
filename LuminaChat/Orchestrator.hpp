@@ -197,9 +197,11 @@ enum class ScheduledTaskType {
     CACHE_CLEANUP,
     HEALTH_CHECK,
     DISCORD_PRESENCE_UPDATE,
-    PRUNING_BUFFER_PROCESSING,  // New scheduled task for processing pruning buffer
-    EMOTION_ANALYSIS_PROCESSING,  // New scheduled task for processing emotion analysis buffer
-    CONTEXT_SIZE_MONITORING       // New scheduled task for monitoring context sizes
+    PRUNING_BUFFER_PROCESSING,  // Processes messages pruned by context size management
+    EMOTION_ANALYSIS_PROCESSING,  // Processes queued emotional analysis requests
+    CONTEXT_SIZE_MONITORING,      // Monitors context sizes and triggers pruning when needed
+    INNER_VOICE_ANALYSIS,         // Analyzes inner voice pairs and creates summarization requests
+    SUMMARIZATION_PROCESSING      // Monitors summarization pipeline health (not processing requests)
 };
 
 // Compile-time utility functions for ScheduledTaskType
@@ -211,13 +213,16 @@ enum class ScheduledTaskType {
 [[nodiscard]] constexpr bool IsProcessingTask(ScheduledTaskType type) noexcept {
     return type == ScheduledTaskType::PRUNING_BUFFER_PROCESSING || 
            type == ScheduledTaskType::EMOTION_ANALYSIS_PROCESSING ||
-           type == ScheduledTaskType::CONTEXT_SIZE_MONITORING;
+           type == ScheduledTaskType::CONTEXT_SIZE_MONITORING ||
+           type == ScheduledTaskType::SUMMARIZATION_PROCESSING;
 }
 
 [[nodiscard]] constexpr bool IsHighFrequencyTask(ScheduledTaskType type) noexcept {
     return type == ScheduledTaskType::EMOTION_ANALYSIS_PROCESSING ||
            type == ScheduledTaskType::DISCORD_PRESENCE_UPDATE ||
-           type == ScheduledTaskType::CONTEXT_SIZE_MONITORING;
+           type == ScheduledTaskType::CONTEXT_SIZE_MONITORING ||
+           type == ScheduledTaskType::INNER_VOICE_ANALYSIS ||
+           type == ScheduledTaskType::SUMMARIZATION_PROCESSING;
 }
 
 struct ScheduledTask {
@@ -347,8 +352,11 @@ public:
     // Manual processing triggers (public for immediate processing)
     // CRITICAL: This function is defined at the END of EmoTagPlugin.hpp to combat circular dependencies
     void ProcessEmotionAnalysisBuffer();  // Process emotion analysis buffer
+    void ProcessInnerVoiceAnalysis();     // Process inner voice user input/AI output pairs
     // CRITICAL: This function is defined at the END of ContextPruningPlugin.hpp to combat circular dependencies
     void MonitorAllContextSizes();        // Monitor all context sizes for pruning
+    // CRITICAL: This function is defined at the END of SummarizationPlugin.hpp to combat circular dependencies
+    void ProcessSummarizationPipeline();  // Process pending summarization requests
     
     // Plugin coordination helpers
     // CRITICAL: This function is defined at the END of SummarizationPlugin.hpp to combat circular dependencies
@@ -1061,7 +1069,7 @@ inline void Orchestrator::SetupDefaultScheduledTasks() {
                     std::chrono::seconds(30),
                     [this]() { UpdateDiscordPresence(); });
     
-    // Pruning buffer processing every 2 minutes
+    // Pruning buffer processing every 2 minutes (processes pruned messages from context size management)
     AddScheduledTask(ScheduledTaskType::PRUNING_BUFFER_PROCESSING,
                     std::chrono::minutes(2),
                     [this]() { ProcessPruningBuffer(); });
@@ -1075,6 +1083,16 @@ inline void Orchestrator::SetupDefaultScheduledTasks() {
     AddScheduledTask(ScheduledTaskType::CONTEXT_SIZE_MONITORING,
                     std::chrono::seconds(10),
                     [this]() { MonitorAllContextSizes(); });
+    
+    // Inner voice analysis every 5 seconds (creates direct summarization requests)
+    AddScheduledTask(ScheduledTaskType::INNER_VOICE_ANALYSIS,
+                    std::chrono::seconds(5),
+                    [this]() { ProcessInnerVoiceAnalysis(); });
+    
+    // Summarization pipeline health monitoring every 10 seconds (monitors pipeline health only)
+    AddScheduledTask(ScheduledTaskType::SUMMARIZATION_PROCESSING,
+                    std::chrono::seconds(10),
+                    [this]() { ProcessSummarizationPipeline(); });
     
     LOG_Orchestrator("Default scheduled tasks configured");
 }
@@ -1217,20 +1235,32 @@ inline void Orchestrator::ExecuteDiscordTwoStageReasoning(ContextInfo* inner_con
     auto start_time = std::chrono::steady_clock::now();
     
     try {
-        // CRITICAL: Share chat history between contexts so inner voice has the same context as outer voice
-        LOG_Orchestrator("Synchronizing chat history between inner and outer voice contexts for channel: " + request.channel_id);
+        // CRITICAL: Only synchronize contexts if this is the very first message in the conversation
+        // After that, let contexts diverge naturally (inner context will summarize, outer context keeps full history)
+        LOG_Orchestrator("Checking if chat history synchronization is needed for channel: " + request.channel_id);
         const auto& outer_history = outer_context->GetMessageHistory();
+        const auto& inner_history = inner_context->GetMessageHistory();
         
-        // Clear inner context history first to ensure clean state
-        inner_context->ClearMessageHistory();
-        
-        // Copy all historical messages from outer context to inner context
-        for (const auto& [role, content] : outer_history) {
-            inner_context->AddHistoricalMessage(role, content);
+        // Only sync if BOTH contexts are empty (first message in conversation)
+        // This prevents undoing summarization work done by the inner context
+        if (outer_history.empty() && inner_history.empty()) {
+            LOG_Orchestrator("First message in conversation for channel " + request.channel_id + " - contexts are already synchronized (both empty)");
+        } else if (inner_history.empty() && !outer_history.empty()) {
+            // Inner context is empty but outer has history - this means inner context was reset or is new
+            // Copy outer history to inner context for initial sync
+            for (const auto& [role, content] : outer_history) {
+                inner_context->AddHistoricalMessage(role, content);
+            }
+            LOG_Orchestrator("Initial sync: Copied " + std::to_string(outer_history.size()) + 
+                            " messages from outer to inner context for channel " + request.channel_id);
+        } else {
+            // Both contexts have history - let them remain independent
+            // Inner context may have fewer messages due to summarization, and that's intentional
+            LOG_Orchestrator("Contexts diverged naturally for channel " + request.channel_id + 
+                            " (outer: " + std::to_string(outer_history.size()) + 
+                            " messages, inner: " + std::to_string(inner_history.size()) + 
+                            " messages) - preserving independent histories");
         }
-        
-        LOG_Orchestrator("Chat history synchronized for channel " + request.channel_id + ": " + 
-                        std::to_string(outer_history.size()) + " messages copied to inner voice context");
         
         // Stage 1: Generate inner voice reasoning
         LOG_Orchestrator("Stage 1: Inner voice reasoning for Discord channel: " + request.channel_id);

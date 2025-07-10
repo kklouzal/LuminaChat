@@ -192,6 +192,11 @@ public:
                 return false;
             }
             
+            // Check if this is an inner voice summary (indicated by "_inner_voice_summary" suffix)
+            if (context_id.find("_inner_voice_summary") != std::string::npos) {
+                return ApplyInnerVoiceSummary(context_id, summary);
+            }
+            
             // Get the original context
             auto* original_context = llama_manager->GetContextInfo(context_id);
             if (!original_context) {
@@ -231,6 +236,73 @@ public:
             
         } catch (const std::exception& e) {
             LogError("Exception applying summary to context: " + std::string(e.what()));
+            return false;
+        }
+    }
+    
+    /**
+     * Apply inner voice summary to the appropriate inner context
+     * This method handles summaries of user input/AI output pairs from inner voice contexts
+     * and applies them to build up a running summary of reasoning thoughts
+     */
+    bool ApplyInnerVoiceSummary(const std::string& summary_id, const std::string& summary) {
+        try {
+            if (!llama_manager) {
+                LogError("LlamaManager not available for applying inner voice summary");
+                return false;
+            }
+            
+            // Extract the original context ID from the summary ID
+            // Format: "inner_context_inner_voice_summary" -> "inner_context"
+            std::string original_context_id = summary_id;
+            size_t suffix_pos = original_context_id.find("_inner_voice_summary");
+            if (suffix_pos != std::string::npos) {
+                original_context_id = original_context_id.substr(0, suffix_pos);
+            }
+            
+            // Get the inner context
+            auto* inner_context = llama_manager->GetContextInfo(original_context_id);
+            if (!inner_context) {
+                LogWarning("Inner context not found for summary application: " + original_context_id);
+                return false;
+            }
+            
+            // Apply the summary to the inner context
+            if (summary.empty()) {
+                LogWarning("Inner voice summary is empty - skipping update for context: " + original_context_id);
+                return false;
+            }
+            
+            // Try to acquire plugin processing lock for safe summary application
+            if (!inner_context->TryAcquirePluginProcessing("SummarizationPlugin_InnerVoice")) {
+                LogWarning("Could not acquire plugin processing lock for inner voice context: " + original_context_id + " - context may be busy");
+                return false;
+            }
+            
+            try {
+                // Format the summary specifically for inner voice reasoning
+                std::string formatted_summary = "Inner Voice Reasoning Summary: " + summary;
+                
+                // Apply the formatted summary to the inner context
+                inner_context->ApplyCompletedSummary(formatted_summary);
+                
+                summaries_applied++;
+                
+                LogInfo("Applied inner voice summary to context: " + original_context_id + 
+                       " - Summary: " + summary.substr(0, 100) + (summary.length() > 100 ? "..." : ""));
+                
+                // Release plugin processing lock
+                [[maybe_unused]] bool released = inner_context->ReleasePluginProcessing("SummarizationPlugin_InnerVoice");
+                return true;
+                
+            } catch (const std::exception&) {
+                // Release plugin processing lock on exception
+                [[maybe_unused]] bool released = inner_context->ReleasePluginProcessing("SummarizationPlugin_InnerVoice");
+                throw; // Re-throw the exception
+            }
+            
+        } catch (const std::exception& e) {
+            LogError("Exception applying inner voice summary to context: " + std::string(e.what()));
             return false;
         }
     }
@@ -797,27 +869,14 @@ inline void Orchestrator::OnSummarizationComplete(const std::string& context_id,
     LOG_Orchestrator("Summarization complete for context: " + context_id);
     
     if (response.success) {
-        // Get context size for main model - settings manager is required
-        auto* settings = GetSettingsManager();
-        if (!settings) {
-            LOG_ERROR_Orchestrator("SettingsManager not available for summarization completion: " + context_id);
-            SetContextState(context_id, ProcessingState::ERROR_STATE);
-            return;
-        }
-        
-        // No fallback values - settings must be properly configured
-        int32_t context_size = settings->GetInt("Models", "outer_context_size", 0);
-        if (context_size <= 0) {
-            LOG_ERROR_Orchestrator("Invalid outer_context_size configuration for summarization: " + context_id);
-            SetContextState(context_id, ProcessingState::ERROR_STATE);
-            return;
-        }
-        
-        // Apply summary to original context
-        auto* context = llama_manager->GetOrCreateContextInfo(context_id, "outer_model", context_size);
-        if (context) {
-            context->ApplyCompletedSummary(response.summary);
+        // Use the SummarizationPlugin's ApplySummaryToContext method
+        // This will handle both regular and inner voice summaries appropriately
+        if (summarization_plugin && summarization_plugin->ApplySummaryToContext(context_id, response.summary)) {
             LOG_Orchestrator("Summary applied to context: " + context_id);
+        } else {
+            LOG_ERROR_Orchestrator("Failed to apply summary to context: " + context_id);
+            SetContextState(context_id, ProcessingState::ERROR_STATE);
+            return;
         }
         
         // Update statistics using lock-free atomic increment
@@ -907,4 +966,168 @@ inline void Orchestrator::RequestSummarizationForPrunedMessages(const std::strin
                     " pruned messages from context: " + context_id);
     
     summarization_plugin->RequestSummarization(context_id, pruned_messages);
+}
+
+// CRITICAL: ProcessInnerVoiceAnalysis implementation moved here to combat circular dependencies
+inline void Orchestrator::ProcessInnerVoiceAnalysis() {
+    LOG_DEBUG_Orchestrator("ProcessInnerVoiceAnalysis: Checking inner contexts for user input/AI output pairs...");
+    
+    if (!llama_manager || !summarization_plugin || !summarization_plugin_available.load()) {
+        LOG_DEBUG_Orchestrator("ProcessInnerVoiceAnalysis: Required components not available");
+        return;
+    }
+    
+    // Track state of inner contexts to avoid duplicate processing
+    static std::unordered_map<std::string, size_t> last_processed_message_count;
+    
+    // Get all contexts that might be inner voice contexts
+    // Look for contexts with "inner" in their ID or check for specific inner context patterns
+    std::vector<std::string> inner_context_candidates = {"inner_context"};
+    
+    // Also check for any context IDs that contain "inner" (for future extensibility)
+    // This could be expanded later if multiple inner contexts are supported
+    
+    for (const std::string& context_id : inner_context_candidates) {
+        auto* context = llama_manager->GetContextInfo(context_id);
+        if (!context) {
+            continue; // Context doesn't exist
+        }
+        
+        // Get current message history
+        const auto& message_history = context->GetMessageHistory();
+        size_t current_message_count = message_history.size();
+        
+        // Check if this context has new messages since last check
+        auto last_count_it = last_processed_message_count.find(context_id);
+        size_t last_processed_count = (last_count_it != last_processed_message_count.end()) ? last_count_it->second : 0;
+        
+        if (current_message_count <= last_processed_count) {
+            continue; // No new messages to process
+        }
+        
+        LOG_DEBUG_Orchestrator("ProcessInnerVoiceAnalysis: Found " + std::to_string(current_message_count - last_processed_count) + 
+                              " new messages in context: " + context_id);
+        
+        // Look for complete user input/AI output pairs in the new messages
+        std::vector<std::pair<std::string, std::string>> new_pairs;
+        
+        // Process messages from where we left off, looking for user/assistant pairs
+        for (size_t i = last_processed_count; i + 1 < current_message_count; i += 2) {
+            const auto& user_msg = message_history[i];
+            const auto& ai_msg = message_history[i + 1];
+            
+            // Check if we have a user -> assistant pair
+            if (user_msg.first == "user" && ai_msg.first == "assistant") {
+                new_pairs.emplace_back(user_msg.second, ai_msg.second);
+                LOG_DEBUG_Orchestrator("ProcessInnerVoiceAnalysis: Found user/AI pair in " + context_id + 
+                                      " - User: " + user_msg.second.substr(0, 50) + "..." +
+                                      " - AI: " + ai_msg.second.substr(0, 50) + "...");
+            }
+        }
+        
+        // If we found complete pairs, request summarization
+        if (!new_pairs.empty()) {
+            LOG_Orchestrator("ProcessInnerVoiceAnalysis: Requesting summarization for " + 
+                           std::to_string(new_pairs.size()) + " inner voice pairs from context: " + context_id);
+            
+            // Convert pairs to the format expected by SummarizationPlugin
+            std::vector<std::pair<std::string, std::string>> formatted_pairs;
+            for (const auto& [user_input, ai_output] : new_pairs) {
+                // Format as "User: <input>" and "Assistant: <output>" for better summarization context
+                formatted_pairs.emplace_back("User", user_input);
+                formatted_pairs.emplace_back("Assistant", ai_output);
+            }
+            
+            // Create a proper PrunedMessageBatch for inner voice summarization
+            PrunedMessageBatch inner_voice_batch(context_id + "_inner_voice_summary", formatted_pairs);
+            
+            // Request summarization directly through the Orchestrator pipeline (not the plugin's buffer)
+            RequestSummarization(inner_voice_batch);
+            
+            LOG_Orchestrator("ProcessInnerVoiceAnalysis: Queued " + std::to_string(formatted_pairs.size()) + 
+                           " messages for summarization from inner voice context: " + context_id);
+            
+            // Remove the processed pairs from the message history to prevent unbounded growth
+            // The pairs we just found start at last_processed_count, so remove from there
+            LOG_Orchestrator("ProcessInnerVoiceAnalysis: BEFORE removal - context " + context_id + 
+                           " has " + std::to_string(context->GetMessageHistory().size()) + " messages");
+            
+            context->RemoveMessagePairs(last_processed_count, new_pairs.size());
+            
+            LOG_Orchestrator("ProcessInnerVoiceAnalysis: AFTER removal - context " + context_id + 
+                           " has " + std::to_string(context->GetMessageHistory().size()) + " messages");
+            LOG_Orchestrator("ProcessInnerVoiceAnalysis: Removed " + std::to_string(new_pairs.size()) + 
+                           " pairs from message history starting at index " + std::to_string(last_processed_count) + 
+                           " in context: " + context_id);
+        }
+        
+        // Update our tracking of processed messages
+        // Since we removed the pairs from the history, the message count has decreased
+        // We need to adjust our tracking to account for the removed messages
+        if (!new_pairs.empty()) {
+            // After removing pairs, we don't advance the processed count because we removed the messages
+            // The next processing should start from the same position (last_processed_count) since
+            // we removed the messages that were there
+            last_processed_message_count[context_id] = last_processed_count;
+            LOG_DEBUG_Orchestrator("ProcessInnerVoiceAnalysis: Maintained last processed count at " + 
+                                  std::to_string(last_processed_count) + " after removing pairs for " + context_id);
+        } else {
+            // No pairs found, update to current message count for next check
+            last_processed_message_count[context_id] = current_message_count;
+            LOG_DEBUG_Orchestrator("ProcessInnerVoiceAnalysis: Advanced last processed count to " + 
+                                  std::to_string(current_message_count) + " (no pairs found) for " + context_id);
+        }
+        
+        LOG_DEBUG_Orchestrator("ProcessInnerVoiceAnalysis: Updated last processed count for " + context_id + 
+                              " to " + std::to_string(last_processed_message_count[context_id]));
+    }
+}
+
+// CRITICAL: ProcessSummarizationPipeline implementation to monitor pipeline health
+inline void Orchestrator::ProcessSummarizationPipeline() {
+    LOG_DEBUG_Orchestrator("ProcessSummarizationPipeline: Monitoring summarization pipeline health...");
+    
+    // Check if the summarization pipeline is shutdown (this shouldn't happen during normal operation)
+    if (summarization_pipeline.IsShutdown()) {
+        LOG_WARNING_Orchestrator("ProcessSummarizationPipeline: Summarization pipeline is shutdown, attempting to restart...");
+        summarization_pipeline.Start();
+        return;
+    }
+    
+    // Get pipeline statistics for monitoring
+    auto pipeline_stats = summarization_pipeline.GetStats();
+    
+    // Only log if there's actual activity or issues
+    if (pipeline_stats.pending_requests > 0 || pipeline_stats.failed_requests > 0) {
+        LOG_DEBUG_Orchestrator("ProcessSummarizationPipeline: Pipeline stats - Total: " + std::to_string(pipeline_stats.total_requests) +
+                              ", Completed: " + std::to_string(pipeline_stats.completed_requests) +
+                              ", Failed: " + std::to_string(pipeline_stats.failed_requests) +
+                              ", Pending: " + std::to_string(pipeline_stats.pending_requests));
+    }
+    
+    // Check for abnormal pipeline states that might indicate a problem
+    if (pipeline_stats.pending_requests > 0 && summarization_pipeline.IsIdle()) {
+        LOG_WARNING_Orchestrator("ProcessSummarizationPipeline: Pipeline shows " + std::to_string(pipeline_stats.pending_requests) + 
+                                " pending requests but is idle - this may indicate a pipeline issue");
+        
+        // If we have a lot of stuck requests, this might indicate a real problem
+        if (pipeline_stats.pending_requests > 10) {
+            LOG_ERROR_Orchestrator("ProcessSummarizationPipeline: Too many stuck requests (" + 
+                                  std::to_string(pipeline_stats.pending_requests) + "), pipeline may need attention");
+        }
+    } else if (pipeline_stats.pending_requests > 0 && summarization_pipeline.IsProcessing()) {
+        LOG_DEBUG_Orchestrator("ProcessSummarizationPipeline: Pipeline is actively processing " + 
+                              std::to_string(pipeline_stats.pending_requests) + " pending requests");
+    }
+    
+    // Monitor for high failure rates
+    if (pipeline_stats.failed_requests > 0 && pipeline_stats.total_requests > 0) {
+        double failure_rate = static_cast<double>(pipeline_stats.failed_requests) / static_cast<double>(pipeline_stats.total_requests);
+        if (failure_rate > 0.1) { // More than 10% failure rate
+            LOG_WARNING_Orchestrator("ProcessSummarizationPipeline: High failure rate detected: " + 
+                                    std::to_string(static_cast<int>(failure_rate * 100)) + "%");
+        }
+    }
+    
+    LOG_DEBUG_Orchestrator("ProcessSummarizationPipeline: Pipeline monitoring complete");
 }

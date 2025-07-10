@@ -82,19 +82,7 @@ inline GenerationCallbacks LuminaChatFrame::CreateGenerationCallbacks() {
                         auto* emotag_plugin = orchestrator->GetEmoTagPlugin();
                         if (context && emotag_plugin) {
                             emotag_plugin->RequestEmotionalAnalysis(current_context_id, context->GetMessageHistory());
-
                             LOG_MessageGeneration("Requested emotional analysis for context: " + current_context_id);
-                            
-                            // Immediately trigger processing of emotion analysis buffer
-                            // instead of waiting for scheduled task
-                            std::thread([this]() {
-                                std::this_thread::sleep_for(std::chrono::milliseconds(LuminaChatConstants::EMOTION_ANALYSIS_DELAY_MS));
-                                if (orchestrator) {
-                                    LOG_MessageGeneration("Manually triggering emotion analysis buffer processing...");
-                                    orchestrator->ProcessEmotionAnalysisBuffer();
-                                    LOG_MessageGeneration("Manual emotion analysis buffer processing completed");
-                                }
-                            }).detach();
                         }
                     }
                 } else {
@@ -157,19 +145,31 @@ inline void LuminaChatFrame::ExecuteTwoStageReasoning(ContextInfo* inner_context
     SetGenerationUIState(true);
     LOG_MessageGeneration("Starting two-stage reasoning process...");
     
-    // CRITICAL: Share chat history between contexts so inner voice has the same context as outer voice
-    LOG_MessageGeneration("Synchronizing chat history between inner and outer voice contexts...");
+    // CRITICAL: Only synchronize contexts if this is the very first message in the conversation
+    // After that, let contexts diverge naturally (inner context will summarize, outer context keeps full history)
+    LOG_MessageGeneration("Checking if chat history synchronization is needed...");
     const auto& outer_history = outer_context->GetMessageHistory();
+    const auto& inner_history = inner_context->GetMessageHistory();
     
-    // Clear inner context history first to ensure clean state
-    inner_context->ClearMessageHistory();
-    
-    // Copy all historical messages from outer context to inner context
-    for (const auto& [role, content] : outer_history) {
-        inner_context->AddHistoricalMessage(role, content);
+    // Only sync if BOTH contexts are empty (first message in conversation)
+    // This prevents undoing summarization work done by the inner context
+    if (outer_history.empty() && inner_history.empty()) {
+        LOG_MessageGeneration("First message in conversation - contexts are already synchronized (both empty)");
+    } else if (inner_history.empty() && !outer_history.empty()) {
+        // Inner context is empty but outer has history - this means inner context was reset or is new
+        // Copy outer history to inner context for initial sync
+        for (const auto& [role, content] : outer_history) {
+            inner_context->AddHistoricalMessage(role, content);
+        }
+        LOG_MessageGeneration("Initial sync: Copied " + std::to_string(outer_history.size()) + 
+                             " messages from outer to inner context");
+    } else {
+        // Both contexts have history - let them remain independent
+        // Inner context may have fewer messages due to summarization, and that's intentional
+        LOG_MessageGeneration("Contexts diverged naturally (outer: " + std::to_string(outer_history.size()) + 
+                             " messages, inner: " + std::to_string(inner_history.size()) + 
+                             " messages) - preserving independent histories");
     }
-    
-    LOG_MessageGeneration("Chat history synchronized: " + std::to_string(outer_history.size()) + " messages copied to inner voice context");
     
     // Start inner voice streaming display
     StartInnerVoiceStreaming();

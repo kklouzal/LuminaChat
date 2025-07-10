@@ -196,6 +196,7 @@ public:    // Constructor overloads
     bool RebuildContext();
     void ClearContext() noexcept;
     void ClearMessageHistory() noexcept;
+    void RemoveMessagePairs(size_t start_index, size_t pair_count) noexcept;  // Remove specific user/assistant pairs
     
     // Override base class methods to include generation state
     [[nodiscard]] [[msvc::forceinline]] bool IsAvailableForGeneration() const noexcept override {
@@ -685,6 +686,38 @@ inline bool ContextInfo::RebuildContext() {
     context_needs_rebuild.store(true, std::memory_order_relaxed);
     
     LOG_DEBUG_ContextInfo("Message history and summaries cleared");
+}
+
+[[msvc::forceinline]] inline void ContextInfo::RemoveMessagePairs(size_t start_index, size_t pair_count) noexcept {
+    std::lock_guard<std::mutex> lock(context_mutex);
+    
+    if (message_history.empty() || start_index >= message_history.size()) {
+        LOG_DEBUG_ContextInfo("RemoveMessagePairs: Invalid start_index or empty message history");
+        return;
+    }
+    
+    // Calculate the actual number of messages to remove (pair_count * 2)
+    size_t messages_to_remove = pair_count * 2;
+    size_t end_index = std::min(start_index + messages_to_remove, message_history.size());
+    
+    // Ensure we don't remove partial pairs by adjusting to pair boundaries
+    if ((end_index - start_index) % 2 != 0 && end_index < message_history.size()) {
+        end_index++; // Include the next message to complete the pair
+    }
+    
+    // Remove the specified range of messages
+    message_history.erase(message_history.begin() + start_index, message_history.begin() + end_index);
+    
+    // Update the message count
+    message_count.store(message_history.size(), std::memory_order_relaxed);
+    
+    // Mark context as needing rebuild since message history changed
+    context_needs_rebuild.store(true, std::memory_order_relaxed);
+    
+    size_t actual_removed = end_index - start_index;
+    LOG_DEBUG_ContextInfo("Removed " + std::to_string(actual_removed) + " messages (" + 
+                         std::to_string(actual_removed / 2) + " pairs) starting from index " + 
+                         std::to_string(start_index));
 }
 
 // Helper function to generate context IDs
