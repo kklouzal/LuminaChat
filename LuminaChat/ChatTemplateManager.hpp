@@ -256,25 +256,7 @@ public:
         system_content += sections[1].content;
     }
     
-    if (sections[6].active && !sections[6].content.empty()) { // EMOTIONAL_STATE
-        if (!system_content.empty()) system_content += "\n\n";
-        system_content += "###YOUR CURRENT EMOTIONAL STATE###\n";
-        system_content += sections[6].content;
-    }
-    
-    if (sections[5].active && !sections[5].content.empty()) { // INTERNAL_REFLECTION
-        if (!system_content.empty()) system_content += "\n\n";
-        system_content += "###YOUR INTERNAL THOUGHTS AND REASONING###\n";
-        system_content += sections[5].content;
-    }
-    
-    if (sections[2].active && !sections[2].content.empty()) { // SYSTEM_PROMPT
-        if (!system_content.empty()) system_content += "\n\n";
-        system_content += "###CORE DIRECTIVES###\n";
-        system_content += sections[2].content;
-    }
-    
-    // Combined summaries
+    // Combined summaries - moved before EMOTIONAL_STATE
     if (sections[3].active || sections[4].active || !summaries.empty()) { // OLD_CHAT_SUMMARY, SUMMARY, or summaries vector
         std::string combined_summaries;
         
@@ -285,7 +267,7 @@ public:
         for (const auto& summary : summaries) {
             if (!summary.empty()) {
                 if (!combined_summaries.empty()) {
-                    combined_summaries += "\n\n";
+                    combined_summaries += "\n";
                 }
                 combined_summaries += summary;
             }
@@ -303,6 +285,24 @@ public:
             system_content += "###OLD CHAT HISTORY###\n";
             system_content += combined_summaries;
         }
+    }
+    
+    if (sections[6].active && !sections[6].content.empty()) { // EMOTIONAL_STATE
+        if (!system_content.empty()) system_content += "\n\n";
+        system_content += "###YOUR CURRENT EMOTIONAL STATE###\n";
+        system_content += sections[6].content;
+    }
+    
+    if (sections[5].active && !sections[5].content.empty()) { // INTERNAL_REFLECTION
+        if (!system_content.empty()) system_content += "\n\n";
+        system_content += "###YOUR INTERNAL THOUGHTS AND REASONING###\n";
+        system_content += sections[5].content;
+    }
+    
+    if (sections[2].active && !sections[2].content.empty()) { // SYSTEM_PROMPT
+        if (!system_content.empty()) system_content += "\n\n";
+        system_content += "###CORE DIRECTIVES###\n";
+        system_content += sections[2].content;
     }
     
     // Add the complete system message FIRST

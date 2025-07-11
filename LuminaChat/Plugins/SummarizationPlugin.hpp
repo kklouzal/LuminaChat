@@ -280,16 +280,13 @@ public:
             }
             
             try {
-                // Format the summary specifically for inner voice reasoning
-                std::string formatted_summary = "Inner Voice Reasoning Summary: " + summary;
-                
-                // Apply the formatted summary to the inner context
-                inner_context->ApplyCompletedSummary(formatted_summary);
+                // Apply the summary to the inner context (summary already includes "Summary: " prefix)
+                inner_context->ApplyCompletedSummary(summary);
                 
                 summaries_applied++;
                 
                 LogInfo("Applied inner voice summary to context: " + original_context_id + 
-                       " - Summary: " + summary.substr(0, 100) + (summary.length() > 100 ? "..." : ""));
+                       " - " + summary.substr(0, 100) + (summary.length() > 100 ? "..." : ""));
                 
                 // Release plugin processing lock
                 [[maybe_unused]] bool released = inner_context->ReleasePluginProcessing("SummarizationPlugin_InnerVoice");

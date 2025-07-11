@@ -1245,16 +1245,8 @@ inline void Orchestrator::ExecuteDiscordTwoStageReasoning(ContextInfo* inner_con
         // This prevents undoing summarization work done by the inner context
         if (outer_history.empty() && inner_history.empty()) {
             LOG_Orchestrator("First message in conversation for channel " + request.channel_id + " - contexts are already synchronized (both empty)");
-        } else if (inner_history.empty() && !outer_history.empty()) {
-            // Inner context is empty but outer has history - this means inner context was reset or is new
-            // Copy outer history to inner context for initial sync
-            for (const auto& [role, content] : outer_history) {
-                inner_context->AddHistoricalMessage(role, content);
-            }
-            LOG_Orchestrator("Initial sync: Copied " + std::to_string(outer_history.size()) + 
-                            " messages from outer to inner context for channel " + request.channel_id);
         } else {
-            // Both contexts have history - let them remain independent
+            // Both contexts have history or are at different stages - let them remain independent
             // Inner context may have fewer messages due to summarization, and that's intentional
             LOG_Orchestrator("Contexts diverged naturally for channel " + request.channel_id + 
                             " (outer: " + std::to_string(outer_history.size()) + 

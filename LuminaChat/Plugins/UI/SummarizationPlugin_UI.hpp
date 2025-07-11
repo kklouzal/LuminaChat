@@ -151,29 +151,65 @@ inline void SummarizationPluginUI::UpdateStatus(const std::string& status, const
 inline void SummarizationPluginUI::UpdateDebugInfo(LuminaChat::SummarizationPlugin* plugin) {
     if (!plugin) return;
     
-    // Update log output
+    // Update log output only if content has changed
     if (summary_log_output_text) {
         auto log_history = plugin->GetLogHistory();
         std::string log_text;
         for (const auto& entry : log_history) {
             log_text += entry + "\n";
         }
-        summary_log_output_text->SetValue(wxString::FromUTF8(log_text));
         
-        // Scroll to bottom
-        summary_log_output_text->SetInsertionPointEnd();
+        // Only update if content has actually changed
+        wxString current_content = summary_log_output_text->GetValue();
+        wxString new_log_text = wxString::FromUTF8(log_text);
+        if (current_content != new_log_text) {
+            // Preserve scroll position
+            long insertion_point = summary_log_output_text->GetInsertionPoint();
+            long scroll_pos = summary_log_output_text->GetScrollPos(wxVERTICAL);
+            
+            summary_log_output_text->SetValue(new_log_text);
+            
+            // Restore scroll position if we weren't at the end
+            if (insertion_point != current_content.length()) {
+                summary_log_output_text->SetInsertionPoint(insertion_point);
+                summary_log_output_text->SetScrollPos(wxVERTICAL, scroll_pos);
+            } else {
+                // If we were at the end, stay at the end (auto-scroll)
+                summary_log_output_text->SetInsertionPointEnd();
+            }
+        }
     }
     
-    // Update last generation
+    // Update last generation only if content has changed
     if (summary_last_generation_text) {
         auto last_gen = plugin->GetLastGeneration();
+        std::string gen_text;
         if (last_gen.has_generation) {
-            std::string gen_text = "Timestamp: " + last_gen.timestamp + "\n\n";
+            gen_text = "Timestamp: " + last_gen.timestamp + "\n\n";
             gen_text += "Input:\n" + last_gen.input + "\n\n";
             gen_text += "Output:\n" + last_gen.output;
-            summary_last_generation_text->SetValue(wxString::FromUTF8(gen_text));
         } else {
-            summary_last_generation_text->SetValue(wxString::FromUTF8("No generation recorded yet."));
+            gen_text = "No generation recorded yet.";
+        }
+        
+        // Only update if content has actually changed
+        wxString current_content = summary_last_generation_text->GetValue();
+        wxString new_gen_text = wxString::FromUTF8(gen_text);
+        if (current_content != new_gen_text) {
+            // Preserve scroll position
+            long insertion_point = summary_last_generation_text->GetInsertionPoint();
+            long scroll_pos = summary_last_generation_text->GetScrollPos(wxVERTICAL);
+            
+            summary_last_generation_text->SetValue(new_gen_text);
+            
+            // Restore scroll position if we weren't at the end
+            if (insertion_point != current_content.length()) {
+                summary_last_generation_text->SetInsertionPoint(insertion_point);
+                summary_last_generation_text->SetScrollPos(wxVERTICAL, scroll_pos);
+            } else {
+                // If we were at the end, stay at the end (auto-scroll)
+                summary_last_generation_text->SetInsertionPointEnd();
+            }
         }
     }
 }
