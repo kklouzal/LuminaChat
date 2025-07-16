@@ -160,6 +160,7 @@
     <ClInclude Include="Logger.hpp" />
     <ClInclude Include="ModelInfo.hpp" />
     <ClInclude Include="Orchestrator.hpp" />
+    <ClInclude Include="Plugins\BasePlugin.hpp" />
     <ClInclude Include="Plugins\ContextPruningPlugin.hpp" />
     <ClInclude Include="Plugins\EmoTagPlugin.hpp" />
     <ClInclude Include="Plugins\SummarizationPlugin.hpp" />

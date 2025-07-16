@@ -1,23 +1,8 @@
 #pragma once
 
-#include "../Context/ContextInfo.hpp"
-#include "../ProcessingPipeline.hpp"
-#include "../Orchestrator.hpp"
-#include "../LlamaManager.hpp"
-#include "../SettingsManager.hpp"
-#include "../Logger.hpp"
-#include "../ErrorHandling.hpp"
-#include "../Utilities.hpp"
-#include <chrono>
-#include <memory>
-#include <optional>
-#include <sstream>
-#include <iomanip>
+#include "BasePlugin.hpp"
 
 namespace LuminaChat {
-
-// Callback type for status updates
-using StatusUpdateCallback = std::function<void(const std::string& status, bool is_error)>;
 
 // Request and response structures for the pipeline
 struct EmotionAnalysisRequest {
@@ -56,278 +41,69 @@ struct EmotionAnalysisResponse {
  * Configuration:
  * - Analysis Window Size: Number of recent AI responses to analyze (default: 3)
  */
-class EmoTagPlugin {
+class EmoTagPlugin : public BasePlugin<EmotionalAnalysisBatch, EmotionAnalysisRequest, EmotionAnalysisResponse> {
 private:
-    // No independent pipeline - Orchestrator coordinates workflow
+    // Plugin-specific constants
+    static constexpr const char* PLUGIN_NAME = "EmoTagPlugin";
+    static constexpr const char* MODEL_ID = "emotion_model";
+    static constexpr const char* CONTEXT_ID = "plugin_emotion_context";
+    static constexpr const char* DEFAULT_SYSTEM_PROMPT = 
+        "You are an emotional state analyzer. When given AI assistant responses, analyze the emotional tone, "
+        "mood, and psychological state conveyed in the text. Provide a brief emotional overview that captures "
+        "the assistant's apparent emotional state, confidence level, and overall demeanor. "
+        "Focus on identifying patterns like: confident, uncertain, empathetic, analytical, cheerful, "
+        "cautious, enthusiastic, or reserved. Keep your analysis concise and actionable.";
     
-    // Reference to orchestrator for context management
-    Orchestrator* orchestrator = nullptr;
-    
-    // Emotion analysis model and context management
-    LlamaManager* llama_manager = nullptr;
-    SettingsManager* settings_manager = nullptr;
-    std::string emotion_model_id = "emotion_model";
-    std::string emotion_context_id = "plugin_emotion_context";
-    std::atomic<bool> emotion_model_ready{false};
-    
-    // Status callback for UI updates
-    StatusUpdateCallback status_callback;
-    
-    // Configuration
-    std::atomic<size_t> analysis_window_size{3}; // Number of AI responses to analyze
-    
-    // Statistics
-    std::atomic<size_t> batches_processed{0};
-    std::atomic<size_t> responses_analyzed{0};
-    std::atomic<size_t> emotional_states_generated{0};
-    std::atomic<size_t> contexts_updated{0};
-    
-    // Buffer management for emotional analysis (moved from ContextInfo)
-    mutable std::mutex emotional_analysis_buffer_mutex;
-    std::vector<EmotionalAnalysisBatch> emotional_analysis_buffer;
-    
-    // Debugging features
-    struct DebugGeneration {
-        std::string input;
-        std::string output;
-        std::string context_id;
-        std::chrono::system_clock::time_point timestamp;
-    };
-    
-    mutable std::mutex debug_mutex;
-    std::deque<std::string> log_history; // Plugin-specific log history
-    static constexpr size_t MAX_LOG_HISTORY = 100; // Keep last 100 log entries
-    std::optional<DebugGeneration> last_generation; // Last generation for debugging
+    // Plugin-specific configuration
+    std::atomic<size_t> analysis_window_size{3};
 
 public:
     explicit EmoTagPlugin(Orchestrator* orch) 
-        : orchestrator(orch) {
-        
-        if (orchestrator) {
-            llama_manager = orchestrator->GetLlamaManager();
-            settings_manager = orchestrator->GetSettingsManager();
-        }
-        
+        : BasePlugin(orch, PLUGIN_NAME, MODEL_ID, CONTEXT_ID, DEFAULT_SYSTEM_PROMPT) {
         LogInfo("EmoTagPlugin initialized as processor service");
     }
     
-    ~EmoTagPlugin() {
-        Shutdown();
-    }
+    void SetAnalysisWindow(size_t window_size) { analysis_window_size = window_size; }
     
-    /**
-     * Initialize the plugin (called by Orchestrator)
-     */
-    bool Initialize() {
-        return InitializeEmotionModel();
-    }
-    
-    /**
-     * Shutdown the plugin and clean up resources
-     */
-    void Shutdown() {
-        // Clean up emotion context and model
-        emotion_model_ready = false;
-        
-        LogInfo("EmoTagPlugin shutdown");
-    }
-    
-    /**
-     * Set status update callback for UI notifications
-     */
-    void SetStatusCallback(StatusUpdateCallback callback) {
-        status_callback = callback;
-    }
-    
-    /**
-     * Configure analysis parameters
-     */
-    void SetAnalysisWindow(size_t window_size) {
-        analysis_window_size = window_size;
-    }
-    
-    /**
-     * Process an emotion analysis request (called by Orchestrator pipeline)
-     * This is the main processing method used by the Orchestrator's pipeline
-     */
-    EmotionAnalysisResponse ProcessEmotionAnalysisRequest(const EmotionAnalysisRequest& request) {
-        LogInfo("Processing emotion analysis for context: " + request.context_id + 
-               " (" + std::to_string(request.batch.ai_responses.size()) + " responses)");
-        
-        try {
-            if (!emotion_model_ready.load() || !llama_manager) {
-                std::string error_msg = "Emotion model not ready for processing batch";
-                LogError(error_msg);
-                return EmotionAnalysisResponse("", request.context_id, false, 0, error_msg);
-            }
-            
-            // Process the batch to generate emotional state (existing logic)
-            std::string emotional_state = ProcessEmotionalAnalysisBatch(request.batch);
-            
-            if (emotional_state.empty()) {
-                std::string error_msg = "Failed to generate emotional state for context: " + request.context_id;
-                LogError(error_msg);
-                return EmotionAnalysisResponse("", request.context_id, false, 0, error_msg);
-            }
-            
-            LogInfo("Successfully generated emotional state for batch: " + request.context_id);
-            
-            // Update statistics
-            responses_analyzed += request.batch.ai_responses.size();
-            emotional_states_generated++;
-            batches_processed++;
-            
-            // Create success response with the generated emotional state
-            return EmotionAnalysisResponse{
-                emotional_state,
-                request.context_id,
-                true,
-                request.batch.ai_responses.size()
-            };
-            
-        } catch (const std::exception& e) {
-            std::string error_msg = "Exception in emotion analysis processing: " + std::string(e.what());
-            LogError(error_msg);
-            return EmotionAnalysisResponse("", request.context_id, false, 0, error_msg);
-        }
-    }
-    
-    /**
-     * Apply an emotional state to a context (called by Orchestrator after successful processing)
-     */
-    bool ApplyEmotionalStateToContext(const std::string& context_id, const std::string& emotional_state) {
-        try {
-            if (!llama_manager) {
-                LogError("LlamaManager not available for applying emotional state");
-                return false;
-            }
-            
-            // Get the original context
-            auto* original_context = llama_manager->GetContextInfo(context_id);
-            if (!original_context) {
-                LogWarning("Original context not found for emotional state application: " + context_id);
-                return false;
-            }
-            
-            // Apply the emotional state to the context
-            if (emotional_state.empty()) {
-                LogWarning("Emotional state is empty - skipping update for context: " + context_id);
-                return false;
-            }
-            
-            // Apply emotional state directly - UpdateEmotionalState is thread-safe
-            original_context->UpdateEmotionalState(emotional_state);
-            contexts_updated++;
-            LogInfo("Applied emotional state to context: " + context_id);
-            
-            // If this is an outer_voice context, also apply to the corresponding inner_voice context
-            std::string inner_context_id;
-            bool has_inner_context = false;
-            
-            if (context_id.starts_with("outer_context_")) {
-                // Discord context pattern: "outer_context_" + channel_id -> "inner_context_" + channel_id
-                std::string channel_id = context_id.substr(14); // Remove "outer_context_" prefix
-                inner_context_id = "inner_context_" + channel_id;
-                has_inner_context = true;
-            } else if (context_id == "outer_context") {
-                // UI context pattern: "outer_context" -> "inner_context"
-                inner_context_id = "inner_context";
-                has_inner_context = true;
-            }
-            
-            if (has_inner_context) {
-                auto* inner_context = llama_manager->GetContextInfo(inner_context_id);
-                if (inner_context) {
-                    try {
-                        inner_context->UpdateEmotionalState(emotional_state);
-                        contexts_updated++;
-                        LogInfo("Applied emotional state to inner_voice context: " + inner_context_id);
-                    } catch (const std::exception& inner_e) {
-                        LogWarning("Failed to apply emotional state to inner_voice context: " + inner_context_id + 
-                                 " - Error: " + inner_e.what());
-                        // Don't fail the whole operation if inner context update fails
-                    }
-                } else {
-                    LogDebug("No corresponding inner_voice context found for: " + inner_context_id);
-                }
-            }
-            
-            return true;
-            
-        } catch (const std::exception& e) {
-            LogError("Exception applying emotional state to context " + context_id + ": " + std::string(e.what()));
-            return false;
-        }
-    }
-    
-    /**
-     * Get plugin statistics
-     */
-    struct PluginStats {
-        size_t batches_processed;
-        size_t responses_analyzed;
-        size_t emotional_states_generated;
-        size_t contexts_updated;
-        size_t analysis_window_size;
+    // Plugin-specific stats that include analysis window size
+    struct EmoTagPluginStats {
+        size_t batches_processed, responses_analyzed, emotional_states_generated, contexts_updated, analysis_window_size;
         bool emotion_model_ready;
         std::string emotion_model_path;
     };
     
-    PluginStats GetStats() const {
-        std::string model_path = "";
-        if (settings_manager) {
-            model_path = settings_manager->GetString("Models", "emotag_model_path", "");
-        }
-        
+    EmoTagPluginStats GetStats() const {
+        auto base_stats = BasePlugin::GetStats();
         return {
-            batches_processed.load(),
-            responses_analyzed.load(),
-            emotional_states_generated.load(),
-            contexts_updated.load(),
+            base_stats.batches_processed,
+            base_stats.items_processed,  // responses_analyzed
+            base_stats.results_generated, // emotional_states_generated
+            base_stats.contexts_updated,
             analysis_window_size.load(),
-            emotion_model_ready.load(),
-            model_path
+            base_stats.model_ready,
+            base_stats.model_path
         };
     }
     
-    /**
-     * Check if the plugin is ready to process emotion analysis requests
-     */
-    bool IsReady() const {
-        return emotion_model_ready.load();
+    EmotionAnalysisResponse ProcessEmotionAnalysisRequest(const EmotionAnalysisRequest& request) {
+        return ProcessRequest(request);
     }
     
-    // Buffer management methods (moved from ContextInfo)
-    /**
-     * Get and clear all pending emotional analysis batches
-     */
+    // Delegate to base class buffer management with clear naming
     std::vector<EmotionalAnalysisBatch> GetAndClearEmotionalAnalysisBuffer() {
-        std::lock_guard<std::mutex> lock(emotional_analysis_buffer_mutex);
-        
-        std::vector<EmotionalAnalysisBatch> result;
-        result.swap(emotional_analysis_buffer);
-        
-        return result;
+        return GetAndClearBuffer();
     }
     
-    /**
-     * Check if there are pending AI responses waiting for emotional analysis
-     */
     bool HasPendingEmotionalAnalysis() const {
-        std::lock_guard<std::mutex> lock(emotional_analysis_buffer_mutex);
-        return !emotional_analysis_buffer.empty();
+        return HasPendingWork();
     }
     
-    /**
-     * Add an emotional analysis batch to the buffer
-     */
     void AddToEmotionalAnalysisBuffer(EmotionalAnalysisBatch&& batch) {
-        std::lock_guard<std::mutex> lock(emotional_analysis_buffer_mutex);
-        emotional_analysis_buffer.emplace_back(std::move(batch));
+        AddToBuffer(std::move(batch));
     }
     
     /**
-     * Request emotional analysis for a specific context (moved from ContextInfo)
+     * Request emotional analysis for a specific context
      */
     void RequestEmotionalAnalysis(const std::string& context_id, const std::vector<std::pair<std::string, std::string>>& message_history) {
         if (message_history.empty()) {
@@ -338,271 +114,191 @@ public:
         // Extract recent AI responses for analysis
         std::vector<std::string> ai_responses;
         const size_t max_responses = analysis_window_size.load();
-        const size_t history_size = message_history.size();
         
-        LogInfo("Searching for AI responses in " + std::to_string(history_size) + " messages for context: " + context_id);
+        LogInfo("Searching for AI responses in " + std::to_string(message_history.size()) + " messages for context: " + context_id);
         
         // Walk backwards through message history to find AI responses
-        for (auto it = message_history.rbegin(); it != message_history.rend() && ai_responses.size() < max_responses; ++it) {
+        for (auto it = message_history.rbegin(); 
+             it != message_history.rend() && ai_responses.size() < max_responses; 
+             ++it) {
             if (it->first == "assistant") {
-                ai_responses.insert(ai_responses.begin(), it->second); // Insert at beginning to maintain order
+                ai_responses.insert(ai_responses.begin(), it->second);
                 LogInfo("Found assistant message (" + std::to_string(it->second.length()) + " chars) for emotional analysis");
             }
         }
         
         if (!ai_responses.empty()) {
-            size_t response_count = ai_responses.size();  // Store size before move
+            size_t response_count = ai_responses.size();
             AddToEmotionalAnalysisBuffer(EmotionalAnalysisBatch(context_id, std::move(ai_responses)));
-            
             LogInfo("Requested emotional analysis for context " + context_id + 
                    " with " + std::to_string(response_count) + " AI responses");
         } else {
-            LogInfo("No assistant messages found in " + std::to_string(history_size) + " messages for context: " + context_id);
+            LogInfo("No assistant messages found in " + std::to_string(message_history.size()) + " messages for context: " + context_id);
         }
     }
     
-    /**
-     * Get plugin-specific log history for debugging
-     */
-    std::vector<std::string> GetLogHistory() const {
-        std::lock_guard<std::mutex> lock(debug_mutex);
-        return std::vector<std::string>(log_history.begin(), log_history.end());
+    // Specialized application method
+    bool ApplyEmotionalStateToContext(const std::string& context_id, const std::string& emotional_state) {
+        return ApplyResult(context_id, emotional_state);
     }
-    
-    /**
-     * Get last generation info for debugging
-     */
-    struct LastGenerationInfo {
-        bool has_generation;
-        std::string input;
-        std::string output;
-        std::string context_id;
-        std::string timestamp;
-    };
-    
-    LastGenerationInfo GetLastGeneration() const {
-        std::lock_guard<std::mutex> lock(debug_mutex);
-        if (!last_generation.has_value()) {
-            return {false, "", "", "", ""};
+
+    void Shutdown() {
+        BasePlugin::Shutdown();
+        LogInfo("EmoTagPlugin shutdown");
+    }
+
+protected:
+    // BasePlugin virtual method implementations
+    EmotionAnalysisResponse ProcessRequest(const EmotionAnalysisRequest& request) override {
+        LogInfo("Processing emotion analysis for context: " + request.context_id + 
+               " (" + std::to_string(request.batch.ai_responses.size()) + " responses)");
+        
+        if (!model_ready.load() || !llama_manager) {
+            std::string error_msg = "Emotion model not ready for processing batch";
+            LogError(error_msg);
+            return EmotionAnalysisResponse("", request.context_id, false, 0, error_msg);
         }
         
-        // Format timestamp
-        auto time_t = std::chrono::system_clock::to_time_t(last_generation->timestamp);
-        std::stringstream ss;
-        ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
-        
-        return {
-            true,
-            last_generation->input,
-            last_generation->output,
-            last_generation->context_id,
-            ss.str()
-        };
-    }
-    
-    /**
-     * Add a log entry to plugin-specific log history (for debugging)
-     * NOTE: This is only for UI debugging display - actual logging goes through unified Logger system
-     */
-    void AddLogEntry(const std::string& log_message) {
-        std::lock_guard<std::mutex> lock(debug_mutex);
-        log_history.push_back(log_message);
-        
-        // Keep only the last MAX_LOG_HISTORY entries
-        while (log_history.size() > MAX_LOG_HISTORY) {
-            log_history.pop_front();
+        try {
+            std::string emotional_state = ProcessEmotionalAnalysisBatch(request.batch);
+            
+            if (emotional_state.empty()) {
+                std::string error_msg = "Failed to generate emotional state for context: " + request.context_id;
+                LogError(error_msg);
+                return EmotionAnalysisResponse("", request.context_id, false, 0, error_msg);
+            }
+            
+            stats.IncrementBatch(request.batch.ai_responses.size());
+            LogInfo("Successfully generated emotional state for batch: " + request.context_id);
+            
+            return EmotionAnalysisResponse{
+                emotional_state, request.context_id, true, request.batch.ai_responses.size()
+            };
+            
+        } catch (const std::exception& e) {
+            std::string error_msg = "Exception in emotion analysis processing: " + std::string(e.what());
+            LogError(error_msg);
+            return EmotionAnalysisResponse("", request.context_id, false, 0, error_msg);
         }
     }
     
-    // Helper methods that use the unified Logger system but avoid deadlock-prone error handling
+    bool ApplyResult(const std::string& context_id, const std::string& emotional_state) override {
+        if (!llama_manager || emotional_state.empty()) {
+            LogError("LlamaManager not available or emotional state is empty");
+            return false;
+        }
+        
+        // Don't apply error states as valid emotional analysis
+        if (PluginUtils::IsErrorResponse(emotional_state)) {
+            LogWarning("Refusing to apply error response as emotional state for context: " + context_id + 
+                      " - Error: " + emotional_state.substr(0, 100));
+            return false;
+        }
+        
+        try {
+            auto* original_context = llama_manager->GetContextInfo(context_id);
+            if (!original_context) {
+                LogWarning("Original context not found for emotional state application: " + context_id);
+                return false;
+            }
+            
+            // Apply emotional state directly - UpdateEmotionalState is thread-safe
+            original_context->UpdateEmotionalState(emotional_state);
+            stats.IncrementContextUpdate();
+            LogInfo("Applied emotional state to context: " + context_id);
+            
+            // Also apply to corresponding inner_voice context if applicable
+            ApplyToInnerContext(context_id, emotional_state);
+            return true;
+            
+        } catch (const std::exception& e) {
+            LogError("Exception applying emotional state to context " + context_id + ": " + std::string(e.what()));
+            return false;
+        }
+    }
+    
+    std::string GetModelPath() const override {
+        return settings_manager ? settings_manager->GetString("Models", "emotag_model_path", "") : "";
+    }
+    
+    std::string GetModelPathSettingKey() const override {
+        return "emotag_model_path";
+    }
+    
+    std::string GetSystemPromptSettingKey() const override {
+        return "Emotion.system_prompt";
+    }
+    
+    std::string GetPluginName() const override {
+        return PLUGIN_NAME;
+    }
+    
+    // Override logging to use plugin-specific macros
     void LogInfo(const std::string& message) {
         LOG_EmoTagPlugin(message);
-        AddLogEntry("[INFO] " + message);
+        debug.AddLog("INFO", message);
     }
     
     void LogWarning(const std::string& message) {
         LOG_WARNING_EmoTagPlugin(message);
-        AddLogEntry("[WARN] " + message);
-        // Note: Removed HandleWarning call to prevent deadlocks when called from pipeline
+        debug.AddLog("WARN", message);
     }
     
     void LogError(const std::string& message) {
         LOG_ERROR_EmoTagPlugin(message);
-        AddLogEntry("[ERROR] " + message);
-        // Note: Removed HandleError call to prevent deadlocks when called from pipeline
+        debug.AddLog("ERROR", message);
     }
     
     void LogDebug(const std::string& message) {
         LOG_DEBUG_EmoTagPlugin(message);
-        AddLogEntry("[DEBUG] " + message);
-    }
-    
-    /**
-     * Dynamically resize emotion context to handle larger analysis inputs
-     * @param needed_tokens The minimum tokens needed for processing
-     * @return true if resize was successful, false otherwise
-     */
-    bool ResizeEmotionContext(size_t needed_tokens) {
-        if (!llama_manager || !settings_manager) {
-            LogError("LlamaManager or SettingsManager not available for context resize");
-            return false;
-        }
-        
-        // Get current emotion context
-        auto* emotion_ctx = llama_manager->GetContextInfo(emotion_context_id);
-        if (!emotion_ctx) {
-            LogError("Emotion context not available for resize");
-            return false;
-        }
-        
-        // Calculate new context size (needed tokens + 25% buffer for system prompt and generation overhead)
-        size_t new_context_size = static_cast<size_t>(needed_tokens * 1.25f) + 500;
-        
-        // Get outer model context size as hard limit
-        int outer_context_size = settings_manager->GetInt("Models", "outer_context_size", 4096);
-        if (new_context_size > static_cast<size_t>(outer_context_size)) {
-            LogWarning("Cannot resize emotion context to " + std::to_string(new_context_size) + 
-                " tokens - would exceed outer context limit of " + std::to_string(outer_context_size));
-            return false;
-        }
-        
-        LogInfo("Resizing emotion context from current size to " + std::to_string(new_context_size) + 
-            " tokens (needed: " + std::to_string(needed_tokens) + ")");
-        
-        try {
-            // Store system prompt before context destruction
-            std::string system_prompt = settings_manager->GetString("Emotion", "system_prompt", "");
-            
-            // Remove the old context (this will free the llama context but keep the model loaded)
-            llama_manager->RemoveContext(emotion_context_id);
-            
-            // Create new context with the larger size (model stays loaded)
-            auto* new_context_ptr = llama_manager->GetOrCreateContextInfo(emotion_context_id, emotion_model_id, static_cast<int32_t>(new_context_size));
-            if (!new_context_ptr) {
-                LogError("Failed to create resized emotion context");
-                return false;
-            }
-            
-            // Reapply system prompt
-            if (!system_prompt.empty()) {
-                new_context_ptr->UpdateSystemPrompt(system_prompt);
-                LogInfo("Reapplied system prompt to resized context");
-            }
-            
-            LogInfo("Successfully resized emotion context to " + std::to_string(new_context_size) + " tokens");
-            return true;
-            
-        } catch (const std::exception& e) {
-            LogError("Exception during context resize: " + std::string(e.what()));
-            return false;
-        }
+        debug.AddLog("DEBUG", message);
     }
 
 private:
     /**
-     * Initialize the emotion analysis model and context for the plugin
+     * Apply emotional state to corresponding inner_voice context
      */
-    bool InitializeEmotionModel() {
-        if (!llama_manager || !settings_manager) {
-            LogError("LlamaManager or SettingsManager not available");
-            if (status_callback) status_callback("Error: Core services not available", true);
-            return false;
+    void ApplyToInnerContext(const std::string& context_id, const std::string& emotional_state) {
+        std::string inner_context_id;
+        
+        if (context_id.starts_with("outer_context_")) {
+            // Discord context pattern: "outer_context_" + channel_id -> "inner_context_" + channel_id
+            inner_context_id = "inner_context_" + context_id.substr(14);
+        } else if (context_id == "outer_context") {
+            // UI context pattern: "outer_context" -> "inner_context"
+            inner_context_id = "inner_context";
+        } else {
+            return; // No corresponding inner context
         }
         
-        LogInfo("Initializing emotion model...");
-        if (status_callback) status_callback("Initializing emotion model...", false);
-        
-        // Get emotion model configuration from settings
-        std::string emotion_model_path = settings_manager->GetString("Models", "emotag_model_path", "");
-        if (emotion_model_path.empty()) {
-            LogWarning("No emotion model path configured - plugin will be disabled");
-            if (status_callback) status_callback("No emotion model configured", true);
-            return false;
-        }
-        
-        // Get outer model settings to derive emotion model config
-        int outer_context_size = settings_manager->GetInt("Models", "outer_context_size", 4096);
-        int outer_gpu_layers = settings_manager->GetInt("Models", "outer_gpu_layers", 999);
-        
-        // Context size calculation for emotional analysis
-        // Need enough space for: system prompt (~300 tokens) + AI responses (up to 1000 tokens each for 3 responses)
-        // + formatting overhead (~100 tokens) + response generation (~200 tokens)
-        // Total: ~3600 tokens minimum for typical analysis
-        // Use 50% of outer context size with minimum 4500 tokens (matching SummarizationPlugin for reliability)
-        int emotion_context_size = std::max(4500, (outer_context_size * 50) / 100);
-        
-        LogInfo("Loading emotion model: " + emotion_model_path + 
-                        " (context: " + std::to_string(emotion_context_size) + 
-                        " [30% of outer, optimized for response analysis], gpu_layers: " + std::to_string(outer_gpu_layers) + ")");
-        
-        if (status_callback) status_callback("Loading emotion model: " + emotion_model_path, false);
-        
-        try {
-            // Load emotion model
-            ModelConfig config;
-            config.model_path = emotion_model_path;
-            config.context_size = emotion_context_size;
-            config.gpu_layers = outer_gpu_layers;
-            
-            if (!llama_manager->LoadModel(emotion_model_id, config)) {
-                LogError("Failed to load emotion model: " + emotion_model_path);
-                if (status_callback) status_callback("Failed to load emotion model", true);
-                return false;
+        auto* inner_context = llama_manager->GetContextInfo(inner_context_id);
+        if (inner_context) {
+            try {
+                inner_context->UpdateEmotionalState(emotional_state);
+                stats.IncrementContextUpdate();
+                LogInfo("Applied emotional state to inner_voice context: " + inner_context_id);
+            } catch (const std::exception& inner_e) {
+                LogWarning("Failed to apply emotional state to inner_voice context: " + inner_context_id + 
+                         " - Error: " + inner_e.what());
             }
-            
-            LogInfo("Emotion model loaded successfully");
-            if (status_callback) status_callback("Creating emotion context...", false);
-            
-            // Create emotion context
-            auto* context_ptr = llama_manager->GetOrCreateContextInfo(emotion_context_id, emotion_model_id, emotion_context_size);
-            if (!context_ptr) {
-                LogError("Failed to create emotion context");
-                if (status_callback) status_callback("Failed to create emotion context", true);
-                return false;
-            }
-            
-            LogInfo("Emotion context created: " + emotion_context_id);
-            if (status_callback) status_callback("Applying emotion system prompt...", false);
-            
-            // Apply emotion system prompt from settings
-            std::string emotion_system_prompt = settings_manager->GetString("Emotion", "system_prompt",
-                "You are an emotional state analyzer. When given AI assistant responses, analyze the emotional tone, "
-                "mood, and psychological state conveyed in the text. Provide a brief emotional overview that captures "
-                "the assistant's apparent emotional state, confidence level, and overall demeanor. "
-                "Focus on identifying patterns like: confident, uncertain, empathetic, analytical, cheerful, "
-                "cautious, enthusiastic, or reserved. Keep your analysis concise and actionable.");
-            
-            if (!emotion_system_prompt.empty()) {
-                context_ptr->UpdateSystemPrompt(emotion_system_prompt);
-                LogInfo("Applied emotion system prompt to context");
-            }
-            
-            emotion_model_ready = true;
-            LogInfo("Emotion model initialization completed successfully");
-            if (status_callback) status_callback("Emotion model ready", false);
-            return true;
-            
-        } catch (const std::exception& e) {
-            LogError("Exception during emotion model initialization: " + std::string(e.what()));
-            if (status_callback) status_callback("Error: " + std::string(e.what()), true);
-            return false;
+        } else {
+            LogDebug("No corresponding inner_voice context found for: " + inner_context_id);
         }
     }
     
     /**
      * Process a single batch of AI responses for emotional analysis
-     * Returns the generated emotional state or empty string on failure
      */
     std::string ProcessEmotionalAnalysisBatch(const EmotionalAnalysisBatch& batch) {
         LogInfo("ProcessEmotionalAnalysisBatch called for context: " + batch.context_id);
         
-        if (!emotion_model_ready.load() || !llama_manager) {
+        if (!model_ready.load() || !llama_manager) {
             LogError("Emotion model not ready for processing batch");
             return "";
         }
         
         try {
-            // Build analysis prompt from AI responses first (before any context operations)
+            // Build analysis prompt from AI responses
             std::ostringstream analysis_stream;
             analysis_stream << "Categorize my emotional state in 1-3 short sentences; identify the presence of any emotions present from the following:\n\n";
 
@@ -615,17 +311,16 @@ private:
             
             LogInfo("Built analysis prompt (" + std::to_string(analysis_prompt.length()) + " chars) for context: " + batch.context_id);
             
-            // Attempt emotional analysis with defensive context handling
-            std::string emotional_state = AttemptEmotionalAnalysis(analysis_prompt, batch.context_id);
+            // Perform emotional analysis using base class generation method
+            std::string emotional_state = PerformGeneration(analysis_prompt, batch.context_id);
             
-            if (emotional_state.empty()) {
+            if (!emotional_state.empty() && !PluginUtils::IsErrorResponse(emotional_state)) {
+                LogInfo("Successfully generated emotional analysis for context: " + batch.context_id + 
+                       " - " + emotional_state.substr(0, 100) + 
+                       (emotional_state.length() > 100 ? "..." : ""));
+            } else {
                 LogWarning("Failed to generate valid emotional analysis for context: " + batch.context_id);
-                return "";
             }
-            
-            LogInfo("Successfully generated emotional analysis for context: " + batch.context_id + 
-                   " - " + emotional_state.substr(0, 100) + 
-                   (emotional_state.length() > 100 ? "..." : ""));
             
             return emotional_state;
             
@@ -633,210 +328,6 @@ private:
             LogError("Exception processing emotional analysis: " + std::string(e.what()));
             return "";
         }
-    }
-    
-    /**
-     * Attempt emotional analysis with defensive context handling to prevent deadlocks
-     */
-    std::string AttemptEmotionalAnalysis(const std::string& analysis_prompt, const std::string& context_id) {
-        try {
-            // Get fresh context pointer for each attempt
-            auto* emotion_ctx = llama_manager->GetContextInfo(emotion_context_id);
-            if (!emotion_ctx) {
-                LogError("Emotion context not available");
-                return "";
-            }
-            
-            // Defensive context operations with explicit scope management
-            std::string emotional_state;
-            
-            // Clear context in isolated scope
-            {
-                try {
-                    emotion_ctx->ClearContext();
-                } catch (const std::exception& clear_e) {
-                    LogError("Exception clearing context: " + std::string(clear_e.what()));
-                    return "";
-                }
-            }
-            
-            // Handle input in isolated scope  
-            {
-                try {
-                    emotional_state = emotion_ctx->HandleInput(analysis_prompt, "user");
-                    LogInfo("Emotion analysis completed for context: " + context_id + " - Generated: " + emotional_state.substr(0, 100) + (emotional_state.length() > 100 ? "..." : ""));
-                    
-                } catch (const std::exception& analysis_e) {
-                    std::string error_msg = std::string(analysis_e.what());
-                    LogError("Exception during emotional analysis for context " + context_id + ": " + error_msg);
-                    emotional_state = "Error: Exception during generation - " + error_msg;
-                }
-            }
-            
-            // Store generation for debugging (in isolated scope)
-            {
-                std::lock_guard<std::mutex> lock(debug_mutex);
-                last_generation = DebugGeneration{
-                    analysis_prompt,
-                    emotional_state,
-                    context_id,
-                    std::chrono::system_clock::now()
-                };
-            }
-            
-            // Check if we got an error and attempt context resize if needed
-            if (emotional_state.empty() || 
-                emotional_state.find("Error: Failed to process prompt") == 0 || 
-                emotional_state.find("Error: Exception during generation") == 0) {
-                
-                LogWarning("Initial analysis failed for context " + context_id + " - attempting resize and retry...");
-                return AttemptEmotionalAnalysisWithResize(analysis_prompt, context_id, emotional_state);
-            }
-            
-            // Check for valid response
-            if (emotional_state.empty() || 
-                emotional_state.find("Error: Failed to process prompt") == 0 || 
-                emotional_state.find("Error: Exception during") == 0) {
-                LogWarning("Failed to generate valid emotional analysis for context: " + context_id + " - Response: " + emotional_state);
-                return "";
-            }
-            
-            return emotional_state;
-            
-        } catch (const std::exception& e) {
-            LogError("Exception in AttemptEmotionalAnalysis: " + std::string(e.what()));
-            return "";
-        }
-    }
-    
-    /**
-     * Attempt emotional analysis with context resize - isolated retry logic
-     */
-    std::string AttemptEmotionalAnalysisWithResize(const std::string& analysis_prompt, const std::string& context_id, const std::string& original_error) {
-        try {
-            // Extract needed token count from error message (if available)
-            size_t needed_tokens = ExtractNeededTokensFromError(original_error);
-            if (needed_tokens == 0) {
-                // Better token estimation: 3 chars per token + 25% buffer for system prompt overhead
-                needed_tokens = static_cast<size_t>((analysis_prompt.length() / 3.0f) * 1.25f) + 500; // +500 for system prompt and generation
-                LogInfo("Estimated needed tokens: " + std::to_string(needed_tokens));
-            } else {
-                LogInfo("Extracted needed tokens from error: " + std::to_string(needed_tokens));
-            }
-            
-            // Attempt to resize the emotion context (this creates a completely new context)
-            if (!ResizeEmotionContext(needed_tokens)) {
-                LogWarning("Context resize failed for emotional analysis - skipping context: " + context_id + 
-                    " (tokens too large or resize failed)");
-                return "";
-            }
-            
-            LogInfo("Context resize successful, retrying emotional analysis for context: " + context_id);
-            
-            // Get the NEW resized context pointer - completely fresh context
-            auto* new_emotion_ctx = llama_manager->GetContextInfo(emotion_context_id);
-            if (!new_emotion_ctx) {
-                LogError("Lost emotion context after resize - skipping analysis");
-                return "";
-            }
-            
-            std::string retry_emotional_state;
-            
-            // Clear new context in isolated scope
-            {
-                try {
-                    new_emotion_ctx->ClearContext();
-                } catch (const std::exception& clear_e) {
-                    LogError("Exception clearing resized context: " + std::string(clear_e.what()));
-                    return "";
-                }
-            }
-            
-            // Retry generation with new context in isolated scope
-            {
-                try {
-                    retry_emotional_state = new_emotion_ctx->HandleInput(analysis_prompt, "user");
-                    LogInfo("Retry analysis completed for context: " + context_id);
-                } catch (const std::exception& retry_e) {
-                    retry_emotional_state = "Error: Exception during retry generation - " + std::string(retry_e.what());
-                    LogError("Exception during retry generation: " + std::string(retry_e.what()));
-                }
-            }
-            
-            // Update debug info with retry result (in isolated scope)
-            {
-                std::lock_guard<std::mutex> lock(debug_mutex);
-                last_generation = DebugGeneration{
-                    analysis_prompt,
-                    retry_emotional_state,
-                    context_id,
-                    std::chrono::system_clock::now()
-                };
-            }
-            
-            // Final validation of retry result
-            if (retry_emotional_state.empty() || 
-                retry_emotional_state.find("Error: Failed to process prompt") == 0 || 
-                retry_emotional_state.find("Error: Exception during") == 0) {
-                LogWarning("Emotional analysis still failed after context resize - skipping context: " + context_id);
-                return "";
-            }
-            
-            LogInfo("Emotional analysis succeeded after context resize for context: " + context_id);
-            return retry_emotional_state;
-            
-        } catch (const std::exception& e) {
-            LogError("Exception in AttemptEmotionalAnalysisWithResize: " + std::string(e.what()));
-            return "";
-        }
-    }
-
-    
-    /**
-     * Extract needed token count from error message if available
-     */
-    size_t ExtractNeededTokensFromError(const std::string& error_message) {
-        if (error_message.empty()) {
-            return 0;
-        }
-        
-        // Look for patterns like "Error: Failed to process prompt" with token information
-        // Error messages from llama.cpp might contain token count information
-        std::string search_patterns[] = {
-            "needed ",
-            "require ",
-            "needs ",
-            "tokens:"
-        };
-        
-        for (const auto& pattern : search_patterns) {
-            size_t pos = error_message.find(pattern);
-            if (pos != std::string::npos) {
-                // Look for a number after the pattern
-                size_t start = pos + pattern.length();
-                while (start < error_message.length() && !std::isdigit(error_message[start])) {
-                    start++;
-                }
-                
-                if (start < error_message.length()) {
-                    // Extract the number
-                    size_t end = start;
-                    while (end < error_message.length() && std::isdigit(error_message[end])) {
-                        end++;
-                    }
-                    
-                    if (end > start) {
-                        try {
-                            return std::stoull(error_message.substr(start, end - start));
-                        } catch (...) {
-                            // Continue looking
-                        }
-                    }
-                }
-            }
-        }
-        
-        return 0; // No token count found
     }
 };
 
@@ -905,7 +396,6 @@ inline void Orchestrator::OnEmotionAnalysisComplete(const std::string& context_i
         }
         
         // Update statistics
-        // Update statistics using lock-free atomic increment
         stats.emotion_analyses_completed.fetch_add(1, std::memory_order_relaxed);
     } else {
         LOG_ERROR_Orchestrator("Emotion analysis failed for context: " + context_id + " - Error: " + response.error_message);

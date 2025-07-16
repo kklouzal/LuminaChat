@@ -459,8 +459,15 @@ inline ContextInfo* LlamaManager::GetOrCreateContextInfo(const std::string& cont
     LOG_LlamaManager("Creating new ContextInfo: " + context_id + " with model: " + model_id + " and context size: " + std::to_string(context_size));
     
     try {
-        // Create ContextInfo with specific context size
-        auto context_info = std::make_unique<ContextInfo>(context_id, model_info, context_size);
+        // Determine summary slot count based on context type
+        size_t max_summary_slots = 5; // Default
+        if (context_id.starts_with("inner_context")) {
+            max_summary_slots = 16; // Inner contexts get more summary capacity (set to 16 as requested)
+            LOG_LlamaManager("Using enhanced summary capacity (" + std::to_string(max_summary_slots) + " slots) for inner context: " + context_id);
+        }
+        
+        // Create ContextInfo with specific context size and summary slot configuration
+        auto context_info = std::make_unique<ContextInfo>(context_id, model_info, context_size, max_summary_slots);
         
         ContextInfo* context_ptr = context_info.get();
         contexts[context_id] = std::move(context_info);

@@ -197,6 +197,11 @@ private:
         HandleError(message, "ContextPruning", false);
     }
     
+    void LogDebug(const std::string& message) {
+        LOG_DEBUG_ContextPruning(message);
+        AddLogEntry("[DEBUG] " + message);
+    }
+    
     void AddLogEntry(const std::string& entry) {
         std::lock_guard<std::mutex> lock(debug_mutex);
         log_history.push_back(entry);
@@ -313,6 +318,22 @@ public:
     
     // Context monitoring - main interface for the plugin
     void MonitorContext(const std::string& context_id, const ContextUsageStats& stats) {
+        // Early exit check for pruning eligibility
+        if (!llama_manager) {
+            return;
+        }
+        
+        auto* context = GetContextInfo(context_id);
+        if (!context) {
+            return;
+        }
+        
+        // Check if this context is eligible for pruning
+        if (!context->IsPruningEligible()) {
+            LogDebug("Skipping pruning monitoring for context: " + context_id + " (not eligible for pruning)");
+            return;
+        }
+        
         std::lock_guard<std::mutex> lock(contexts_mutex);
         
         auto& monitoring = monitored_contexts[context_id];
@@ -327,8 +348,7 @@ public:
         // Check for deferred pruning requests first
         if (monitoring.has_deferred_pruning) {
             // Check if context is now available and enough time has passed
-            auto* context = GetContextInfo(context_id);
-            if (context && IsContextAvailableForPruning(context) && 
+            if (IsContextAvailableForPruning(context) && 
                 (monitoring.last_update - monitoring.deferred_pruning_time >= std::chrono::seconds(2))) {
                 
                 LogInfo("Executing deferred pruning for context: " + context_id);

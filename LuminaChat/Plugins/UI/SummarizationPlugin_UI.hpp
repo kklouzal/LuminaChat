@@ -184,10 +184,8 @@ inline void SummarizationPluginUI::UpdateDebugInfo(LuminaChat::SummarizationPlug
     if (summary_last_generation_text) {
         auto last_gen = plugin->GetLastGeneration();
         std::string gen_text;
-        if (last_gen.has_generation) {
-            gen_text = "Timestamp: " + last_gen.timestamp + "\n\n";
-            gen_text += "Input:\n" + last_gen.input + "\n\n";
-            gen_text += "Output:\n" + last_gen.output;
+        if (last_gen.has_value()) {
+            gen_text = last_gen.value();
         } else {
             gen_text = "No generation recorded yet.";
         }

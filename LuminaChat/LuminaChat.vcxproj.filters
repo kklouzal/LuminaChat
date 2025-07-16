@@ -27,7 +27,7 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="LuminaChat.cpp">
+    <ClCompile Include="Core\LuminaChat.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -105,6 +105,9 @@
       <Filter>Header Files\UI</Filter>
     </ClInclude>
     <ClInclude Include="Utilities.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Plugins\BasePlugin.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
